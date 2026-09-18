@@ -1,0 +1,5 @@
+# Minimal on purpose: these are stdlib-only standalone drivers, not a package.
+# The only thing this file configures is how pytest finds and imports them.
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
