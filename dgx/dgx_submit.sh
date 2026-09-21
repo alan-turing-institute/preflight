@@ -152,8 +152,19 @@ echo "[dgx] leg 2/4: OK"
 # ---- LEG 3 -------------------------------------------------------------------
 echo "[dgx] leg 3/4: checking the GPU is free on $HOST ..."
 # Piped from this clone so the box cannot run a stale copy of the guard itself.
+# ⛔ QUOTE EACH ARGUMENT FOR THE REMOTE SHELL. `${gpu_args[*]}` was interpolated
+# raw into the ssh command string, so a declared reason containing a space was
+# split into words and one containing `(`, `)` or `;` was a remote SYNTAX ERROR
+# -- and the gate then reported "the GPU is not free", blaming the card for a
+# quoting bug in itself. Found 2026-09-21 on the first multi-word
+# --allow-other-users. A gate that refuses a correctly-declared input is one
+# that gets switched off, which is worse than no gate.
+gpu_remote=""
+if [[ ${#gpu_args[@]} -gt 0 ]]; then
+    gpu_remote="$(printf ' %q' "${gpu_args[@]}")"
+fi
 if ! ssh -o BatchMode=yes "$HOST" \
-        "python3 - ${gpu_args[*]+${gpu_args[*]}}" < "$HERE/assert_gpu_free.py"; then
+        "python3 -$gpu_remote" < "$HERE/assert_gpu_free.py"; then
     echo "[dgx] REFUSED by leg 3: the GPU on $HOST is not free." >&2
     exit 4
 fi
