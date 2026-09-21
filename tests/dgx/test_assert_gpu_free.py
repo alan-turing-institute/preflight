@@ -13,6 +13,10 @@ import pytest
 MY_UID = 1000
 OTHER_UID = 2000
 
+#: The real function, captured before the autouse fixture below stubs it out --
+#: the one test that exercises ``running_jobs`` itself needs the real one back.
+_REAL_RUNNING_JOBS = mod.running_jobs
+
 
 @pytest.fixture(autouse=True)
 def _quiet_device(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -92,3 +96,49 @@ def test_an_unmeasurable_device_warns_and_does_not_claim(
 def test_a_nonsense_budget_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
     """MUTATION: accepting --max-jobs 0, which would permit nothing coherently."""
     assert run(monkeypatch, "--max-jobs", "0") == 2
+
+
+def test_our_budget_counts_only_our_own_processes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """Catches the ownership filter being dropped from ``running_jobs``.
+
+    A SHARED box means another user runs the same module we do, and without
+    this filter their job is counted against OUR budget -- measured on the
+    Turing DGX on 2026-09-21, where a colleague's
+    ``python3 -m autocast.scripts.train.encoder_processor_decoder`` made the
+    gate refuse with "1 job(s) of ours already running" while we had none,
+    which also makes ``--allow-other-users`` impossible to honour.
+    """
+    module = mod.DEFAULT_MODULES[0]
+    entries = []
+    for pid in (1111, 2222):
+        directory = tmp_path / str(pid)
+        directory.mkdir()
+        (directory / "cmdline").write_bytes(
+            b"\x00".join([b"/usr/bin/python3", b"-m", module.encode()]) + b"\x00"
+        )
+        entries.append(directory)
+    monkeypatch.setattr(mod, "running_jobs", _REAL_RUNNING_JOBS)
+    monkeypatch.setattr(mod, "ancestors", lambda _pid: set())
+    monkeypatch.setattr(mod, "Path", lambda *_a, **_k: _FakeProc(entries))
+    monkeypatch.setattr(
+        mod, "owner_of", lambda pid: MY_UID if pid == 1111 else OTHER_UID
+    )
+    found = {pid for pid, _ in mod.running_jobs()}
+    assert found == {1111}, (
+        "running_jobs must count only OUR processes: the other user's job "
+        "belongs to the 'another user is on the card' leg, not to our budget."
+    )
+
+
+class _FakeProc:
+    """Stands in for ``Path("/proc")`` -- and for ``Path(argv[0])``."""
+
+    def __init__(self, entries) -> None:
+        self._entries = entries
+        self.name = "python3"
+
+    def iterdir(self):
+        """The fake process directories, in order."""
+        return iter(self._entries)

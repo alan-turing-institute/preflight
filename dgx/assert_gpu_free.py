@@ -84,9 +84,28 @@ def ancestors(pid: int) -> set[int]:
 
 
 def running_jobs(modules: tuple[str, ...] = DEFAULT_MODULES) -> list[tuple[int, str]]:
-    """PIDs running one of ``modules`` as ``-m``, excluding our own ancestry."""
+    """OUR PIDs running one of ``modules`` as ``-m``, excluding our own ancestry.
+
+    ⛔⛔ **OWNERSHIP IS PART OF THE QUESTION THIS LEG ASKS, and leaving it out
+    made the gate's own ``--allow-other-users`` declaration impossible to
+    honour.** This leg counts *our* jobs against *our* declared budget; the
+    separate "another user is on the card" leg is what speaks for everyone
+    else. Matching on the module name alone conflated them, because a
+    colleague on a SHARED box runs the same module we do: measured 2026-09-21
+    on the Turing DGX, another user's
+    ``python3 -m autocast.scripts.train.encoder_processor_decoder`` was counted
+    as one of ours, so a correctly-declared queueing request was refused with
+    "1 job(s) of ours already running" while we had none. The misdirection is
+    the cost -- it blamed our own budget for someone else's job.
+
+    ⚠ Unknown ownership still counts as OURS here, which is the conservative
+    direction for a budget leg: it can only over-count and refuse. (The
+    other-user leg treats unknown ownership as someone else's, which is the
+    conservative direction there. The two differ deliberately.)
+    """
     found: list[tuple[int, str]] = []
     mine = ancestors(os.getpid())
+    me = os.getuid()
     for entry in Path("/proc").iterdir():
         if not entry.name.isdigit():
             continue
@@ -99,6 +118,9 @@ def running_jobs(modules: tuple[str, ...] = DEFAULT_MODULES) -> list[tuple[int, 
             continue
         args = [a.decode(errors="replace") for a in raw if a]
         if not args or "python" not in Path(args[0]).name:
+            continue
+        owner = owner_of(pid)
+        if owner is not None and owner != me:
             continue
         if any(module in args for module in modules):
             found.append((pid, " ".join(args)[:120]))
