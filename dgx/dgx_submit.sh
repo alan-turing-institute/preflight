@@ -76,7 +76,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # then $AUTOCAST_DGX_REPO, then the git top level of wherever it was invoked.
 repo_arg=""
 
-entry=""; searches=(); allows=(); alsos=(); cmd=(); gpu_args=()
+entry=""; searches=(); allows=(); alsos=(); cmd=(); gpu_args=(); resident_given=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --repo)              repo_arg="$2"; shift 2 ;;
@@ -86,10 +86,17 @@ while [[ $# -gt 0 ]]; do
         --also)              alsos+=("--also" "$2"); shift 2 ;;
         --max-jobs)          gpu_args+=("--max-jobs" "$2"); shift 2 ;;
         --allow-other-users) gpu_args+=("--allow-other-users" "$2"); shift 2 ;;
+        --resident)          gpu_args+=("--resident" "$2"); resident_given=1; shift 2 ;;
         --)                  shift; cmd=("$@"); break ;;
         *) echo "[dgx] unknown argument: $1" >&2; exit 2 ;;
     esac
 done
+
+# AUTOCAST_GPU_RESIDENT='<name>=<reason>' is the standing way to declare the
+# owner's resident process (2026-09-25); an explicit --resident wins over it.
+if [[ "$resident_given" == 0 && -n "${AUTOCAST_GPU_RESIDENT:-}" ]]; then
+    gpu_args+=("--resident" "$AUTOCAST_GPU_RESIDENT")
+fi
 
 REPO="${repo_arg:-${AUTOCAST_DGX_REPO:-$(git rev-parse --show-toplevel 2>/dev/null || true)}}"
 if [[ -z "$REPO" || ! -d "$REPO" ]]; then
@@ -102,7 +109,8 @@ REPO="$(cd "$REPO" && pwd)"
 if [[ -z "$entry" ]]; then
     echo "usage: dgx_submit.sh [--repo <project>] --entry <script.py> [--search dir]..." >&2
     echo "                     [--also <file>]... [--allow-diff 'path=reason']..." >&2
-    echo "                     [--max-jobs N] [--allow-other-users <reason>] [-- command...]" >&2
+    echo "                     [--max-jobs N] [--allow-other-users <reason>]" >&2
+    echo "                     [--resident '<name>=<reason>'] [-- command...]" >&2
     exit 2
 fi
 [[ -f "$REPO/$entry" ]] || { echo "[dgx] no such entrypoint: $entry" >&2; exit 2; }

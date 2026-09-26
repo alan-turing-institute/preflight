@@ -142,3 +142,48 @@ class _FakeProc:
     def iterdir(self):
         """The fake process directories, in order."""
         return iter(self._entries)
+
+
+RESIDENT_APP = (7, "20934 MiB, /home/me/llama.cpp/build/bin/llama-server")
+
+
+def test_a_declared_resident_of_ours_is_not_counted(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """MUTATION: making --resident inert, or dropping its printed declaration.
+
+    Without it a queued grid's wait for a free card never succeeds on a box
+    where the owner's LLM server holds the GPU permanently.
+    """
+    monkeypatch.setattr(mod, "compute_apps", lambda: [RESIDENT_APP])
+    assert run(monkeypatch) == 1
+    assert run(monkeypatch, "--resident", "llama-server=owner's resident LLM") == 0
+    assert "DECLARED RESIDENT" in capsys.readouterr().out
+
+
+def test_a_resident_excuses_only_the_named_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """MUTATION: excusing every process once any resident is declared."""
+    monkeypatch.setattr(
+        mod, "compute_apps", lambda: [RESIDENT_APP, (8, "4000 MiB, python")]
+    )
+    assert run(monkeypatch, "--resident", "llama-server=owner's resident LLM") == 1
+
+
+def test_a_resident_never_excuses_another_user(monkeypatch: pytest.MonkeyPatch) -> None:
+    """MUTATION: matching the name without checking the owner.
+
+    A stranger's process of the same name is someone else on the card.
+    """
+    monkeypatch.setattr(mod, "compute_apps", lambda: [RESIDENT_APP])
+    monkeypatch.setattr(mod, "owner_of", lambda _pid: OTHER_UID)
+    assert run(monkeypatch, "--resident", "llama-server=owner's resident LLM") == 1
+
+
+def test_a_resident_without_a_reason_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """MUTATION: accepting a bare name, which would be an undocumented hole."""
+    assert run(monkeypatch, "--resident", "llama-server") == 2
+    assert run(monkeypatch, "--resident", "llama-server=") == 2
