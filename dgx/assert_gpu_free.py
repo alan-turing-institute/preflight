@@ -40,6 +40,17 @@ a running launcher stricter without tracing its call sites is how the next
 failure gets introduced while fixing the last. Converging them is a follow-up
 that needs those call sites read first.
 
+⭐ **A DECLARED RESIDENT (`--resident 'name=reason'`).** Excuses ONE long-lived
+process of OUR user whose name contains `name` from the budget -- written for the
+owner's `llama-server`, which holds ~21 GB of the GB10 permanently, so a queued
+grid's wait for a free card could never succeed on spark-ad27. Printed on every
+run, like `--allow-other-users`, so it cannot become an invisible permanent hole.
+Another user's process is never excused by it, and unknown ownership is never
+ours. Moved here 2026-09-26 from the older guard's `AUTOCAST_GPU_RESIDENT`
+(owner: keep it as standing practice, in the tracked preflight); `dgx_submit.sh`
+turns that variable into this flag, since an environment variable does not reach
+a guard piped over ssh.
+
 A box whose `nvidia-smi` does not answer WARNS rather than refuses: a guard that
 cannot measure must not report that it did.
 
@@ -191,6 +202,35 @@ def classify(rows: list[tuple[int, str]]) -> tuple[list[str], list[str]]:
     return mine, theirs
 
 
+def parse_resident(raw: str | None) -> tuple[str, str] | None:
+    """``(name, reason)`` from a ``--resident`` declaration, or ``None``.
+
+    Raises:
+        ValueError: On a declaration missing its name or its reason.
+    """
+    if raw is None:
+        return None
+    name, _, reason = raw.partition("=")
+    if not name.strip() or not reason.strip():
+        msg = f"--resident must be '<process name>=<reason>'; got {raw!r}."
+        raise ValueError(msg)
+    return name.strip(), reason.strip()
+
+
+def resident_pids(
+    apps: list[tuple[int, str]], resident: tuple[str, str] | None
+) -> set[int]:
+    """The compute processes ``resident`` excuses: OUR user's, name matching."""
+    if resident is None:
+        return set()
+    me = os.getuid()
+    return {
+        pid
+        for pid, description in apps
+        if resident[0] in description.rsplit(",", 1)[-1] and owner_of(pid) == me
+    }
+
+
 def main() -> int:
     """Both legs, cheaper and more specific first, against a declared budget."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -219,11 +259,25 @@ def main() -> int:
             " Off by default and it should stay off"
         ),
     )
+    parser.add_argument(
+        "--resident",
+        default=None,
+        metavar="NAME=REASON",
+        help=(
+            "one long-lived process of OUR user, whose name contains NAME, that"
+            " is not counted against the budget. Printed on every run"
+        ),
+    )
     arguments = parser.parse_args()
     modules = DEFAULT_MODULES + tuple(arguments.module)
 
     if arguments.max_jobs < 1:
         print("[gpu] --max-jobs must be at least 1", file=sys.stderr)
+        return 2
+    try:
+        resident = parse_resident(arguments.resident)
+    except ValueError as error:
+        print(f"[gpu] {error}", file=sys.stderr)
         return 2
 
     ours_by_pid = {pid for pid, _ in running_jobs(modules)}
@@ -234,6 +288,14 @@ def main() -> int:
         print("[gpu] WARNING: nvidia-smi did not answer; the device leg did NOT run.")
         mine, theirs = [], []
     else:
+        excused = resident_pids(apps, resident)
+        for pid, description in apps:
+            if pid in excused:
+                print(
+                    f"[gpu] DECLARED RESIDENT, not counted: pid {pid}"
+                    f" ({description}) -- {resident[1] if resident else ''}"
+                )
+        apps = [(pid, d) for pid, d in apps if pid not in excused]
         mine, theirs = classify(apps)
         ours_by_pid |= {pid for pid, _ in apps if owner_of(pid) == os.getuid()}
 
