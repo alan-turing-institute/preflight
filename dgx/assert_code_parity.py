@@ -201,7 +201,11 @@ def remote_digests(host: str, root: str, relatives: list[str]) -> dict[str, str]
     """
     listed = " ".join(f"'{name}'" for name in relatives)
     completed = subprocess.run(
-        ["ssh", "-o", "BatchMode=yes", host, f"cd '{root}' && md5sum {listed}"],
+        (
+            ["bash", "-c", f"cd '{root}' && md5sum {listed}"]
+            if host == "localhost"
+            else ["ssh", "-o", "BatchMode=yes", host, f"cd '{root}' && md5sum {listed}"]
+        ),
         capture_output=True,
         text=True,
         timeout=_REMOTE_TIMEOUT_S,

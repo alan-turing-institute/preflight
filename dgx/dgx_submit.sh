@@ -69,6 +69,13 @@ HOST="${AUTOCAST_DGX_HOST:-aiphys}"
 REMOTE_ROOT="${AUTOCAST_DGX_ROOT:-/data/aiphys/fferoz/autocast-private}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# When the box IS this machine (AUTOCAST_DGX_HOST=localhost) every leg runs here
+# directly. It used to `ssh localhost`, which only worked while a forwarded agent was
+# attached, so a chain armed for later (2026-10-02, owner away) could not gate itself.
+on_box() {
+    if [[ "$HOST" == localhost ]]; then bash -c "$1"; else ssh -o BatchMode=yes "$HOST" "$1"; fi
+}
+
 # ⛔ This gate lives in its OWN repository, NOT inside the project it checks --
 # `autocast-private` reconciles with a public repo eventually, so a machine-level
 # gate must not travel in it. It therefore cannot derive the project root from
@@ -135,8 +142,14 @@ fi
 # launches runs THERE, hours later, and cannot diff against this clone -- so it
 # re-checks these digests instead. Both files are copied by the gate itself on
 # every arm, so neither can be the stale hand-copy this gate exists to prevent.
-ssh -o BatchMode=yes "$HOST" "mkdir -p '$REMOTE_ROOT/$STAGE'"
-scp -q "$manifest" "$HERE/assert_code_parity.py" "$HOST:$REMOTE_ROOT/$STAGE/"
+on_box "mkdir -p '$REMOTE_ROOT/$STAGE'"
+if [[ "$HOST" == localhost ]]; then
+    for f in "$manifest" "$HERE/assert_code_parity.py"; do
+        [[ "$f" -ef "$REMOTE_ROOT/$STAGE/$(basename "$f")" ]] || cp "$f" "$REMOTE_ROOT/$STAGE/"
+    done
+else
+    scp -q "$manifest" "$HERE/assert_code_parity.py" "$HOST:$REMOTE_ROOT/$STAGE/"
+fi
 echo "[dgx] staged manifest + checker to $HOST:$REMOTE_ROOT/$STAGE"
 echo "[dgx] launch-time re-check (put this in the supervisor, before it launches):"
 echo "[dgx]   python3 $STAGE/assert_code_parity.py --check-manifest $STAGE/manifest.json --local-root \"\$PWD\""
@@ -149,7 +162,7 @@ search_paths="$REMOTE_ROOT/src:$REMOTE_ROOT/$entry_dir"
 for ((i = 0; i < ${#searches[@]}; i += 2)); do
     search_paths="$search_paths:$REMOTE_ROOT/${searches[i + 1]}"
 done
-if ! ssh -o BatchMode=yes "$HOST" \
+if ! on_box \
         "cd '$REMOTE_ROOT' && PYTHONPATH='$search_paths' \
          .venv/bin/python -c 'import $entry_mod' 2>&1 | tail -20"; then
     echo "[dgx] REFUSED by leg 2: the entrypoint does not import on $HOST." >&2
@@ -171,7 +184,7 @@ gpu_remote=""
 if [[ ${#gpu_args[@]} -gt 0 ]]; then
     gpu_remote="$(printf ' %q' "${gpu_args[@]}")"
 fi
-if ! ssh -o BatchMode=yes "$HOST" \
+if ! on_box \
         "python3 -$gpu_remote" < "$HERE/assert_gpu_free.py"; then
     echo "[dgx] REFUSED by leg 3: the GPU on $HOST is not free." >&2
     exit 4
