@@ -1,8 +1,10 @@
 # preflight
 
-Submit-time gates for the shared compute this account uses. One repository, so a
-check written for one machine is reviewable, discoverable and reusable instead of
-being re-invented per study.
+Submit-time gates and job management for the shared compute this account uses.
+One repository, so a check written for one machine is reviewable, discoverable and
+reusable instead of being re-invented per study. Job management lives here, not in
+a project repository, for the same reason: in a project it ends up in gitignored
+trees where it is never reviewed and never checked in.
 
 ## Why this is not inside a project repository
 
@@ -37,6 +39,8 @@ time, never in one move.
     dgx/assert_gpu_free.py      leg 3 — the GPU is free, against a declared budget
     dgx/dgx_submit.sh           the four-leg gate; runs the legs, then launches
     tests/dgx/                  22 tests, every fix mutation-checked
+    jobs/queue_hold_watchdog.py resume a SIGSTOPped queue when the unit holding it ends
+    tests/jobs/                 7 tests, mutation-checked
 
 ## Use
 
@@ -51,4 +55,10 @@ project's checkout needs no extra argument.
 With no `--` command it runs every leg and launches nothing; so does
 `AUTOCAST_DGX_GATE_CHECK_ONLY=1`.
 
-    python3 -m pytest        # from this directory
+A priority job that holds a running queue with SIGSTOP and resumes it from an EXIT
+trap strands the queue if it is killed hard or never ends. Watch it from outside:
+
+    systemd-run --user --unit=<name> jobs/queue_hold_watchdog.py \
+        --holder-unit <unit> --queue-pid <pid> [--stuck-if '<cmd, exit 0 = stuck>']
+
+    python3 -m pytest        # from this directory (needs pytest on that python)
