@@ -40,7 +40,9 @@ time, never in one move.
     dgx/dgx_submit.sh           the four-leg gate; runs the legs, then launches
     tests/dgx/                  22 tests, every fix mutation-checked
     jobs/queue_hold_watchdog.py resume a SIGSTOPped queue when the unit holding it ends
-    tests/jobs/                 7 tests, mutation-checked
+    jobs/pause_and_resume.py    stop a training unit at a fresh checkpoint, run another
+                                job, then resume the first however that job ends
+    tests/jobs/                 17 tests, mutation-checked
 
 ## Use
 
@@ -60,5 +62,12 @@ trap strands the queue if it is killed hard or never ends. Watch it from outside
 
     systemd-run --user --unit=<name> jobs/queue_hold_watchdog.py \
         --holder-unit <unit> --queue-pid <pid> [--stuck-if '<cmd, exit 0 = stuck>']
+
+To give the GPU to another job and continue a training run afterwards without losing
+work (SIGTERM at a fresh checkpoint, never SIGSTOP; see the module docstring for why):
+
+    systemd-run --user --unit=<name> jobs/pause_and_resume.py \
+        --pause-unit <A> --checkpoint <A last.ckpt> --run-unit <B> --run-command '<B>' \
+        --resume-unit <A resume> --resume-command '<A resume>' [--workdir <dir>]
 
     python3 -m pytest        # from this directory (needs pytest on that python)
