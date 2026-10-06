@@ -38,11 +38,15 @@ time, never in one move.
     dgx/assert_code_parity.py   leg 1 — the box runs the same code as this clone
     dgx/assert_gpu_free.py      leg 3 — the GPU is free, against a declared budget
     dgx/dgx_submit.sh           the four-leg gate; runs the legs, then launches
+    hostguard/hostguard.py      unified-memory guard: caps torch at (available - reserve), marks
+                                GPU jobs as the preferred OOM victim (loaded via PYTHONPATH or .pth)
+    hostguard/install_pth.py    puts the guard in EVERY python a venv runs (smokes, scorers too)
     tests/dgx/                  22 tests, every fix mutation-checked
     jobs/queue_hold_watchdog.py resume a SIGSTOPped queue when the unit holding it ends
     jobs/pause_and_resume.py    stop a training unit at a fresh checkpoint, run another
                                 job, then resume the first however that job ends
     tests/jobs/                 17 tests, mutation-checked
+    tests/hostguard/            12 tests, every guard mutation-checked
 
 ## Use
 
