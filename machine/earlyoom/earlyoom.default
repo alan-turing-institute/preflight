@@ -1,0 +1,42 @@
+# earlyoom - out-of-memory guard for the DGX (plan 26.8 / D74, chosen 2026-09-04).
+#
+# WHY earlyoom AND NOT systemd-oomd: oomd is cgroup-based and only acts on a unit whose
+# ancestor opts in with ManagedOOM*=kill. Nothing on this box does, so it watched exactly one
+# cgroup (user@1000.service) while every container lives in system.slice - active for months
+# and protecting nothing. earlyoom is process-based and watches all of memory, so it needs no
+# per-cgroup opt-in and cannot silently cover nothing.
+#
+# WHY THESE FLAGS:
+#  -r 3600   hourly memory report (as shipped), so the journal shows it alive and watching.
+#  -p        niceness -20 and oom_score_adj -100 on earlyoom ITSELF, so the guard is not a
+#            candidate for the shortage it exists to resolve.
+#  --avoid   THE POINT OF THE WHOLE EXERCISE. This machine is reached over Tailscale; killing
+#            sshd or tailscaled to save it would lose it exactly as thoroughly as thrashing
+#            would. dockerd/containerd are here because killing the daemon takes every
+#            container with it rather than the one process actually consuming the memory.
+#
+# THRESHOLDS ARE THE SHIPPED DEFAULTS, verified from 'earlyoom -h' on this host: act when
+# available memory < 10% AND free swap < 10% (SIGTERM), SIGKILL at half that. BOTH must be
+# below minimum - that is earlyoom's documented behaviour, not an assumption. On 121 GiB of
+# RAM and 46 GiB of swap that is roughly 12 GiB available and 4.6 GiB swap free.
+#
+# ACCEPTED AND STATED: during a training run the largest consumer IS the training job, so this
+# will kill it. That was the deliberate choice - an unreachable remote box costs more than a
+# job that can be restarted. There is no setting that saves both.
+#
+# ⛔ AMENDED 2026-10-06 after the 13:51 hang (a GPU smoke test exhausted the unified pool, kswapd
+# livelocked, the box was power-cycled). Neither condition above held: swap (32 GiB zram + 16 GiB
+# file) never ran low, so the "AND free swap < 10%" leg never fired. GPU allocations on this
+# unified-memory box are not counted in RSS/oom_score either (measured: a job holding ~46 GiB
+# scored 808 vs shpool 800), so the "largest process" was a coin toss between sessions.
+#  -s 100,100 IGNORE SWAP for SIGTERM AND SIGKILL (a bare "-s 100" leaves SIGKILL at swap <= 50%). (documented in man earlyoom: "effectively ignore swap usage").
+#  -M 8388608,4194304  FIXED SIZES, not percentages (owner 2026-10-06: the host's need does not grow with the
+#            box, so a percentage gives a 1 TB machine 100 GiB of slack): SIGTERM below 8 GiB available, SIGKILL
+#            below 4 GiB. earlyoom uses the LOWER of -M and its default -m 10, so these govern on any box >= 80 GiB.
+#            Deliberately BELOW hostguard's fixed 12 GiB reserve, so a guarded job using its whole cap is never
+#            killed; only something the guard did not bound gets here.
+#  --prefer  python processes; hostguard also raises every guarded GPU process's oom_score_adj to
+#            800, which is what actually makes the job, not a terminal, the one chosen.
+#  --avoid   + shpool: it holds every terminal session (2026-09-01: killing it lost all of them).
+# Previous line kept in /etc/default/earlyoom.bak-2026-10-06.
+EARLYOOM_ARGS="-r 3600 -p -M 8388608,4194304 -s 100,100 --prefer '(^|/)python[0-9.]*$' --avoid '(^|/)(sshd|tailscaled|systemd|dockerd|containerd|shpool)$'"

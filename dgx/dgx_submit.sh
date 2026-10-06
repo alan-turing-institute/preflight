@@ -192,6 +192,17 @@ fi
 
 # ---- LEG 4 -------------------------------------------------------------------
 echo "[dgx] leg 4/4: checking the host memory guard is in the launch ..."
+# (a) The project venv on the box loads the guard at EVERY interpreter start (hostguard.pth),
+# and it is byte-identical to this clone's. Run by the venv's own python with PYTHONPATH
+# cleared, so it sees what an unwrapped smoke test would get -- the 2026-10-06 13:51 hang
+# came from one. Piped from here, like leg 3, so the box cannot run a stale checker.
+guard_sha="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' \
+    "$HERE/../hostguard/hostguard.py")"
+if ! on_box "cd '$REMOTE_ROOT' && env -u PYTHONPATH .venv/bin/python - --expect-sha $guard_sha" \
+        < "$HERE/assert_hostguard.py"; then
+    echo "[dgx] REFUSED by leg 4: the venv on $HOST does not load the current memory guard." >&2
+    exit 5
+fi
 if [[ ${#cmd[@]} -eq 0 ]]; then
     echo "[dgx] leg 4/4: SKIPPED -- no command given, so there is nothing to launch."
 else
