@@ -21,15 +21,14 @@ pass. The mismatch is unreachable until the instant of real launch, i.e. after
 the queue wait is already spent. A gate that walks the AST sees the deferred
 import; a gate that runs the program does not.
 
-⛔ **WHY GIT CANNOT DO THIS JOB HERE.** ``~/dev/turing/CLAUDE.md`` item 1 says
-to prefer git-synced code, and for ``src/`` that is right. It is UNAVAILABLE for
+⛔ **WHY GIT CANNOT DO THIS JOB HERE.** The submission rules say to prefer
+git-synced code, and for ``src/`` that is right. It is UNAVAILABLE for
 DGX study code: ``notes/`` carries 0 tracked files (``.git/info/exclude``), and
 every DGX launcher, cell definition and study script lives under ``notes/``.
 Hand-copying is therefore structurally forced for exactly the files that broke,
-which is why the copy must be VERIFIED rather than trusted. Item 2 already
-demands an AST dependency closure and names
-``autocast-rollout/scratchpad/b0prime_closure.py`` -- that file does not exist
-on this machine. This is that tool, tracked so it cannot go missing again.
+which is why the copy must be VERIFIED rather than trusted. The rules also
+demand an AST dependency closure; this is that tool, tracked so it cannot go
+missing again.
 
 DECLARED EXCEPTIONS
 -------------------
