@@ -44,6 +44,8 @@ time, never in one move.
     hostguard/install_pth.py    puts the guard in EVERY python a venv runs (smokes, scorers too)
     machine/earlyoom/           this box's earlyoom settings (source of truth; /etc is the install
                                 target): install_earlyoom.py [--check]. Fixed-size thresholds, swap ignored
+    machine/watchdog/           systemd drop-in arming the board's hardware watchdog (60 s), so a
+                                hung box reboots itself; install target /etc/systemd/system.conf.d/
     tests/dgx/                  26 tests, every fix mutation-checked
     jobs/queue_hold_watchdog.py resume a SIGSTOPped queue when the unit holding it ends
     jobs/pause_and_resume.py    stop a training unit at a fresh checkpoint, run another
