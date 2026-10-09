@@ -132,3 +132,45 @@ def test_chain_skips_hostguard_shims_and_runs_the_real_one(tmp_path, monkeypatch
     monkeypatch.setattr(hg.sys, "path", [str(shim), str(real)])
     hg.chain_shadowed_sitecustomize()
     assert ran.exists()
+
+
+# --- the fixed per-job budget (shared boxes) ------------------------------------
+
+
+def test_budget_lowers_the_cap_below_what_is_available():
+    """Caught by: ignoring the budget -- the 2026-10-07 Turing shape, where a job
+    that started with ~117 GiB free kept a cap far above its agreed share."""
+    cap = hg.cap_bytes(TOTAL, int(117 * GIB), 12 * GIB, budget=60 * GIB)
+    assert cap == 60 * GIB
+
+
+def test_budget_never_raises_the_cap_above_what_is_available():
+    """Caught by: max() instead of min(), which would hand a job more than the
+    host can spare whenever its budget is generous."""
+    cap = hg.cap_bytes(TOTAL, int(50 * GIB), 12 * GIB, budget=60 * GIB)
+    assert cap == 38 * GIB
+
+
+def test_no_budget_leaves_the_cap_unchanged():
+    """Caught by: a default budget, which would silently shrink every job."""
+    assert hg.cap_bytes(TOTAL, int(85.7 * GIB), 12 * GIB) == hg.cap_bytes(
+        TOTAL, int(85.7 * GIB), 12 * GIB, budget=None
+    )
+
+
+@pytest.mark.parametrize("raw", ["", "0", "-5", "sixty"])
+def test_unset_zero_negative_or_garbled_budget_means_none(monkeypatch, raw):
+    """Caught by: float() raising on a typo (killing the import) or a 0 budget
+    becoming a 0-byte cap."""
+    monkeypatch.setenv("AUTOCAST_HOSTGUARD_BUDGET_GIB", raw)
+    assert hg.read_budget_gib() is None
+
+
+def test_apply_honours_the_budget_from_the_environment(tmp_path, monkeypatch):
+    """Caught by: reading the budget but never passing it to the cap."""
+    monkeypatch.delenv("SLURM_JOB_ID", raising=False)
+    monkeypatch.delenv("AUTOCAST_HOST_MEMORY_RESERVE_GIB", raising=False)
+    monkeypatch.setenv("AUTOCAST_HOSTGUARD_BUDGET_GIB", "60")
+    be = FakeBackend(TOTAL)
+    hg.apply(_torch(be), _meminfo(tmp_path, TOTAL, int(117 * GIB)), _oom(tmp_path))
+    assert be.fraction == pytest.approx(60 * GIB / TOTAL, rel=1e-6)

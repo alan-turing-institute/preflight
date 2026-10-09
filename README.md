@@ -41,6 +41,8 @@ time, never in one move.
     dgx/dgx_submit.sh           the four-leg gate; runs the legs, then launches
     hostguard/hostguard.py      unified-memory guard: caps torch at (available - reserve), marks
                                 GPU jobs as the preferred OOM victim (loaded via PYTHONPATH or .pth)
+                                optional fixed per-job ceiling for shared boxes:
+                                AUTOCAST_HOSTGUARD_BUDGET_GIB=60 caps at min(60 GiB, available - reserve)
     hostguard/install_pth.py    puts the guard in EVERY python a venv runs (smokes, scorers too)
     machine/earlyoom/           this box's earlyoom settings (source of truth; /etc is the install
                                 target): install_earlyoom.py [--check]. Fixed-size thresholds, swap ignored
@@ -51,7 +53,7 @@ time, never in one move.
     jobs/pause_and_resume.py    stop a training unit at a fresh checkpoint, run another
                                 job, then resume the first however that job ends
     tests/jobs/                 17 tests, mutation-checked
-    tests/hostguard/            12 tests, every guard mutation-checked
+    tests/hostguard/            20 tests, every guard mutation-checked
     tests/machine/              4 tests, mutation-checked
 
 ## Use
