@@ -35,8 +35,15 @@ nothing: the scheduler bounds the job and a cluster GPU is not host memory.
 INSTALL: put this directory on PYTHONPATH (its sitecustomize.py imports this), or
 add a `.pth` line to a virtualenv: see README.md.
 
+3. Optionally caps it lower still, at a FIXED per-job budget, on a box shared with
+   other people's jobs (AUTOCAST_HOSTGUARD_BUDGET_GIB). The available-memory cap is
+   taken once, at import: on Turing (2026-10-07) our job started with ~117 GiB free,
+   so its cap was large, and nothing stopped it growing into the memory another
+   user's job then needed. A fixed budget keeps each job to its agreed share.
+
 Env:
     AUTOCAST_HOST_MEMORY_RESERVE_GIB   GiB kept for the host (default 12; 0 = off)
+    AUTOCAST_HOSTGUARD_BUDGET_GIB      fixed per-job ceiling in GiB (unset or 0 = none)
     AUTOCAST_HOSTGUARD_VERBOSE=1       also report the cases where it declines
 """
 
@@ -89,9 +96,28 @@ def read_meminfo(path: str = "/proc/meminfo") -> dict[str, int]:
     return out
 
 
-def cap_bytes(device_total: int, mem_available: int, reserve: int) -> int:
-    """The most torch may hold: what the host can spare now, less the reserve."""
-    return max(min(device_total, mem_available) - reserve, FLOOR_BYTES)
+def cap_bytes(device_total: int, mem_available: int, reserve: int,
+              budget: int | None = None) -> int:
+    """The most torch may hold: what the host can spare now, less the reserve,
+    and never more than ``budget`` when one is set."""
+    cap = min(device_total, mem_available) - reserve
+    if budget is not None:
+        cap = min(cap, budget)
+    return max(cap, FLOOR_BYTES)
+
+
+def read_budget_gib() -> float | None:
+    """The fixed per-job ceiling from the environment; None when unset, <= 0 or
+    unreadable (a typo must not stop a job, so it falls back to no budget)."""
+    raw = os.environ.get("AUTOCAST_HOSTGUARD_BUDGET_GIB")
+    if raw is None or not raw.strip():
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        _say(f"ignoring AUTOCAST_HOSTGUARD_BUDGET_GIB={raw!r}: not a number", force=True)
+        return None
+    return value if value > 0 else None
 
 
 def mark_preferred_victim(path: str = "/proc/self/oom_score_adj") -> None:
@@ -121,6 +147,8 @@ def apply(torch, meminfo_path: str = "/proc/meminfo",
         _say("skipped: /proc/meminfo unreadable")
         return
     reserve = int(reserve_gib * GIB)
+    budget_gib = read_budget_gib()
+    budget = None if budget_gib is None else int(budget_gib * GIB)
 
     for name in ("cuda", "xpu"):
         backend = getattr(torch, name, None)
@@ -137,7 +165,7 @@ def apply(torch, meminfo_path: str = "/proc/meminfo",
         if abs(total - mem["MemTotal"]) / total >= UNIFIED_TOLERANCE:
             _say(f"skipped {name}: discrete ({total / GIB:.1f} GiB), host memory is separate")
             continue
-        cap = cap_bytes(total, mem["MemAvailable"], reserve)
+        cap = cap_bytes(total, mem["MemAvailable"], reserve, budget)
         backend.set_per_process_memory_fraction(cap / total)
         mark_preferred_victim(oom_path)
         floor_note = " -- TOO LITTLE FREE: this job will fail its first large allocation" \
@@ -145,7 +173,9 @@ def apply(torch, meminfo_path: str = "/proc/meminfo",
         _say(
             f"{name}: unified pool {total / GIB:.1f} GiB, {mem['MemAvailable'] / GIB:.1f} GiB "
             f"available now, reserving {reserve_gib:.0f} GiB for the host -> cap "
-            f"{cap / GIB:.1f} GiB; oom_score_adj >= {OOM_SCORE_ADJ}{floor_note}",
+            f"{cap / GIB:.1f} GiB"
+            f"{'' if budget_gib is None else f' (fixed budget {budget_gib:g} GiB)'}"
+            f"; oom_score_adj >= {OOM_SCORE_ADJ}{floor_note}",
             force=True,
         )
 
