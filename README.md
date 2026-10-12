@@ -48,13 +48,16 @@ time, never in one move.
                                 target): install_earlyoom.py [--check]. Fixed-size thresholds, swap ignored
     machine/watchdog/           systemd drop-in arming the board's hardware watchdog (60 s), so a
                                 hung box reboots itself; install target /etc/systemd/system.conf.d/
+    machine/flight_recorder/    per-second memory/stall/GPU record, fsynced, one day file per day,
+                                so the next freeze leaves its last seconds on disk; one user service
+                                per box: flight_recorder.py --install-unit (needs Linger=yes)
     tests/dgx/                  26 tests, every fix mutation-checked
     jobs/queue_hold_watchdog.py resume a SIGSTOPped queue when the unit holding it ends
     jobs/pause_and_resume.py    stop a training unit at a fresh checkpoint, run another
                                 job, then resume the first however that job ends
     tests/jobs/                 17 tests, mutation-checked
     tests/hostguard/            20 tests, every guard mutation-checked
-    tests/machine/              4 tests, mutation-checked
+    tests/machine/              11 tests, mutation-checked
 
 ## Use
 
