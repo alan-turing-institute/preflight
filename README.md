@@ -47,6 +47,7 @@ time, never in one move.
     hostguard/install_pth.py    puts the guard in EVERY python a venv runs (smokes, scorers too)
     machine/earlyoom/           this box's earlyoom settings (source of truth; /etc is the install
                                 target): install_earlyoom.py [--check]. Fixed-size thresholds, swap ignored
+                                cache_first_oom.py reclaims cache before enabling earlyoom
     machine/watchdog/           systemd drop-in arming the board's hardware watchdog (60 s), so a
                                 hung box reboots itself; install target /etc/systemd/system.conf.d/
     tests/dgx/                  26 tests, every fix mutation-checked
@@ -77,7 +78,10 @@ Install once on the GPU host, from the account that owns this checkout (requires
 
     sudo bash machine/gpu/install.sh
 
-This enables `preflight-gpu-usage.service` under your account. Every five seconds
+This enables `preflight-gpu-usage.service` under your account and installs a
+root-owned cache-first supervisor for `earlyoom`. The installer performs one
+bounded cache-reclaim test (no process killing) before changing earlyoom's service.
+Every five seconds
 the recorder writes GPU utilization, compute-process PID/name/memory,
 UID/username/process start time/cgroup, and host
 free/available/cache/swap/pressure to `/var/log/preflight/gpu.jsonl`. It retains
@@ -96,6 +100,17 @@ The existing `AUTOCAST_HOST_MEMORY_RESERVE_GIB` and
 `earlyoom` continuously reacts to low available system RAM across users; its
 thresholds are independent of GPU utilization. A GPU allocation can still fail
 while available RAM is high, so OOM killing is not a cure for every driver fault.
+The supervisor tries `sync` plus `drop_caches=3` at 12 GiB available RAM, or when
+a recently recorded GPU job has <=4 GiB raw free RAM and >=8 GiB cached. Repeated
+non-urgent reclaims are limited to once per minute. It rechecks memory before
+enabling the original earlyoom binary: SIGTERM below 8 GiB available, SIGKILL below
+4 GiB, with existing process preferences unchanged. Reclaim has a 2-second limit,
+shortened to 0.2 seconds in critical pressure; a stuck reclaim cannot block killing.
+The old memory thresholds are read from `EARLYOOM_ARGS`, not replaced by GPU job
+quotas. The original kernel OOM killer remains an independent emergency fallback.
+Cache attempts/results/timeouts, memory recovery and earlyoom's PID/UID kill
+records are in `journalctl -u earlyoom`. Cache-first protection is a mitigation,
+not proof that NVIDIA's allocation failure or loss of connectivity is resolved.
 To inspect deployment: `systemctl status preflight-gpu-usage.service` and
 `tail -1 /var/log/preflight/gpu.jsonl` (timestamps are UTC).
 
