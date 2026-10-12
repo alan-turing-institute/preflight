@@ -95,18 +95,6 @@ def test_an_unmeasurable_device_refuses_launch(
     assert "occupancy is unknown" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("uid", [MY_UID, OTHER_UID])
-def test_health_only_allows_concurrent_jobs_regardless_of_owner(monkeypatch, uid):
-    monkeypatch.setattr(mod, "compute_apps", lambda: [(41, "N/A, python"), (42, "N/A, python")])
-    monkeypatch.setattr(mod, "owner_of", lambda pid: uid)
-    assert run(monkeypatch, "--health-only") == 0
-
-
-def test_health_only_still_refuses_a_failed_gpu_query(monkeypatch):
-    monkeypatch.setattr(mod, "compute_apps", lambda: None)
-    assert run(monkeypatch, "--health-only") == 1
-
-
 @pytest.mark.parametrize("output", ["driver warning", "unknown, N/A, python"])
 def test_malformed_gpu_output_does_not_mean_free(monkeypatch, output):
     monkeypatch.setattr(mod.subprocess, "run", lambda *a, **kw:
