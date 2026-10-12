@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install the recorder as the invoking user and the common root-owned job lock.
+# Install the recorder as the invoking user; memory protection remains earlyoom.
 set -euo pipefail
 if [[ $EUID -ne 0 || -z ${SUDO_USER:-} || $SUDO_USER == root ]]; then
     echo 'Run with sudo bash machine/gpu/install.sh from your own account.' >&2
@@ -9,8 +9,6 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 account_home="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
 runtime="$account_home/.local/bin/uv"
 [[ -x "$runtime" ]] || { echo "uv not found at $runtime" >&2; exit 1; }
-printf 'f /run/lock/preflight-gpu.lock 0644 root root -\n' > /etc/tmpfiles.d/preflight-gpu.conf
-systemd-tmpfiles --create /etc/tmpfiles.d/preflight-gpu.conf
 cat > /etc/systemd/system/preflight-gpu-usage.service <<EOF
 [Unit]
 Description=Preflight GPU usage and process ownership recorder

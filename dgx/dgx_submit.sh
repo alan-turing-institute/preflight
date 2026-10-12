@@ -42,24 +42,20 @@
 #   own venv, its own datasets and its own paths. Leg 2 imports the entrypoint's
 #   module graph remotely, under the box's own interpreter.
 #
-# LEG 3 -- the GPU is free.
-#   One GPU job at a time per DGX (owner's standing rule; 2026-09-01). The guard
-#   is PIPED to the box from this clone, so the box cannot run a stale copy of
-#   the check itself -- the failure mode this whole gate exists for.
+# LEG 3 -- the GPU can be queried.
+#   Sharing is allowed by default. Explicit --max-jobs enables the older
+#   occupancy policy. The checker is PIPED to the box from this clone, so
+#   the box cannot run a stale copy of the check itself.
 #
 # LEG 4 -- the host memory guard is in the launch command.
 #   The CUDA pool is system RAM, so an uncapped job can take the box down. The
 #   guard is applied by PYTHONPATH; a job launched without it is uncovered
 #   (Q12). Declared exceptions are refused -- this one has no good reason.
 #
-# CONCURRENCY. Leg 3 defaults to the standing rule -- one job at a time -- and
-# --max-jobs N raises it. Raise it only against a MEASURED sharing result for
-# the workload in hand: 9-at-once was tried on 2026-09-15 and stopped after 15
-# minutes (370 s/epoch against a recorded 82, i.e. a 4-5x optimistic
-# projection), and sharing bought only ~1.5x on this GPU-bound grid. Another
-# USER on the card is refused separately and always, unless
-# --allow-other-users 'reason': the sharing daemon has a measured deadlock when
-# a second user's client appears, which wedged it for 9 h 44 m.
+# CONCURRENCY. No lifetime lock or default job/user limit. earlyoom and the
+# host allocator guard protect memory; the recorder captures usage/owners.
+# Explicit --max-jobs N opts into occupancy limits; in that mode another
+# user is refused unless --allow-other-users 'reason' is also supplied.
 #
 # AUTOCAST_DGX_GATE_CHECK_ONLY=1 runs every leg and stops before launching.
 # Running with no command runs the legs and reports, launching nothing.
@@ -84,6 +80,7 @@ on_box() {
 repo_arg=""
 
 entry=""; searches=(); allows=(); alsos=(); cmd=(); gpu_args=(); resident_given=0
+health_only=(--health-only)
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --repo)              repo_arg="$2"; shift 2 ;;
@@ -91,7 +88,7 @@ while [[ $# -gt 0 ]]; do
         --search)            searches+=("--search" "$2"); shift 2 ;;
         --allow-diff)        allows+=("--allow-diff" "$2"); shift 2 ;;
         --also)              alsos+=("--also" "$2"); shift 2 ;;
-        --max-jobs)          gpu_args+=("--max-jobs" "$2"); shift 2 ;;
+        --max-jobs)          health_only=(); gpu_args+=("--max-jobs" "$2"); shift 2 ;;
         --allow-other-users) gpu_args+=("--allow-other-users" "$2"); shift 2 ;;
         --resident)          gpu_args+=("--resident" "$2"); resident_given=1; shift 2 ;;
         --)                  shift; cmd=("$@"); break ;;
@@ -171,7 +168,7 @@ fi
 echo "[dgx] leg 2/4: OK"
 
 # ---- LEG 3 -------------------------------------------------------------------
-echo "[dgx] leg 3/4: checking the GPU is free on $HOST ..."
+echo "[dgx] leg 3/4: checking GPU status on $HOST ..."
 # Piped from this clone so the box cannot run a stale copy of the guard itself.
 # ⛔ QUOTE EACH ARGUMENT FOR THE REMOTE SHELL. `${gpu_args[*]}` was interpolated
 # raw into the ssh command string, so a declared reason containing a space was
@@ -181,12 +178,13 @@ echo "[dgx] leg 3/4: checking the GPU is free on $HOST ..."
 # --allow-other-users. A gate that refuses a correctly-declared input is one
 # that gets switched off, which is worse than no gate.
 gpu_remote=""
+gpu_args+=("${health_only[@]+"${health_only[@]}"}")
 if [[ ${#gpu_args[@]} -gt 0 ]]; then
     gpu_remote="$(printf ' %q' "${gpu_args[@]}")"
 fi
 if ! on_box \
         "python3 -$gpu_remote" < "$HERE/assert_gpu_free.py"; then
-    echo "[dgx] REFUSED by leg 3: the GPU on $HOST is not free." >&2
+    echo "[dgx] REFUSED by leg 3: GPU query or requested occupancy policy failed." >&2
     exit 4
 fi
 
@@ -221,12 +219,4 @@ if [[ "${AUTOCAST_DGX_GATE_CHECK_ONLY:-0}" == "1" || ${#cmd[@]} -eq 0 ]]; then
 fi
 
 echo "[dgx] all legs passed; launching ..."
-if [[ "$HOST" == localhost ]]; then
-    # Recheck occupancy under the shared lock and hold it for the actual job.
-    exec bash "$HERE/run_gpu_job.sh" "${gpu_args[@]+"${gpu_args[@]}"}" -- "${cmd[@]}"
-fi
-if [[ ! "${cmd[*]}" =~ run_gpu_job.sh ]]; then
-    echo "[dgx] REFUSED: remote jobs must run inside run_gpu_job.sh on $HOST." >&2
-    exit 5
-fi
 exec "${cmd[@]}"

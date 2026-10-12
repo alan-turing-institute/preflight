@@ -36,10 +36,9 @@ time, never in one move.
 ## Layout
 
     dgx/assert_code_parity.py   leg 1 — the box runs the same code as this clone
-    dgx/assert_gpu_free.py      leg 3 — the GPU is free, against a declared budget
+    dgx/assert_gpu_free.py      leg 3 — query health; optional strict occupancy policy
     dgx/assert_hostguard.py     leg 4 — the box venv loads the current memory guard at startup
     dgx/dgx_submit.sh           the four-leg gate; runs the legs, then launches
-    dgx/run_gpu_job.sh          host-wide lock + occupancy recheck, held for the foreground job
     machine/gpu/               rotating GPU/process-owner and host-memory recorder; install.sh
     hostguard/hostguard.py      unified-memory guard: caps torch at (available - reserve), marks
                                 GPU jobs as the preferred OOM victim (loaded via PYTHONPATH or .pth)
@@ -71,35 +70,32 @@ project's checkout needs no extra argument.
 With no `--` command it runs every leg and launches nothing; so does
 `AUTOCAST_DGX_GATE_CHECK_ONLY=1`.
 
-## GPU launch lock and incident records
+## Shared GPU jobs and incident records
 
 Install once on the GPU host, from the account that owns this checkout (requires
 `uv` at `~/.local/bin/uv`):
 
     sudo bash machine/gpu/install.sh
 
-This enables `preflight-gpu-usage.service` under your account and creates the
-root-owned shared lock. Every five seconds the recorder writes GPU utilization,
-GPU process PID/name/memory, UID/username/process start time/cgroup, and host
+This enables `preflight-gpu-usage.service` under your account. Every five seconds
+the recorder writes GPU utilization, compute-process PID/name/memory,
+UID/username/process start time/cgroup, and host
 free/available/cache/swap/pressure to `/var/log/preflight/gpu.jsonl`. It retains
 five files of up to 10 MiB each and syncs completed records to disk. Unsupported
 GPU values and failed queries are explicit; command lines and environments are
 not recorded. This records evidence, not a protective memory limit.
 
-Run the wrapper ON THE GPU HOST around the actual foreground workload:
+`dgx_submit.sh` permits concurrent jobs/users by default, while refusing a failed
+or malformed `nvidia-smi` query. There is no lifetime lock or advance reservation.
+Explicit `--max-jobs N` selects the older occupancy policy (and requires
+`--allow-other-users 'reason'` when sharing with another user). Standalone
+`assert_gpu_free.py` retains its strict default; use `--health-only` for sharing.
 
-    bash dgx/run_gpu_job.sh -- uv run --no-sync python train.py
-
-For a systemd job, put that wrapper inside its `ExecStart`, rather than wrapping
-the short-lived `systemd-run` command. Local `dgx_submit.sh` launches use it
-automatically; remote launch commands must include the wrapper on the remote
-host. The common lock serializes participating jobs across users, and exit 75
-means another launcher holds it. Launches outside this wrapper are not locked.
-The occupancy gate refuses launch if `nvidia-smi` fails.
-
-`PREFLIGHT_UV` selects the `uv` binary; `PREFLIGHT_GPU_LOCK` overrides the lock
-path for tests. The existing `AUTOCAST_HOST_MEMORY_RESERVE_GIB` and
+The existing `AUTOCAST_HOST_MEMORY_RESERVE_GIB` and
 `AUTOCAST_HOSTGUARD_BUDGET_GIB` configure the PyTorch allocator guard separately.
+`earlyoom` continuously reacts to low available system RAM across users; its
+thresholds are independent of GPU utilization. A GPU allocation can still fail
+while available RAM is high, so OOM killing is not a cure for every driver fault.
 To inspect deployment: `systemctl status preflight-gpu-usage.service` and
 `tail -1 /var/log/preflight/gpu.jsonl` (timestamps are UTC).
 
