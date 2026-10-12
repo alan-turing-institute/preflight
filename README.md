@@ -39,6 +39,8 @@ time, never in one move.
     dgx/assert_gpu_free.py      leg 3 — the GPU is free, against a declared budget
     dgx/assert_hostguard.py     leg 4 — the box venv loads the current memory guard at startup
     dgx/dgx_submit.sh           the four-leg gate; runs the legs, then launches
+    dgx/run_gpu_job.sh          host-wide lock + occupancy recheck, held for the foreground job
+    machine/gpu/               rotating GPU/process-owner and host-memory recorder; install.sh
     hostguard/hostguard.py      unified-memory guard: caps torch at (available - reserve), marks
                                 GPU jobs as the preferred OOM victim (loaded via PYTHONPATH or .pth)
                                 optional fixed per-job ceiling for shared boxes:
@@ -69,6 +71,38 @@ project's checkout needs no extra argument.
 With no `--` command it runs every leg and launches nothing; so does
 `AUTOCAST_DGX_GATE_CHECK_ONLY=1`.
 
+## GPU launch lock and incident records
+
+Install once on the GPU host, from the account that owns this checkout (requires
+`uv` at `~/.local/bin/uv`):
+
+    sudo bash machine/gpu/install.sh
+
+This enables `preflight-gpu-usage.service` under your account and creates the
+root-owned shared lock. Every five seconds the recorder writes GPU utilization,
+GPU process PID/name/memory, UID/username/process start time/cgroup, and host
+free/available/cache/swap/pressure to `/var/log/preflight/gpu.jsonl`. It retains
+five files of up to 10 MiB each and syncs completed records to disk. Unsupported
+GPU values and failed queries are explicit; command lines and environments are
+not recorded. This records evidence, not a protective memory limit.
+
+Run the wrapper ON THE GPU HOST around the actual foreground workload:
+
+    bash dgx/run_gpu_job.sh -- uv run --no-sync python train.py
+
+For a systemd job, put that wrapper inside its `ExecStart`, rather than wrapping
+the short-lived `systemd-run` command. Local `dgx_submit.sh` launches use it
+automatically; remote launch commands must include the wrapper on the remote
+host. The common lock serializes participating jobs across users, and exit 75
+means another launcher holds it. Launches outside this wrapper are not locked.
+The occupancy gate refuses launch if `nvidia-smi` fails.
+
+`PREFLIGHT_UV` selects the `uv` binary; `PREFLIGHT_GPU_LOCK` overrides the lock
+path for tests. The existing `AUTOCAST_HOST_MEMORY_RESERVE_GIB` and
+`AUTOCAST_HOSTGUARD_BUDGET_GIB` configure the PyTorch allocator guard separately.
+To inspect deployment: `systemctl status preflight-gpu-usage.service` and
+`tail -1 /var/log/preflight/gpu.jsonl` (timestamps are UTC).
+
 A priority job that holds a running queue with SIGSTOP and resumes it from an EXIT
 trap strands the queue if it is killed hard or never ends. Watch it from outside:
 
@@ -82,4 +116,4 @@ work (SIGTERM at a fresh checkpoint, never SIGSTOP; see the module docstring for
         --pause-unit <A> --checkpoint <A last.ckpt> --run-unit <B> --run-command '<B>' \
         --resume-unit <A resume> --resume-command '<A resume>' [--workdir <dir>]
 
-    python3 -m pytest        # from this directory (needs pytest on that python)
+    uv run --no-project --with pytest python -m pytest

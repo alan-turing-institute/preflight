@@ -221,4 +221,12 @@ if [[ "${AUTOCAST_DGX_GATE_CHECK_ONLY:-0}" == "1" || ${#cmd[@]} -eq 0 ]]; then
 fi
 
 echo "[dgx] all legs passed; launching ..."
+if [[ "$HOST" == localhost ]]; then
+    # Recheck occupancy under the shared lock and hold it for the actual job.
+    exec bash "$HERE/run_gpu_job.sh" "${gpu_args[@]+"${gpu_args[@]}"}" -- "${cmd[@]}"
+fi
+if [[ ! "${cmd[*]}" =~ run_gpu_job.sh ]]; then
+    echo "[dgx] REFUSED: remote jobs must run inside run_gpu_job.sh on $HOST." >&2
+    exit 5
+fi
 exec "${cmd[@]}"
