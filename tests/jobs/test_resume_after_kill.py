@@ -122,3 +122,25 @@ def test_watched_job_is_judged_only_after_it_ends(box: Box) -> None:
     assert box.pid_polls == PID_ALIVE_POLLS + 1
     assert box.now == PID_ALIVE_POLLS * INTERVAL_S
     assert "job" not in box.calls
+
+
+def test_restart_after_reboot_resumes_instead_of_starting_over(box: Box, tmp_path: Path) -> None:
+    # Mutation caught: ignoring the state file, so a reboot reruns the job from scratch.
+    state = tmp_path / "state.json"
+    box.script("done?", 1, 0)
+    assert run(box, state_file=state) is mod.Exit.DONE
+    box.calls.clear()
+    box.script("done?", 1, 0)
+    assert run(box, state_file=state) is mod.Exit.DONE
+    assert "job" not in box.calls
+    assert box.calls.count("resume") == 1
+
+
+def test_resumes_are_bounded_across_reboots(box: Box, tmp_path: Path) -> None:
+    # Mutation caught: resetting the resume count per run -> freeze, reboot, restart, loop.
+    state = tmp_path / "state.json"
+    box.script("done?", 1)
+    assert run(box, state_file=state, max_resumes=MAX_RESUMES) is mod.Exit.OUT_OF_RESUMES
+    box.calls.clear()
+    assert run(box, state_file=state, max_resumes=MAX_RESUMES) is mod.Exit.OUT_OF_RESUMES
+    assert "resume" not in box.calls and "job" not in box.calls

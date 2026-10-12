@@ -58,7 +58,7 @@ time, never in one move.
     jobs/queue_hold_watchdog.py resume a SIGSTOPped queue when the unit holding it ends
     jobs/pause_and_resume.py    stop a training unit at a fresh checkpoint, run another
                                 job, then resume the first however that job ends
-    tests/jobs/                 17 tests, mutation-checked
+    tests/jobs/                 19 tests, mutation-checked
     tests/hostguard/            20 tests, every guard mutation-checked
     tests/machine/              11 tests, mutation-checked
 

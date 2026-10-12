@@ -16,10 +16,13 @@ squeeze. The steps:
    polling every ``--interval`` s, at most ``--max-wait`` s;
 5. run ``--resume-command`` and go back to 2, at most ``--max-resumes`` times.
 
-It is a plain process, not a systemd unit, because the Turing DGX does not keep a
-user's units alive after logout (``Linger=no``, checked 2026-10-10). Start it with
-``setsid nohup`` so it outlives the session. Commands run under ``bash -c`` in
-``--workdir``.
+Commands run under ``bash -c`` in ``--workdir``. Start it with ``setsid nohup`` so it
+outlives the session, or, to survive a REBOOT, as a user unit enabled for
+``default.target`` on a box with ``Linger=yes`` (the Turing DGX since 2026-10-12) and
+pass ``--state FILE``: the file records that the job was started and how many resumes
+were used, so a restart after a reboot resumes instead of starting over, and
+``--max-resumes`` bounds the total across reboots. Without it, a box that froze
+because of the job would restart the job, freeze again, and loop.
 
 Written 2026-10-10 for the raw-field memorisation toy on the Turing DGX
 (project-a), after the owner asked that jobs there be resumable when killed.
@@ -27,12 +30,13 @@ Written 2026-10-10 for the raw-field memorisation toy on the Turing DGX
     jobs/resume_after_kill.py (--command '<cmd>' | --watch-pid <pid>) \
         --resume-command '<cmd>' --done-if '<cmd>' --ready-if '<cmd>' \
         [--give-up-if '<cmd>'] [--max-resumes 3] [--interval 300] [--max-wait 86400] \
-        [--workdir <dir>]
+        [--workdir <dir>] [--state <file.json>]
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import time
@@ -68,6 +72,20 @@ def pid_alive(pid: int) -> bool:
     return state != "Z"
 
 
+def load_state(path: Path | None) -> dict:
+    """What a previous run of this supervisor recorded; empty without a state file."""
+    if path is None or not path.exists():
+        return {}
+    return json.loads(path.read_text())
+
+
+def save_state(path: Path | None, state: dict) -> None:
+    if path is not None:
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(state))
+        os.replace(tmp, path)
+
+
 def wait_ready(
     ready_if: str,
     workdir: Path,
@@ -98,8 +116,13 @@ def supervise(
     max_wait: float = 86400.0,
     sleep: Callable[[float], None] = time.sleep,
     clock: Callable[[], float] = time.monotonic,
+    state_file: Path | None = None,
 ) -> Exit:
-    if command is not None:
+    state = load_state(state_file)
+    if state.get("started"):
+        log(f"already started by an earlier run ({state_file}): checking, not restarting")
+    elif command is not None:
+        save_state(state_file, {**state, "started": True})
         log(f"running: {command}")
         log(f"job exited {shell(command, workdir)}")
     elif watch_pid is not None:
@@ -107,7 +130,7 @@ def supervise(
         while pid_alive(watch_pid):
             sleep(interval)
         log(f"pid {watch_pid} has ended")
-    resumes = 0
+    resumes = int(state.get("resumes", 0))
     while True:
         if shell(done_if, workdir) == 0:
             log("done")
@@ -123,6 +146,7 @@ def supervise(
             log(f"box not ready within {max_wait:.0f} s: giving up")
             return Exit.NEVER_READY
         resumes += 1
+        save_state(state_file, {"started": True, "resumes": resumes})
         log(f"resume {resumes}/{max_resumes}: {resume_command}")
         log(f"resume exited {shell(resume_command, workdir)}")
 
@@ -142,6 +166,7 @@ def main() -> int:
     ap.add_argument("--interval", type=float, default=300.0, help="seconds per poll")
     ap.add_argument("--max-wait", type=float, default=86400.0, help="seconds to wait")
     ap.add_argument("--workdir", type=Path, default=Path.cwd())
+    ap.add_argument("--state", type=Path, help="JSON file: started + resumes used")
     a = ap.parse_args()
     if not os.path.isdir(a.workdir):
         ap.error(f"--workdir {a.workdir} is not a directory")
@@ -157,6 +182,7 @@ def main() -> int:
             max_resumes=a.max_resumes,
             interval=a.interval,
             max_wait=a.max_wait,
+            state_file=a.state,
         )
     )
 
