@@ -48,6 +48,9 @@ time, never in one move.
                                 target): install_earlyoom.py [--check]. Fixed-size thresholds, swap ignored
     machine/watchdog/           systemd drop-in arming the board's hardware watchdog (60 s), so a
                                 hung box reboots itself; install target /etc/systemd/system.conf.d/
+    machine/kernel/             reboot when the kernel detects it is stuck (stalled CPU, soft lockup,
+                                a task stuck > 120 s) + kernel-log read access for the invoking user:
+                                sudo machine/kernel/install_reboot_when_stuck.sh (each box)
     machine/flight_recorder/    per-second memory/stall/GPU record, fsynced, one day file per day,
                                 so the next freeze leaves its last seconds on disk; one user service
                                 per box: flight_recorder.py --install-unit (needs Linger=yes)
