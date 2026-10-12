@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import assert_gpu_free as mod
 import pytest
+from types import SimpleNamespace
 
 MY_UID = 1000
 OTHER_UID = 2000
@@ -16,6 +17,7 @@ OTHER_UID = 2000
 #: The real function, captured before the autouse fixture below stubs it out --
 #: the one test that exercises ``running_jobs`` itself needs the real one back.
 _REAL_RUNNING_JOBS = mod.running_jobs
+_REAL_COMPUTE_APPS = mod.compute_apps
 
 
 @pytest.fixture(autouse=True)
@@ -84,13 +86,21 @@ def test_unknown_ownership_counts_as_someone_else(
     assert run(monkeypatch) == 1
 
 
-def test_an_unmeasurable_device_warns_and_does_not_claim(
+def test_an_unmeasurable_device_refuses_launch(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """MUTATION: treating 'nvidia-smi did not answer' as 'the card is free'."""
+    """An unavailable device query must not permit another GPU allocation."""
     monkeypatch.setattr(mod, "compute_apps", lambda: None)
-    assert run(monkeypatch) == 0
-    assert "did NOT run" in capsys.readouterr().out
+    assert run(monkeypatch) == 1
+    assert "occupancy is unknown" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("output", ["driver warning", "unknown, N/A, python"])
+def test_malformed_gpu_output_does_not_mean_free(monkeypatch, output):
+    monkeypatch.setattr(mod.subprocess, "run", lambda *a, **kw:
+                        SimpleNamespace(returncode=0, stdout=output))
+    # The fixture replaces this function; exercise its actual implementation.
+    assert _REAL_COMPUTE_APPS() is None
 
 
 def test_a_nonsense_budget_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
