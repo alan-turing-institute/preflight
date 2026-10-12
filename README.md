@@ -71,7 +71,7 @@ project's checkout needs no extra argument.
 With no `--` command it runs every leg and launches nothing; so does
 `AUTOCAST_DGX_GATE_CHECK_ONLY=1`.
 
-## Shared GPU jobs and incident records
+## GPU incident records
 
 Install once on the GPU host, from the account that owns this checkout (requires
 `uv` at `~/.local/bin/uv`):
@@ -89,11 +89,11 @@ five files of up to 10 MiB each and syncs completed records to disk. Unsupported
 GPU values and failed queries are explicit; command lines and environments are
 not recorded. This records evidence, not a protective memory limit.
 
-`dgx_submit.sh` permits concurrent jobs/users by default, while refusing a failed
-or malformed `nvidia-smi` query. There is no lifetime lock or advance reservation.
-Explicit `--max-jobs N` selects the older occupancy policy (and requires
-`--allow-other-users 'reason'` when sharing with another user). Standalone
-`assert_gpu_free.py` retains its strict default; use `--health-only` for sharing.
+`dgx_submit.sh` retains its existing concurrency policy: one job of yours by
+default, and refusal while another user occupies the GPU. Use `--max-jobs N`
+to permit more of your own jobs and `--allow-other-users 'reason'` to explicitly
+permit sharing with another user. Failed or malformed `nvidia-smi` queries also
+refuse launch.
 
 The existing `AUTOCAST_HOST_MEMORY_RESERVE_GIB` and
 `AUTOCAST_HOSTGUARD_BUDGET_GIB` configure the PyTorch allocator guard separately.

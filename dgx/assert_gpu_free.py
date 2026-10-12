@@ -52,7 +52,6 @@ turns that variable into this flag, since an environment variable does not reach
 a guard piped over ssh.
 
 A box whose `nvidia-smi` does not answer refuses launch: GPU occupancy is unknown.
-With --health-only, a successful query permits sharing without counting jobs/users.
 
 Exit 0 = free. Exit 1 = refused, with the occupant named.
 """
@@ -236,8 +235,6 @@ def resident_pids(
 def main() -> int:
     """Both legs, cheaper and more specific first, against a declared budget."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--health-only", action="store_true",
-                        help="check GPU query health without limiting jobs or users")
     parser.add_argument(
         "--module",
         action="append",
@@ -289,10 +286,6 @@ def main() -> int:
         print("[gpu] REFUSED: nvidia-smi did not answer; GPU occupancy is unknown.",
               file=sys.stderr)
         return 1
-    if arguments.health_only:
-        print(f"[gpu] OK -- queried {len(apps)} compute process(es); sharing permitted")
-        return 0
-
     ours_by_pid = {pid for pid, _ in running_jobs(modules)}
     ours_detail = [f"pid {pid}: {cmd}" for pid, cmd in running_jobs(modules)]
     excused = resident_pids(apps, resident)
