@@ -48,8 +48,13 @@ time, never in one move.
     machine/earlyoom/           this box's earlyoom settings (source of truth; /etc is the install
                                 target): install_earlyoom.py [--check]. Fixed-size thresholds, swap ignored
                                 cache_first_oom.py reclaims cache before enabling earlyoom
-    machine/watchdog/           systemd drop-in arming the board's hardware watchdog (60 s), so a
-                                hung box reboots itself; install target /etc/systemd/system.conf.d/
+    machine/watchdog/           systemd drop-in arming the board's hardware watchdog (60 s; it did NOT
+                                fire in the 35-h 2026-10-10 hang); heartbeat.py: a systemd SERVICE
+                                watchdog that reboots the box after 300 s of memory stall, or if it
+                                cannot run at all (WatchdogSec=360)
+    machine/memory/             keep_free.py: keeps >= 16 GiB truly free by dropping clean page cache
+                                (the GPU driver's allocation failures came with free memory at 1-13 GiB)
+    machine/install_hang_guards.sh  sudo, each box: installs both, then checks them live (PASS/FAIL)
     machine/kernel/             reboot when the kernel detects it is stuck (stalled CPU, soft lockup,
                                 a task stuck > 120 s) + kernel-log read access for the invoking user:
                                 sudo machine/kernel/install_reboot_when_stuck.sh (each box)
