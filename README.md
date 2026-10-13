@@ -67,7 +67,11 @@ time, never in one move.
                                 kills a named child in flight (the card check); resume with kill -CONT
     jobs/pause_and_resume.py    stop a training unit at a fresh checkpoint, run another
                                 job, then resume the first however that job ends
-    tests/jobs/                 19 tests, mutation-checked
+    jobs/stop_on_low_free.py    kill a job's unit when truly free memory stays low (default < 4 GiB
+                                for 10 s) while its processes run: the job dies, the box does not
+    jobs/evict_from_cache.py    drop your own files from the page cache (fadvise, no root), so a big
+                                GPU job starts with memory that is truly free
+    tests/jobs/                 35 tests, mutation-checked
     tests/hostguard/            20 tests, every guard mutation-checked
     tests/machine/              11 tests, mutation-checked
 
