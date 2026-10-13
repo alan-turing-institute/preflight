@@ -63,6 +63,8 @@ time, never in one move.
                                 per box: flight_recorder.py --install-unit (needs Linger=yes)
     tests/dgx/                  26 tests, every fix mutation-checked
     jobs/queue_hold_watchdog.py resume a SIGSTOPped queue when the unit holding it ends
+    jobs/hold_at_line.py        SIGSTOP a queue at a log line, after a named child (e.g. scoring) starts;
+                                kills a named child in flight (the card check); resume with kill -CONT
     jobs/pause_and_resume.py    stop a training unit at a fresh checkpoint, run another
                                 job, then resume the first however that job ends
     tests/jobs/                 19 tests, mutation-checked
