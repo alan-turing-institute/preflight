@@ -51,8 +51,7 @@ ours. Moved here 2026-09-26 from the older guard's `AUTOCAST_GPU_RESIDENT`
 turns that variable into this flag, since an environment variable does not reach
 a guard piped over ssh.
 
-A box whose `nvidia-smi` does not answer WARNS rather than refuses: a guard that
-cannot measure must not report that it did.
+A box whose `nvidia-smi` does not answer refuses launch: GPU occupancy is unknown.
 
 Exit 0 = free. Exit 1 = refused, with the occupant named.
 """
@@ -180,13 +179,15 @@ def compute_apps() -> list[tuple[int, str]] | None:
         return None
     rows: list[tuple[int, str]] = []
     for line in completed.stdout.splitlines():
+        if not line.strip():
+            continue
         fields = [f.strip() for f in line.split(",")]
         if len(fields) < _MIN_CSV_FIELDS or not fields[0]:
-            continue
+            return None
         try:
             rows.append((int(fields[0]), ", ".join(fields[1:])))
         except ValueError:
-            continue
+            return None
     return rows
 
 
@@ -280,24 +281,23 @@ def main() -> int:
         print(f"[gpu] {error}", file=sys.stderr)
         return 2
 
-    ours_by_pid = {pid for pid, _ in running_jobs(modules)}
-    ours_detail = [f"pid {pid}: {cmd}" for pid, cmd in running_jobs(modules)]
-
     apps = compute_apps()
     if apps is None:
-        print("[gpu] WARNING: nvidia-smi did not answer; the device leg did NOT run.")
-        mine, theirs = [], []
-    else:
-        excused = resident_pids(apps, resident)
-        for pid, description in apps:
-            if pid in excused:
-                print(
-                    f"[gpu] DECLARED RESIDENT, not counted: pid {pid}"
-                    f" ({description}) -- {resident[1] if resident else ''}"
-                )
-        apps = [(pid, d) for pid, d in apps if pid not in excused]
-        mine, theirs = classify(apps)
-        ours_by_pid |= {pid for pid, _ in apps if owner_of(pid) == os.getuid()}
+        print("[gpu] REFUSED: nvidia-smi did not answer; GPU occupancy is unknown.",
+              file=sys.stderr)
+        return 1
+    ours_by_pid = {pid for pid, _ in running_jobs(modules)}
+    ours_detail = [f"pid {pid}: {cmd}" for pid, cmd in running_jobs(modules)]
+    excused = resident_pids(apps, resident)
+    for pid, description in apps:
+        if pid in excused:
+            print(
+                f"[gpu] DECLARED RESIDENT, not counted: pid {pid}"
+                f" ({description}) -- {resident[1] if resident else ''}"
+            )
+    apps = [(pid, d) for pid, d in apps if pid not in excused]
+    mine, theirs = classify(apps)
+    ours_by_pid |= {pid for pid, _ in apps if owner_of(pid) == os.getuid()}
 
     # ---- another user on the card: refuse unless explicitly declared --------
     if theirs and arguments.allow_other_users is None:
