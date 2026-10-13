@@ -16,8 +16,17 @@ in ``--unit`` (memory is freed at once; SIGTERM would let a squeezed job take it
 stop the unit, log it and exit STOPPED. Exits UNIT_ENDED when the unit stops by itself.
 Every entry into and exit from the low state is logged as one JSON line. Stdlib only.
 
+With ``--stop-on-driver-error PATTERN`` (e.g. ``NV_ERR``) the unit is also stopped, exit
+DRIVER_ERROR, at the first kernel-log line matching PATTERN since the job's process appeared,
+but only during its first ``--driver-error-window-s`` s (default 40 min): on the Turing box the
+2026-10-10 freeze followed the driver's first NV_ERR_NO_MEMORY 7 s into a job's start, while a
+job that has run cleanly past its start-up is left alone (gpu-node-1 logged hundreds of these
+over days and kept running). This replaces the session-bound start-up watcher of 2026-10-13,
+which stopped covering a job the moment the session that armed it ended.
+
     jobs/stop_on_low_free.py --unit <user unit> --while-process '<cmdline substring>' \
-        [--free-below-gib 4] [--for-s 10] [--interval 1]
+        [--free-below-gib 4] [--for-s 10] [--interval 1] \
+        [--stop-on-driver-error NV_ERR [--driver-error-window-s 2400]]
 """
 
 from __future__ import annotations
@@ -44,6 +53,7 @@ class Exit(IntEnum):
 
     UNIT_ENDED = 0
     STOPPED = 3
+    DRIVER_ERROR = 4
 
 
 def watch(read_free_kib: Callable[[], int], unit_active: Callable[[], bool],
@@ -51,11 +61,18 @@ def watch(read_free_kib: Callable[[], int], unit_active: Callable[[], bool],
           floor_kib: int, hold_s: float, interval: float,
           clock: Callable[[], float] = time.monotonic,
           sleep: Callable[[float], None] = time.sleep,
-          log: Callable[[dict], None] = lambda r: print(json.dumps(r), flush=True)) -> Exit:
-    """Stop the unit once free memory has stayed under ``floor_kib`` for ``hold_s`` s."""
+          log: Callable[[dict], None] = lambda r: print(json.dumps(r), flush=True),
+          driver_error: Callable[[], bool] | None = None,
+          driver_window_s: float = 2400.0) -> Exit:
+    """Stop the unit once free memory has stayed under ``floor_kib`` for ``hold_s`` s.
+
+    With ``driver_error``, also stop it the first time that returns True while the job's
+    process runs and within ``driver_window_s`` s of the process first being seen.
+    """
     low_since: float | None = None
     checked = -float("inf")
     running = False
+    running_since: float | None = None
     while True:
         now = clock()
         if now - checked >= CHECK_EVERY_S:
@@ -64,6 +81,13 @@ def watch(read_free_kib: Callable[[], int], unit_active: Callable[[], bool],
                 return Exit.UNIT_ENDED
             running = process_running()
             checked = now
+            if running and running_since is None:
+                running_since = now
+            if (running and driver_error is not None
+                    and now - running_since <= driver_window_s and driver_error()):
+                log({"event": "driver_error_stopping", "since_start_s": round(now - running_since, 1)})
+                stop()
+                return Exit.DRIVER_ERROR
         free = read_free_kib()
         if running and free < floor_kib:
             if low_since is None:
@@ -88,6 +112,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--free-below-gib", type=float, default=4.0)
     parser.add_argument("--for-s", type=float, default=10.0)
     parser.add_argument("--interval", type=float, default=1.0)
+    parser.add_argument("--stop-on-driver-error", metavar="PATTERN", default=None)
+    parser.add_argument("--driver-error-window-s", type=float, default=2400.0)
     args = parser.parse_args(argv)
     systemctl = ["systemctl", "--user"]
     fd = os.open(MEMINFO, os.O_RDONLY)
@@ -106,11 +132,27 @@ def main(argv: list[str] | None = None) -> int:
         # quiet: a --collect unit is already gone once its processes die, and says so on stderr
         subprocess.run([*systemctl, "stop", args.unit], check=False, capture_output=True)
 
+    since: list[int] = []
+
+    def driver_error() -> bool:
+        # first call = the check that first saw the process; back off one check plus slack so the
+        # job's first seconds (the 2026-10-10 error came 7 s in) are inside the window
+        if not since:
+            since.append(int(time.time() - CHECK_EVERY_S - 5))
+        out = subprocess.run(["journalctl", "-k", "-q", "--no-pager", "--since", f"@{since[0]}",
+                              "-g", args.stop_on_driver_error], capture_output=True, text=True,
+                             check=False).stdout
+        return bool(out.strip())
+
     print(json.dumps({"event": "started", "unit": args.unit, "while_process": args.while_process,
-                      "free_below_gib": args.free_below_gib, "for_s": args.for_s}), flush=True)
+                      "free_below_gib": args.free_below_gib, "for_s": args.for_s,
+                      "stop_on_driver_error": args.stop_on_driver_error,
+                      "driver_error_window_s": args.driver_error_window_s}), flush=True)
     return watch(lambda: meminfo(fd)[0], unit_active, process_running, stop,
                  floor_kib=int(args.free_below_gib * KIB_PER_GIB), hold_s=args.for_s,
-                 interval=args.interval)
+                 interval=args.interval,
+                 driver_error=driver_error if args.stop_on_driver_error else None,
+                 driver_window_s=args.driver_error_window_s)
 
 
 if __name__ == "__main__":

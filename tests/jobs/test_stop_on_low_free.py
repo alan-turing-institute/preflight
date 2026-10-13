@@ -12,7 +12,8 @@ GIB = mod.KIB_PER_GIB
 SPARK_DIPS = 2
 
 
-def run(free_gib, *, running=True, active_for=None, floor_gib=4.0, hold_s=10.0):
+def run(free_gib, *, running=True, active_for=None, floor_gib=4.0, hold_s=10.0,
+        driver_error_at=None, window_s=2400.0):
     """Drive watch() one simulated second per sample of ``free_gib``; return (exit, stops, log)."""
     clock = {"t": 0.0}
     samples = iter(free_gib)
@@ -28,10 +29,14 @@ def run(free_gib, *, running=True, active_for=None, floor_gib=4.0, hold_s=10.0):
             clock["t"] = 1e9  # out of samples: end the unit
             return int(100 * GIB)
 
+    def driver_error():
+        return clock["t"] >= driver_error_at
+
     code = mod.watch(free, active, lambda: running, lambda: stops.append(clock["t"]),
                      floor_kib=int(floor_gib * GIB), hold_s=hold_s, interval=1.0,
                      clock=lambda: clock["t"], sleep=lambda s: clock.__setitem__("t", clock["t"] + s),
-                     log=log.append)
+                     log=log.append, driver_error=driver_error if driver_error_at is not None else None,
+                     driver_window_s=window_s)
     return code, stops, log
 
 
@@ -73,3 +78,21 @@ def test_evict_counts_files_and_skips_symlinks(tmp_path):
     os.symlink("/etc/hostname", tmp_path / "link")
     assert evict_from_cache.evict([str(tmp_path)]) == {"files": 2, "bytes": 5300, "skipped": 1}
     assert evict_from_cache.evict([str(tmp_path / "y.json")])["files"] == 1
+
+
+def test_a_driver_error_at_start_up_stops_at_the_next_check():
+    # 2026-10-10 on Turing: NV_ERR_NO_MEMORY 7 s into the job, box frozen ~80 s later
+    code, stops, log = run([50.0] * 40, driver_error_at=7.0)
+    assert code is mod.Exit.DRIVER_ERROR
+    assert stops == [10.0]  # first check after the error (checks every CHECK_EVERY_S = 5 s)
+    assert log[-1]["event"] == "driver_error_stopping"
+
+
+def test_a_driver_error_after_the_start_up_window_is_left_alone():
+    code, stops, _ = run([50.0] * 60, driver_error_at=30.0, window_s=20.0, active_for=55)
+    assert (code, stops) == (mod.Exit.UNIT_ENDED, [])
+
+
+def test_no_driver_error_stop_while_the_job_process_is_absent():
+    code, stops, _ = run([50.0] * 30, running=False, driver_error_at=0.0, active_for=25)
+    assert (code, stops) == (mod.Exit.UNIT_ENDED, [])
