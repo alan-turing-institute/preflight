@@ -49,15 +49,36 @@ def elapsed(job_id: str) -> str:
     return done.stdout.strip() or "?"
 
 
+def free_memory_mb() -> int | None:
+    """Memory slurm has not allocated on the node (`RealMemory - AllocMem`), or None if unknown."""
+    done = subprocess.run(["scontrol", "show", "node", "gpu-node-1"], capture_output=True, text=True, check=False)
+    fields = dict(part.split("=", 1) for part in done.stdout.split() if "=" in part)
+    try:
+        return int(fields["RealMemory"]) - int(fields["AllocMem"])
+    except (KeyError, ValueError):
+        return None
+
+
+def mem_mb(text: str) -> int:
+    """slurm memory notation (`24G`, `512M`, plain megabytes) in megabytes."""
+    scale = {"K": 1 / 1024, "M": 1, "G": 1024, "T": 1024 * 1024}
+    unit = text[-1].upper()
+    return int(float(text[:-1]) * scale[unit]) if unit in scale else int(text)
+
+
 def plan(
     queue: list[gpu_jobs.QueuedJob], *, gpu: bool, whole_box: bool, leases: list[tuple[str, bool]],
-    unregistered: list[tuple[int, float, str]],
+    unregistered: list[tuple[int, float, str]], memory_short: bool = False,
 ) -> tuple[list[str], list[str], list[str], list[str]]:
-    """(lines to print, normal victims, steady blockers, other wait-only blockers)."""
+    """(lines to print, normal victims, steady blockers, other wait-only blockers).
+
+    `memory_short`: the urgent job's memory does not fit in what slurm has left, so every running job is in
+    its way (slurm picks which `normal` ones to pre-empt).
+    """
     lines, victims, steady, wait_only = [], [], [], []
     for job in queue:
         record = gpu_jobs.read_sidecar(job.job_id) or {}
-        in_way = whole_box or (gpu and bool(record.get("gpu")))
+        in_way = whole_box or memory_short or (gpu and bool(record.get("gpu")))
         if not in_way or not (job.active or job.partition == gpu_jobs.Partition.URGENT):
             continue
         what = f"{job.job_id} {job.name} ({record.get('what', 'no sidecar')}), running {elapsed(job.job_id)}"
@@ -112,6 +133,10 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--log", type=Path, default=None)
     p.add_argument("--workdir", type=Path, default=Path.cwd())
     p.add_argument("--wait-limit", default="1h")
+    p.add_argument(
+        "--max-jobs", type=int, default=1,
+        help="GPU jobs allowed on the card, this one included; above 1 only against a measured sharing result",
+    )
     p.add_argument("--dry-run", action="store_true", help="print the plan and the job script; change nothing")
     p.add_argument("command", nargs=argparse.REMAINDER)
     return p
@@ -126,14 +151,20 @@ def run(argv: list[str]) -> int:
     whole_box = arguments.whole_box or arguments.mem is None
     arguments.gpu = arguments.gpu or whole_box
     arguments.name = arguments.name or Path(arguments.command[0]).name
-    arguments.job_class, arguments.after, arguments.max_jobs = "urgent", [], 1
+    arguments.job_class, arguments.after = "urgent", []
     queue = gpu_jobs.read_queue()
     if queue is None:
         print("[urgent] REFUSED: slurm does not answer (controller down); see slurm/status.py", file=sys.stderr)
         return 1
+    free = free_memory_mb() if arguments.mem else None
+    memory_short = bool(arguments.mem) and free is not None and mem_mb(arguments.mem) > free
     lines, victims, steady, wait_only = plan(
-        queue, gpu=arguments.gpu, whole_box=whole_box, leases=other_leases(), unregistered=audit.unregistered()
+        queue, gpu=arguments.gpu, whole_box=whole_box, leases=other_leases(), unregistered=audit.unregistered(),
+        memory_short=memory_short,
     )
+    if arguments.mem and free is not None:
+        print(f"[urgent] memory: needs {mem_mb(arguments.mem)} MB, slurm has {free} MB unallocated"
+              + ("; jobs will be pre-empted to make room" if memory_short else "; it fits beside what runs"))
     print("\n".join(lines))
     print(f"[urgent] expected start: slurm's own {SLURM_START_S[0]}-{SLURM_START_S[1]} s after the pre-empted jobs "
           "end (trial), plus the slowest yield above")

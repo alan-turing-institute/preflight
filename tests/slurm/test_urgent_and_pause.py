@@ -48,7 +48,19 @@ def test_stops_without_submitting_behind_a_wait_only_blocker(monkeypatch: pytest
     monkeypatch.setattr(gpu_jobs, "read_queue", lambda: [job("2", "steady")])
     monkeypatch.setattr(urgent, "other_leases", list)
     monkeypatch.setattr(urgent.audit, "unregistered", list)
+    monkeypatch.setattr(urgent, "free_memory_mb", lambda: None)
     submitted = []
     monkeypatch.setattr(urgent.subprocess, "run", lambda *a, **k: submitted.append(a))
     assert urgent.run(["--project", "p", "--what", "w", "--time", "0:10:00", "--", "true"]) == 1
     assert submitted == []
+
+
+def test_a_memory_only_urgent_job_that_does_not_fit_puts_running_jobs_in_the_way() -> None:
+    _, victims, _, _ = urgent.plan(
+        [job("3", "normal")], gpu=False, whole_box=False, leases=[], unregistered=[], memory_short=True
+    )
+    assert victims == ["3"]
+
+
+def test_memory_notation() -> None:
+    assert (urgent.mem_mb("24G"), urgent.mem_mb("512M"), urgent.mem_mb("2048")) == (24576, 512, 2048)

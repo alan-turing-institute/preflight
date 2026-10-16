@@ -62,7 +62,10 @@ class State(StrEnum):
 #: States in which a job holds (or is about to hold) its resources.
 ACTIVE_STATES = frozenset({State.RUNNING, State.CONFIGURING, State.COMPLETING, State.SUSPENDED})
 #: Pending reasons meaning a person or the requeue limit holds the job: it will not start by itself.
-HELD_REASONS = frozenset({"JobHeldUser", "JobHeldAdmin", "DependencyNeverSatisfied"})
+#: "job requeued in held state" is what squeue's %r shows after `scontrol requeuehold` (stage C test 9).
+HELD_REASONS = frozenset(
+    {"JobHeldUser", "JobHeldAdmin", "DependencyNeverSatisfied", "job requeued in held state"}
+)
 
 _SQUEUE_FORMAT = "%i|%P|%T|%r|%j"
 #: Explicit, because with MinJobAge a day slurm keeps finished jobs listable; these tools want unfinished ones only.
