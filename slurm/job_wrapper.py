@@ -11,9 +11,10 @@ sbatch script whose only line runs this wrapper. In order:
    FAILED and, under `kill_invalid_depend`, its dependents are cancelled. A SIGTERM here ends it at once.
 2. RE-CHECK the submission's manifest (`dgx/assert_code_parity.py --check-manifest`) when there is one,
    so a file changed during the queue wait is caught before launch.
-3. RUN the command as a CHILD, never `exec`: the wrapper must stay alive to sample it, and slurm signals
-   the child itself on pre-emption (trial B3). On SIGTERM it records the signal and keeps waiting while
-   the child saves its checkpoint, until slurm's grace ends.
+3. RUN the command as a CHILD in its own process group, never `exec`: the wrapper must stay alive to
+   sample it. On SIGTERM it passes the signal to the whole group (slurm signals only the job script's own
+   process: stage C test 3), records it, and keeps waiting while the child saves its checkpoint, until
+   `KillWait` ends.
 4. MEASURE every `--sample` s: GPU memory per process of this job's cgroup (`nvidia-smi`) and the
    cgroup's `memory.current`/`memory.peak` (the CPU side; GPU memory is not charged to the cgroup on the
    GB10, trial B2), appended to `footprints/<job id>.jsonl`.
@@ -23,6 +24,7 @@ sbatch script whose only line runs this wrapper. In order:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import signal
@@ -148,11 +150,18 @@ def sample(cgroup: Path | None, fallback_pids: set[int]) -> dict[str, object]:
 def run_and_measure(command: list[str], footprint: Path, cgroup: Path | None, sample_s: float) -> dict[str, object]:
     received: list[int] = []
 
-    def note(signum: int, _frame: object) -> None:
-        received.append(signum)
+    # The command runs in its own process group, and SIGTERM is passed on to all of it. Measured 2026-10-16
+    # (stage C test 3): on pre-emption slurm signals only the job script's own process when the job has no
+    # `srun` steps (`man slurm.conf`, GraceTime: the signals go to "the tasks and the containing batch
+    # script"), so a child that is not told never saves; it is SIGKILLed when KillWait ends.
+    child = subprocess.Popen(command, start_new_session=True)
 
-    child = subprocess.Popen(command)
-    signal.signal(signal.SIGTERM, note)  # a handler, not SIG_IGN: the child must not inherit "ignored"
+    def forward(signum: int, _frame: object) -> None:
+        received.append(signum)
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(child.pid, signum)
+
+    signal.signal(signal.SIGTERM, forward)
     peak_gpu, peak_mem = 0.0, 0
     footprint.parent.mkdir(parents=True, exist_ok=True)
     with footprint.open("a", encoding="utf-8") as out:

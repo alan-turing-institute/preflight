@@ -70,7 +70,7 @@ time.sleep(30)
 """
 
 
-def test_sigterm_waits_for_the_child_to_save_then_records_the_leg(tmp_path: Path) -> None:
+def test_sigterm_is_passed_to_the_child_which_saves_then_the_leg_is_recorded(tmp_path: Path) -> None:
     saved, up = tmp_path / "saved", tmp_path / "up"
     env = dict(os.environ, SLURM_GPU_STATE_DIR=str(tmp_path / "state"), SLURM_JOB_ID="77")
     wrapper = subprocess.Popen(
@@ -80,9 +80,7 @@ def test_sigterm_waits_for_the_child_to_save_then_records_the_leg(tmp_path: Path
     deadline = time.time() + 10
     while not up.exists() and time.time() < deadline:
         time.sleep(0.05)
-    child = [int(p) for p in subprocess.check_output(["pgrep", "-P", str(wrapper.pid)]).split()]
-    for pid in [wrapper.pid, *child]:  # slurm signals every process of the job, wrapper and child alike
-        os.kill(pid, signal.SIGTERM)
+    os.kill(wrapper.pid, signal.SIGTERM)  # slurm signals only the job script's own process (stage C test 3)
     assert wrapper.wait(timeout=10) == 0
     assert saved.read_text() == "saved"
     record = json.loads((tmp_path / "state" / "jobs" / "77.json").read_text())

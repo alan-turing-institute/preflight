@@ -14,6 +14,8 @@ A restart is safe only with no slurm job running: `squeue` must be empty, or the
 from __future__ import annotations
 
 import argparse
+import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -29,7 +31,12 @@ TARGETS: dict[str, str] = {
     "slurm.conf": "etc/slurm/slurm.conf",
     "cgroup.conf": "etc/slurm/cgroup.conf",
     "gres.conf": "etc/slurm/gres.conf",
-    **{f"{DROPIN}@{unit}": f"etc/systemd/system/{unit}.service.d/{DROPIN}" for unit in ("slurmctld", "slurmd", "munge")},
+    "slurmdbd.conf": "etc/slurm/slurmdbd.conf",
+    "mariadb-slurm.cnf": "etc/mysql/mariadb.conf.d/90-slurm.cnf",
+    **{
+        f"{DROPIN}@{unit}": f"etc/systemd/system/{unit}.service.d/{DROPIN}"
+        for unit in ("slurmctld", "slurmd", "munge", "slurmdbd")
+    },
 }
 KEEPER = "slurm-gpu-lease-keeper.service"
 
@@ -53,9 +60,15 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--check", action="store_true")
     ap.add_argument("--user", action="store_true", help="install and start the lease keeper's user unit")
     args = ap.parse_args(argv)
-    user_unit = {KEEPER: f"{Path.home().relative_to('/')}/.config/systemd/user/{KEEPER}"}
+    # The keeper is the invoking user's unit, also when the check runs under sudo.
+    home = Path(os.path.expanduser(f"~{os.environ['SUDO_USER']}")) if os.environ.get("SUDO_USER") else Path.home()
+    user_unit = {KEEPER: f"{home.relative_to('/')}/.config/systemd/user/{KEEPER}"}
     if args.check:
-        diff = differing(Path("/"), sources(), TARGETS) + differing(Path("/"), HERE, user_unit)
+        try:
+            diff = differing(Path("/"), sources(), TARGETS) + differing(Path("/"), HERE, user_unit)
+        except PermissionError as error:  # slurmdbd.conf is 0600 slurm, as slurmdbd requires
+            print(f"cannot read {error.filename}: run the check with sudo", file=sys.stderr)
+            return 2
         for d in diff:
             print(f"DIFFERS  {d}")
         if not diff:
@@ -72,8 +85,12 @@ def main(argv: list[str] | None = None) -> int:
         print("REFUSED: slurm has jobs; restarting its daemons now would requeue or kill them", file=sys.stderr)
         return 1
     install(Path("/"), sources(), TARGETS)
+    dbd = Path("/etc/slurm/slurmdbd.conf")
+    shutil.chown(dbd, "slurm", "slurm")
+    dbd.chmod(0o600)  # slurmdbd refuses a config readable by others
     subprocess.run(["systemctl", "daemon-reload"], check=True)
-    subprocess.run(["systemctl", "restart", "munge", "slurmctld", "slurmd"], check=True)
+    subprocess.run(["systemctl", "restart", "mariadb", "munge", "slurmdbd"], check=True)
+    subprocess.run(["systemctl", "restart", "slurmctld", "slurmd"], check=True)
     subprocess.run(["scontrol", "show", "config"], capture_output=True, check=True)
     print(f"installed {len(TARGETS)} file(s); munge, slurmctld and slurmd restarted")
     return 0
