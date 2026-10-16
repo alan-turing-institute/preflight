@@ -1,0 +1,230 @@
+#!/usr/bin/env python3
+"""Submit one job to slurm on gpu-node-1: the one command every project uses for GPU work on this box.
+
+Design 3.3 (`design notes`).
+
+    slurm/submit.py --project P --what 'one line' --class resume|restart --mem 24G|auto [--gpu] \
+        [--entry script.py --repo DIR] [--after JOBID]... [--cpus N] [--name NAME] [--log FILE] \
+        [--workdir DIR] [--wait-limit 1h] [--resume-ok] -- <command...>
+
+REFUSES: a GPU job without `--mem`; `--mem auto` with no measured run of that name; a class outside
+the closed set; a `resume` job without `--resume-ok` (the caller's statement that running the command
+again continues from its latest checkpoint); `--after` on a job slurm no longer knows; any submission
+while the lease keeper is not running.
+
+AT SUBMISSION, before anything is queued (a fault must surface before the queue wait, not after it):
+with `--entry`, the DGX gate in check-only mode against this box (code parity, the entry script's
+import, the host memory guard), its GPU leg deferred to launch, where the job wrapper runs it; the
+manifest it writes is copied per job, so two queued jobs with one entry script cannot overwrite each
+other's. Then `audit.py`, and the job's sidecar record.
+
+Every job gets `--requeue` (a `steady` job is protected by its partition's `PreemptMode=OFF`, not by
+`--no-requeue`, which would also stop recovery after a node failure) and `--open-mode=append` (a
+requeued job keeps its first leg's log). The job name is `P:class:NAME`.
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import audit  # noqa: E402 - path set just above
+import gpu_jobs  # noqa: E402
+
+HERE = Path(__file__).resolve().parent
+GATE = HERE.parent / "dgx" / "dgx_submit.sh"
+KEEPER_UNIT = "slurm-gpu-lease-keeper"
+#: --mem auto: the measured peak, plus this share, rounded up to whole GiB.
+AUTO_MARGIN = 0.10
+_DURATION = re.compile(r"^(\d+(?:\.\d+)?)([smh]?)$")
+_UNIT_S = {"": 1, "s": 1, "m": 60, "h": 3600}
+
+
+class Refused(Exception):
+    """A submission this tool will not make; the message says why."""
+
+
+def seconds(text: str) -> float:
+    match = _DURATION.match(text.strip())
+    if not match:
+        msg = f"not a duration: {text!r} (use 90, 30m or 2h)"
+        raise Refused(msg)
+    return float(match.group(1)) * _UNIT_S[match.group(2)]
+
+
+def resolve_mem(mem: str | None, name: str, gpu: bool) -> str | None:
+    if mem is None:
+        if gpu:
+            msg = "a GPU job must state --mem (its measured footprint; on the GB10 GPU memory is system RAM)"
+            raise Refused(msg)
+        return None
+    if mem != "auto":
+        return mem
+    peak = gpu_jobs.measured_peak_bytes(name)
+    if peak is None:
+        msg = f"--mem auto: no measured run called {name!r}; state the figure"
+        raise Refused(msg)
+    return f"{math.ceil(peak * (1 + AUTO_MARGIN) / 1024**3)}G"
+
+
+def keeper_running() -> bool:
+    done = subprocess.run(["systemctl", "--user", "is-active", "-q", KEEPER_UNIT], check=False)
+    return done.returncode == 0
+
+
+def known_to_slurm(job_id: str) -> bool:
+    done = subprocess.run(["scontrol", "show", "job", job_id], capture_output=True, text=True, check=False)
+    return done.returncode == 0
+
+
+def run_gate(repo: Path, entry: str, command: list[str], manifest_copy: Path) -> None:
+    env = dict(os.environ, AUTOCAST_DGX_GATE_CHECK_ONLY="1", AUTOCAST_DGX_HOST="localhost", AUTOCAST_DGX_ROOT=str(repo))
+    done = subprocess.run(
+        [
+            "bash", str(GATE), "--repo", str(repo), "--entry", entry,
+            "--gpu-leg-at-launch", "slurm: the job wrapper checks the card when the job starts",
+            "--", *command,
+        ],
+        env=env,
+        check=False,
+    )
+    if done.returncode != 0:
+        msg = f"the DGX gate refused (exit {done.returncode}); nothing was queued"
+        raise Refused(msg)
+    manifest = repo / "outputs" / "dgx_gate" / Path(entry).stem / "manifest.json"
+    manifest_copy.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(manifest, manifest_copy)
+
+
+def sbatch_script(arguments: argparse.Namespace, *, mem: str | None, log: Path, manifest: Path | None) -> str:
+    job_class = gpu_jobs.JobClass(arguments.job_class)
+    lines = [
+        "#!/bin/bash",
+        f"#SBATCH --partition={gpu_jobs.PARTITION_OF[job_class]}",
+        f"#SBATCH --job-name={arguments.project}:{job_class}:{arguments.name}",
+        f"#SBATCH --cpus-per-task={arguments.cpus}",
+        "#SBATCH --requeue",
+        "#SBATCH --open-mode=append",
+        f"#SBATCH --output={log}",
+        f"#SBATCH --chdir={arguments.workdir}",
+    ]
+    if mem:
+        lines.append(f"#SBATCH --mem={mem}")
+    if arguments.gpu:
+        lines.append("#SBATCH --gres=gpu:1")
+    if arguments.after:
+        lines.append(f"#SBATCH --dependency=afterok:{':'.join(arguments.after)}")
+    wrapper = [sys.executable, str(HERE / "job_wrapper.py"), "--wait-limit", str(seconds(arguments.wait_limit))]
+    if arguments.gpu:
+        wrapper += ["--needs-lease", "--needs-card"]
+    if manifest:
+        wrapper += ["--manifest", str(manifest), "--repo", str(arguments.repo)]
+    lines.append(f"exec {shlex.join([*wrapper, '--', *arguments.command])}")
+    return "\n".join(lines) + "\n"
+
+
+def parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    p.add_argument("--project", required=True)
+    p.add_argument("--what", required=True, help="one line: what the job is")
+    p.add_argument("--class", dest="job_class", required=True, choices=[c.value for c in gpu_jobs.JobClass])
+    p.add_argument("--mem", default=None, help="e.g. 24G, or auto (the last measured run of --name)")
+    p.add_argument("--gpu", action="store_true")
+    p.add_argument("--entry", default=None, help="the Python entry script, relative to --repo (runs the gate)")
+    p.add_argument("--repo", type=Path, default=None)
+    p.add_argument("--after", action="append", default=[], metavar="JOBID")
+    p.add_argument("--cpus", type=int, default=4)
+    p.add_argument("--name", default=None)
+    p.add_argument("--log", type=Path, default=None)
+    p.add_argument("--workdir", type=Path, default=Path.cwd())
+    p.add_argument("--wait-limit", default="1h", help="how long the job waits in-job for the card")
+    p.add_argument("--resume-ok", action="store_true", help="running the command again resumes it")
+    p.add_argument("--dry-run", action="store_true", help="print the sbatch script and submit nothing")
+    p.add_argument("command", nargs=argparse.REMAINDER)
+    return p
+
+
+def submit(argv: list[str]) -> str:
+    arguments = parser().parse_args(argv)
+    arguments.command = arguments.command[1:] if arguments.command[:1] == ["--"] else arguments.command
+    if not arguments.command:
+        msg = "no command after --"
+        raise Refused(msg)
+    arguments.name = arguments.name or Path(arguments.command[0]).name
+    if arguments.job_class == gpu_jobs.JobClass.RESUME and not arguments.resume_ok:
+        msg = "a resume job needs --resume-ok: running its command again must continue from its latest checkpoint"
+        raise Refused(msg)
+    if arguments.entry and arguments.repo is None:
+        msg = "--entry needs --repo (the project checkout)"
+        raise Refused(msg)
+    seconds(arguments.wait_limit)
+    mem = resolve_mem(arguments.mem, arguments.name, arguments.gpu)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    log = arguments.log or gpu_jobs.STATE_DIR / "logs" / f"{arguments.name}-{stamp}.log"
+    manifest = gpu_jobs.STATE_DIR / "manifests" / f"{arguments.name}-{stamp}.json" if arguments.entry else None
+    script = sbatch_script(arguments, mem=mem, log=log, manifest=manifest)
+    if arguments.dry_run:
+        return script
+    if not keeper_running():
+        msg = f"the lease keeper ({KEEPER_UNIT}) is not running; start it before submitting"
+        raise Refused(msg)
+    for job_id in arguments.after:
+        if not known_to_slurm(job_id):
+            msg = f"--after {job_id}: slurm no longer knows that job (finished over a day ago, or never existed)"
+            raise Refused(msg)
+    if arguments.entry:
+        run_gate(arguments.repo.resolve(), arguments.entry, arguments.command, manifest)
+    print("\n".join(audit.report(audit.unregistered())))
+    path = gpu_jobs.STATE_DIR / "scripts" / f"{arguments.name}-{stamp}.sbatch"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    log.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(script, encoding="utf-8")
+    done = subprocess.run(["sbatch", "--parsable", str(path)], capture_output=True, text=True, check=False)
+    if done.returncode != 0:
+        msg = f"sbatch refused: {done.stderr.strip()}"
+        raise Refused(msg)
+    job_id = done.stdout.strip().split(";")[0]
+    gpu_jobs.update_sidecar(
+        job_id,
+        project=arguments.project,
+        what=arguments.what,
+        job_class=arguments.job_class,
+        name=arguments.name,
+        gpu=arguments.gpu,
+        mem=mem,
+        command=arguments.command,
+        log=str(log),
+        script=str(path),
+        entry=arguments.entry,
+        manifest=str(manifest) if manifest else None,
+        after=arguments.after,
+        submitted_at=int(time.time()),
+    )
+    partition = gpu_jobs.PARTITION_OF[gpu_jobs.JobClass(arguments.job_class)]
+    pauses = "pre-empted and resumed from its checkpoint" if partition == gpu_jobs.Partition.NORMAL else "never pre-empted"
+    print(f"[submit] job {job_id} ({partition}: {pauses}); log {log}")
+    return job_id
+
+
+def main() -> int:
+    try:
+        out = submit(sys.argv[1:])
+    except Refused as refusal:
+        print(f"[submit] REFUSED: {refusal}", file=sys.stderr)
+        return 1
+    print(out)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

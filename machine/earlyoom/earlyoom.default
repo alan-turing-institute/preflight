@@ -38,5 +38,7 @@
 #  --prefer  python processes; hostguard also raises every guarded GPU process's oom_score_adj to
 #            800, which is what actually makes the job, not a terminal, the one chosen.
 #  --avoid   + shpool: it holds every terminal session (2026-09-01: killing it lost all of them).
+#  --avoid   + slurmctld, slurmd, munged (2026-10-16, SLURM design 3.1): killing a slurm daemon sets the node DOWN and
+#            requeues or fails every job on it, instead of freeing the memory of the one process consuming it.
 # Previous line kept in /etc/default/earlyoom.bak-2026-10-06.
-EARLYOOM_ARGS="-r 3600 -p -M 8388608,4194304 -s 100,100 --prefer '(^|/)python[0-9.]*$' --avoid '(^|/)(sshd|tailscaled|systemd|dockerd|containerd|shpool)$'"
+EARLYOOM_ARGS="-r 3600 -p -M 8388608,4194304 -s 100,100 --prefer '(^|/)python[0-9.]*$' --avoid '(^|/)(sshd|tailscaled|systemd|dockerd|containerd|shpool|slurmctld|slurmd|munged)$'"

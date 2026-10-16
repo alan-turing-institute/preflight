@@ -28,18 +28,18 @@ TARGETS: dict[str, str] = {
 }
 
 
-def differing(root: Path, src_dir: Path = HERE) -> list[str]:
+def differing(root: Path, src_dir: Path = HERE, targets: dict[str, str] | None = None) -> list[str]:
     """Installed paths whose content differs from (or lacks) the tracked copy."""
     out = []
-    for name, rel in TARGETS.items():
+    for name, rel in (TARGETS if targets is None else targets).items():
         dest = root / rel
         if not dest.exists() or dest.read_bytes() != (src_dir / name).read_bytes():
             out.append(str(dest))
     return out
 
 
-def install(root: Path, src_dir: Path = HERE) -> None:
-    for name, rel in TARGETS.items():
+def install(root: Path, src_dir: Path = HERE, targets: dict[str, str] | None = None) -> None:
+    for name, rel in (TARGETS if targets is None else targets).items():
         dest = root / rel
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(src_dir / name, dest)

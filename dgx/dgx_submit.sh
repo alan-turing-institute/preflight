@@ -83,7 +83,7 @@ on_box() {
 # then $AUTOCAST_DGX_REPO, then the git top level of wherever it was invoked.
 repo_arg=""
 
-entry=""; searches=(); allows=(); alsos=(); cmd=(); gpu_args=(); resident_given=0
+entry=""; searches=(); allows=(); alsos=(); cmd=(); gpu_args=(); resident_given=0; gpu_leg_at_launch=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --repo)              repo_arg="$2"; shift 2 ;;
@@ -94,6 +94,7 @@ while [[ $# -gt 0 ]]; do
         --max-jobs)          gpu_args+=("--max-jobs" "$2"); shift 2 ;;
         --allow-other-users) gpu_args+=("--allow-other-users" "$2"); shift 2 ;;
         --resident)          gpu_args+=("--resident" "$2"); resident_given=1; shift 2 ;;
+        --gpu-leg-at-launch) gpu_leg_at_launch="$2"; shift 2 ;;
         --)                  shift; cmd=("$@"); break ;;
         *) echo "[dgx] unknown argument: $1" >&2; exit 2 ;;
     esac
@@ -121,6 +122,14 @@ if [[ -z "$entry" ]]; then
     exit 2
 fi
 [[ -f "$REPO/$entry" ]] || { echo "[dgx] no such entrypoint: $entry" >&2; exit 2; }
+# --gpu-leg-at-launch 'reason': a job queued behind another (slurm on gpu-node-1) is checked
+# here at submission, while the card is legitimately busy with the job ahead of it, and its
+# launcher runs leg 3 itself at the moment it starts. Only for a check that launches nothing:
+# a launch with leg 3 skipped would be the unguarded start this gate exists to stop.
+if [[ -n "$gpu_leg_at_launch" && "${AUTOCAST_DGX_GATE_CHECK_ONLY:-0}" != "1" && ${#cmd[@]} -gt 0 ]]; then
+    echo "[dgx] REFUSED: --gpu-leg-at-launch is for a check-only run; this one would launch." >&2
+    exit 2
+fi
 
 echo "[dgx] gate for $entry on $HOST (project: $REPO)"
 
@@ -171,6 +180,9 @@ fi
 echo "[dgx] leg 2/4: OK"
 
 # ---- LEG 3 -------------------------------------------------------------------
+if [[ -n "$gpu_leg_at_launch" ]]; then
+    echo "[dgx] leg 3/4: DEFERRED to launch -- $gpu_leg_at_launch"
+else
 echo "[dgx] leg 3/4: checking the GPU is free on $HOST ..."
 # Piped from this clone so the box cannot run a stale copy of the guard itself.
 # ⛔ QUOTE EACH ARGUMENT FOR THE REMOTE SHELL. `${gpu_args[*]}` was interpolated
@@ -188,6 +200,7 @@ if ! on_box \
         "python3 -$gpu_remote" < "$HERE/assert_gpu_free.py"; then
     echo "[dgx] REFUSED by leg 3: the GPU on $HOST is not free." >&2
     exit 4
+fi
 fi
 
 # ---- LEG 4 -------------------------------------------------------------------
