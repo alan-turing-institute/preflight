@@ -65,6 +65,8 @@ ACTIVE_STATES = frozenset({State.RUNNING, State.CONFIGURING, State.COMPLETING, S
 HELD_REASONS = frozenset({"JobHeldUser", "JobHeldAdmin", "DependencyNeverSatisfied"})
 
 _SQUEUE_FORMAT = "%i|%P|%T|%r|%j"
+#: Explicit, because with MinJobAge a day slurm keeps finished jobs listable; these tools want unfinished ones only.
+_UNFINISHED = ",".join(state.lower() for state in State)
 
 
 @dataclass(frozen=True)
@@ -101,7 +103,11 @@ def read_queue() -> list[QueuedJob] | None:
     """Every job slurm knows that has not finished, or None when slurm does not answer."""
     try:
         done = subprocess.run(
-            ["squeue", "-h", "-o", _SQUEUE_FORMAT], capture_output=True, text=True, timeout=30, check=False
+            ["squeue", "-h", "-t", _UNFINISHED, "-o", _SQUEUE_FORMAT],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
         )
     except (OSError, subprocess.TimeoutExpired):
         return None

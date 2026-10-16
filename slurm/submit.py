@@ -106,12 +106,23 @@ def run_gate(repo: Path, entry: str, command: list[str], manifest_copy: Path) ->
     shutil.copyfile(manifest, manifest_copy)
 
 
-def sbatch_script(arguments: argparse.Namespace, *, mem: str | None, log: Path, manifest: Path | None) -> str:
-    job_class = gpu_jobs.JobClass(arguments.job_class)
+def sbatch_script(
+    arguments: argparse.Namespace,
+    *,
+    mem: str | None,
+    log: Path,
+    manifest: Path | None,
+    partition: str | None = None,
+    extra: tuple[str, ...] = (),
+    needs_lease: bool | None = None,
+) -> str:
+    """The job script: directives, then one line running the wrapper. `urgent.py` passes its own partition."""
+    label = arguments.job_class
+    partition = partition or gpu_jobs.PARTITION_OF[gpu_jobs.JobClass(label)]
     lines = [
         "#!/bin/bash",
-        f"#SBATCH --partition={gpu_jobs.PARTITION_OF[job_class]}",
-        f"#SBATCH --job-name={arguments.project}:{job_class}:{arguments.name}",
+        f"#SBATCH --partition={partition}",
+        f"#SBATCH --job-name={arguments.project}:{label}:{arguments.name}",
         f"#SBATCH --cpus-per-task={arguments.cpus}",
         "#SBATCH --requeue",
         "#SBATCH --open-mode=append",
@@ -124,9 +135,14 @@ def sbatch_script(arguments: argparse.Namespace, *, mem: str | None, log: Path, 
         lines.append("#SBATCH --gres=gpu:1")
     if arguments.after:
         lines.append(f"#SBATCH --dependency=afterok:{':'.join(arguments.after)}")
+    lines += [f"#SBATCH {directive}" for directive in extra]
     wrapper = [sys.executable, str(HERE / "job_wrapper.py"), "--wait-limit", str(seconds(arguments.wait_limit))]
+    if arguments.gpu if needs_lease is None else needs_lease:
+        wrapper.append("--needs-lease")
     if arguments.gpu:
-        wrapper += ["--needs-lease", "--needs-card"]
+        wrapper.append("--needs-card")
+    if arguments.max_jobs != 1:
+        wrapper += ["--max-jobs", str(arguments.max_jobs)]
     if manifest:
         wrapper += ["--manifest", str(manifest), "--repo", str(arguments.repo)]
     lines.append(f"exec {shlex.join([*wrapper, '--', *arguments.command])}")
@@ -149,6 +165,12 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--workdir", type=Path, default=Path.cwd())
     p.add_argument("--wait-limit", default="1h", help="how long the job waits in-job for the card")
     p.add_argument("--resume-ok", action="store_true", help="running the command again resumes it")
+    p.add_argument(
+        "--max-jobs",
+        type=int,
+        default=1,
+        help="GPU jobs allowed on the card, this one included; above 1 only against a measured sharing result",
+    )
     p.add_argument("--dry-run", action="store_true", help="print the sbatch script and submit nothing")
     p.add_argument("command", nargs=argparse.REMAINDER)
     return p
@@ -208,6 +230,7 @@ def submit(argv: list[str]) -> str:
         entry=arguments.entry,
         manifest=str(manifest) if manifest else None,
         after=arguments.after,
+        max_jobs=arguments.max_jobs,
         submitted_at=int(time.time()),
     )
     partition = gpu_jobs.PARTITION_OF[gpu_jobs.JobClass(arguments.job_class)]

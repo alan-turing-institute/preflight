@@ -50,8 +50,10 @@ class Exit(IntEnum):
     CODE_CHANGED = 4  # the manifest re-check failed
 
 
-def card_is_free() -> tuple[bool, str]:
-    done = subprocess.run([sys.executable, str(GPU_FREE)], capture_output=True, text=True, check=False)
+def card_is_free(max_jobs: int = 1) -> tuple[bool, str]:
+    done = subprocess.run(
+        [sys.executable, str(GPU_FREE), "--max-jobs", str(max_jobs)], capture_output=True, text=True, check=False
+    )
     return done.returncode == 0, (done.stdout + done.stderr).strip()
 
 
@@ -179,6 +181,9 @@ def main() -> int:
     parser.add_argument("--needs-lease", action="store_true", help="a GPU or urgent job: wait for slurm's lease")
     parser.add_argument("--needs-card", action="store_true", help="a GPU job: wait for a free card")
     parser.add_argument("--wait-limit", type=float, default=3600.0, help="seconds to wait for the card")
+    parser.add_argument(
+        "--max-jobs", type=int, default=1, help="GPU jobs allowed on the card, this one included (declared sharing)"
+    )
     parser.add_argument("--poll", type=float, default=30.0)
     parser.add_argument("--sample", type=float, default=5.0)
     parser.add_argument("--manifest", default=None, help="the submission's code manifest, re-checked at launch")
@@ -192,13 +197,15 @@ def main() -> int:
     job_id = os.environ.get("SLURM_JOB_ID", "nojob")
     restart = int(os.environ.get("SLURM_RESTART_COUNT", "0") or 0)
     print(f"[job] {job_id} leg {restart}: {' '.join(command)}", flush=True)
+    if arguments.max_jobs > 1:
+        print(f"[job] DECLARED SHARING: up to {arguments.max_jobs} GPU jobs on the card", flush=True)
 
     if arguments.needs_lease or arguments.needs_card:
         ok, reason = wait_for_card(
             needs_lease=arguments.needs_lease,
             limit_s=arguments.wait_limit,
             poll_s=arguments.poll,
-            card_free=card_is_free if arguments.needs_card else lambda: (True, ""),
+            card_free=(lambda: card_is_free(arguments.max_jobs)) if arguments.needs_card else lambda: (True, ""),
         )
         if not ok:
             print(f"[job] REFUSED after {arguments.wait_limit:.0f} s: {reason}", file=sys.stderr, flush=True)

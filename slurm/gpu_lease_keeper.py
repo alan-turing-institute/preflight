@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import subprocess
 import sys
 import time
 from collections.abc import Callable
@@ -73,6 +74,7 @@ class Keeper:
         self.blockers: list[str] = []
         self.jobs: list[str] = []
         self.note = ""
+        self.last_queue: list[gpu_jobs.QueuedJob] | None = None
 
     def demand(self, queue: list[gpu_jobs.QueuedJob], now: float) -> bool:
         relevant = [job for job in queue if self.needs_the_card(job)]
@@ -92,7 +94,7 @@ class Keeper:
 
     def step(self) -> dict[str, object]:
         now = self.clock()
-        queue = self.read_queue()
+        queue = self.last_queue = self.read_queue()
         if queue is None:
             self.note = "squeue did not answer; keeping the last state"
             return self.state(now)
@@ -132,6 +134,38 @@ class Keeper:
         }
 
 
+def release_jobs(job_ids: list[str]) -> None:
+    subprocess.run(["scontrol", "release", ",".join(job_ids)], check=False)
+
+
+def restore_order(
+    queue: list[gpu_jobs.QueuedJob], path: Path, release: Callable[[list[str]], None] = release_jobs
+) -> str:
+    """Release the jobs `urgent.py` held once every pre-empted job has paused and is running again, or has left.
+
+    A victim must first be SEEN not running (requeued), since the file is written while it still runs;
+    without that, the first look would release the held jobs before the pre-emption had even happened.
+    """
+    order = gpu_jobs.read_json(path)
+    if not order:
+        return ""
+    victims: dict[str, bool] = dict(order.get("victims") or {})
+    jobs = {job.job_id: job for job in queue}
+    for victim, seen_paused in victims.items():
+        if not seen_paused and (victim not in jobs or not jobs[victim].active):
+            victims[victim] = True
+    back = all(seen and (v not in jobs or jobs[v].active) for v, seen in victims.items())
+    if back:
+        held = list(order.get("held") or [])
+        if held:
+            release(held)
+        gpu_jobs.remove_quietly(path)
+        return f"released {held}: the pre-empted jobs run again"
+    if victims != order.get("victims"):
+        gpu_jobs.write_json(path, {**order, "victims": victims})
+    return ""
+
+
 def remove_leases_from_before_boot(lease_dir: Path, booted_at: float) -> list[str]:
     """Delete lease files last written before this boot; their pids may now name unrelated processes."""
     removed = []
@@ -166,8 +200,12 @@ def main() -> int:
     last = None
     # No cleanup on exit: a lease left by a dead keeper names a dead pid, which every reader ignores,
     # while removing it at a restart would open exactly the gap this keeper exists to close.
+    order_path = gpu_jobs.STATE_DIR / "restore_order.json"
     while True:
         state = keeper.step()
+        queue = keeper.last_queue
+        if queue is not None and (released := restore_order(queue, order_path)):
+            print(f"[keeper] {released}", flush=True)
         summary = (state["phase"], tuple(state["blockers"]), state["note"])
         if summary != last:
             print(f"[keeper] {state['phase']}; jobs {state['jobs']}; blockers {state['blockers']} {state['note']}",

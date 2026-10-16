@@ -156,3 +156,27 @@ def test_only_leases_from_before_the_boot_are_removed(tmp_path: Path) -> None:
     os.utime(old, (booted - 50, booted - 50))
     assert remove_leases_from_before_boot(tmp_path, booted) == ["old.json"]
     assert new.exists()
+
+
+def test_restore_order_waits_for_the_pause_then_for_the_return(tmp_path: Path) -> None:
+    from gpu_lease_keeper import restore_order
+
+    path = tmp_path / "restore_order.json"
+    gpu_jobs.write_json(path, {"victims": {"1": False}, "held": ["7"]})
+    released: list[list[str]] = []
+    assert restore_order([job("1")], path, released.append) == ""  # still running: not yet pre-empted
+    assert restore_order([job("1", "PENDING", "BeginTime")], path, released.append) == ""  # paused
+    assert json.loads(path.read_text())["victims"] == {"1": True}
+    assert restore_order([job("1")], path, released.append).startswith("released")  # running again
+    assert released == [["7"]]
+    assert not path.exists()
+
+
+def test_restore_order_releases_when_the_victim_left_the_queue(tmp_path: Path) -> None:
+    from gpu_lease_keeper import restore_order
+
+    path = tmp_path / "restore_order.json"
+    gpu_jobs.write_json(path, {"victims": {"1": False}, "held": ["7", "8"]})
+    released: list[list[str]] = []
+    assert restore_order([], path, released.append).startswith("released")
+    assert released == [["7", "8"]]
