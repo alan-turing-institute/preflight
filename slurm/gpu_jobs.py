@@ -14,6 +14,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -67,7 +68,10 @@ HELD_REASONS = frozenset(
     {"JobHeldUser", "JobHeldAdmin", "DependencyNeverSatisfied", "job requeued in held state"}
 )
 
-_SQUEUE_FORMAT = "%i|%P|%T|%r|%j"
+#: The pending reason of a job waiting for the jobs it depends on (`man squeue`, JOB REASON CODES).
+DEPENDENCY_REASON = "Dependency"
+
+_SQUEUE_FORMAT = "%i|%P|%T|%r|%E|%j"
 #: Explicit, because with MinJobAge a day slurm keeps finished jobs listable; these tools want unfinished ones only.
 _UNFINISHED = ",".join(state.lower() for state in State)
 
@@ -81,6 +85,17 @@ class QueuedJob:
     state: str
     reason: str
     name: str
+    dependency: str = ""  # squeue's %E, e.g. "afterok:65(unfulfilled)"; "(null)" or "" for none
+
+    @property
+    def depends_on(self) -> tuple[str, ...]:
+        """The ids of the jobs this one still waits for."""
+        return tuple(re.findall(r":(\d+)", self.dependency))
+
+    @property
+    def held(self) -> bool:
+        """Pending and held: it will not start until a person (or the requeue limit) releases it."""
+        return self.state == State.PENDING and self.reason in HELD_REASONS
 
     @property
     def active(self) -> bool:
@@ -93,13 +108,27 @@ class QueuedJob:
 
 
 def parse_squeue(text: str) -> list[QueuedJob]:
-    """Rows of `squeue -h -o '%i|%P|%T|%r|%j'`; the name is last, so a `|` inside it is kept."""
+    """Rows of `squeue -h -o '%i|%P|%T|%r|%E|%j'`; the name is last, so a `|` inside it is kept."""
     jobs = []
     for line in text.splitlines():
-        parts = line.strip().split("|", 4)
-        if len(parts) == 5:  # noqa: PLR2004 - the five fields of _SQUEUE_FORMAT
-            jobs.append(QueuedJob(*parts))
+        parts = line.strip().split("|", 5)
+        if len(parts) == 6:  # noqa: PLR2004 - the six fields of _SQUEUE_FORMAT
+            job_id, partition, state, reason, dependency, name = parts
+            jobs.append(QueuedJob(job_id, partition, state, reason, name, dependency))
     return jobs
+
+
+def held_back(job: QueuedJob, jobs: dict[str, QueuedJob], _seen: frozenset[str] = frozenset()) -> bool:
+    """Pending only on jobs that are held, directly or down a chain: it cannot start until someone releases them.
+
+    A dependency no longer in the queue has just finished, so the job may be about to start: not held back.
+    """
+    if job.reason != DEPENDENCY_REASON or not job.depends_on or job.job_id in _seen:
+        return False
+    before = [jobs.get(job_id) for job_id in job.depends_on]
+    return all(
+        other is not None and (other.held or held_back(other, jobs, _seen | {job.job_id})) for other in before
+    )
 
 
 def read_queue() -> list[QueuedJob] | None:

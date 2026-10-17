@@ -11,7 +11,8 @@ pre-emption in which service-a reloads its ~21 GB model. So this one long-lived 
 Every `--interval` seconds:
 
 * DEMAND: a GPU job or an urgent job is active, or one is pending (not held) within `--linger` seconds of
-  the last active one ending, or of first being seen with nothing active. A job held by a person, or one
+  the last active one ending, or of first being seen with nothing active. A job held by a person, one
+  pending only on held jobs (its chain cannot move until someone releases them: `gpu_jobs.held_back`), or one
   pending past the linger while nothing of slurm's runs (waiting on a CPU step, say), is not demand.
 * demand and no lease: write the lease with `requested_at` (services start yielding); wait by the fair
   rule (`GpuLease.blockers`: holders block, an earlier waiter goes first, our request withdrawn while one
@@ -82,7 +83,8 @@ class Keeper:
         if any(job.active for job in relevant):
             self.anchor = now
             return True
-        if not any(job.waiting for job in relevant):
+        jobs = {job.job_id: job for job in queue}
+        if not any(job.waiting and not gpu_jobs.held_back(job, jobs) for job in relevant):
             self.anchor = None
             return False
         if self.anchor is None:

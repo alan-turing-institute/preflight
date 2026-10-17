@@ -15,8 +15,8 @@ from gpu_lease_keeper import Keeper, Phase, remove_leases_from_before_boot
 from localmodels.lease import GpuLease
 
 
-def job(job_id: str, state: str = "RUNNING", reason: str = "None") -> gpu_jobs.QueuedJob:
-    return gpu_jobs.QueuedJob(job_id, "normal", state, reason, f"p:resume:{job_id}")
+def job(job_id: str, state: str = "RUNNING", reason: str = "None", dependency: str = "") -> gpu_jobs.QueuedJob:
+    return gpu_jobs.QueuedJob(job_id, "normal", state, reason, f"p:resume:{job_id}", dependency)
 
 
 class World:
@@ -122,10 +122,19 @@ def test_the_lease_is_held_across_a_chain_hand_off_then_released_after_the_linge
     assert world.step()["phase"] == Phase.ADMITTED
 
 
-def test_a_held_job_is_not_demand(tmp_path: Path) -> None:
+def test_a_held_job_is_not_demand_nor_is_a_chain_waiting_only_on_it(tmp_path: Path) -> None:
     world = World(tmp_path)
     world.queue = [job("1", "PENDING", "JobHeldUser")]
     assert world.step()["phase"] == Phase.NONE
+    # a job paused by hand with its next step waiting on it (and one after that): nothing can start, so no lease
+    world.queue = [
+        job("1", "PENDING", "job requeued in held state"),
+        job("2", "PENDING", "Dependency", "afterok:1(unfulfilled)"),
+        job("3", "PENDING", "Dependency", "afterok:2(unfulfilled)"),
+    ]
+    assert world.step()["phase"] == Phase.NONE
+    world.queue[0] = job("1", "PENDING", "Resources")  # released: the chain can move again
+    assert world.step()["phase"] == Phase.ADMITTED
 
 
 def test_a_silent_controller_keeps_the_last_state(tmp_path: Path) -> None:
