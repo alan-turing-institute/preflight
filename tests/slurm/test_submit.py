@@ -37,9 +37,7 @@ def test_restart_job_runs_in_steady_still_requeueable() -> None:
 @pytest.mark.parametrize(
     ("argv", "why"),
     [
-        (["--class", "restart", "--gpu", "--", "x"], "must state --mem"),
         (["--class", "resume", "--mem", "4G", "--", "x"], "--resume-ok"),
-        (["--class", "restart", "--mem", "auto", "--name", "never-ran", "--", "x"], "no measured run"),
         (["--class", "restart", "--entry", "a.py", "--", "x"], "--entry needs --repo"),
         (["--class", "restart", "--wait-limit", "soon", "--", "x"], "not a duration"),
         (["--class", "restart"], "no command"),
@@ -65,6 +63,39 @@ def test_mem_auto_uses_the_last_measured_run_plus_a_margin(tmp_path: Path, monke
     script = dry("--project", "p", "--what", "w", "--class", "restart", "--gpu", "--mem", "auto", "--name", "n",
                  "--", "x")
     assert f"{DIRECTIVE} --mem=14G" in script  # newest run: 10 + 2 GiB, plus 10%, rounded up
+
+
+def test_no_mem_reuses_the_last_measured_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(gpu_jobs, "STATE_DIR", tmp_path)
+    (tmp_path / "jobs").mkdir()
+    leg = {"peak_gpu_mib": 10 * 1024, "peak_mem_bytes": 2 * 1024**3, "ended_at": 1}
+    (tmp_path / "jobs" / "1.json").write_text(json.dumps({"name": "n", "last_leg": leg}))
+    script = dry("--project", "p", "--what", "w", "--class", "restart", "--gpu", "--name", "n", "--", "x")
+    assert f"{DIRECTIVE} --mem=14G" in script
+
+
+@pytest.mark.parametrize("mem", [[], ["--mem", "auto"]])
+def test_a_first_gpu_run_with_no_mem_takes_the_whole_box(mem: list[str], tmp_path: Path,
+                                                          monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(gpu_jobs, "STATE_DIR", tmp_path)
+    script = dry("--project", "p", "--what", "w", "--class", "restart", "--gpu", *mem, "--name", "never-ran",
+                 "--", "x")
+    assert f"{DIRECTIVE} --mem=0" in script
+
+
+def test_a_first_cpu_run_with_no_mem_gets_slurms_default(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(gpu_jobs, "STATE_DIR", tmp_path)
+    script = dry("--project", "p", "--what", "w", "--class", "restart", "--name", "never-ran", "--", "x")
+    assert "--mem" not in script
+
+
+def test_no_mem_without_a_name_never_reuses_another_jobs_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(gpu_jobs, "STATE_DIR", tmp_path)
+    (tmp_path / "jobs").mkdir()
+    leg = {"peak_gpu_mib": 10 * 1024, "peak_mem_bytes": 0, "ended_at": 1}
+    (tmp_path / "jobs" / "1.json").write_text(json.dumps({"name": "python", "last_leg": leg}))
+    script = dry("--project", "p", "--what", "w", "--class", "restart", "--gpu", "--", "python", "other.py")
+    assert f"{DIRECTIVE} --mem=0" in script
 
 
 def test_refuses_while_the_keeper_is_down(monkeypatch: pytest.MonkeyPatch) -> None:

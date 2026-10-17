@@ -3,11 +3,14 @@
 
 Design 3.3 (`design notes`).
 
-    slurm/submit.py --project P --what 'one line' --class resume|restart --mem 24G|auto [--gpu] \
+    slurm/submit.py --project P --what 'one line' --class resume|restart [--mem 24G|auto] [--gpu] \
         [--entry script.py --repo DIR] [--after JOBID]... [--cpus N] [--name NAME] [--log FILE] \
         [--workdir DIR] [--wait-limit 1h] [--resume-ok] -- <command...>
 
-REFUSES: a GPU job without `--mem`; `--mem auto` with no measured run of that name; a class outside
+MEMORY: `--mem` is optional. Without it (or with `auto`) a job given `--name` asks for that name's newest measured
+run plus 10%; with no measured run (or no `--name`) a GPU job asks for the whole box, a CPU job for slurm's default.
+
+REFUSES: a class outside
 the closed set; a `resume` job without `--resume-ok` (the caller's statement that running the command
 again continues from its latest checkpoint); `--after` on a job slurm no longer knows; any submission
 while the lease keeper is not running.
@@ -46,6 +49,8 @@ GATE = HERE.parent / "dgx" / "dgx_submit.sh"
 KEEPER_UNIT = "slurm-gpu-lease-keeper"
 #: --mem auto: the measured peak, plus this share, rounded up to whole GiB.
 AUTO_MARGIN = 0.10
+#: --mem with no measured run, for a GPU job: slurm's "all of the memory on each node".
+WHOLE_BOX = "0"
 _DURATION = re.compile(r"^(\d+(?:\.\d+)?)([smh]?)$")
 _UNIT_S = {"": 1, "s": 1, "m": 60, "h": 3600}
 
@@ -62,19 +67,18 @@ def seconds(text: str) -> float:
     return float(match.group(1)) * _UNIT_S[match.group(2)]
 
 
-def resolve_mem(mem: str | None, name: str, gpu: bool) -> str | None:
-    if mem is None:
-        if gpu:
-            msg = "a GPU job must state --mem (its measured footprint; on the GB10 GPU memory is system RAM)"
-            raise Refused(msg)
-        return None
-    if mem != "auto":
+def resolve_mem(mem: str | None, name: str | None, gpu: bool) -> str | None:
+    """The `--mem` to ask slurm for. A stated figure is used as given; none (or `auto`) is the newest measured run of
+    `name` plus `AUTO_MARGIN`, only for a job given `--name` (the default name, the command's first word such as
+    `python`, is shared by unrelated jobs); with no measured run, the whole box for a GPU job (`0`: slurm grants
+    every byte it hands out) and slurm's own default for a CPU job. The wrapper measures every run, so only a
+    named job's first run takes the whole box."""
+    if mem not in (None, "auto"):
         return mem
-    peak = gpu_jobs.measured_peak_bytes(name)
-    if peak is None:
-        msg = f"--mem auto: no measured run called {name!r}; state the figure"
-        raise Refused(msg)
-    return f"{math.ceil(peak * (1 + AUTO_MARGIN) / 1024**3)}G"
+    peak = None if name is None else gpu_jobs.measured_peak_bytes(name)
+    if peak is not None:
+        return f"{math.ceil(peak * (1 + AUTO_MARGIN) / 1024**3)}G"
+    return WHOLE_BOX if gpu else None
 
 
 def keeper_running() -> bool:
@@ -154,7 +158,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--project", required=True)
     p.add_argument("--what", required=True, help="one line: what the job is")
     p.add_argument("--class", dest="job_class", required=True, choices=[c.value for c in gpu_jobs.JobClass])
-    p.add_argument("--mem", default=None, help="e.g. 24G, or auto (the last measured run of --name)")
+    p.add_argument("--mem", default=None,
+                   help="e.g. 24G; default auto: the last measured run of --name plus 10%%, else the whole box (GPU)")
     p.add_argument("--gpu", action="store_true")
     p.add_argument("--entry", default=None, help="the Python entry script, relative to --repo (runs the gate)")
     p.add_argument("--repo", type=Path, default=None)
@@ -182,6 +187,7 @@ def submit(argv: list[str]) -> str:
     if not arguments.command:
         msg = "no command after --"
         raise Refused(msg)
+    named = arguments.name
     arguments.name = arguments.name or Path(arguments.command[0]).name
     if arguments.job_class == gpu_jobs.JobClass.RESUME and not arguments.resume_ok:
         msg = "a resume job needs --resume-ok: running its command again must continue from its latest checkpoint"
@@ -190,7 +196,7 @@ def submit(argv: list[str]) -> str:
         msg = "--entry needs --repo (the project checkout)"
         raise Refused(msg)
     seconds(arguments.wait_limit)
-    mem = resolve_mem(arguments.mem, arguments.name, arguments.gpu)
+    mem = resolve_mem(arguments.mem, named, arguments.gpu)
     stamp = time.strftime("%Y%m%d-%H%M%S")
     log = arguments.log or gpu_jobs.STATE_DIR / "logs" / f"{arguments.name}-{stamp}.log"
     manifest = gpu_jobs.STATE_DIR / "manifests" / f"{arguments.name}-{stamp}.json" if arguments.entry else None
