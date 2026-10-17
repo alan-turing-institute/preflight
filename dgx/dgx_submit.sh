@@ -219,13 +219,30 @@ fi
 if [[ ${#cmd[@]} -eq 0 ]]; then
     echo "[dgx] leg 4/4: SKIPPED -- no command given, so there is nothing to launch."
 else
-    if [[ ! "${cmd[*]}" =~ hostguard ]]; then
+    # (b) The command loads the guard: either it names hostguard (PYTHONPATH, autocast's launch), or its
+    # interpreter IS the venv python that (a) just verified loads it at startup through hostguard.pth
+    # (service-c's `.venv/bin/python -I ...`; -I keeps site-packages .pth files, -S would drop them).
+    first="${cmd[0]}"
+    [[ "$first" == /* ]] || first="$REMOTE_ROOT/$first"
+    venv_python=0
+    if [[ "$first" == "$REMOTE_ROOT/.venv/bin/python" || "$first" == "$REMOTE_ROOT"/.venv/bin/python3* ]]; then
+        venv_python=1
+        for arg in "${cmd[@]:1}"; do
+            [[ "$arg" == -* ]] || break
+            [[ "$arg" == -S || "$arg" =~ ^-[a-zA-Z]*S ]] && venv_python=0
+        done
+    fi
+    if [[ ! "${cmd[*]}" =~ hostguard && $venv_python -eq 0 ]]; then
         echo "[dgx] REFUSED by leg 4: the command carries no hostguard on" >&2
         echo "[dgx] PYTHONPATH. The CUDA pool on this box IS system RAM and an" >&2
         echo "[dgx] uncapped job took the whole machine down on 2026-09-01." >&2
         exit 5
     fi
-    echo "[dgx] leg 4/4: OK"
+    if [[ $venv_python -eq 1 ]]; then
+        echo "[dgx] leg 4/4: OK (the command runs the venv python, which loads the guard at startup)"
+    else
+        echo "[dgx] leg 4/4: OK"
+    fi
 fi
 
 if [[ "${AUTOCAST_DGX_GATE_CHECK_ONLY:-0}" == "1" || ${#cmd[@]} -eq 0 ]]; then
