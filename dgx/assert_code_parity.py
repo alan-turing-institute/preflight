@@ -155,6 +155,21 @@ def repo_module_index(local_root: Path) -> dict[str, Path]:
     return index
 
 
+def installed_in_venv(head: str, local_root: Path) -> bool:
+    """True when `head` is a package installed in the project's own `.venv`.
+
+    Such an import is third-party even when a repository file shares its name
+    (service-c's `service-c/generate/llama_cpp.py` wraps the installed
+    `llama_cpp` package and is never reached by a bare `import llama_cpp`), so
+    it is not a stranded first-party module. A name that is NOT installed still
+    refuses: the safety the stranded-import check gives is unchanged.
+    """
+    for site in local_root.glob(".venv/lib/python*/site-packages"):
+        if (site / head).is_dir() or (site / f"{head}.py").is_file() or any(site.glob(f"{head}.*.so")):
+            return True
+    return False
+
+
 def unreachable_first_party(unresolved: set[str], local_root: Path) -> dict[str, Path]:
     """Unresolved imports that DO exist in this repository.
 
@@ -171,7 +186,7 @@ def unreachable_first_party(unresolved: set[str], local_root: Path) -> dict[str,
     found: dict[str, Path] = {}
     for name in unresolved:
         head = name.split(".")[0]
-        if head in sys.stdlib_module_names:
+        if head in sys.stdlib_module_names or installed_in_venv(head, local_root):
             continue
         if head in index:
             found[head] = index[head]

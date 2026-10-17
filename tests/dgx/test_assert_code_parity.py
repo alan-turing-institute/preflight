@@ -334,3 +334,21 @@ def test_a_class_imported_from_a_module_is_not_a_missing_module(
     )
     _, unresolved = mod.closure(study / "scripts" / "entry.py", [study / "scripts"])
     assert mod.unreachable_first_party(unresolved, study) == {}
+
+
+@pytest.mark.parametrize("installed", [True, False])
+def test_an_installed_package_sharing_a_repo_file_name_is_not_stranded(study: Path, installed: bool) -> None:
+    """MUTATION: refusing a third-party import because a repository file has its name.
+
+    service-c has `service-c/generate/llama_cpp.py` and imports the installed
+    `llama_cpp` package bare; the stranded check refused v3's submission on it
+    (2026-10-17). Installed in the project's .venv, it is third-party; not
+    installed, the refusal stands.
+    """
+    write(study / "src" / "pkg" / "llama_cpp.py", "import llama_cpp\n")
+    write(study / "scripts" / "entry.py", "def run():\n    import llama_cpp\n    return llama_cpp\n")
+    if installed:
+        write(study / ".venv" / "lib" / "python3.13" / "site-packages" / "llama_cpp" / "__init__.py", "")
+    _, unresolved = mod.closure(study / "scripts" / "entry.py", [study / "scripts"])
+    stranded = mod.unreachable_first_party(unresolved, study)
+    assert ("llama_cpp" in stranded) is not installed
