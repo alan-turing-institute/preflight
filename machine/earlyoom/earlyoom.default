@@ -36,9 +36,16 @@
 #            Deliberately BELOW hostguard's fixed 12 GiB reserve, so a guarded job using its whole cap is never
 #            killed; only something the guard did not bound gets here.
 #  --prefer  python processes; hostguard also raises every guarded GPU process's oom_score_adj to
-#            800, which is what actually makes the job, not a terminal, the one chosen.
+#            800, which is what actually makes the job, not a terminal, the one chosen. Since 2026-10-18
+#            slurm/job_wrapper.py raises it to 800 for EVERY slurm job too: a service-c job (not in a
+#            hostguard venv) sat at 0 while holding 68.5 GB, and its GPU memory is not in RSS.
 #  --avoid   + shpool: it holds every terminal session (2026-09-01: killing it lost all of them).
 #  --avoid   + slurmctld, slurmd, munged (2026-10-16, SLURM design 3.1): killing a slurm daemon sets the node DOWN and
 #            requeues or fails every job on it, instead of freeing the memory of the one process consuming it.
+#  --avoid   + ccage-auto, ccage-watch, claude (2026-10-18): at 13:57 earlyoom ended three Claude sessions by killing
+#            their ccage-auto wrappers (25-30 MB each), which ran as plain "python3": --prefer matched them, and the
+#            sessions' inherited oom_score_adj 200 (score 800) out-ranked the unmarked job (677). A session cannot lower
+#            its own adj, so the wrappers now name themselves (prctl PR_SET_NAME) and are avoided here by that name.
+#            --avoid subtracts 300; it does not exempt, so a session is still killable when nothing else is left.
 # Previous line kept in /etc/default/earlyoom.bak-2026-10-06.
-EARLYOOM_ARGS="-r 3600 -p -M 8388608,4194304 -s 100,100 --prefer '(^|/)python[0-9.]*$' --avoid '(^|/)(sshd|tailscaled|systemd|dockerd|containerd|shpool|slurmctld|slurmd|munged)$'"
+EARLYOOM_ARGS="-r 3600 -p -M 8388608,4194304 -s 100,100 --prefer '(^|/)python[0-9.]*$' --avoid '(^|/)(sshd|tailscaled|systemd|dockerd|containerd|shpool|slurmctld|slurmd|munged|ccage-auto|ccage-watch|claude)$'"

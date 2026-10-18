@@ -59,13 +59,14 @@ def test_job_cgroup_is_the_job_component_of_our_cgroup(tmp_path: Path) -> None:
 
 
 CHILD = """
-import signal, sys, time
+import os, signal, sys, time
 def term(*_):
     time.sleep(1.0)  # "writing a checkpoint"
     open(sys.argv[1], "w").write("saved")
     sys.exit(0)
 signal.signal(signal.SIGTERM, term)
-open(sys.argv[2], "w").write("up")
+open(sys.argv[2] + ".tmp", "w").write(open("/proc/self/oom_score_adj").read())
+os.rename(sys.argv[2] + ".tmp", sys.argv[2])
 time.sleep(30)
 """
 
@@ -80,6 +81,7 @@ def test_sigterm_is_passed_to_the_child_which_saves_then_the_leg_is_recorded(tmp
     deadline = time.time() + 10
     while not up.exists() and time.time() < deadline:
         time.sleep(0.05)
+    assert int(up.read_text()) >= 800  # the job, not a session, is the preferred memory victim
     os.kill(wrapper.pid, signal.SIGTERM)  # slurm signals only the job script's own process (stage C test 3)
     assert wrapper.wait(timeout=10) == 0
     assert saved.read_text() == "saved"

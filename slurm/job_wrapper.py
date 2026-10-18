@@ -35,8 +35,12 @@ from enum import IntEnum
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "hostguard"))
 
 import gpu_jobs  # noqa: E402 - path set just above
+
+# Importing hostguard only arms a hook on torch's import; the wrapper never imports torch.
+from hostguard import mark_preferred_victim
 
 PREFLIGHT = Path(__file__).resolve().parents[1]
 GPU_FREE = PREFLIGHT / "dgx" / "assert_gpu_free.py"
@@ -154,6 +158,11 @@ def run_and_measure(command: list[str], footprint: Path, cgroup: Path | None, sa
     # (stage C test 3): on pre-emption slurm signals only the job script's own process when the job has no
     # `srun` steps (`man slurm.conf`, GraceTime: the signals go to "the tasks and the containing batch
     # script"), so a child that is not told never saves; it is SIGKILLed when KillWait ends.
+    # The job is what a memory shortage should end, not a session: 2026-10-18 13:57 earlyoom ended three
+    # Claude sessions while a training job holding 68.5 GB of the unified pool sat at oom_score_adj 0 (GPU
+    # memory is not in RSS, so its score saw 2.8 GB). Raised here, inherited by the command, so every slurm
+    # job is marked whatever environment it loads; hostguard marks only processes in a guarded venv.
+    mark_preferred_victim()
     child = subprocess.Popen(command, start_new_session=True)
 
     def forward(signum: int, _frame: object) -> None:
