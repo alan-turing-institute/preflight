@@ -7,7 +7,7 @@ import json
 import os
 import signal
 import sys
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from wsgiref.util import setup_testing_defaults
 
@@ -20,6 +20,7 @@ sys.path.insert(0, str(SLURM / "ood_app"))
 import app
 
 HOST = "ood.example:8080"
+MOUNT = "/pun/sys/gpujobs"  # where OOD serves the app (Passenger's SCRIPT_NAME)
 
 
 def queued(job_id: str, user: str, name: str = "proj:normal:train", partition: str = "normal") -> gpu_jobs.QueuedJob:
@@ -49,6 +50,12 @@ class Fake:
             run=lambda argv: (self.ran.append(argv) or 0, "done"),
             python="py",
             slurm_dir=Path("/slurm"),
+            host=lambda: "box",
+            keeper=lambda: {"blockers": []},
+            live_memory=lambda _j: {"gpu": 3 * 1024**3},
+            finished=lambda _j: None,
+            now=lambda: datetime(2026, 10, 19, 12, 0),
+            project_order=lambda: ["proj"],
         )
         self.application = app.make_application(self.backend)
 
@@ -58,7 +65,7 @@ def call(fake: Fake, path: str, method: str = "GET", body: object | None = None,
     setup_testing_defaults(environ)
     route, _, query = path.partition("?")
     payload = json.dumps(body).encode() if body is not None else b""
-    environ.update(PATH_INFO=route, QUERY_STRING=query, REQUEST_METHOD=method, HTTP_HOST=HOST)
+    environ.update(PATH_INFO=route, QUERY_STRING=query, REQUEST_METHOD=method, HTTP_HOST=HOST, SCRIPT_NAME=MOUNT)
     environ.update({"wsgi.input": io.BytesIO(payload), "CONTENT_LENGTH": str(len(payload))})
     if method == "POST":
         environ.update(CONTENT_TYPE="application/json", HTTP_ORIGIN=f"http://{HOST}")
@@ -176,4 +183,8 @@ def test_buttons_follow_can_act(viewer: str, admin: bool, shown: bool) -> None:
     assert ('data-action="kill"' in page) is shown
     held = gpu_jobs.QueuedJob("9", "steady", "PENDING", "JobHeldUser", "n")
     assert 'data-action="pause"' not in app._buttons_html(held, steady=False)  # paused already
-    assert "../../jobstats/7" in page
+    assert 'data-action="resume"' in app._buttons_html(held, steady=False)
+    assert 'data-action="resume"' not in page  # job 7 runs: nothing to resume
+    assert "/pun/sys/jobstats/7" in page
+    # links are absolute from the mount: opened without its trailing slash, the page still finds its stylesheet
+    assert f'href="{MOUNT}/static/app.css"' in page

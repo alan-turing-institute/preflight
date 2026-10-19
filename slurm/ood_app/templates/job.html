@@ -1,46 +1,49 @@
-<section aria-labelledby="h-record">
-<h2 id="h-record">Record</h2>
-<table><tbody>
-$record_rows
-</tbody></table>
-$jobstats
+<a class="back" href="../">← Queue</a>
+<div class="page-head">
+<div><h1>$title</h1><p class="sub">$subtitle</p></div>
+<div>$buttons</div>
+</div>
+<p id="action-result" class="notice" role="status" aria-live="polite"></p>
+<div class="grid">
+<section class="card" aria-labelledby="h-details">
+<div class="card-head"><h2 id="h-details">Details</h2></div>
+<div class="card-body"><dl class="facts">$facts</dl></div>
 </section>
-<section aria-labelledby="h-actions">
-<h2 id="h-actions">Actions</h2>
-$buttons
-<p id="action-result" role="status" aria-live="polite"></p>
+<section class="card" aria-labelledby="h-resources">
+<div class="card-head"><h2 id="h-resources">Resources</h2>$jobstats</div>
+<div class="card-body">$resources</div>
 </section>
-<section aria-labelledby="h-command">
-<h2 id="h-command">Command</h2>
-<pre>$command</pre>
+</div>
+<div class="grid">
+<section class="card" aria-labelledby="h-timeline">
+<div class="card-head"><h2 id="h-timeline">Timeline</h2></div>
+<div class="card-body">$timeline</div>
 </section>
-<section aria-labelledby="h-chain">
-<h2 id="h-chain">Dependency chain</h2>
-$chain
+<section class="card" aria-labelledby="h-chain">
+<div class="card-head"><h2 id="h-chain">Dependencies</h2></div>
+<div class="card-body chain">$chain</div>
 </section>
-<section aria-labelledby="h-eff">
-<h2 id="h-eff">Efficiency</h2>
-$efficiency
-</section>
-<section aria-labelledby="h-events">
-<h2 id="h-events">Events</h2>
-$events
-</section>
-<section aria-labelledby="h-log">
-<h2 id="h-log">Log</h2>
-<form id="log-viewer" data-job="$job_id">
-<label>Only lines containing <input name="text" type="text"></label>
-<label><input name="errors" type="checkbox"> Errors and warnings only</label>
+</div>
+<section class="card" aria-labelledby="h-log">
+<div class="card-head"><h2 id="h-log">Log</h2><span class="meta mono">$log_path</span></div>
+<form id="log-viewer" class="toolbar" data-job="$job_id">
+<label class="field">Only lines containing <input name="text" type="search" placeholder="e.g. loss"></label>
+<label class="check"><input name="errors" type="checkbox"> Errors and warnings only</label>
 <button type="submit">Refresh</button>
 </form>
-<pre id="log-output" tabindex="0" aria-label="Log of job $job_id">loading</pre>
+<pre id="log-output" class="log" tabindex="0" aria-label="Log of job $job_id">Loading…</pre>
+</section>
+<section class="card">
+<details class="code"><summary>Command and job script</summary><pre>$command</pre></details>
 </section>
 <dialog id="confirm" aria-labelledby="confirm-title">
 <form method="dialog">
 <h2 id="confirm-title"></h2>
 <pre id="confirm-detail"></pre>
 <p id="confirm-lose-label" hidden><label><input id="confirm-lose" type="checkbox"> I accept losing this job's progress</label></p>
-<button id="confirm-no" value="no">Cancel</button>
+<div class="actions">
+<button id="confirm-no" value="no">Keep it</button>
 <button id="confirm-yes" value="yes" class="danger">Confirm</button>
+</div>
 </form>
 </dialog>

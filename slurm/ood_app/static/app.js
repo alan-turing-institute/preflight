@@ -1,54 +1,66 @@
 "use strict";
-// Every value from the server goes in through textContent; every URL is relative (OOD serves this app under /pun/sys/<name>/).
+// The server renders every page (all values escaped there); this script only refreshes the live parts of the queue
+// page by fetching the page again, shows chart tooltips, runs the job actions, and loads the log (textContent only).
 
-const JOB_COLUMNS = ["id", "user", "project", "class", "name", "description", "state", "waiting", "elapsed", "gpus", "mem"];
+const ROOT = document.body.dataset.root || "./";
+const REFRESH_MS = 10000;
 
-function renderJobs(jobs) {
-  const body = document.querySelector("#jobs tbody");
-  if (!body) return;
-  body.replaceChildren();
-  for (const job of jobs) {
-    const row = document.createElement("tr");
-    for (const column of JOB_COLUMNS) {
-      const cell = document.createElement("td");
-      if (column === "id") {
-        const link = document.createElement("a");
-        link.href = "job/" + encodeURIComponent(job.id);
-        link.textContent = job.id;
-        cell.append(link);
-      } else {
-        cell.textContent = String(job[column] ?? "");
-      }
-      row.append(cell);
-    }
-    body.append(row);
-  }
-  const status = document.getElementById("jobs-status");
-  if (status) status.textContent = jobs.length + " job(s), updated " + new Date().toLocaleTimeString();
-}
-
-async function pollJobs() {
+async function refreshLive() {
+  const note = document.getElementById("live-note");
   try {
-    const reply = await fetch("api/jobs", { headers: { Accept: "application/json" } });
-    if (reply.ok) renderJobs((await reply.json()).jobs);
+    const reply = await fetch(location.href, { headers: { Accept: "text/html" }, cache: "no-store" });
+    if (!reply.ok) throw new Error(String(reply.status));
+    const fresh = new DOMParser().parseFromString(await reply.text(), "text/html");
+    for (const part of document.querySelectorAll("[data-live]")) {
+      const next = fresh.querySelector('[data-live="' + part.dataset.live + '"]');
+      if (next) part.replaceChildren(...next.childNodes);
+    }
+    if (note) note.textContent = "Updated " + new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }) + " · refreshes every 10 s";
   } catch (_) {
-    const status = document.getElementById("jobs-status");
-    if (status) status.textContent = "could not refresh; retrying";
+    if (note) note.textContent = "Could not refresh; retrying in 10 s";
   }
 }
 
-async function loadLog(root) {
+function tooltips() {
+  let tip = null;
+  document.addEventListener("mouseover", (event) => {
+    const target = event.target.closest && event.target.closest("[data-tip]");
+    if (!target) return;
+    const [project, when, value] = target.dataset.tip.split("|");
+    tip = tip || Object.assign(document.createElement("div"), { className: "tip", role: "tooltip" });
+    const head = document.createElement("b");
+    head.textContent = project;
+    tip.replaceChildren(head, document.createTextNode(when + ": " + value));
+    document.body.append(tip);
+  });
+  document.addEventListener("mousemove", (event) => {
+    if (!tip || !tip.isConnected) return;
+    tip.style.left = Math.min(event.clientX + 14, window.innerWidth - tip.offsetWidth - 8) + "px";
+    tip.style.top = event.clientY + 14 + "px";
+  });
+  document.addEventListener("mouseout", (event) => {
+    if (tip && event.target.closest && event.target.closest("[data-tip]")) tip.remove();
+  });
+}
+
+async function loadLog(form) {
   const params = new URLSearchParams();
-  const text = root.querySelector("[name=text]").value;
+  const text = form.querySelector("[name=text]").value;
   if (text) params.set("text", text);
-  if (root.querySelector("[name=errors]").checked) params.set("errors", "1");
-  const reply = await fetch("../api/job/" + root.dataset.job + "/log?" + params, { headers: { Accept: "application/json" } });
-  const body = reply.ok ? (await reply.json()).log : "could not load the log (" + reply.status + ")";
-  document.getElementById("log-output").textContent = body;
+  if (form.querySelector("[name=errors]").checked) params.set("errors", "1");
+  const out = document.getElementById("log-output");
+  try {
+    const reply = await fetch(ROOT + "api/job/" + form.dataset.job + "/log?" + params, { headers: { Accept: "application/json" } });
+    const body = reply.ok ? (await reply.json()).log : "Could not load the log (HTTP " + reply.status + ").";
+    out.textContent = body || "The log is empty" + (text || params.has("errors") ? " for this filter." : " so far.");
+    out.scrollTop = out.scrollHeight;
+  } catch (_) {
+    out.textContent = "Could not load the log.";
+  }
 }
 
 async function post(job, action, payload) {
-  const reply = await fetch("../api/job/" + job + "/" + action, {
+  const reply = await fetch(ROOT + "api/job/" + job + "/" + action, {
     method: "POST",
     headers: { "Content-Type": "application/json", Accept: "application/json" },
     body: JSON.stringify(payload),
@@ -56,7 +68,7 @@ async function post(job, action, payload) {
   try {
     return await reply.json();
   } catch (_) {
-    return { ok: false, output: "unexpected reply (" + reply.status + ")" };
+    return { ok: false, output: "unexpected reply (HTTP " + reply.status + ")" };
   }
 }
 
@@ -85,22 +97,24 @@ async function act(button) {
   const result = document.getElementById("action-result");
   let payload = {};
   if (action === "pause") {
-    const preview = await (await fetch("../api/job/" + job + "/pause-preview")).json();
+    const preview = await (await fetch(ROOT + "api/job/" + job + "/pause-preview")).json();
     const answer = await confirmInPage("Pause job " + job + "?", preview.output, button.dataset.steady === "1");
     if (!answer) return;
     payload = { lose_progress: answer.lose };
   } else if (action === "kill") {
-    if (!(await confirmInPage("Kill job " + job + "?", "It is cancelled and cannot be resumed.", false))) return;
+    if (!(await confirmInPage("Cancel job " + job + "?", "Slurm stops it now. A cancelled job cannot be resumed.", false))) return;
   }
+  for (const b of document.querySelectorAll("button[data-action]")) b.disabled = true;
   const done = await post(job, action, payload);
-  result.textContent = (done.ok ? action + " done: " : action + " failed: ") + (done.output || done.error || "");
+  result.className = "notice " + (done.ok ? "ok" : "err");
+  result.textContent = (done.ok ? "Done: " : "Failed: ") + (done.output || done.error || action);
+  if (done.ok) setTimeout(() => location.reload(), 1500);
+  else for (const b of document.querySelectorAll("button[data-action]")) b.disabled = false;
 }
 
 document.addEventListener("DOMContentLoaded", () => {
-  if (document.getElementById("jobs")) {
-    pollJobs();
-    setInterval(pollJobs, 10000);
-  }
+  if (document.querySelector("[data-live]")) setInterval(refreshLive, REFRESH_MS);
+  if (document.querySelector("[data-tip]")) tooltips();
   const log = document.getElementById("log-viewer");
   if (log) {
     log.addEventListener("submit", (event) => { event.preventDefault(); loadLog(log); });

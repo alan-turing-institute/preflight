@@ -2,18 +2,20 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>$title - GPU jobs</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>$title · GPU jobs</title>
 <link rel="stylesheet" href="${root}static/app.css">
 <script src="${root}static/app.js" defer></script>
 </head>
-<body>
-<header>
-<h1>$title</h1>
-<nav aria-label="Pages"><a href="${root}.">Jobs</a><a href="${root}history">History</a><a href="${root}projects">Use per project</a></nav>
-<p>Signed in as $viewer$admin_note</p>
+<body data-root="${root}">
+<header class="topbar">
+<div class="topbar-inner">
+<a class="brand" href="${root}./"><svg width="20" height="20" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="6" width="18" height="12" rx="2"/><path d="M7 10h4v4H7zM15 10h2M15 14h2M6 18v2M10 18v2M14 18v2M18 18v2"/></svg>GPU jobs<span class="host">$host</span></a>
+<nav class="tabs" aria-label="Pages">$tabs</nav>
+<div class="who"><span class="name">Signed in as <strong>$viewer</strong></span>$role</div>
+</div>
 </header>
-<main>
+<main class="page">
 $body
 </main>
 </body>
