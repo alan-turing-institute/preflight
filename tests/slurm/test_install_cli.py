@@ -100,6 +100,9 @@ def test_apply_then_check_against_a_temp_root(env):
     assert ["systemctl", "enable", "--now", "gpujobs-agent.service"] in fake.calls
     assert ["systemctl", "--user", f"--machine={USER}@.host", "restart", "slurm-gpu-lease-keeper.service"] in fake.calls
     assert ["install", "-d", "-m", "1777", "-o", "slurm", "-g", "slurm"] in [a[:-1] for a in fake.calls if a[-1].endswith("/requests")]
+    # submit.py writes a job's log and batch script there as the submitting user
+    made = {a[-1].rsplit("/", 1)[1] for a in fake.calls if a[:4] == ["install", "-d", "-m", "1777"]}
+    assert {"logs", "scripts", "manifests"} <= made
 
 
 def test_apply_refuses_with_a_busy_queue_or_without_the_lease_client(env):
