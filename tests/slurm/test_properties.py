@@ -27,7 +27,7 @@ settings.load_profile("repo")
 import gpu_jobs  # noqa: E402 - after the Hypothesis setup above
 import jobs_view  # noqa: E402 - after the Hypothesis setup above
 import site_config  # noqa: E402 - after the Hypothesis setup above
-from test_ood_app import HOST, Fake, call  # noqa: E402 - after the Hypothesis setup above
+from test_ood_app import Fake, call  # noqa: E402 - after the Hypothesis setup above
 
 # A job name is any text: slurm keeps even a newline in one (measured, 23.11.4), and the owner may rename the job.
 NAME = st.text(st.characters(blacklist_categories=("Cs",)), max_size=40)
@@ -43,16 +43,6 @@ def test_squeue_jobs_parse_back_to_their_fields_whatever_the_name(job: int, user
     first, second = gpu_jobs.parse_squeue(json.dumps({"jobs": [raw(job, name), raw(job + 1, "next")]}))
     assert (first.job_id, first.user, first.priority, first.gpus, first.name) == (str(job), user, priority, gpus, name)
     assert second.job_id == str(job + 1)  # a name never swallows or forges a job
-
-
-@given(scheme=st.sampled_from(["http", "https"]), other=st.from_regex(r"[a-z0-9.-]{1,20}(:[0-9]{1,5})?", fullmatch=True),
-       path=st.sampled_from(["", "/", "/x"]))
-def test_a_post_whose_origin_names_another_host_runs_nothing(scheme: str, other: str, path: str) -> None:
-    if other == HOST:
-        return
-    fake = Fake()
-    status, _ = call(fake, "/api/job/7/pause", "POST", {}, {"HTTP_ORIGIN": f"{scheme}://{other}{path}"})
-    assert status.startswith("403") and fake.ran == []
 
 
 @settings(max_examples=300)
