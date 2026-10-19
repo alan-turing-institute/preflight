@@ -43,6 +43,7 @@ APP_NAME = "gpujobs"
 APP_LINK = f"/var/www/ood/apps/sys/{APP_NAME}"
 APP_SOURCE = Path("slurm") / "ood_app"  # under site.install_dir; the tools component installs it
 UPDATE_OOD_PORTAL = "/opt/ood/ood-portal-generator/sbin/update_ood_portal"  # ondemand-dex postinst, line 3
+NGINX_STAGE = "/opt/ood/nginx_stage/sbin/nginx_stage"
 SECRET_FILE_MODE_MASK = stat.S_IRWXG | stat.S_IRWXO
 
 # Package repository: docs "1. Install Software", Ubuntu 24.04 tab. Its release .deb
@@ -523,7 +524,11 @@ def post_install(site: Site) -> list[list[str]]:
     steps.append(["systemctl", "daemon-reload"])  # the allow_from drop-ins
     if _dex(site):
         steps += [["systemctl", "enable", "ondemand-dex"], ["systemctl", "restart", "ondemand-dex"]]
-    steps += [["systemctl", "enable", "apache2"], ["systemctl", "restart", "apache2"], link]
+    steps += [["systemctl", "enable", "apache2"], ["systemctl", "restart", "apache2"]]
+    # Each user's running web server keeps the environment Apache gave it at start, including OOD_ALLOWED_HOSTS
+    # (the server name): after a rename the dashboard refused every page with "Blocked hosts" (measured 2026-10-19).
+    # Stopping them all makes the next request start one with the current settings; jobs are not touched.
+    steps += [[NGINX_STAGE, "nginx_clean", "--force"], link]
     return steps
 
 

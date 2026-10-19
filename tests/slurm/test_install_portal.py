@@ -263,6 +263,8 @@ def test_install_links_our_app_after_the_restart_and_ships_the_repo_keys(tmp_pat
     assert steps.index([portal.UPDATE_OOD_PORTAL, "--force", "--insecure"]) < steps.index(
         ["systemctl", "restart", "apache2"]
     )
+    # running per-user servers keep the old server name until stopped, after Apache has the new one
+    assert steps.index(["systemctl", "restart", "apache2"]) < steps.index([portal.NGINX_STAGE, "nginx_clean", "--force"])
     sources = portal.apt_sources(site)
     assert sources[portal.OOD_LIST].content == (
         f"deb [signed-by={portal.OOD_KEYRING}] https://apt.osc.edu/ondemand/4.2/web/apt noble main\n"
