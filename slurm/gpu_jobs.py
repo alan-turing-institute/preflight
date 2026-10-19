@@ -188,9 +188,14 @@ def read_queue() -> list[QueuedJob] | None:
 
 
 def write_json(path: Path, payload: dict[str, object]) -> None:
-    """Write atomically (temp file, then rename), so a reader never sees half a record."""
+    """Write atomically (temp file, then rename), so a reader never sees half a record, readable by everyone.
+
+    The state directories are shared and each file belongs to its writer (plan 3.3, mode 0644): another user's
+    status, the web app and the agent (a different user) must be able to read a record or a request they did not write.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    os.fchmod(fd, 0o644)  # mkstemp creates 0600
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=1, sort_keys=True)
     Path(temp).replace(path)
@@ -320,7 +325,6 @@ def write_event(job_id: str, action: EventAction, **fields: object) -> Path:
     at = time.time_ns()
     path = STATE_DIR / "events" / f"{job_id}-{at}-{action}.json"
     write_json(path, {"job": job_id, "action": str(action), "at": at, **fields})
-    path.chmod(0o644)
     return path
 
 
