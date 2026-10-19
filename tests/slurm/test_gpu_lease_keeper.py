@@ -67,7 +67,7 @@ def test_active_gpu_job_with_a_free_card_is_admitted_at_once(tmp_path: Path) -> 
     lease = world.lease()
     assert lease["pid"] == os.getpid()
     assert "requested_at" not in lease
-    assert lease["started_at"] == 1000
+    assert "started_at" in lease
 
 
 def test_a_holder_makes_it_wait_with_a_request_until_it_goes(tmp_path: Path, other: int) -> None:
@@ -77,7 +77,7 @@ def test_a_holder_makes_it_wait_with_a_request_until_it_goes(tmp_path: Path, oth
     state = world.step()
     assert state["phase"] == Phase.WAITING
     assert state["blockers"] == ["service-a"]
-    assert world.lease()["requested_at"] == 1000  # what makes the service yield
+    assert "requested_at" in world.lease()  # what makes the service yield
     (tmp_path / "service-a.json").unlink()  # the service yielded
     world.t += 5
     assert world.step()["phase"] == Phase.ADMITTED
@@ -90,18 +90,19 @@ def test_an_earlier_waiter_goes_first_and_ours_is_withdrawn_meanwhile(tmp_path: 
     world.queue = [job("1")]
     state = world.step()
     assert state["phase"] == Phase.WAITING
+    requested_at = state["requested_at"]
     assert world.lease() is None  # withdrawn: service-c treats every other lease as busy
     write_other(tmp_path, "service-c", other)  # service-c admitted: now a holder
     world.t += 5
     world.step()
-    assert world.lease()["requested_at"] == 1000  # re-published with the original time
+    assert world.lease()["requested_at"] == requested_at  # re-published with the original time
     (tmp_path / "service-c.json").unlink()
     world.t += 5
     assert world.step()["phase"] == Phase.ADMITTED
 
 
 def test_a_later_waiter_does_not_block_us(tmp_path: Path, other: int) -> None:
-    write_other(tmp_path, "service-c", other, requested_at=5000)
+    write_other(tmp_path, "service-c", other, requested_at=int(time.time()) + 3600)  # the client stamps real time
     world = World(tmp_path)
     world.queue = [job("1")]
     assert world.step()["phase"] == Phase.ADMITTED
@@ -151,10 +152,11 @@ def test_a_silent_controller_keeps_the_last_state(tmp_path: Path) -> None:
 def test_a_deleted_lease_is_rewritten_while_admitted(tmp_path: Path) -> None:
     world = World(tmp_path)
     world.queue = [job("1")]
-    world.step()
+    admitted_at = world.step()["admitted_at"]
     (tmp_path / "slurm.json").unlink()
-    world.step()
+    state = world.step()
     assert "requested_at" not in world.lease()
+    assert state["admitted_at"] == admitted_at
 
 
 def test_only_leases_from_before_the_boot_are_removed(tmp_path: Path) -> None:
@@ -165,27 +167,3 @@ def test_only_leases_from_before_the_boot_are_removed(tmp_path: Path) -> None:
     os.utime(old, (booted - 50, booted - 50))
     assert remove_leases_from_before_boot(tmp_path, booted) == ["old.json"]
     assert new.exists()
-
-
-def test_restore_order_waits_for_the_pause_then_for_the_return(tmp_path: Path) -> None:
-    from gpu_lease_keeper import restore_order
-
-    path = tmp_path / "restore_order.json"
-    gpu_jobs.write_json(path, {"victims": {"1": False}, "held": ["7"]})
-    released: list[list[str]] = []
-    assert restore_order([job("1")], path, released.append) == ""  # still running: not yet pre-empted
-    assert restore_order([job("1", "PENDING", "BeginTime")], path, released.append) == ""  # paused
-    assert json.loads(path.read_text())["victims"] == {"1": True}
-    assert restore_order([job("1")], path, released.append).startswith("released")  # running again
-    assert released == [["7"]]
-    assert not path.exists()
-
-
-def test_restore_order_releases_when_the_victim_left_the_queue(tmp_path: Path) -> None:
-    from gpu_lease_keeper import restore_order
-
-    path = tmp_path / "restore_order.json"
-    gpu_jobs.write_json(path, {"victims": {"1": False}, "held": ["7", "8"]})
-    released: list[list[str]] = []
-    assert restore_order([], path, released.append).startswith("released")
-    assert released == [["7", "8"]]

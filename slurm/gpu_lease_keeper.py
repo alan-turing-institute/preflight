@@ -31,7 +31,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import subprocess
 import sys
 import time
 from collections.abc import Callable
@@ -42,7 +41,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import gpu_jobs  # noqa: E402 - path set just above
 
-from localmodels.lease import GpuLease, LeaseRecord  # noqa: E402
+from localmodels.lease import GpuLease, GpuLeaseClient, LeaseRecord  # noqa: E402
 
 
 class Phase(StrEnum):
@@ -64,6 +63,7 @@ class Keeper:
         clock: Callable[[], float] = time.time,
     ) -> None:
         self.lease = lease
+        self.client = GpuLeaseClient(lease)
         self.linger_s = linger_s
         self.read_queue = read_queue
         self.needs_the_card = needs_the_card
@@ -91,8 +91,8 @@ class Keeper:
             self.anchor = now
         return now - self.anchor <= self.linger_s
 
-    def _write(self, **fields: int | str | None) -> None:
-        self.lease.write(LeaseRecord(pid=os.getpid(), project=self.lease.project, job_id=",".join(self.jobs), **fields))
+    def _job_id(self) -> str:
+        return ",".join(self.jobs)
 
     def step(self) -> dict[str, object]:
         now = self.clock()
@@ -103,25 +103,27 @@ class Keeper:
         self.note = ""
         if not self.demand(queue, now):
             if self.phase != Phase.NONE:
-                self.lease.remove()
+                self.client.release()
             self.phase, self.requested_at, self.admitted_at, self.blockers = Phase.NONE, None, None, []
             return self.state(now)
         if self.phase == Phase.NONE:
-            self.phase, self.requested_at = Phase.WAITING, int(now)
-            self._write(requested_at=self.requested_at)
+            self.client.begin_wait(job_id=self._job_id())
+            self.phase, self.requested_at = Phase.WAITING, self._own().requested_at
         if self.phase == Phase.WAITING:
-            blocking, earlier_waiter = self.lease.blockers(self.requested_at)
+            blocking = self.client.step()
             self.blockers = sorted(record.project for record in blocking)
             if not blocking:
-                self.phase, self.admitted_at = Phase.ADMITTED, int(now)
-                self._write(started_at=self.admitted_at)
-            elif earlier_waiter:
-                self.lease.remove()  # so the earlier waiter is not blocked by us
-            elif not self.lease.lease_path().exists():
-                self._write(requested_at=self.requested_at)  # re-published with the original time
+                self.client.admit(job_id=self._job_id())
+                self.phase, self.admitted_at = Phase.ADMITTED, self._own().started_at
         elif not self.lease.lease_path().exists():
-            self._write(started_at=self.admitted_at)  # someone deleted it; a holder keeps holding
+            self.client.admit(job_id=self._job_id())  # someone deleted it; a holder keeps holding
         return self.state(now)
+
+    def _own(self) -> LeaseRecord:
+        """What the client just wrote, so keeper.json carries the lease's own times."""
+        record = self.lease.read_own()
+        assert record is not None, "the lease just written is unreadable"
+        return record
 
     def state(self, now: float) -> dict[str, object]:
         return {
@@ -134,38 +136,6 @@ class Keeper:
             "keeper_pid": os.getpid(),
             "updated_at": int(now),
         }
-
-
-def release_jobs(job_ids: list[str]) -> None:
-    subprocess.run(["scontrol", "release", ",".join(job_ids)], check=False)
-
-
-def restore_order(
-    queue: list[gpu_jobs.QueuedJob], path: Path, release: Callable[[list[str]], None] = release_jobs
-) -> str:
-    """Release the jobs `urgent.py` held once every pre-empted job has paused and is running again, or has left.
-
-    A victim must first be SEEN not running (requeued), since the file is written while it still runs;
-    without that, the first look would release the held jobs before the pre-emption had even happened.
-    """
-    order = gpu_jobs.read_json(path)
-    if not order:
-        return ""
-    victims: dict[str, bool] = dict(order.get("victims") or {})
-    jobs = {job.job_id: job for job in queue}
-    for victim, seen_paused in victims.items():
-        if not seen_paused and (victim not in jobs or not jobs[victim].active):
-            victims[victim] = True
-    back = all(seen and (v not in jobs or jobs[v].active) for v, seen in victims.items())
-    if back:
-        held = list(order.get("held") or [])
-        if held:
-            release(held)
-        gpu_jobs.remove_quietly(path)
-        return f"released {held}: the pre-empted jobs run again"
-    if victims != order.get("victims"):
-        gpu_jobs.write_json(path, {**order, "victims": victims})
-    return ""
 
 
 def remove_leases_from_before_boot(lease_dir: Path, booted_at: float) -> list[str]:
@@ -202,12 +172,8 @@ def main() -> int:
     last = None
     # No cleanup on exit: a lease left by a dead keeper names a dead pid, which every reader ignores,
     # while removing it at a restart would open exactly the gap this keeper exists to close.
-    order_path = gpu_jobs.STATE_DIR / "restore_order.json"
     while True:
         state = keeper.step()
-        queue = keeper.last_queue
-        if queue is not None and (released := restore_order(queue, order_path)):
-            print(f"[keeper] {released}", flush=True)
         summary = (state["phase"], tuple(state["blockers"]), state["note"])
         if summary != last:
             print(f"[keeper] {state['phase']}; jobs {state['jobs']}; blockers {state['blockers']} {state['note']}",
