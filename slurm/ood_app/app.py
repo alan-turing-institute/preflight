@@ -575,24 +575,28 @@ def index_page(backend: Backend, root: str = "") -> str:
 # --- job page --------------------------------------------------------------------------------------------------------
 
 
-def _node_lines(node: jobs_view.ChainNode, up: bool, root: str) -> str:
+def _node_lines(node: jobs_view.ChainNode, up: bool, root: str, lookup: Callable[[str], jobs_view.HistoryRow | None]) -> str:
     links = node.before if up else node.after
-    kind, label = _result(node.state) if node.state else (Kind.OTHER, "unknown")
-    inner = "".join(_node_lines(child, up, root) for child in links)
+    name, state = node.name, node.state
+    if not name or not state:  # a job no longer queued: slurm's accounting still knows its name and result
+        row = lookup(node.job_id)
+        name, state = name or (row.name if row else ""), state or (row.state if row else "")
+    kind, label = _result(state) if state else (Kind.OTHER, "unknown")
+    inner = "".join(_node_lines(child, up, root, lookup) for child in links)
     return (
-        f'<li><a href="{root}job/{esc(node.job_id)}">{esc(_short(node.name) or "job " + node.job_id)}</a> '
+        f'<li><a href="{root}job/{esc(node.job_id)}">{esc(_short(name) or "job " + node.job_id)}</a> '
         f'<span class="jobid">#{esc(node.job_id)}</span> {_badge(kind, label)}{f"<ul>{inner}</ul>" if inner else ""}</li>'
     )
 
 
-def _chain_html(node: jobs_view.ChainNode, root: str = "") -> str:
+def _chain_html(node: jobs_view.ChainNode, root: str, lookup: Callable[[str], jobs_view.HistoryRow | None]) -> str:
     if not node.before and not node.after:
         return '<p class="muted">Runs on its own: it waits for no job, and no job waits for it.</p>'
     parts = []
     if node.before:
-        parts.append("<h3>Starts after</h3><ul>" + "".join(_node_lines(c, True, root) for c in node.before) + "</ul>")
+        parts.append("<h3>Starts after</h3><ul>" + "".join(_node_lines(c, True, root, lookup) for c in node.before) + "</ul>")
     if node.after:
-        parts.append("<h3>Then starts</h3><ul>" + "".join(_node_lines(c, False, root) for c in node.after) + "</ul>")
+        parts.append("<h3>Then starts</h3><ul>" + "".join(_node_lines(c, False, root, lookup) for c in node.after) + "</ul>")
     return "".join(parts)
 
 
@@ -753,7 +757,7 @@ def job_page(backend: Backend, job_id: str, root: str = "") -> str | None:
         jobstats=jobstats,
         resources=_resources_html(backend.efficiency(job_id, record=record), backend.live_memory(job_id) if running else {}, kind),
         timeline=_timeline_html(row, backend.events(job_id), now),
-        chain=_chain_html(jobs_view.chain(job_id, by_id, records), root),
+        chain=_chain_html(jobs_view.chain(job_id, by_id, records), root, backend.finished),
         buttons=buttons,
         log_path=esc(record.get("log") or ""),
         command=esc(_command_text(record)),
