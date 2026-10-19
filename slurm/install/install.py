@@ -4,6 +4,7 @@
     install.py render --out DIR                 # write every enabled component's files under DIR
     install.py check                            # exit 1 if the installed files differ from the rendered ones
     sudo install.py apply [--component NAME ...]
+    sudo install.py user add|remove USER          # let USER submit (slurm accounting: the site's account)
     sudo install.py admin add|remove USER
     sudo install.py migrate-state --from DIR    # copy job records from an older state directory
 
@@ -88,8 +89,12 @@ def write_files(root: Path, files: dict[str, render.FileSpec], chown: Chown | No
             chown(dest, spec.owner)
 
 
-def _run_all(commands: list[list[str]]) -> None:
+def _run_all(commands: list) -> None:
+    """Run each argv in turn, stopping at the first failure; a function in the list gives its argvs when reached."""
     for argv in commands:
+        if callable(argv):
+            _run_all(argv())
+            continue
         done = components.run(argv)
         if done.returncode != 0:
             raise SystemExit(f"FAILED ({done.returncode}): {' '.join(argv)}\n{done.stderr or ''}".rstrip())
@@ -167,6 +172,16 @@ def cmd_apply(site, args, modules, chown: Chown | None = _chown) -> int:
     return 0
 
 
+def cmd_user(site, args, modules) -> int:
+    if args.action == "add":
+        _run_all(components.accounting_adds(site, args.user))
+    else:
+        _run_all([["sacctmgr", "-i", "delete", "user", f"name={args.user}", f"account={site.account}",
+                   f"cluster={site.cluster_name}"]])
+    print(f"{args.user}: {args.action} user (slurm account {site.account} on cluster {site.cluster_name})")
+    return 0
+
+
 def cmd_admin(site, args, modules) -> int:
     level = OPERATOR if args.action == "add" else NO_LEVEL
     membership = (
@@ -174,7 +189,9 @@ def cmd_admin(site, args, modules) -> int:
         if args.action == "add"
         else ["gpasswd", "-d", args.user, site.admin_group]
     )
-    _run_all([membership, ["sacctmgr", "-i", "modify", "user", f"name={args.user}", "set", f"adminlevel={level}"]])
+    joins = components.accounting_adds(site, args.user) if args.action == "add" else []  # an admin is a user too
+    _run_all([*joins, membership,
+              ["sacctmgr", "-i", "modify", "user", f"name={args.user}", "set", f"adminlevel={level}"]])
     print(f"{args.user}: {args.action} admin ({site.admin_group}, slurm AdminLevel {level})")
     return 0
 
@@ -221,9 +238,10 @@ def parser() -> argparse.ArgumentParser:
     sub.add_parser("apply", parents=[shared]).add_argument(
         "--component", action="append", choices=components.ORDER, dest="components"
     )
-    admin = sub.add_parser("admin", parents=[shared])
-    admin.add_argument("action", choices=["add", "remove"])
-    admin.add_argument("user")
+    for name in ("user", "admin"):
+        who = sub.add_parser(name, parents=[shared])
+        who.add_argument("action", choices=["add", "remove"])
+        who.add_argument("user")
     sub.add_parser("migrate-state", parents=[shared]).add_argument("--from", type=Path, required=True, dest="source")
     return ap
 
@@ -232,6 +250,7 @@ COMMANDS = {
     "render": cmd_render,
     "check": cmd_check,
     "apply": cmd_apply,
+    "user": cmd_user,
     "admin": cmd_admin,
     "migrate-state": cmd_migrate,
 }

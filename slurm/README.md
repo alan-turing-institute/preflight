@@ -73,7 +73,9 @@ and pass `--site` each time.
 
    Components run in a fixed order: `slurm`, `tools`, `agent`, `lease`, `metrics`, `portal` (only those the site
    file enables). First every component's refusals are collected and printed as `REFUSED:`; if there is any, nothing
-   is changed. Then apt sources, packages, files, and the post-install steps (service restarts) run. **`apply`
+   is changed. Then apt sources, packages, files, and the post-install steps (service restarts) run. The `slurm`
+   component also gives slurm's accounting the cluster (`cluster_name`) and the site's `account`, between restarting
+   `slurmdbd` and starting `slurmctld`; records that already exist are left alone. **`apply`
    refuses while slurm has jobs**, or when `squeue` fails, because restarting the slurm daemons would requeue or
    kill them. Wait for the queue to empty, or install only other components with
    `apply --component NAME` (repeat the option for several; the choices are `slurm`, `tools`, `agent`, `lease`,
@@ -83,23 +85,21 @@ and pass `--site` each time.
    `apply` also copies the site file to `/etc/gpujobs/site.toml`; the agent and the tools read that copy. After
    editing the site file, run `apply` again.
 
-6. **Create the slurm accounts.** The generated `slurm.conf` sets `AccountingStorageEnforce=associations`, so a
-   user can submit only after the accounting database knows them. The installer does not create these records
-   (the test cluster does it in `tests/integration/bootstrap/accounts-init.sh`).
-   By hand, once the cluster is up, with `CLUSTER` equal to `cluster_name`:
+6. **Let each user submit.** The generated `slurm.conf` sets `AccountingStorageEnforce=associations`, so slurm
+   accepts a job only from a user its accounting database knows. For each user:
 
-       sudo sacctmgr -i add cluster CLUSTER
-       sudo sacctmgr -i add account ACCOUNT Cluster=CLUSTER Description=ACCOUNT Organization=ACCOUNT
-       sudo sacctmgr -i add user USER Account=ACCOUNT DefaultAccount=ACCOUNT Cluster=CLUSTER
+       sudo python3 slurm/install/install.py --site site.toml user add USER
 
-   `ACCOUNT` is any name you choose. Repeat the last command for each user.
+   This adds USER to the site's `account` on the cluster (and the cluster and account themselves, if missing); a
+   user already there is left alone. `user remove USER` takes the user out of that account.
 
 7. **Make someone an administrator** (section 6):
 
        sudo python3 slurm/install/install.py --site site.toml admin add USER
 
-   This adds the user to the site's `admin_group` and sets their slurm administrator level to Operator. The user
-   must already exist in slurm's accounting (step 6). `admin remove USER` takes both away.
+   This adds the user to slurm's accounting as in step 6 if they are not there yet, adds them to the site's
+   `admin_group` and sets their slurm administrator level to Operator. `admin remove USER` takes the group and the
+   level away; the user can still submit.
 
 8. **A machine that ran the earlier, per-user version** of these tools keeps its job records in an older state
    directory. Copy the job records, footprints and events into the new one (existing files are left alone):
@@ -120,6 +120,7 @@ TOML. Tables: the top level, `[[nodes]]` with `[[nodes.gpus]]`, `[lease]` with `
 |---|---|---|
 | `name` | required | Short name of the site. Also the default for `cluster_name`. |
 | `cluster_name` | the value of `name` | Slurm's `ClusterName`; Open OnDemand names its cluster file after it and Jobstats labels its series with it. Never change it on a running cluster: `slurmctld` refuses to start when it differs from the one in its saved state. |
+| `account` | `gpujobs` | The slurm account the installer creates and `user add` puts users in. |
 | `state_dir` | `/var/lib/gpujobs` | Where the job layer keeps its records and events (section 8). |
 | `install_dir` | `/opt/gpujobs` | Where the tools are installed (`install_dir/slurm/`). |
 | `admin_group` | `gpujobs-admin` | Unix group of administrators. Also the group allowed to submit to the `urgent` partition. |

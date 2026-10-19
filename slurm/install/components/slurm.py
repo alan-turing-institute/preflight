@@ -34,5 +34,21 @@ def refusals(site) -> list[str]:
     return []
 
 
-def post_install(site) -> list[list[str]]:
-    return [["systemctl", "daemon-reload"], *(["systemctl", "restart", *group] for group in RESTARTS)]
+def post_install(site) -> list:
+    """Restart the database side, give accounting the cluster and its account, then start the controller.
+
+    The records go in before slurmctld starts, the order the test cluster boots in, so slurmctld registers with a
+    cluster accounting already knows.
+    """
+    database, controller = RESTARTS
+    return [
+        ["systemctl", "daemon-reload"],
+        ["systemctl", "restart", *database],
+        lambda: _records(site),
+        ["systemctl", "restart", *controller],
+    ]
+
+
+def _records(site) -> list[list[str]]:
+    components.wait_for_accounting()
+    return components.accounting_adds(site)

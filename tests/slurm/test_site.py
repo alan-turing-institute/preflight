@@ -32,7 +32,7 @@ def write(tmp_path: Path, text: str) -> Path:
 
 def test_this_box_site_file_loads() -> None:
     site = gpujobs_site.load(ROOT / "machine/slurm/site.toml")
-    assert (site.name, site.cluster_name) == ("gpu-node-1", "spark") and site.unified_memory and site.hostguard and site.dgx_gate
+    assert (site.name, site.cluster_name, site.account) == ("gpu-node-1", "spark", "local") and site.unified_memory and site.hostguard and site.dgx_gate
     gpu = site.nodes[0].gpus[0]
     assert (site.nodes[0].real_memory_mb, gpu.device, gpu.type) == (100000, "/dev/nvidia0", "gb10")
     assert set(site.lease.services) == {"service-a", "service-b"}
@@ -54,7 +54,7 @@ def test_example_loads_and_minimal_file_gets_every_default(tmp_path: Path) -> No
     assert site.lease is None and not site.hostguard and not site.dgx_gate
     assert site.metrics.mode is gpujobs_site.MetricsMode.OFF and site.portal.mode is gpujobs_site.PortalMode.OFF
     assert site.nodes[0].gpus == ()
-    assert site.cluster_name == site.name  # defaults to the site name
+    assert site.cluster_name == site.name and site.account == "gpujobs"  # defaults
 
 
 @pytest.mark.parametrize(

@@ -30,16 +30,19 @@ python = "{sys.executable}"
 
 
 class Fake:
-    """Records every argv; `queue` is squeue's output and `client_ok` the lease-client import's success."""
+    """Records every argv; `queue` is squeue's output, `client_ok` the lease-client import's success, and `known` the
+    `sacctmgr show` queries (after `show`) that find a record."""
 
     def __init__(self, queue="", client_ok=True):
-        self.calls, self.queue, self.client_ok = [], queue, client_ok
+        self.calls, self.queue, self.client_ok, self.known = [], queue, client_ok, set()
 
     def __call__(self, argv):
         self.calls.append(argv)
         rc = 0
         if argv[:1] == ["squeue"]:
             return subprocess.CompletedProcess(argv, 0, self.queue, "")
+        if argv[:4] == ["sacctmgr", "-n", "-P", "show"]:
+            return subprocess.CompletedProcess(argv, 0, "row\n" if " ".join(argv[4:]) in self.known else "", "")
         if argv[0] == sys.executable:
             rc = 0 if self.client_ok else 1
         return subprocess.CompletedProcess(argv, rc, "", "")
@@ -89,6 +92,11 @@ def test_apply_then_check_against_a_temp_root(env):
     assert names.index("apt-get") < names.index("groupadd")
     assert ["apt-get", "install", "-y", "slurm-wlm", "slurmdbd", "mariadb-server", "munge"] in fake.calls
     assert ["systemctl", "restart", "slurmctld", "slurmd"] in fake.calls
+    # slurm's accounting gets the cluster and the account after slurmdbd is back and before slurmctld starts
+    db, ctld = (fake.calls.index(["systemctl", "restart", *g]) for g in (["mariadb", "munge", "slurmdbd"], ["slurmctld", "slurmd"]))
+    adds = [a for a in fake.calls[db:ctld] if a[2:3] == ["add"]]
+    assert adds == [["sacctmgr", "-i", "add", "cluster", "t"],
+                    ["sacctmgr", "-i", "add", "account", "gpujobs", "Cluster=t", "Description=gpujobs", "Organization=gpujobs"]]
     assert ["systemctl", "enable", "--now", "gpujobs-agent.service"] in fake.calls
     assert ["systemctl", "--user", f"--machine={USER}@.host", "restart", "slurm-gpu-lease-keeper.service"] in fake.calls
     assert ["install", "-d", "-m", "1777", "-o", "slurm", "-g", "slurm"] in [a[:-1] for a in fake.calls if a[-1].endswith("/requests")]
@@ -105,15 +113,21 @@ def test_apply_refuses_with_a_busy_queue_or_without_the_lease_client(env):
     assert not (tmp / "root").exists()
 
 
-def test_admin_argv(env):
+def test_user_and_admin_argv(env):
     tmp, site, fake = env
-    assert run(site, tmp, "admin", "add", "alice") == 0
+    fake.known = {"cluster where cluster=t format=cluster", "assoc where cluster=t account=gpujobs format=account",
+                  "assoc where cluster=t account=gpujobs user=bob format=user"}
+    assert run(site, tmp, "user", "add", "bob") == 0  # already there: nothing added
+    assert run(site, tmp, "admin", "add", "alice") == 0  # not a user yet: made one first
     assert run(site, tmp, "admin", "remove", "alice") == 0
-    assert fake.calls == [
+    assert run(site, tmp, "user", "remove", "alice") == 0
+    assert [a for a in fake.calls if "show" not in a] == [
+        ["sacctmgr", "-i", "add", "user", "alice", "Account=gpujobs", "DefaultAccount=gpujobs", "Cluster=t"],
         ["usermod", "-aG", "gpujobs-admin", "alice"],
         ["sacctmgr", "-i", "modify", "user", "name=alice", "set", "adminlevel=Operator"],
         ["gpasswd", "-d", "alice", "gpujobs-admin"],
         ["sacctmgr", "-i", "modify", "user", "name=alice", "set", "adminlevel=None"],
+        ["sacctmgr", "-i", "delete", "user", "name=alice", "account=gpujobs", "cluster=t"],
     ]
 
 
