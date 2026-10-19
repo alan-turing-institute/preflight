@@ -23,7 +23,8 @@ Design 3.6 (`design notes`).
 from __future__ import annotations
 
 import argparse
-import getpass
+import os
+import pwd
 import subprocess
 import sys
 import time
@@ -165,7 +166,7 @@ def run(argv: list[str]) -> int:
         print("[urgent] REFUSED: --gpus must be an integer >= 1", file=sys.stderr)
         return 1
     site = site_config.load_optional()
-    if site and not site_config.is_admin(site, getpass.getuser()):
+    if site and not site_config.is_admin(site, pwd.getpwuid(os.getuid()).pw_name):
         print(f"[urgent] REFUSED: only members of {site.admin_group} may submit urgent work; "
               f"an admin adds you with: {ADMIN_REMEDY}", file=sys.stderr)
         return 1

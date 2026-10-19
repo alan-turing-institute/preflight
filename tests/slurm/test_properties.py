@@ -8,14 +8,21 @@ Hypothesis is a test-only dependency (slurm/ stays stdlib-only), so this file is
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 from pathlib import Path
 
 import pytest
 
+# Hypothesis keeps a cache directory; never in the repository.
+os.environ.setdefault("HYPOTHESIS_STORAGE_DIRECTORY", str(Path(tempfile.gettempdir()) / "gpujobs-hypothesis"))
 pytest.importorskip("hypothesis")
 from hypothesis import given, settings
 from hypothesis import strategies as st
+
+# No example database: it would land in the working directory and replay old failures.
+settings.register_profile("repo", database=None)
+settings.load_profile("repo")
 
 import gpu_jobs
 import jobs_view
@@ -60,7 +67,7 @@ def test_only_ascii_digit_ids_reach_a_tool(job_id: str) -> None:
 
 @given(payload=st.text(min_size=1, max_size=30))
 def test_anything_in_a_job_name_is_escaped_on_every_page(payload: str) -> None:
-    marker = "<b" + payload.replace(":", "")
+    marker = "<zq9" + payload.replace(":", "")  # no page has this tag ("<b" + "o" matched <body>)
     fake = Fake(name=f"proj:normal:{marker}")
     for path in ("/", "/job/7"):
         status, page = call(fake, path)

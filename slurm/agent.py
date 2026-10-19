@@ -172,7 +172,7 @@ class Agent:
         clock: Callable[[], float] = time.time,
         boot_id: Callable[[], str] = read_boot_id,
         completion: Callable[
-            [], dict[str, dict[str, str]]
+            [], dict[str, dict[str, str]] | None
         ] = gpu_jobs.completion_records,
         notify: Callable[[list[str], dict[str, str]], None] = notify_run,
     ) -> None:
@@ -435,6 +435,9 @@ class Agent:
     def _failure_notices(self, errors: list[str]) -> None:
         s = self.state
         records = self.completion()
+        if records is None:
+            errors.append("sacct did not answer; failure notices wait")
+            return
         ended = {
             job_id: fields
             for job_id, fields in records.items()
@@ -443,8 +446,7 @@ class Agent:
         if (
             s.ended_seen is None
         ):  # first look at a log: what is already in it is history, not news
-            if ended:
-                s.ended_seen = sorted(ended, key=_by_id)[-ENDED_KEPT:]
+            s.ended_seen = sorted(ended, key=_by_id)[-ENDED_KEPT:]  # even when none: the next failure is news
             return
         # A job requeued after it ended (its latest record is a pending leg) may end again, and be news again.
         known = set(s.ended_seen) & set(ended) | (set(s.ended_seen) - set(records))

@@ -61,9 +61,15 @@ def test_job_cgroup_is_the_job_component_of_our_cgroup(tmp_path: Path) -> None:
 SMI = "100, GPU-aaa\n200, GPU-bbb\n300, GPU-bbb\n"
 
 
-def test_occupancy_blocks_on_any_process_outside_the_job_and_names_it() -> None:
+def test_occupancy_blocks_on_any_process_outside_the_job_and_names_it(monkeypatch) -> None:
     assert job_wrapper.foreign_gpu_processes({100, 200, 300}, SMI) == []
     assert job_wrapper.foreign_gpu_processes({100}, SMI) == [(200, "GPU-bbb"), (300, "GPU-bbb")]
+    # nvidia-smi missing, hung or failing: occupancy unknown is not free (as dgx/assert_gpu_free.py refused)
+    for fail in (FileNotFoundError("nvidia-smi"), subprocess.TimeoutExpired("nvidia-smi", 30)):
+        monkeypatch.setattr(job_wrapper.subprocess, "run", lambda *_a, fail=fail, **_k: (_ for _ in ()).throw(fail))
+        assert job_wrapper.card_is_free(set()) == (False, "nvidia-smi did not answer, so the card's occupancy is unknown")
+    monkeypatch.setattr(job_wrapper.subprocess, "run", lambda argv, **_k: subprocess.CompletedProcess(argv, 9, "", "NVML"))
+    assert job_wrapper.card_is_free(set())[0] is False
 
 
 def test_declared_sharing_skips_the_occupancy_check(monkeypatch) -> None:

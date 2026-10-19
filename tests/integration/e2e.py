@@ -230,6 +230,9 @@ def stage_install() -> None:
     sh("openssl rand -hex 32 | install -m 0600 /dev/stdin /etc/gpujobs/portal/crypto_passphrase")
     cl("python3", "-W", "ignore", "-c", HASH_USERS, stdin=json.dumps(PASSWORDS))
     put("/usr/local/bin/harness-notify", NOTIFY, "0755")
+    # The job wrapper refuses to start a GPU job when nvidia-smi does not answer (occupancy unknown). The fake GPUs are
+    # /dev/null, so no compute process ever runs on them: this stand-in answers with none.
+    put("/usr/local/bin/nvidia-smi", "#!/bin/sh\nexit 0\n", "0755")
     # The container refuses the namespace sandboxing of the services' units (systemd: "Failed to set up mount
     # namespacing: Operation not supported"); a real host does not. Harness drop-ins switch it off.
     for unit in ("prometheus", "grafana-server"):

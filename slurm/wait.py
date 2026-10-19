@@ -55,7 +55,7 @@ def main() -> int:
                 print(f"[wait] unfinished: {sorted(unfinished)}")
                 return 2
         time.sleep(arguments.poll)
-    records = gpu_jobs.completion_records(jobs)
+    records = gpu_jobs.completion_records(jobs) or {}
     states = {job: records.get(job, {}).get("JobState", "UNKNOWN") for job in jobs}
     for job, state in states.items():
         print(f"[wait] {job}: {state}")

@@ -59,8 +59,9 @@ class Exit(IntEnum):
     CODE_CHANGED = 4  # the manifest re-check failed
 
 
-def foreign_gpu_processes(own_pids: set[int], output: str | None = None) -> list[tuple[int, str]]:
-    """(pid, gpu uuid) of every compute process on this job's GPUs that is not in `own_pids`."""
+def foreign_gpu_processes(own_pids: set[int], output: str | None = None) -> list[tuple[int, str]] | None:
+    """(pid, gpu uuid) of every compute process on this job's GPUs that is not in `own_pids`; None when nvidia-smi
+    does not answer (missing, hung or failing), so the caller cannot mistake an unknown card for a free one."""
     if output is None:
         try:
             done = subprocess.run(
@@ -71,7 +72,9 @@ def foreign_gpu_processes(own_pids: set[int], output: str | None = None) -> list
                 check=False,
             )
         except (OSError, subprocess.TimeoutExpired):
-            return []
+            return None
+        if done.returncode != 0:
+            return None
         output = done.stdout
     found: list[tuple[int, str]] = []
     for line in output.splitlines():
@@ -89,6 +92,8 @@ def card_is_free(own_pids: set[int], max_jobs: int = 1) -> tuple[bool, str]:
     if max_jobs > 1:
         return True, ""
     foreign = foreign_gpu_processes(own_pids)
+    if foreign is None:  # as dgx/assert_gpu_free.py did: occupancy unknown is not free
+        return False, "nvidia-smi did not answer, so the card's occupancy is unknown"
     if not foreign:
         return True, ""
     return False, "compute process(es) outside this job: " + ", ".join(f"pid {p} on {u}" for p, u in foreign)

@@ -92,6 +92,18 @@ def world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> World:
     return World(tmp_path, monkeypatch)
 
 
+def test_a_fresh_install_notices_its_first_failure_and_an_unanswered_sacct_is_not_no_jobs(world: World) -> None:
+    world.records = {}  # first look on a fresh install: nothing has ended yet
+    world.step()
+    world.records = None  # sacct down: not "no jobs", so nothing is settled
+    world.t += agent_module.NOTICES_EVERY_S
+    assert "sacct did not answer" in str(world.step())
+    world.records = {"5": {"JobId": "5", "JobState": "FAILED", "Name": "n", "UserId": "ann"}}
+    world.t += agent_module.NOTICES_EVERY_S
+    world.step()
+    assert [(e.job, e.action) for e in gpu_jobs.events()] == [("5", "failed")]
+
+
 def test_slurmctld_uptime_probe_reads_the_monotonic_timestamp() -> None:
     out = "ActiveState=active\nActiveEnterTimestampMonotonic=23287769\n"
     assert agent_module.slurmctld_active_s(

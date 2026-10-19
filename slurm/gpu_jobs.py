@@ -289,9 +289,9 @@ def _sacct_jobs(*selection: str) -> list[dict[str, object]] | None:
         return None
 
 
-def completion_records(job_ids: Iterable[str] | None = None) -> dict[str, dict[str, str]]:
+def completion_records(job_ids: Iterable[str] | None = None) -> dict[str, dict[str, str]] | None:
     """The latest accounting record of each job, `{id: {"JobId", "JobState", "Name", "UserId"}}`; without ids, every
-    job of the last day. Empty when sacct does not answer.
+    job of the last day. None when sacct does not answer (never mistaken for "no jobs ended").
 
     From `sacct --json`. These tools read slurm's jobcomp/filetxt log before, which writes a job name unescaped, so a
     name with a newline forged whole records (another user's job "FAILED"; measured on 23.11.4, review R). A time
@@ -301,11 +301,16 @@ def completion_records(job_ids: Iterable[str] | None = None) -> dict[str, dict[s
     ids = sorted(set(job_ids)) if job_ids is not None else None
     if ids is None:
         recent = _sacct_jobs("-S", "now-1days")
-        ids = sorted({str(job["job_id"]) for job in recent or []})
+        if recent is None:
+            return None
+        ids = sorted({str(job["job_id"]) for job in recent})
     if not ids:
         return {}
+    latest = _sacct_jobs("-j", ",".join(ids))
+    if latest is None:
+        return None
     records: dict[str, dict[str, str]] = {}
-    for job in _sacct_jobs("-j", ",".join(ids)) or []:
+    for job in latest:
         states = job.get("state", {}).get("current") or [""]
         records[str(job["job_id"])] = {"JobId": str(job["job_id"]), "JobState": states[0],
                                        "Name": str(job.get("name", "")), "UserId": str(job.get("user", ""))}
@@ -372,7 +377,7 @@ def write_event(job_id: str, action: EventAction, **fields: object) -> Path:
 
 
 def _owner(path: Path) -> str:
-    uid = path.stat().st_uid
+    uid = path.lstat().st_uid  # a symlink is its creator's, never its target's owner's
     try:
         return pwd.getpwuid(uid).pw_name
     except KeyError:
