@@ -246,9 +246,11 @@ def submit(argv: list[str]) -> str:
         run_gate(arguments.repo.resolve(), arguments.entry, arguments.command, manifest)
     print("\n".join(audit.report(audit.unregistered())))
     path = gpu_jobs.STATE_DIR / "scripts" / f"{arguments.name}-{stamp}.sbatch"
-    path.parent.mkdir(parents=True, exist_ok=True)
     log.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(script, encoding="utf-8")
+    try:
+        path = gpu_jobs.write_new(path, script)
+    except FileExistsError as error:
+        raise Refused(f"the batch script {error.strerror}") from None
     done = subprocess.run(["sbatch", "--parsable", str(path)], capture_output=True, text=True, check=False)
     if done.returncode != 0:
         msg = f"sbatch refused: {done.stderr.strip()}"

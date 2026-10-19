@@ -341,6 +341,12 @@ prints a job's last measured peak memory. `gpujobs-status` and `gpujobs-audit` t
   portal's cluster file points at `http://SERVER_NAME:grafana_port`, and a browser blocks that as mixed content
   inside the HTTPS portal. Set `metrics.grafana_url` to an HTTPS address of a Grafana that serves TLS (for
   example behind a TLS proxy) for the embedded panels to work.
+- **Shared folders keep predictable names.** Scripts are `scripts/NAME-STAMP.sbatch` and logs `logs/NAME-STAMP.log`.
+  A batch script is always a file the submitter creates: when the name is taken (the same name twice in one second,
+  or a file or link someone left), it becomes `NAME-STAMP-2.sbatch`, `-3`, and so on, and is never written into or
+  through. `apply` refuses, and `check` reports, a kernel with `fs.protected_regular`, `fs.protected_symlinks` or
+  `fs.protected_hardlinks` at 0: those settings stop a log, record or request left under someone else's name from
+  being written through (Ubuntu turns all three on).
 - **A job's docker containers are its own to stop.** The wrapper counts a container labelled `slurm-job=JOBID`
   toward the job's GPU memory, but the container runs outside the job's cgroup, so slurm's final SIGKILL reaches
   only the `docker` client. A job that starts a container must stop it on SIGTERM (an attached `docker run`

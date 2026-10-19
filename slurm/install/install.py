@@ -41,6 +41,10 @@ MIGRATED = ("jobs", "footprints", "events")
 OPERATOR = "Operator"
 NO_LEVEL = "None"
 Chown = Callable[[Path, str], None]
+#: The kernel settings the shared, world-writable state directories rely on (`man 5 proc_sys_fs`): with any of
+#: them 0, a file or link another user leaves under a predictable name (a job's log, a record) is written through.
+KERNEL_PROTECTIONS = Path("/proc/sys/fs")
+PROTECTIONS = ("protected_regular", "protected_symlinks", "protected_hardlinks")
 
 
 class Action(StrEnum):
@@ -139,8 +143,23 @@ def _wrong_mode_or_owner(root: Path, files: dict[str, render.FileSpec], *, check
     return out
 
 
+def kernel_refusals() -> list[str]:
+    problems = []
+    for name in PROTECTIONS:
+        try:
+            value = int((KERNEL_PROTECTIONS / name).read_text())
+        except (OSError, ValueError):
+            value = 0  # absent: a kernel without the protection
+        if value < 1:
+            problems.append(f"fs.{name} is {value}; the shared state directories need it at least 1 "
+                            f"(sysctl -w fs.{name}=1, and a file in /etc/sysctl.d to keep it)")
+    return problems
+
+
 def cmd_check(site, args, modules) -> int:
     _warn_portal_secrets(site, modules)
+    for problem in kernel_refusals():
+        print(f"REFUSED  {problem}")
     files = _all(modules, site, "files")
     with tempfile.TemporaryDirectory() as tmp:
         try:
@@ -153,7 +172,7 @@ def cmd_check(site, args, modules) -> int:
         print(f"DIFFERS  {d}")
     if not diff:
         print("ok       installed files match the rendered ones")
-    return 1 if diff else 0
+    return 1 if diff or kernel_refusals() else 0
 
 
 def apt_install_commands(modules, site) -> list[list[str]]:
@@ -170,7 +189,7 @@ def apt_install_commands(modules, site) -> list[list[str]]:
 
 
 def cmd_apply(site, args, modules, chown: Chown | None = _chown) -> int:
-    refusals = [r for m in modules for r in m.refusals(site)]
+    refusals = [*kernel_refusals(), *(r for m in modules for r in m.refusals(site))]
     if refusals:
         for r in refusals:
             print(f"REFUSED: {r}", file=sys.stderr)

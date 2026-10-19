@@ -215,6 +215,14 @@ def run(argv: list[str]) -> int:
     except submit.Refused as refused:
         print(f"[urgent] REFUSED: {refused}", file=sys.stderr)
         return 1
+    # Written before anything is requeued or held, so a refusal here leaves every other job as it was.
+    path = gpu_jobs.STATE_DIR / "scripts" / f"{arguments.name}-{stamp}.sbatch"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        path = gpu_jobs.write_new(path, script)
+    except FileExistsError as error:
+        print(f"[urgent] REFUSED: the batch script {error.strerror}", file=sys.stderr)
+        return 1
     if arguments.requeue_steady:
         for job_id in steady:
             subprocess.run(["scontrol", "requeue", job_id], check=True)
@@ -229,10 +237,6 @@ def run(argv: list[str]) -> int:
         for job_id in held:
             gpu_jobs.write_event(job_id, gpu_jobs.EventAction.URGENT_HOLD, urgent=f"{arguments.name}: {arguments.what}")
         print(f"[urgent] held {held} until the pre-empted jobs {victims} run again")
-    path = gpu_jobs.STATE_DIR / "scripts" / f"{arguments.name}-{stamp}.sbatch"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    log.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(script, encoding="utf-8")
     done = subprocess.run(["sbatch", "--parsable", str(path)], capture_output=True, text=True, check=False)
     if done.returncode != 0:
         print(f"[urgent] REFUSED by slurm: {done.stderr.strip()}", file=sys.stderr)

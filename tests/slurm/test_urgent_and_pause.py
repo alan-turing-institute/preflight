@@ -143,6 +143,12 @@ def test_site_admin_check_multi_gpu_plan_and_request_file(
     assert calls == []
     assert urgent.run([*argv, "--requeue-steady", "--", "true"]) == 1  # sbatch still refuses
     assert ["scontrol", "requeue", "2"] in calls
+    # no batch script (every name taken): refused before any requeue or hold, so nothing is left held
+    calls.clear()
+    capsys.readouterr()
+    monkeypatch.setattr(urgent.gpu_jobs, "write_new", lambda *_a: (_ for _ in ()).throw(FileExistsError(17, "taken")))
+    assert urgent.run([*argv, "--requeue-steady", "--", "true"]) == 1
+    assert calls == [] and "REFUSED: the batch script taken" in capsys.readouterr().err
 
 
 class FakeSlurm:

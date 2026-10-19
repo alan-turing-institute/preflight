@@ -116,7 +116,7 @@ def test_apply_then_check_against_a_temp_root(env):
         f"{state}/requests": ("1777", "slurm"),
         **{f"{state}/{name}": ("1777", None) for name in sticky},
     }
-def test_apply_refuses_with_a_busy_queue_or_without_the_lease_client(env):
+def test_apply_refuses_with_a_busy_queue_or_without_the_lease_client(env, monkeypatch):
     tmp, site, fake = env
     fake.queue = "123 gpu job user R\n"
     assert run(site, tmp / "root", "apply") == 1
@@ -130,6 +130,15 @@ def test_apply_refuses_with_a_busy_queue_or_without_the_lease_client(env):
     old.parent.mkdir(parents=True)
     old.symlink_to("/etc/ld.so.preload")  # a user's own unit (or link) would override the one root installs
     assert run(site, tmp / "root", "apply") == 1
+    assert not (tmp / "root").exists()
+    old.unlink()
+    proc = tmp / "proc"
+    proc.mkdir()
+    for name, value in [("protected_regular", "2"), ("protected_symlinks", "0")]:  # protected_hardlinks absent
+        (proc / name).write_text(value + "\n")
+    monkeypatch.setattr(cli, "KERNEL_PROTECTIONS", proc)
+    assert [p.split()[0] for p in cli.kernel_refusals()] == ["fs.protected_symlinks", "fs.protected_hardlinks"]
+    assert run(site, tmp / "root", "apply") == 1  # the shared directories would be unsafe: nothing is installed
     assert not (tmp / "root").exists()
 
 

@@ -12,6 +12,7 @@ Stdlib only: every tool here runs under the system `python3`, except the keeper,
 from __future__ import annotations
 
 import contextlib
+import errno
 import json
 import os
 import pwd
@@ -223,6 +224,32 @@ def write_json(path: Path, payload: dict[str, object]) -> None:
         # In a sticky directory a rename over another user's file is refused: say whose file is in the way.
         msg = f"{path} exists and belongs to {_owner(path)}; it cannot be replaced ({error.strerror})"
         raise OSError(error.errno, msg) from error
+
+
+#: How many numbered names `write_new` tries after the first (`NAME-2.sbatch`, ...).
+NEW_NAME_TRIES = 99
+
+
+def write_new(path: Path, text: str) -> Path:
+    """Create a new file holding `text` at `path`, or at the first free `<stem>-2<suffix>`, `-3`, ...; the path used.
+
+    The scripts and logs directories are shared by every user and the names are predictable on purpose, so a file
+    (or link) already under a name is never written into or through: a batch script written into another user's file
+    could be changed by them before sbatch reads it. A name taken by the same user's earlier submission in the same
+    second just moves on to the next number. FileExistsError when every name is taken.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    for n in range(1, NEW_NAME_TRIES + 2):
+        candidate = path if n == 1 else path.with_name(f"{path.stem}-{n}{path.suffix}")
+        try:
+            fd = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+        except FileExistsError:
+            continue
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        return candidate
+    msg = f"{path} and its {NEW_NAME_TRIES} numbered names already exist; nothing was written"
+    raise FileExistsError(errno.EEXIST, msg)
 
 
 #: A record is a few kilobytes; a bigger file is not one.

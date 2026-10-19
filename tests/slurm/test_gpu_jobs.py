@@ -37,6 +37,16 @@ def test_event_actor_is_the_file_owner_not_the_content(tmp_path: Path, monkeypat
 
 def test_a_hostile_or_foreign_record_is_ignored_and_never_blocks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(gpu_jobs, "STATE_DIR", tmp_path)
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    target = tmp_path / "victim-file"
+    target.write_text("theirs")
+    (scripts / "x-1.sbatch").symlink_to(target)  # left under the predictable name: never written through
+    assert gpu_jobs.write_new(scripts / "x-1.sbatch", "mine") == scripts / "x-1-2.sbatch"
+    assert target.read_text() == "theirs" and (scripts / "x-1-2.sbatch").read_text() == "mine"
+    monkeypatch.setattr(gpu_jobs, "NEW_NAME_TRIES", 1)
+    with pytest.raises(FileExistsError, match="already exist"):
+        gpu_jobs.write_new(scripts / "x-1.sbatch", "again")
     jobs = tmp_path / "jobs"
     jobs.mkdir()
     os.mkfifo(jobs / "1.json")  # any user may leave one; opening it for reading would block for ever
