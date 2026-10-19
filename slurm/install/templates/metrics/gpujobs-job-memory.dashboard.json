@@ -1,0 +1,31 @@
+{
+  "uid": "${dashboard_uid}",
+  "title": "${dashboard_title}",
+  "tags": ["gpujobs"],
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": false,
+  "graphTooltip": 1,
+  "refresh": "30s",
+  "time": {"from": "now-6h", "to": "now"},
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "GPU memory by job",
+      "description": "Memory the job's processes hold on the GPU, per slurm job id. Read from nvidia-smi per process by the job wrapper, so it also works where the device-level figure is not available (unified-memory GPUs such as the GB10).",
+      "datasource": {"type": "prometheus", "uid": "${datasource_name}"},
+      "gridPos": {"h": 10, "w": 24, "x": 0, "y": 0},
+      "fieldConfig": {"defaults": {"unit": "bytes", "min": 0}, "overrides": []},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["max", "lastNotNull"]}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "prometheus", "uid": "${datasource_name}"},
+          "expr": "sum by (jobid) (gpujobs_job_gpu_memory_bytes)",
+          "legendFormat": "job {{jobid}}"
+        }
+      ]
+    }
+  ]
+}

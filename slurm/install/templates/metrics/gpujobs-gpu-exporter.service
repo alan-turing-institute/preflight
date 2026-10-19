@@ -1,0 +1,12 @@
+[Unit]
+Description=Jobstats GPU exporter (NVML; job ids from /run/gpustat)
+After=network-online.target
+
+[Service]
+DynamicUser=yes
+NoNewPrivileges=yes
+ExecStart=${bin_dir}/nvml_exporter -web.listen-address=:${gpu_port}
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

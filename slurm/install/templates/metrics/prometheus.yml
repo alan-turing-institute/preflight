@@ -1,0 +1,15 @@
+# Scrape configuration for the gpujobs metrics, rendered from the site file. Targets are in ${targets_file}.
+global:
+  scrape_interval: ${scrape_interval}s
+  scrape_timeout: ${scrape_interval}s
+  evaluation_interval: ${scrape_interval}s
+
+scrape_configs:
+  - job_name: gpujobs
+    file_sd_configs:
+      - files:
+          - ${targets_file}
+    metric_relabel_configs:
+      - source_labels: [__name__]
+        regex: "^go_.*"
+        action: drop
