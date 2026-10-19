@@ -36,6 +36,9 @@ ERROR_LINE = re.compile(r"(?i)\b(error|exception|traceback|warning|killed|out of
 _NEVER = 2**32 - 2  # sacct's start time for a job that never started
 
 
+WHOLE_NODE_MEM = "0"
+
+
 class Bucket(StrEnum):
     """How `project_usage` groups time."""
 
@@ -170,8 +173,8 @@ def waiting_reason(
     if reason == Reason.RESOURCES:
         needs = [f"{job.gpus} GPU(s)"] if job.gpus else []
         mem = records.get(job.job_id, {}).get("mem")
-        if mem:
-            needs.append(f"{mem} memory")
+        if mem:  # --mem=0 is slurm's "all of the node's memory"
+            needs.append("all of the box's memory" if str(mem) == WHOLE_NODE_MEM else f"{mem} memory")
         return f"waiting for {' / '.join(needs)} to free" if needs else "waiting for resources to free"
     if reason == Reason.PRIORITY:
         return f"queued behind {_queued_ahead(job, queue)} job(s)"
@@ -262,32 +265,36 @@ def _mib(mebibytes: int | None) -> int | None:
     return mebibytes * 1024**2 if mebibytes else None
 
 
+def _row(job: Mapping[str, object]) -> HistoryRow:
+    name = str(job.get("name", ""))
+    states = _field(job, "state", "current")
+    elapsed = _field(job, "time", "elapsed")
+    return HistoryRow(
+        job_id=str(job.get("job_id", "")),
+        name=name,
+        project=project_of(name),
+        user=str(job.get("user", "")),
+        partition=str(job.get("partition", "")),
+        state=str(states[0]) if isinstance(states, list) and states else "UNKNOWN",
+        exit_code=f"{_field(job, 'exit_code', 'return_code', 'number') or 0}:"
+        f"{_field(job, 'exit_code', 'signal', 'id', 'number') or 0}",
+        submit=_time(_field(job, "time", "submission")),
+        start=_time(_field(job, "time", "start")),
+        end=_time(_field(job, "time", "end")),
+        elapsed_s=elapsed if isinstance(elapsed, int) else 0,
+        gpus=_tres_count(_field(job, "tres", "allocated"), "gres", "gpu") or 0,
+        req_mem_bytes=_mib(_tres_count(_field(job, "tres", "requested"), "mem")),
+        max_rss_bytes=_peak_rss(job),
+    )
+
+
 def _rows(runner: Runner, since: str, until: str | None) -> list[HistoryRow]:
-    rows = []
-    for job in _sacct(runner, "-S", since, *(["-E", until] if until else [])):
-        name = str(job.get("name", ""))
-        states = _field(job, "state", "current")
-        elapsed = _field(job, "time", "elapsed")
-        rows.append(
-            HistoryRow(
-                job_id=str(job.get("job_id", "")),
-                name=name,
-                project=project_of(name),
-                user=str(job.get("user", "")),
-                partition=str(job.get("partition", "")),
-                state=str(states[0]) if isinstance(states, list) and states else "UNKNOWN",
-                exit_code=f"{_field(job, 'exit_code', 'return_code', 'number') or 0}:"
-                f"{_field(job, 'exit_code', 'signal', 'id', 'number') or 0}",
-                submit=_time(_field(job, "time", "submission")),
-                start=_time(_field(job, "time", "start")),
-                end=_time(_field(job, "time", "end")),
-                elapsed_s=elapsed if isinstance(elapsed, int) else 0,
-                gpus=_tres_count(_field(job, "tres", "allocated"), "gres", "gpu") or 0,
-                req_mem_bytes=_mib(_tres_count(_field(job, "tres", "requested"), "mem")),
-                max_rss_bytes=_peak_rss(job),
-            )
-        )
-    return rows
+    return [_row(job) for job in _sacct(runner, "-S", since, *(["-E", until] if until else []))]
+
+
+def finished_job(job_id: str, runner: Runner = run_command) -> HistoryRow | None:
+    """Slurm's accounting record of one job (finished or not), None when slurm has none."""
+    return next((_row(j) for j in _sacct(runner, "-j", job_id) if str(j.get("job_id")) == job_id), None)
 
 
 def history(

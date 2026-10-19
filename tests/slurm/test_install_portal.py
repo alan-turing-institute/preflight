@@ -95,7 +95,7 @@ def test_dex_local_renders_users_and_runs_update_with_insecure(tmp_path):
     assert f'hash: "{HASH}"' in spec_.content
     assert DEX_DEFAULT["email"] not in spec_.content and DEX_DEFAULT["hash"] not in spec_.content
     assert 'servername: "ood.example.org"' in spec_.content and "security_strict_transport: true" in spec_.content
-    assert 'root_uri: "/pun/sys/gpujobs"' in spec_.content  # the portal opens on the jobs page
+    assert 'root_uri: "/pun/sys/gpujobs/"' in spec_.content  # the portal opens on the jobs page
     assert portal.refusals(site) == []
     assert "ondemand-dex" in portal.packages(site) and "python-is-python3" in portal.packages(site)
     update = next(c for c in portal.post_install(site) if c[0] == portal.UPDATE_OOD_PORTAL)

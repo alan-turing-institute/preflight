@@ -436,7 +436,7 @@ def _build_portal_yml(site: Site) -> tuple[str, list[str]]:
     # docs "4. Secure Apache httpd": servername plus ssl directives; the HTTP vhost then redirects to https.
     text = Template((TEMPLATE_DIR / "ood_portal.yml").read_text()).substitute(
         servername=_quote(servername),
-        root_uri=_quote(f"/pun/sys/{APP_NAME}"),
+        root_uri=_quote(f"/pun/sys/{APP_NAME}/"),
         ssl_lines="\n".join(_yaml([f'SSLCertificateFile "{cert}"', f'SSLCertificateKeyFile "{key}"'], 2)),
         hsts="false" if _self_signed(site) else "true",
         login_lines=login_lines,

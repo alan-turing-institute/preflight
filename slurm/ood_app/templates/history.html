@@ -1,17 +1,17 @@
-<form method="get" class="filters" aria-label="History filters">
-<label>Since <input name="since" value="$since" placeholder="YYYY-MM-DD"></label>
-<label>Until <input name="until" value="$until" placeholder="YYYY-MM-DD"></label>
-<label>User <input name="user" value="$user"></label>
-<label>Project <input name="project" value="$project"></label>
-<label>State <input name="state" value="$state"></label>
-<button type="submit">Show</button>
+<div class="page-head">
+<div><h1>History</h1><p class="sub">Jobs slurm has a record of, newest first.</p></div>
+</div>
+<section class="card" aria-labelledby="h-history">
+<h2 id="h-history" class="sr-only">Jobs</h2>
+<form method="get" class="toolbar" aria-label="History filters">
+<div class="field">Period <span class="segmented">$presets</span></div>
+<label class="field">From <input type="date" name="since" value="$since"></label>
+<label class="field">To <input type="date" name="until" value="$until"></label>
+<label class="field">Project <select name="project">$project_options</select></label>
+<label class="field">User <select name="user">$user_options</select></label>
+<label class="field">Result <select name="state">$state_options</select></label>
+<button type="submit" class="primary">Apply</button>
 </form>
-<table>
-<caption>$count job(s)</caption>
-<thead><tr><th scope="col">Job</th><th scope="col">Name</th><th scope="col">Project</th><th scope="col">User</th>
-<th scope="col">State</th><th scope="col">Exit</th><th scope="col">Start</th><th scope="col">Elapsed (s)</th>
-<th scope="col">GPUs</th><th scope="col">Peak CPU memory</th></tr></thead>
-<tbody>
-$rows
-</tbody>
-</table>
+$table
+$pager
+</section>
