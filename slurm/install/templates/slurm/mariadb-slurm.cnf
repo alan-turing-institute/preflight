@@ -1,0 +1,8 @@
+# MariaDB settings slurmdbd asks for (its log: "Database settings not recommended values: innodb_buffer_pool_size
+# innodb_lock_wait_timeout"). Values: the examples in SchedMD's accounting guide, which slurmdbd's check compares
+# against (support.schedmd.com ticket 11066). The buffer pool stays at the example's 1024M, not the larger figures
+# some sites use: on a unified-memory machine (the GB10) the RAM is also the GPU's memory, and this database holds one node's job records.
+# Installed to /etc/mysql/mariadb.conf.d/90-slurm.cnf by install_slurm.py.
+[mysqld]
+innodb_buffer_pool_size=1024M
+innodb_lock_wait_timeout=900
