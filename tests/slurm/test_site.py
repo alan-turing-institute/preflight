@@ -40,9 +40,10 @@ def test_this_box_site_file_loads() -> None:
     assert (site.metrics.mode, site.metrics.grafana_port) == (gpujobs_site.MetricsMode.LOCAL, 3001)
     assert site.metrics.allow_from == ("100.64.0.0/10", "fd7a:115c:a1e0::/48", "192.0.2.8/32")  # Tailscale + NAS Caddy
     assert site.metrics.grafana_url == "https://jobs-grafana.home.example.com"
-    assert (site.portal.mode, site.portal.auth) == (gpujobs_site.PortalMode.INSTALL, gpujobs_site.AuthMode.DEX_LOCAL)
-    assert (site.portal.server_name, site.portal.session_days) == ("jobs.home.example.com", 365)  # a *.home name, like every service
-    assert site.portal.allow_from == ("192.0.2.8/32", "100.64.0.3/32")  # only the NAS Caddy
+    assert (site.portal.mode, site.portal.auth) == (gpujobs_site.PortalMode.INSTALL, gpujobs_site.AuthMode.PROXY)
+    assert site.portal.server_name == "jobs.home.example.com"  # a *.home name, like every service
+    assert site.portal.auth_settings == {"user": "user1", "key_file": "/etc/gpujobs/portal/proxy_key"}  # no login
+    assert site.portal.allow_from == ("192.0.2.8/32",)  # only the NAS Caddy
     assert site.portal.tls_cert is None and site.notify_command == ()
 
 
