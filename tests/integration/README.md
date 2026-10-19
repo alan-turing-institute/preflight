@@ -71,6 +71,9 @@ scenarios below as alice, bob and carol, and exits 1 if any check failed. Each c
 as it happens; the summary lists the failures and any `NOTE` (something that could not be exercised). `--only` takes
 `install,jobs,urgent,failure,recovery,portal,lease,host`; later stages need `install` to have run once on that cluster.
 
+Disk: the image stays 569 MB, but an installed container's writable layer grows to about 4 GB (Open OnDemand, Grafana,
+Prometheus, a Go toolchain, caches) in Docker's data root. `run.sh down` removes it; run it when you are done.
+
 ### What the run does outside the installer
 
 Only what an operator would supply, or what the container cannot do:
