@@ -58,6 +58,75 @@ def test_job_cgroup_is_the_job_component_of_our_cgroup(tmp_path: Path) -> None:
     assert job_wrapper.job_cgroup("43", proc) is None
 
 
+SMI = "100, GPU-aaa\n200, GPU-bbb\n300, GPU-bbb\n"
+
+
+def test_occupancy_blocks_on_any_process_outside_the_job_and_names_it() -> None:
+    assert job_wrapper.foreign_gpu_processes({100, 200, 300}, SMI) == []
+    assert job_wrapper.foreign_gpu_processes({100}, SMI) == [(200, "GPU-bbb"), (300, "GPU-bbb")]
+
+
+def test_declared_sharing_skips_the_occupancy_check(monkeypatch) -> None:
+    monkeypatch.setattr(job_wrapper, "foreign_gpu_processes", lambda own: [(9, "GPU-x")])
+    assert job_wrapper.card_is_free({1}) == (False, "compute process(es) outside this job: pid 9 on GPU-x")
+    assert job_wrapper.card_is_free({1}, max_jobs=2) == (True, "")
+
+
+def test_footprint_sums_all_gpus_and_counts_labelled_containers(tmp_path: Path, monkeypatch) -> None:
+    import audit
+
+    cg = tmp_path / "job_5"
+    cg.mkdir()
+    (cg / "cgroup.procs").write_text("10\n")
+    (cg / "memory.current").write_text("4096\n")
+    box = "/system.slice/docker-" + "a" * 64 + ".scope"
+    monkeypatch.setattr(job_wrapper, "gpu_mib_by_pid", lambda: {10: 300.0, 20: 50.0, 30: 70.0})
+    monkeypatch.setattr(audit, "cgroup_of", lambda pid: box if pid == 20 else "/user.slice")
+    labels = {"a" * 64: "5"}
+    real = job_wrapper.gpu_jobs.container_label
+    monkeypatch.setattr(
+        job_wrapper.gpu_jobs, "container_label",
+        lambda cgroup, label: real(cgroup, label, lambda cid, _l: labels.get(cid, "")),
+    )
+    row = job_wrapper.sample(cg, set(), "5")
+    assert row["gpu_mib"] == 350.0  # pid 10 (cgroup) + pid 20 (container of job 5); pid 30 is someone else's
+    assert row["mem_current"] == 4096
+
+
+def test_metrics_textfile_is_written_atomically_and_removed_with_the_job(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(job_wrapper.gpu_jobs, "STATE_DIR", tmp_path)
+    monkeypatch.setenv("SLURM_JOB_NAME", "proj:train")
+    job_wrapper.write_metrics("7", {"gpu_mib": 2.0, "mem_current": 99})
+    text = job_wrapper.metrics_file("7").read_text()
+    labels = text.split("{")[1].split("}")[0]
+    assert 'jobid="7"' in labels and 'project="proj"' in labels and "user=" in labels
+    assert f"}} {2 * 1024 * 1024}\n" in text and "} 99\n" in text
+    assert not list((tmp_path / "metrics").glob("*.tmp"))
+    monkeypatch.delenv("SLURM_JOB_NAME")
+    assert 'project="(other)"' in job_wrapper.metrics_text("7", {"gpu_mib": 0.0, "mem_current": None})
+
+
+SITE = 'name = "t"\n[[nodes]]\nname = "n"\ncpus = 1\nreal_memory_mb = 1\n[metrics]\nmode = "%s"\n'
+SEEN = "import time, sys, pathlib; time.sleep(0.7); pathlib.Path(sys.argv[2]).write_text(str(pathlib.Path(sys.argv[1]).exists()))"
+
+
+def run_wrapper(tmp_path: Path, job: str, mode: str) -> tuple[str, bool]:
+    """(whether the job saw its textfile while running, whether it is still there afterwards)."""
+    env = dict(os.environ, SLURM_GPU_STATE_DIR=str(tmp_path / "state"), SLURM_JOB_ID=job,
+               GPUJOBS_SITE=str(tmp_path / "site.toml"))
+    (tmp_path / "site.toml").write_text(SITE % mode)
+    prom = tmp_path / "state" / "metrics" / f"job_{job}.prom"
+    seen = tmp_path / f"seen_{job}"
+    subprocess.run([sys.executable, str(WRAPPER), "--sample", "0.2", "--", sys.executable, "-c", SEEN, str(prom), str(seen)],
+                   env=env, check=True)
+    return seen.read_text(), prom.exists()
+
+
+def test_metrics_mode_decides_whether_a_textfile_is_written_and_it_is_gone_at_the_end(tmp_path: Path) -> None:
+    assert run_wrapper(tmp_path, "81", "off") == ("False", False)
+    assert run_wrapper(tmp_path, "82", "local") == ("True", False)
+
+
 CHILD = """
 import os, signal, sys, time
 def term(*_):
