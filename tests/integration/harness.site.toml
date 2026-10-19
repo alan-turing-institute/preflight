@@ -1,0 +1,61 @@
+# Site file for the integration test cluster (tests/integration/README.md): what an operator would write for the
+# container, installed by e2e.py through the real installer. Differences from a real box are noted where they occur.
+name = "harness"
+cluster_name = "harness"          # the container's bootstrap accounting database already knows this cluster
+# account: the default, gpujobs. The container's first-boot unit created cluster and users in account "harness", so the
+# installer has to create account "gpujobs" (and each user's membership) itself.
+state_dir = "/var/lib/gpujobs"
+install_dir = "/opt/gpujobs"
+admin_group = "gpujobs-admin"
+unified_memory = false
+hostguard = true                  # the installed job wrapper must find hostguard beside install_dir/slurm
+dgx_gate = false
+notify_command = ["/usr/local/bin/harness-notify"]   # e2e.py installs this script; the agent runs it on a failure
+
+# The container's node as the bootstrap slurm.conf declares it. Four fake GPUs: slurm 23.11.4 refuses a bare count,
+# so each is a symlink to /dev/null (README, "Fake GPUs").
+[[nodes]]
+name = "testnode"
+cpus = 4
+real_memory_mb = 4096
+
+[[nodes.gpus]]
+index = 0
+uuid = "GPU-00000000-0000-0000-0000-000000000000"
+device = "/opt/fakegpu/gpu0"
+type = "fake"
+
+[[nodes.gpus]]
+index = 1
+uuid = "GPU-00000000-0000-0000-0000-000000000001"
+device = "/opt/fakegpu/gpu1"
+type = "fake"
+
+[[nodes.gpus]]
+index = 2
+uuid = "GPU-00000000-0000-0000-0000-000000000002"
+device = "/opt/fakegpu/gpu2"
+type = "fake"
+
+[[nodes.gpus]]
+index = 3
+uuid = "GPU-00000000-0000-0000-0000-000000000003"
+device = "/opt/fakegpu/gpu3"
+type = "fake"
+
+# No [lease]: nothing else shares the container's fake GPUs.
+
+[metrics]
+mode = "local"
+grafana_port = 3001
+# Grafana serves plain HTTP only, and a browser blocks that inside the HTTPS portal (mixed content). The harness
+# reaches it through a TLS front added by e2e.py (an Apache virtual host on 3443 that proxies to 3001):
+grafana_url = "https://testnode:3443"
+
+[portal]
+mode = "install"
+auth = "dex-local"
+server_name = "testnode"
+
+[portal.auth_settings]
+users_file = "/etc/gpujobs/portal/users.json"
