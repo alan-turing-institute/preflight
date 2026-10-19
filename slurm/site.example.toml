@@ -55,6 +55,8 @@ prometheus_url = ""     # used when mode = "external". Default: empty
 grafana_url = ""        # used when mode = "external". Default: empty
 grafana_port = 3000     # port for the local Grafana. Default: 3000
 retention_days = 365    # how long Prometheus keeps samples. Default: 365
+allow_from = []         # networks that may reach Grafana and the exporters, e.g. ["100.64.0.0/10"]; the machine
+                        # itself always may. Default: empty (any network)
 
 [portal]
 mode = "off"            # install (Open OnDemand here), existing (reuse one), or off. Default: off

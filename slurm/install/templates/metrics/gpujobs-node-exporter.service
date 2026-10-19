@@ -8,6 +8,6 @@ DynamicUser=yes
 NoNewPrivileges=yes
 ExecStart=${bin_dir}/node_exporter --web.listen-address=:${node_port} --collector.textfile.directory=${textfile_dir}
 Restart=on-failure
-
+${ip_filter_lines}
 [Install]
 WantedBy=multi-user.target

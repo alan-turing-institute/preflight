@@ -8,6 +8,7 @@ table level, so a typo cannot silently fall back to a default. `site.example.tom
 from __future__ import annotations
 
 import grp
+import ipaddress
 import os
 import pwd
 import tomllib
@@ -72,6 +73,7 @@ class Metrics:
     grafana_url: str
     grafana_port: int
     retention_days: int
+    allow_from: tuple[str, ...] = ()  # networks that may reach Grafana and the exporters; empty = any
 
 
 @dataclass(frozen=True)
@@ -126,6 +128,18 @@ def _enum[E: StrEnum](cls: type[E], value: str, where: str) -> E:
         raise SiteError(f"site file: {where} = {value!r}; expected one of {allowed}") from None
 
 
+def _networks(value: Any, where: str) -> tuple[str, ...]:
+    """IP networks (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`, or one address), as systemd's IPAddressAllow= takes."""
+    if not isinstance(value, list):
+        raise SiteError(f"site file: {where} must be a list of IP networks")
+    for entry in value:
+        try:
+            ipaddress.ip_network(entry, strict=False)
+        except (TypeError, ValueError):
+            raise SiteError(f"site file: {where} entry {entry!r} is not an IP network such as 100.64.0.0/10") from None
+    return tuple(value)
+
+
 def _opt_path(value: str) -> Path | None:
     return Path(value) if value else None
 
@@ -169,7 +183,8 @@ def parse(raw: dict[str, Any]) -> Site:
         top["metrics"],
         "metrics",
         set(),
-        {"mode": "off", "prometheus_url": "", "grafana_url": "", "grafana_port": 3000, "retention_days": 365},
+        {"mode": "off", "prometheus_url": "", "grafana_url": "", "grafana_port": 3000, "retention_days": 365,
+         "allow_from": []},
     )
     p = _table(
         top["portal"],
@@ -202,6 +217,7 @@ def parse(raw: dict[str, Any]) -> Site:
             m["grafana_url"],
             m["grafana_port"],
             m["retention_days"],
+            _networks(m["allow_from"], "metrics.allow_from"),
         ),
         portal=Portal(
             _enum(PortalMode, p["mode"], "portal.mode"),

@@ -297,6 +297,16 @@ def _anonymous_lines(site: Site) -> str:
     return "".join(f"Environment={s}\n" for s in settings)
 
 
+def _ip_filter_lines(site: Site) -> str:
+    # Grafana and the exporters answer on every address and have no login of their own (Grafana's is off for the
+    # portal's embedded panels), so a site can name the networks that may reach them: systemd drops every other
+    # packet of the service (`man systemd.resource-control`, IPAddressAllow=; checked first, then IPAddressDeny=).
+    # localhost always stays: Prometheus scrapes the exporters and Grafana reads Prometheus over 127.0.0.1.
+    if not site.metrics.allow_from:
+        return ""
+    return f"IPAddressDeny=any\nIPAddressAllow=localhost {' '.join(site.metrics.allow_from)}\n"
+
+
 def files(site: Site) -> dict[str, render.FileSpec]:
     if not enabled(site):
         return {}
@@ -307,6 +317,7 @@ def files(site: Site) -> dict[str, render.FileSpec]:
         "node_port": int(Port.NODE),
         "cgroup_port": int(Port.CGROUP),
         "gpu_port": int(Port.GPU),
+        "ip_filter_lines": _ip_filter_lines(site),
     }
     out = {
         str(TARGETS_FILE): _spec(_targets(site)),
@@ -361,6 +372,7 @@ def _local_files(site: Site) -> dict[str, render.FileSpec]:
                 "grafana.service.dropin.conf",
                 grafana_port=site.metrics.grafana_port,
                 anonymous_lines=_anonymous_lines(site),
+                ip_filter_lines=_ip_filter_lines(site),
                 admin_env_file=GRAFANA_ENV_FILE,
             )
         ),

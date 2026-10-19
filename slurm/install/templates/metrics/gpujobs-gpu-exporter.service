@@ -7,6 +7,6 @@ DynamicUser=yes
 NoNewPrivileges=yes
 ExecStart=${bin_dir}/nvml_exporter -web.listen-address=:${gpu_port}
 Restart=on-failure
-
+${ip_filter_lines}
 [Install]
 WantedBy=multi-user.target

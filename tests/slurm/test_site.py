@@ -38,6 +38,7 @@ def test_this_box_site_file_loads() -> None:
     assert set(site.lease.services) == {"service-a", "service-b"}
     assert site.lease.lease_dir == Path("/home/user1/.local/state/gpu-lease")
     assert (site.metrics.mode, site.metrics.grafana_port) == (gpujobs_site.MetricsMode.LOCAL, 3001)
+    assert site.metrics.allow_from == ("100.64.0.0/10", "fd7a:115c:a1e0::/48")  # Tailscale only (owner, 2026-10-19)
     assert (site.portal.mode, site.portal.auth) == (gpujobs_site.PortalMode.INSTALL, gpujobs_site.AuthMode.DEX_LOCAL)
     assert site.portal.tls_cert is None and site.notify_command == ()
 
@@ -53,6 +54,7 @@ def test_example_loads_and_minimal_file_gets_every_default(tmp_path: Path) -> No
     )
     assert site.lease is None and not site.hostguard and not site.dgx_gate
     assert site.metrics.mode is gpujobs_site.MetricsMode.OFF and site.portal.mode is gpujobs_site.PortalMode.OFF
+    assert site.metrics.allow_from == ()
     assert site.nodes[0].gpus == ()
     assert site.cluster_name == site.name and site.account == "gpujobs"  # defaults
 
@@ -64,6 +66,8 @@ def test_example_loads_and_minimal_file_gets_every_default(tmp_path: Path) -> No
         (MINIMAL + "[metrics]\nmodee = 'off'\n", "unknown key(s) in [metrics]"),
         (MINIMAL + GPU + "extra = 1\n", "unknown key(s) in [nodes[0].gpus[0]]"),
         (MINIMAL + "[metrics]\nmode = 'sideways'\n", "metrics.mode"),
+        (MINIMAL + "[metrics]\nallow_from = ['tailnet']\n", "metrics.allow_from entry 'tailnet' is not an IP network"),
+        (MINIMAL + "[metrics]\nallow_from = '100.64.0.0/10'\n", "metrics.allow_from must be a list"),
         ('name = "x"\n', "missing nodes"),
     ],
 )

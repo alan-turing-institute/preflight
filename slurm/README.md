@@ -170,6 +170,7 @@ TOML. Tables: the top level, `[[nodes]]` with `[[nodes.gpus]]`, `[lease]` with `
 | `grafana_url` | `""` | Used when `mode = "external"` (required then). When set, also where the portal's cluster file points Grafana (see section 8). |
 | `grafana_port` | `3000` | Port of the local Grafana. Refused if it equals one of the stack's own ports (9101, 9306, 9445, 9090). |
 | `retention_days` | `365` | How long Prometheus keeps samples; at least 1. |
+| `allow_from` | `[]` | IP networks that may reach Grafana and the three exporters (`["100.64.0.0/10"]` for a Tailscale network); the machine itself always may. Empty: any network. Every other packet of those services is dropped by systemd (`IPAddressDeny=any` plus `IPAddressAllow=`). |
 
 ### `[portal]`
 
@@ -262,7 +263,7 @@ read-only access and embedding turned on when the portal is on; the first admin 
 from our job wrapper is written as node-exporter textfiles in `state_dir/metrics/`. With the portal on, the
 helper app is installed at `/var/www/ood/apps/sys/jobstats`.
 
-The three exporters listen on all interfaces without authentication, because Prometheus scrapes them by node name (on a site with several nodes, over the network). They expose job ids, user names, projects and per-job use, so allow ports 9101, 9306 and 9445 only from the Prometheus host (a firewall rule); with `mode = "local"` on one node, nothing outside the node needs them.
+The three exporters listen on all interfaces without authentication, because Prometheus scrapes them by node name (on a site with several nodes, over the network). They expose job ids, user names, projects and per-job use, and Grafana shows them without a login when the portal is on. Set `metrics.allow_from` to the networks that should reach them (on several nodes, include the Prometheus host); with it empty, any network that reaches the machine does.
 
 **`portal`** (when `portal.mode` is `install` or `existing`). With `install`: Open OnDemand 4.2 and its NodeSource
 and OnDemand apt repositories, `python-is-python3`, plus `ondemand-dex` (Dex modes), `libapache2-mod-auth-openidc`
