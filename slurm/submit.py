@@ -48,6 +48,8 @@ import site_config
 HERE = Path(__file__).resolve().parent
 GATE = HERE.parent / "dgx" / "dgx_submit.sh"
 KEEPER_UNIT = "slurm-gpu-lease-keeper"
+#: The keeper rewrites its state every 5 s (`gpu_lease_keeper.py --interval`); a heartbeat older than this means it is down.
+KEEPER_STALE_S = 60
 #: Longest `--comment` we write: our choice (it keeps `squeue` output readable), not a slurm limit.
 COMMENT_MAX = 200
 #: --mem auto: the measured peak, plus this share, rounded up to whole GiB.
@@ -89,9 +91,14 @@ def comment(what: str) -> str:
     return what.replace("\r", " ").replace("\n", " ")[:COMMENT_MAX]
 
 
-def keeper_running() -> bool:
-    done = subprocess.run(["systemctl", "--user", "is-active", "-q", KEEPER_UNIT], check=False)
-    return done.returncode == 0
+def keeper_running(now: float | None = None) -> bool:
+    """Whether the keeper's heartbeat is fresh. Read from its state file, not `systemctl --user`: the keeper is a user
+    unit of the site's keeper user, which another submitter's systemd cannot see (found in the container cluster, F1)."""
+    state = gpu_jobs.read_json(gpu_jobs.keeper_state_path()) or {}
+    updated = state.get("updated_at")
+    if not isinstance(updated, (int, float)):
+        return False
+    return (time.time() if now is None else now) - updated < KEEPER_STALE_S
 
 
 def known_to_slurm(job_id: str) -> bool:

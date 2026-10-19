@@ -114,7 +114,13 @@ def test_no_mem_without_a_name_never_reuses_another_jobs_run(tmp_path: Path, mon
     assert f"{DIRECTIVE} --mem=0" in script
 
 
-def test_refuses_while_the_keeper_is_down(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_refuses_while_the_keeper_is_down(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # The keeper is up while its heartbeat is fresh, whoever asks (a user unit of another user is invisible to them).
+    monkeypatch.setattr(gpu_jobs, "STATE_DIR", tmp_path)
+    assert not submit.keeper_running(now=100.0)  # no heartbeat yet
+    gpu_jobs.write_json(gpu_jobs.keeper_state_path(), {"updated_at": 100})
+    assert submit.keeper_running(now=100.0 + submit.KEEPER_STALE_S - 1)
+    assert not submit.keeper_running(now=100.0 + submit.KEEPER_STALE_S)
     monkeypatch.setattr(submit, "keeper_running", lambda: False)
     with pytest.raises(submit.Refused, match="keeper"):
         submit.submit(["--project", "p", "--what", "w", "--class", "restart", "--mem", "1G", "--", "x"])

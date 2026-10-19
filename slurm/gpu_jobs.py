@@ -209,6 +209,12 @@ def read_json(path: Path) -> dict[str, object] | None:
     return data if isinstance(data, dict) else None
 
 
+def keeper_state_path() -> Path:
+    """The lease keeper's state and heartbeat, in a directory of its own: the keeper runs as the site's keeper user, and
+    the state directory itself is root's (the lease component makes `keeper/` that user's)."""
+    return STATE_DIR / "keeper" / "keeper.json"
+
+
 def sidecar_path(job_id: str) -> Path:
     return STATE_DIR / "jobs" / f"{job_id}.json"
 

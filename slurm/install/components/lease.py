@@ -53,5 +53,8 @@ def refusals(site) -> list[str]:
 def post_install(site) -> list[list[str]]:
     # `systemctl --user --machine=USER@.host` reaches that user's bus (systemctl(1), -M/--machine); it needs the
     # user's systemd instance running (linger on, or a login session).
-    user = ["systemctl", "--user", f"--machine={site.lease.keeper_user}@.host"]
-    return [[*user, "daemon-reload"], [*user, "enable", "--now", UNIT], [*user, "restart", UNIT]]
+    keeper = site.lease.keeper_user
+    user = ["systemctl", "--user", f"--machine={keeper}@.host"]
+    # The keeper writes its heartbeat under the state directory, which is root's; this directory is the keeper user's.
+    heartbeat = ["install", "-d", "-m", "0755", "-o", keeper, str(Path(site.state_dir) / "keeper")]
+    return [heartbeat, [*user, "daemon-reload"], [*user, "enable", "--now", UNIT], [*user, "restart", UNIT]]

@@ -24,7 +24,7 @@ PAUSES = {
 
 def lines(queue: list[gpu_jobs.QueuedJob] | None) -> list[str]:
     out = [f"[status] node: {gpu_jobs.node_state()}"]
-    keeper = gpu_jobs.read_json(gpu_jobs.STATE_DIR / "keeper.json") or {}
+    keeper = gpu_jobs.read_json(gpu_jobs.keeper_state_path()) or {}
     out.append(
         f"[status] keeper: {keeper.get('phase', 'no state')}; blockers {keeper.get('blockers', [])};"
         f" updated {keeper.get('updated_at', '?')} {keeper.get('note', '')}".rstrip()

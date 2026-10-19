@@ -22,7 +22,7 @@ Every `--interval` seconds:
 
 On start it deletes lease files written before this boot (their pids belong to the previous boot and may
 be reused) and reports the node's state, since `ReturnToService=1` leaves it DOWN after a reboot.
-State for the other tools: `~/.local/state/slurm-gpu/keeper.json`.
+State for the other tools, rewritten every loop: `gpu_jobs.keeper_state_path()` (`STATE_DIR/keeper/keeper.json`).
 
 Run by the `slurm-gpu-lease-keeper.service` user unit (`slurm/install/templates/lease/`) under the site's lease python.
 """
@@ -168,7 +168,7 @@ def main() -> int:
     print(f"[keeper] start; removed leases from before this boot: {removed or 'none'}", flush=True)
     print(f"[keeper] node state: {gpu_jobs.node_state()}", flush=True)
     keeper = Keeper(GpuLease(gpu_jobs.LEASE_DIR, gpu_jobs.LEASE_PROJECT), linger_s=arguments.linger)
-    state_path = gpu_jobs.STATE_DIR / "keeper.json"
+    state_path = gpu_jobs.keeper_state_path()
     last = None
     # No cleanup on exit: a lease left by a dead keeper names a dead pid, which every reader ignores,
     # while removing it at a restart would open exactly the gap this keeper exists to close.
