@@ -1,4 +1,8 @@
-"""The GPU lease keeper: a user unit of site.lease.keeper_user, written into that user's home."""
+"""The GPU lease keeper: a user unit run by site.lease.keeper_user's own systemd.
+
+The unit file goes to /etc/systemd/user/ (root's) and is enabled through that user's manager, so root never writes
+into a home directory the user controls (a planted symlink there would turn the write and chown into theirs).
+"""
 
 from __future__ import annotations
 
@@ -12,6 +16,7 @@ import components
 
 NAME = "lease"
 UNIT = "slurm-gpu-lease-keeper.service"
+UNIT_DIR = Path("/etc/systemd/user")
 CLIENT_CHECK = "from localmodels.lease import GpuLeaseClient"
 
 
@@ -31,7 +36,7 @@ def files(site) -> dict[str, render.FileSpec]:
     unit = Template((render.TEMPLATES / NAME / UNIT).read_text()).substitute(
         keeper_user=user, python=site.lease.python, install_dir=site.install_dir
     )
-    return {str(_home(user) / ".config/systemd/user" / UNIT): render.FileSpec(unit, render.FILE_MODE, user)}
+    return {str(UNIT_DIR / UNIT): render.FileSpec(unit, render.FILE_MODE, "root")}
 
 
 def packages(site) -> list[str]:
@@ -39,6 +44,9 @@ def packages(site) -> list[str]:
 
 
 def refusals(site) -> list[str]:
+    old = _home(site.lease.keeper_user) / ".config/systemd/user" / UNIT
+    if old.is_symlink() or old.exists():  # a user's own unit overrides /etc/systemd/user/
+        return [f"{old} would override the installed keeper unit; remove it (as {site.lease.keeper_user}) first"]
     python = str(site.lease.python)
     try:
         done = components.run([python, "-c", CLIENT_CHECK])

@@ -24,10 +24,10 @@ from hypothesis import strategies as st
 settings.register_profile("repo", database=None)
 settings.load_profile("repo")
 
-import gpu_jobs
-import jobs_view
-import site_config
-from test_ood_app import HOST, Fake, call
+import gpu_jobs  # noqa: E402 - after the Hypothesis setup above
+import jobs_view  # noqa: E402 - after the Hypothesis setup above
+import site_config  # noqa: E402 - after the Hypothesis setup above
+from test_ood_app import HOST, Fake, call  # noqa: E402 - after the Hypothesis setup above
 
 # A job name is any text: slurm keeps even a newline in one (measured, 23.11.4), and the owner may rename the job.
 NAME = st.text(st.characters(blacklist_categories=("Cs",)), max_size=40)

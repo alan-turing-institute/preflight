@@ -720,9 +720,11 @@ def stage_lease() -> None:
           good.rc == 0 and unit.out.split() == ["enabled", "active"], f"apply rc={good.rc} {good.text[-120:]} | {unit.text}")
     time.sleep(15)
     still = sh("systemctl --user --machine=dave@.host is-active slurm-gpu-lease-keeper").out.strip()
-    owner = sh("ls -l /home/dave/.config/systemd/user/slurm-gpu-lease-keeper.service").out
-    check("lease: the unit file is dave's and the keeper survives the end of the installer's login session (linger)",
-          still == "active" and " dave dave " in owner, f"{still} {owner.strip()}")
+    owner = sh("stat -c %U /etc/systemd/user/slurm-gpu-lease-keeper.service; "
+               "stat -c %U /home/dave/.config/systemd/user/default.target.wants/slurm-gpu-lease-keeper.service").out.split()
+    check("lease: the unit file is root's (root never writes in dave's home), dave's own systemd enabled it, and the "
+          "keeper survives the end of the installer's login session (linger)",
+          still == "active" and owner == ["root", "dave"], f"{still} {owner}")
     sub = cl("env", "GPUJOBS_SITE=/tmp/lease-good.toml", "gpujobs-submit", "--project", "e2e", "--what", "lease", "--class", "restart",
              "--name", "lease", "--mem", "200M", "--gpu", "--", *sleep_cmd(3), user="bob")
     beat = sh("stat -c %U /var/lib/gpujobs/keeper/keeper.json").out.strip()

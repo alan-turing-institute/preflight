@@ -49,11 +49,13 @@ class Fake:
 
 
 @pytest.fixture
-def env(tmp_path):
+def env(tmp_path, monkeypatch):
     site = tmp_path / "site.toml"
     site.write_text(SITE)
     fake = Fake()
     components.set_runner(fake)
+    # the keeper user's home, where an old copy of the unit would override the installed one
+    monkeypatch.setattr(importlib.import_module("components.lease"), "_home", lambda _user: tmp_path / "home")
     yield tmp_path, site, fake
     components.set_runner(None)
 
@@ -115,6 +117,12 @@ def test_apply_refuses_with_a_busy_queue_or_without_the_lease_client(env):
     fake.queue, fake.client_ok = "", False
     assert run(site, tmp / "root", "apply") == 1
     assert not (tmp / "root").exists()
+    fake.client_ok = True
+    old = tmp / "home/.config/systemd/user/slurm-gpu-lease-keeper.service"
+    old.parent.mkdir(parents=True)
+    old.symlink_to("/etc/ld.so.preload")  # a user's own unit (or link) would override the one root installs
+    assert run(site, tmp / "root", "apply") == 1
+    assert not (tmp / "root").exists()
 
 
 def test_user_and_admin_argv(env):
@@ -146,11 +154,17 @@ def test_migrate_keeps_owner_and_mode_and_never_overwrites(env):
     (old / "events").mkdir()
     (old / "events/e.json").write_text("e")
     (old / "events/e.json").chmod(0o640)
+    secret = tmp / "secret"
+    secret.write_text("not the user's to copy")
+    (old / "events/link.json").symlink_to(secret)  # root copies from a user's directory: never through a link
+    (old / "footprints").symlink_to(tmp)
     existing = root / "var/lib/gpujobs/jobs/1.json"
     existing.parent.mkdir(parents=True)
     existing.write_text("keep")
     assert run(site, root, "migrate-state", "--from", str(old)) == 0
     assert existing.read_text() == "keep"
+    assert not (root / "var/lib/gpujobs/events/link.json").exists()
+    assert not (root / "var/lib/gpujobs/footprints").exists()
     moved = root / "var/lib/gpujobs/events/e.json"
     assert moved.read_text() == "e"
     assert stat.S_IMODE(moved.stat().st_mode) == stat.S_IMODE((old / "events/e.json").stat().st_mode)

@@ -196,30 +196,49 @@ def cmd_admin(site, args, modules) -> int:
     return 0
 
 
-def _copy_keeping(src: Path, dest: Path) -> None:
-    info = src.stat()
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(src, dest)
+def _copy_keeping(src: Path, dest: Path) -> bool:
+    """Copy a regular file keeping its mode, times and owner; False (nothing copied) for anything else.
+
+    Root copies from a directory a user owns, so the source is opened without following a symlink (a file swapped
+    for one after the walk is refused, never read through) and checked to be a regular file on the open descriptor.
+    """
+    try:
+        fd = os.open(src, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return False
+    with os.fdopen(fd, "rb") as source:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            return False
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        with dest.open("xb") as target:
+            shutil.copyfileobj(source, target)
+    dest.chmod(stat.S_IMODE(info.st_mode))
+    os.utime(dest, ns=(info.st_atime_ns, info.st_mtime_ns))
     try:
         os.chown(dest, info.st_uid, info.st_gid)
     except PermissionError:  # not root: the copy is ours, and the owner is the thing that cannot be kept
         print(f"warning: could not give {dest} its owner (uid {info.st_uid}); run with sudo", file=sys.stderr)
+    return True
 
 
 def cmd_migrate(site, args, modules) -> int:
     copied = skipped = 0
     for name in MIGRATED:
         source = args.source / name
-        if not source.is_dir():
+        if source.is_symlink() or not source.is_dir():
             continue
-        for src in sorted(p for p in source.rglob("*") if p.is_file()):
+        # os.walk does not descend into symlinked directories; _copy_keeping refuses anything but a regular file.
+        for src in sorted(Path(d) / f for d, _dirs, files in os.walk(source) for f in files):
             dest = _under(args.root, site.state_dir) / name / src.relative_to(source)
             if dest.exists():
                 skipped += 1
                 continue
-            _copy_keeping(src, dest)
-            copied += 1
-    print(f"copied {copied} file(s), left {skipped} existing file(s) alone")
+            if _copy_keeping(src, dest):
+                copied += 1
+            else:
+                skipped += 1
+    print(f"copied {copied} file(s), left {skipped} alone (already there, or not a plain file)")
     return 0
 
 
