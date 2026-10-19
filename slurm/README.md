@@ -127,7 +127,7 @@ TOML. Tables: the top level, `[[nodes]]` with `[[nodes.gpus]]`, `[lease]` with `
 | `admin_group` | `gpujobs-admin` | Unix group of administrators. Also the group allowed to submit to the `urgent` partition. |
 | `unified_memory` | `false` | True when the GPU shares system memory with the host (`nvidia-smi` reports total memory as `[N/A]`). `detect` sets it. Read and checked, but no tool acts on it yet. |
 | `hostguard` | `false` | The job wrapper marks every job as the preferred out-of-memory victim (`oom_score_adj` 800, through the host memory guard in `hostguard/hostguard.py`), so a memory shortage ends a job rather than a login session. The `tools` component installs the guard when this is on. |
-| `dgx_gate` | `false` | Require the DGX submission gate for jobs submitted with `--entry`. The `tools` component installs the gate (`dgx/`) and the host memory guard it checks when this is on. |
+| `dgx_gate` | `false` | Require the DGX submission gate for jobs submitted with `--entry` (other jobs are not gated). The `tools` component installs the gate (`dgx/`) and the host memory guard it checks when this is on. |
 | `notify_command` | `[]` | Command (list of arguments, no shell, 30 s limit) the agent runs when a job ends FAILED, OUT_OF_MEMORY, TIMEOUT or NODE_FAIL, with the job in the environment: `GPUJOBS_JOB` (id), `GPUJOBS_STATE`, `GPUJOBS_USER`, `GPUJOBS_NAME`. Empty means no notification. |
 | `nodes` | required | One `[[nodes]]` table per compute node; at least one. |
 | `lease` | absent | Optional table; leave it out when no other service shares the GPU through the lease. Without it the `lease` component is not installed. |
@@ -239,10 +239,11 @@ on, and `dgx/` to `install_dir/dgx/` when `dgx_gate` is on), and installs one sm
 **`agent`** (always on). A system service `gpujobs-agent.service` run as slurm's `SlurmUser` (`slurm`), plus the
 site file copy `/etc/gpujobs/site.toml`, the group `admin_group`, and the state directories (section 8). Every
 5 seconds it does: boot re-registration, restoring the priority of released jobs, releasing held jobs after
-urgent work, failure notices, and a heartbeat (`agent/agent.json`). Enabled and started by `apply`.
+urgent work, failure notices (slurm's accounting is asked at most every 30 s), and a heartbeat (`agent/agent.json`). Enabled and started by `apply`.
 
 **`lease`** (only when `[lease]` is present). `slurm-gpu-lease-keeper.service`, a systemd **user** unit of
-`keeper_user`, written to that user's `~/.config/systemd/user/`. It needs that user's systemd instance running
+`keeper_user`, written to `/etc/systemd/user/` and enabled through that user's manager (nothing is written in the
+user's home). It needs that user's systemd instance running
 (login session or `loginctl enable-linger`). One long-lived process holds the cross-project GPU lease for slurm
 as a whole. The component also makes `state_dir/keeper/`, owned by `keeper_user`, where the keeper rewrites its
 state every 5 s; `submit` and `urgent` refuse while that heartbeat is more than 60 s old.
@@ -259,7 +260,7 @@ read-only access and embedding turned on when the portal is on; the first admin 
 `/usr/local/bin/jobstats`), slurm prolog and epilog scripts under `/etc/slurm/prolog.d/` and `epilog.d/`
 (GPUs only), `/usr/local/sbin/slurmctldepilog.sh`, and lines added to `slurm.conf` for them. Per-job GPU memory
 from our job wrapper is written as node-exporter textfiles in `state_dir/metrics/`. With the portal on, the
-helper app is installed at `/var/www/ood/apps/sys/ood-jobstats-helper`.
+helper app is installed at `/var/www/ood/apps/sys/jobstats`.
 
 The three exporters listen on all interfaces without authentication, because Prometheus scrapes them by node name (on a site with several nodes, over the network). They expose job ids, user names, projects and per-job use, so allow ports 9101, 9306 and 9445 only from the Prometheus host (a firewall rule); with `mode = "local"` on one node, nothing outside the node needs them.
 
@@ -276,7 +277,7 @@ written. In both modes our page is linked at `/var/www/ood/apps/sys/gpujobs`.
 
 - **Owners** pause, resume and kill their own jobs.
 - **Admins** act on anyone's jobs, and **only admins may submit urgent work** (`urgent.py` refuses everyone
-  else and prints how to be added). An admin is a member of `admin_group` (as a listed member or as that
+  else and prints how to be added; with no site file it checks nothing, see section 8). An admin is a member of `admin_group` (as a listed member or as that
   primary group) and has slurm's administrator level Operator; `install.py admin add USER` sets both.
 - The rules are slurm's: the tools run `scontrol` and `scancel` as the user and print slurm's own refusal. The
   `urgent` partition also limits who may submit to it by group.
@@ -284,10 +285,10 @@ written. In both modes our page is linked at `/var/www/ood/apps/sys/gpujobs`.
 **The web page.** Open OnDemand logs the person in and runs our page as that person, so the page shows every
 unfinished GPU job to everybody, and shows the pause, resume and kill buttons only on jobs the viewer owns, or
 on any job for an admin ("Signed in as NAME (admin)"). The buttons call the same tools as the command line, so
-slurm still decides. The page has four views: Jobs (job, user, project, class, name, state, plain-language
+slurm still decides. The page has four views: Jobs (job, user, project, class, name, description, state, plain-language
 waiting reason, elapsed, GPUs, memory), History (filter by date, user, project and state), Use per project
 (GPU-hours per project and period), and a job page (record, link to Jobstats when metrics are on, actions,
-command, dependency chain, efficiency, events, and a log viewer with a text filter and an errors-only filter).
+command and batch script, dependency chain, efficiency, events, and a log viewer with a text filter and an errors-only filter).
 Page-changing requests must carry an `Origin` header that matches `Host`.
 
 ## 7. Daily use
@@ -319,15 +320,16 @@ The commands below are the shims installed in `/usr/local/bin`; from a checkout 
 
 Other options: `submit --mem 24G` (otherwise the last measured run of `--name` plus 10 percent, else the whole
 box for a GPU job), `--after JOBID` to chain, `--gpus N`, `--dry-run` to print the batch script. `gpujobs-footprint NAME`
-prints a job's last measured peak memory. `gpujobs-status` and `gpujobs-audit` take no options and run at once
-(`--help` does not print usage for them). `gpujobs-audit` reports GPU work running outside slurm and the lease.
+prints a job's last measured peak memory. `gpujobs-status` and `gpujobs-audit` take no options and run at once. `gpujobs-audit` reports GPU work running outside slurm and the lease.
 
 ## 8. Operations and caveats
 
 - **`render` and `check` need root once portal secrets exist.** They read the portal's root-only files (client
   secret, bind password, users file, cookie passphrase), and `check` also reads `slurmdbd.conf` (0600, owned by
-  `slurm`). Without root, `check` stops with "run the check with sudo" (exit status 2). Run both with `sudo`
-  for a site with the portal on.
+  `slurm`). Without root, `check` of an installed system stops with "run the check with sudo" (exit status 2).
+  With the portal in `install` mode, both commands also print one warning that the files needing the portal's
+  secrets (`/etc/ood/config/ood_portal.yml`) are left out, so the output is incomplete. Run both with `sudo` for a
+  site with the portal on.
 - **An `ondemand-dex` package upgrade turns logins off.** The package regenerates the login configuration
   without our users, so nobody can sign in until you run
   `sudo python3 slurm/install/install.py --site site.toml apply --component portal`.
@@ -355,13 +357,23 @@ prints a job's last measured peak memory. `gpujobs-status` and `gpujobs-audit` t
   | `metrics/` | 1777 | root | node-exporter textfiles for running jobs |
   | `logs/` | 1777 | root | each job's log, when `submit` is not given `--log` |
   | `scripts/` | 1777 | root | each job's batch script |
-  | `manifests/` | 1777 | root | the DGX gate's code manifest per job (only with `dgx_gate`) |
+  | `manifests/` | 1777 | root | the DGX gate's code manifest per job (the directory is always created; used only with `dgx_gate`) |
   | `requests/` | 1777 | the slurm user | restore-order requests written by admins; the agent ignores files owned by a non-admin |
   | `agent/` | 0755 | the slurm user | the agent's heartbeat and what it has learnt |
   | `keeper/` | 0755 | `keeper_user` | the lease keeper's state and heartbeat (only with `[lease]`) |
 
   The sticky bit (the leading 1) lets everyone write but lets only a file's owner delete it.
 - **Changing the site file** means running `apply` again; the services read the copy in `/etc/gpujobs/`.
+
+- **Without a site file** the tools still run (`site_config.load_optional()` returns nothing) and keep the settings
+  of the single machine they were first written for. This is a fallback, and a wrong `$GPUJOBS_SITE` lands there
+  silently. Then:
+  - State and lease directories come from `$SLURM_GPU_STATE_DIR` and `$GPU_LEASE_DIR` if set, else the per-user
+    `~/.local/state/slurm-gpu` and `~/.local/state/gpu-lease` (`gpu_jobs._site_dirs`).
+  - `urgent` does not check the admin group, and takes the built-in service list (`service-a`, `service-b`) for
+    what yields the card.
+  - `submit` requires the lease keeper's heartbeat, and gates every `--entry` job with the DGX gate.
+  - The job wrapper turns the host memory guard on, and metrics count as off.
 
 ## 9. Uninstall
 

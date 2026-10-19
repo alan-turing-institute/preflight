@@ -20,7 +20,7 @@ admin_group = "gpujobs-admin"
 unified_memory = false
 # Install the host memory guard on GPU jobs. Default: false
 hostguard = false
-# Require the DGX submission gate for DGX jobs. Default: false
+# Require the DGX submission gate for jobs submitted with --entry. Default: false
 dgx_gate = false
 # Command (argv, no shell) run when a job fails, with GPUJOBS_JOB, GPUJOBS_STATE, GPUJOBS_USER and GPUJOBS_NAME in its
 # environment; empty means no notification. Default: []
@@ -59,7 +59,7 @@ retention_days = 365    # how long Prometheus keeps samples. Default: 365
 [portal]
 mode = "off"            # install (Open OnDemand here), existing (reuse one), or off. Default: off
 auth = "dex-local"      # oidc, dex-ldap or dex-local. Default: dex-local
-server_name = ""        # host name the portal answers to. Default: empty
+server_name = ""        # host name the portal answers to; required when mode = "install". Default: empty
 tls_cert = ""           # path to the certificate; empty means none. Default: empty
 tls_key = ""            # path to its key; empty means none. Default: empty
 
