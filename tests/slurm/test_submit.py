@@ -4,12 +4,28 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import gpu_jobs
 import pytest
+import site_config
 import submit
 
 DIRECTIVE = "#S" + "BATCH"  # spelled in two halves so a text-matching guard does not read a submission here
+
+
+@pytest.fixture(autouse=True)
+def no_site_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Default: no site file, so the box behaves as before the cutover."""
+    monkeypatch.setattr(site_config, "SITE_FILE", tmp_path / "absent-site.toml")
+
+
+def fake_site(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, lease: object, dgx_gate: bool) -> None:
+    """A site file that exists; `load` returns just the two fields submit.py reads."""
+    present = tmp_path / "site.toml"
+    present.write_text("")
+    monkeypatch.setattr(site_config, "SITE_FILE", present)
+    monkeypatch.setattr(site_config, "load", lambda: SimpleNamespace(lease=lease, dgx_gate=dgx_gate))
 
 
 def dry(*argv: str) -> str:
@@ -110,3 +126,61 @@ def test_refuses_an_after_on_a_job_slurm_no_longer_knows(monkeypatch: pytest.Mon
     with pytest.raises(submit.Refused, match="no longer knows"):
         submit.submit(["--project", "p", "--what", "w", "--class", "restart", "--mem", "1G", "--after", "9", "--",
                        "x"])
+
+
+def test_gpus_asks_for_that_many_and_is_exclusive_with_gpu() -> None:
+    script = dry("--project", "p", "--what", "w", "--class", "restart", "--gpus", "2", "--mem", "1G", "--", "x")
+    assert f"{DIRECTIVE} --gres=gpu:2" in script
+    assert "--needs-card" in script
+    with pytest.raises(SystemExit):
+        dry("--project", "p", "--what", "w", "--class", "restart", "--gpu", "--gpus", "2", "--", "x")
+    with pytest.raises(submit.Refused, match="at least one GPU"):
+        dry("--project", "p", "--what", "w", "--class", "restart", "--gpus", "0", "--", "x")
+
+
+def test_comment_is_the_what_on_one_line_cut_to_200(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    script = dry("--project", "p", "--what", "line one\nline two " + "x" * 300, "--class", "restart", "--mem", "1G",
+                 "--", "x")
+    comment = next(line for line in script.splitlines() if line.startswith(f"{DIRECTIVE} --comment="))
+    assert "\n" not in comment
+    assert submit.comment("line one\nline two") == "line one line two"
+    assert len(submit.comment("y" * 300)) == submit.COMMENT_MAX
+
+
+def submit_for_real(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *extra: str) -> dict[str, object]:
+    """Run a full submission against fakes; return the sidecar record and whether the gate and keeper ran."""
+    monkeypatch.setattr(gpu_jobs, "STATE_DIR", tmp_path)
+    seen = {"keeper": False, "gate": False}
+    monkeypatch.setattr(submit, "keeper_running", lambda: seen.update(keeper=True) or True)
+    monkeypatch.setattr(submit, "run_gate", lambda *_a: seen.update(gate=True))
+    monkeypatch.setattr(submit.audit, "unregistered", list)
+    monkeypatch.setattr(submit.audit, "report", lambda _u: [])
+    monkeypatch.setattr(
+        submit.subprocess, "run",
+        lambda *_a, **_k: SimpleNamespace(returncode=0, stdout="77\n", stderr=""),
+    )
+    submit.submit(["--project", "p", "--what", "w", "--class", "restart", "--mem", "1G", "--gpus", "2",
+                   "--entry", "a.py", "--repo", str(tmp_path), *extra, "--", "x"])
+    return {**gpu_jobs.read_sidecar("77"), **seen}
+
+
+def test_no_site_file_checks_keeper_and_gate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    record = submit_for_real(monkeypatch, tmp_path)
+    assert record["keeper"] is True
+    assert record["gate"] is True
+    assert (record["gpu"], record["gpus"]) == (True, 2)
+
+
+def test_a_site_without_lease_or_gate_skips_both(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_site(monkeypatch, tmp_path, lease=None, dgx_gate=False)
+    record = submit_for_real(monkeypatch, tmp_path)
+    assert record["keeper"] is False
+    assert record["gate"] is False
+    assert record["manifest"] is None
+
+
+def test_a_site_with_lease_and_gate_checks_both(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_site(monkeypatch, tmp_path, lease=object(), dgx_gate=True)
+    record = submit_for_real(monkeypatch, tmp_path)
+    assert record["keeper"] is True
+    assert record["gate"] is True
