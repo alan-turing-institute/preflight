@@ -14,7 +14,10 @@ SITE_COPY = "/etc/gpujobs/site.toml"
 UNIT = "gpujobs-agent.service"
 # plan 3.3: each file owned by its writer; logs, scripts and manifests are where submit.py and urgent.py write a job's
 # log, batch script and gate manifest when the caller gives no --log
-STICKY = ("jobs", "events", "footprints", "metrics", "requests", "logs", "scripts", "manifests")
+STICKY = ("jobs", "events", "footprints", "requests", "logs", "scripts", "manifests")
+# the agent writes these two itself: agent/ is its heartbeat, metrics/ the per-job node-exporter textfiles (a file any user
+# could write there could forge a series); readers (the exporter) need only read access
+AGENT_ONLY = ("agent", "metrics")
 
 
 def enabled(site) -> bool:
@@ -49,7 +52,7 @@ def post_install(site) -> list[list[str]]:
     # delete it, and the agent must delete the restore-order requests it has carried out.
     dirs += [["install", "-d", "-m", "1777", *(["-o", user, "-g", user] if name == "requests" else []), str(state / name)]
              for name in STICKY]
-    dirs.append(["install", "-d", "-m", "0755", "-o", user, "-g", user, str(state / "agent")])
+    dirs += [["install", "-d", "-m", "0755", "-o", user, "-g", user, str(state / name)] for name in AGENT_ONLY]
     return [
         ["groupadd", "-f", site.admin_group],
         *dirs,

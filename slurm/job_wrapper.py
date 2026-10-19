@@ -18,8 +18,9 @@ sbatch script whose only line runs this wrapper. In order:
    `KillWait` ends.
 4. MEASURE every `--sample` s: GPU memory, over all the job's GPUs, of the processes in this job's cgroup
    and of docker containers labelled `slurm-job=<id>` (`nvidia-smi`), and the cgroup's `memory.current`/`memory.peak` (the CPU side; GPU memory is not charged to the cgroup on the
-   GB10, trial B2), appended to `footprints/<job id>.jsonl`. When the site's metrics mode is not "off" the
-   same numbers go to `metrics/job_<id>.prom` (a node-exporter textfile), removed when the job ends.
+   GB10, trial B2), appended to `footprints/<job id>.jsonl`. The per-job node-exporter textfile
+   (`metrics/job_<id>.prom`) is not written here: the wrapper runs as the job's user, and only the agent may write
+   that directory, so the agent measures the same numbers itself.
 5. RECORD the leg's outcome in the job's sidecar (exit status, signal, restart count, peaks).
 """
 
@@ -43,13 +44,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "hostguard"))
 
 import gpu_jobs  # noqa: E402 - path set just above
 import site_config
+from gpu_jobs import (  # audit.py imports gpu_mib_by_pid from here
+    CGROUP_ROOT,
+    cgroup_pids,
+    gpu_mib_by_pid,
+    job_pids,
+    read_int,
+)
 
 PREFLIGHT = Path(__file__).resolve().parents[1]
 PARITY = PREFLIGHT / "dgx" / "assert_code_parity.py"
-CGROUP_ROOT = Path("/sys/fs/cgroup")
-#: The docker label `submit.py`-launched containers carry so their GPU memory counts toward the job.
-JOB_LABEL = "slurm-job"
-MIB = 1024 * 1024
 
 
 class Exit(IntEnum):
@@ -138,56 +142,6 @@ def job_cgroup(job_id: str, proc_cgroup: Path = Path("/proc/self/cgroup")) -> Pa
     return CGROUP_ROOT.joinpath(*parts[: parts.index(marker) + 1])
 
 
-def cgroup_pids(cgroup: Path) -> set[int]:
-    pids: set[int] = set()
-    for procs in cgroup.rglob("cgroup.procs"):
-        try:
-            pids |= {int(pid) for pid in procs.read_text(encoding="utf-8").split()}
-        except (OSError, ValueError):
-            continue
-    return pids
-
-
-def gpu_mib_by_pid() -> dict[int, float]:
-    """GPU memory (MiB) per pid, summed over every GPU the pid uses."""
-    try:
-        done = subprocess.run(
-            ["nvidia-smi", "--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return {}
-    usage: dict[int, float] = {}
-    for line in done.stdout.splitlines():
-        pid, _, mib = line.partition(",")
-        try:
-            usage[int(pid)] = usage.get(int(pid), 0.0) + float(mib)
-        except ValueError:
-            continue
-    return usage
-
-
-def read_int(path: Path) -> int | None:
-    try:
-        return int(path.read_text(encoding="utf-8").strip())
-    except (OSError, ValueError):
-        return None
-
-
-def job_pids(cgroup: Path | None, fallback_pids: set[int], job_id: str, gpu_pids: set[int]) -> set[int]:
-    """The cgroup's pids plus those of `gpu_pids` running in a docker container labelled `slurm-job=<id>`."""
-    import audit  # lazy: audit imports this module
-
-    pids = cgroup_pids(cgroup) if cgroup else set(fallback_pids)
-    for pid in gpu_pids - pids:
-        if gpu_jobs.container_label(audit.cgroup_of(pid), JOB_LABEL) == job_id:
-            pids.add(pid)
-    return pids
-
-
 def sample(cgroup: Path | None, fallback_pids: set[int], job_id: str = "") -> dict[str, object]:
     usage = gpu_mib_by_pid()
     pids = job_pids(cgroup, fallback_pids, job_id, set(usage))
@@ -199,37 +153,6 @@ def sample(cgroup: Path | None, fallback_pids: set[int], job_id: str = "") -> di
         "mem_current": read_int(cgroup / "memory.current") if cgroup else None,
         "mem_peak": read_int(cgroup / "memory.peak") if cgroup else None,
     }
-
-
-def metrics_file(job_id: str) -> Path:
-    return gpu_jobs.STATE_DIR / "metrics" / f"job_{job_id}.prom"
-
-
-def _label(value: str) -> str:
-    return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
-
-
-def metrics_text(job_id: str, row: dict[str, object]) -> str:
-    """The job's two gauges in Prometheus text format; project is the first `:` field of the job name."""
-    name = os.environ.get("SLURM_JOB_NAME", "")
-    project = name.split(":", 1)[0] if ":" in name else "(other)"
-    labels = f'jobid="{_label(job_id)}",user="{_label(gpu_jobs.current_user())}",project="{_label(project)}"'
-    gpu_bytes = int(float(row["gpu_mib"]) * MIB)  # type: ignore[arg-type]
-    return (
-        "# TYPE gpujobs_job_gpu_memory_bytes gauge\n"
-        f"gpujobs_job_gpu_memory_bytes{{{labels}}} {gpu_bytes}\n"
-        "# TYPE gpujobs_job_cpu_memory_bytes gauge\n"
-        f"gpujobs_job_cpu_memory_bytes{{{labels}}} {int(row['mem_current'] or 0)}\n"  # type: ignore[call-overload]
-    )
-
-
-def write_metrics(job_id: str, row: dict[str, object]) -> None:
-    """Write-then-rename, so the exporter never reads half a file."""
-    target = metrics_file(job_id)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    temp = target.with_suffix(".prom.tmp")
-    temp.write_text(metrics_text(job_id, row), encoding="utf-8")
-    os.replace(temp, target)
 
 
 _WARNED: set[str] = set()
@@ -259,7 +182,7 @@ def append_row(out: IO[str], row: dict[str, object]) -> None:
 
 
 def run_and_measure(
-    command: list[str], footprint: Path, cgroup: Path | None, sample_s: float, job_id: str = "", metrics: bool = False
+    command: list[str], footprint: Path, cgroup: Path | None, sample_s: float, job_id: str = ""
 ) -> dict[str, object]:
     received: list[int] = []
 
@@ -287,23 +210,18 @@ def run_and_measure(
             os.killpg(child.pid, missed[0])
     peak_gpu, peak_mem = 0.0, 0
     out = best_effort("footprint", open_footprint, footprint)
-    try:
-        with out or contextlib.nullcontext():
-            while True:
-                try:
-                    status = child.wait(timeout=sample_s)
-                    break
-                except subprocess.TimeoutExpired:
-                    pass
-                row = sample(cgroup, {child.pid}, job_id)
-                if out:
-                    best_effort("footprint", append_row, out, row)
-                if metrics:
-                    best_effort("metrics", write_metrics, job_id, row)
-                peak_gpu = max(peak_gpu, float(row["gpu_mib"]))
-                peak_mem = max(peak_mem, int(row["mem_peak"] or row["mem_current"] or 0))
-    finally:
-        gpu_jobs.remove_quietly(metrics_file(job_id))
+    with out or contextlib.nullcontext():
+        while True:
+            try:
+                status = child.wait(timeout=sample_s)
+                break
+            except subprocess.TimeoutExpired:
+                pass
+            row = sample(cgroup, {child.pid}, job_id)
+            if out:
+                best_effort("footprint", append_row, out, row)
+            peak_gpu = max(peak_gpu, float(row["gpu_mib"]))
+            peak_mem = max(peak_mem, int(row["mem_peak"] or row["mem_current"] or 0))
     final = read_int(cgroup / "memory.peak") if cgroup else None
     return {
         "exit": status,
@@ -370,7 +288,6 @@ def main() -> int:
 
     footprint = gpu_jobs.STATE_DIR / "footprints" / f"{job_id}.jsonl"
     started = int(time.time())
-    metrics_on = site is not None and site.metrics.mode != site_config.MetricsMode.OFF
     if site is None or site.hostguard:
         # The job is what a memory shortage should end, not a session: 2026-10-18 13:57 earlyoom ended three
         # Claude sessions while a training job holding 68.5 GB of the unified pool sat at oom_score_adj 0 (GPU
@@ -381,7 +298,7 @@ def main() -> int:
         from hostguard import mark_preferred_victim  # noqa: PLC0415
 
         mark_preferred_victim()
-    outcome = run_and_measure(command, footprint, cgroup, arguments.sample, job_id, metrics_on)
+    outcome = run_and_measure(command, footprint, cgroup, arguments.sample, job_id)
     outcome.update(leg=restart, started_at=started, ended_at=int(time.time()))
     record = gpu_jobs.read_sidecar(job_id, gpu_jobs.current_user()) or {}
     earlier = record.get("legs")

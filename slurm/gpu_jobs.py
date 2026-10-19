@@ -529,6 +529,68 @@ def container_label(cgroup: str, label: str, runner: Callable[[str, str], str] =
         return ""
 
 
+CGROUP_ROOT = Path("/sys/fs/cgroup")
+#: The docker label `submit.py`-launched containers carry so their GPU memory counts toward the job.
+JOB_LABEL = "slurm-job"
+
+
+def cgroup_pids(cgroup: Path) -> set[int]:
+    pids: set[int] = set()
+    for procs in cgroup.rglob("cgroup.procs"):
+        try:
+            pids |= {int(pid) for pid in procs.read_text(encoding="utf-8").split()}
+        except (OSError, ValueError):
+            continue
+    return pids
+
+
+def read_int(path: Path) -> int | None:
+    try:
+        return int(path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+
+
+def gpu_usage() -> dict[int, float] | None:
+    """GPU memory (MiB) per pid, summed over every GPU the pid uses; None when `nvidia-smi` does not answer."""
+    try:
+        done = subprocess.run(
+            ["nvidia-smi", "--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if done.returncode != 0:
+        return None
+    usage: dict[int, float] = {}
+    for line in done.stdout.splitlines():
+        pid, _, mib = line.partition(",")
+        try:
+            usage[int(pid)] = usage.get(int(pid), 0.0) + float(mib)
+        except ValueError:
+            continue
+    return usage
+
+
+def gpu_mib_by_pid() -> dict[int, float]:
+    """`gpu_usage`, with {} for an unanswered `nvidia-smi`."""
+    return gpu_usage() or {}
+
+
+def job_pids(cgroup: Path | None, fallback_pids: set[int], job_id: str, gpu_pids: set[int]) -> set[int]:
+    """The cgroup's pids plus those of `gpu_pids` running in a docker container labelled `slurm-job=<id>`."""
+    import audit  # lazy: audit imports job_wrapper, which imports this module
+
+    pids = cgroup_pids(cgroup) if cgroup else set(fallback_pids)
+    for pid in gpu_pids - pids:
+        if container_label(audit.cgroup_of(pid), JOB_LABEL) == job_id:
+            pids.add(pid)
+    return pids
+
+
 def nodes(runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run) -> list[str]:
     """Node names slurm knows (`scontrol show nodes -o`); [] when slurm does not answer."""
     try:

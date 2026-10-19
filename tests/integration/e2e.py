@@ -346,9 +346,9 @@ def stage_jobs() -> None:
           f"jobs {j1},{j2},{j3}; job {j2} reason {reason}")
     waits = status_text("bob")
     check("S1: bob's status shows the waiting reason in plain words", f"waits for job {j1}" in waits, waits.split(f" {j2} ")[-1][:200])
-    prom = wait_for(lambda: sh(f"cat {STATE}/metrics/job_{j1}.prom 2>/dev/null").out, 30, 2)
+    prom = wait_for(lambda: sh(f"cat {STATE}/metrics/job_{j1}.prom 2>/dev/null").out, 30, 2)  # the agent looks every 5 s
     scraped = sh("curl -s localhost:9101/metrics | grep -c gpujobs_job_cpu_memory_bytes").out.strip()
-    check("S1: the wrapper writes the running job's metrics file, and the node exporter serves it",
+    check("S1: the agent writes the running job's metrics file, and the node exporter serves it",
           bool(prom) and "gpujobs_job_cpu_memory_bytes" in str(prom) and scraped not in ("", "0"), f"{str(prom)[:160]} scraped={scraped}")
     done = wait_for(lambda: all(state(j) == "COMPLETED" for j in (j1, j2, j3)), 120, 3)
     rows = sh(f"sacct -n -X -P -j {j1},{j2},{j3} -o JobID,State,Start,End").out.strip().splitlines()
@@ -359,8 +359,9 @@ def stage_jobs() -> None:
     log = sh(f"cat {STATE}/logs/chain1-*.log").out
     check("S1: the installed wrapper ran the job with hostguard (record has a leg with exit 0, log shows no import error)",
           record.get("legs", [{}])[0].get("exit") == 0 and "Error" not in log, f"leg={record.get('last_leg')} log={log[:120]!r}")
+    ended = wait_for(lambda: f"job_{j1}.prom" not in sh(f"ls {STATE}/metrics/").out, 15, 2)  # the agent looks every 5 s
     gone = sh(f"ls {STATE}/metrics/").out.strip()
-    check("S1: the metrics file is removed when the job ends", f"job_{j1}.prom" not in gone, gone or "(empty)")
+    check("S1: the agent removes the metrics file once the job has ended", bool(ended), gone or "(empty)")
 
     # S2: bob, one 2-GPU job
     b = submit("bob", "two-gpu", 60, "--gpus", "2")

@@ -20,7 +20,13 @@ Plan 3.5 (`plan notes`). One system service, run as SlurmUser
 4. FAILURE NOTICES for jobs that ended FAILED, OUT_OF_MEMORY, TIMEOUT or NODE_FAIL: a `FAILED` event, and the
    site's `notify_command` if any (argv, no shell, 30 s). Slurm's accounting is asked at most every 30 s
    (`NOTICES_EVERY_S`).
-5. HEARTBEAT `agent/agent.json`. When `squeue` does not answer, the queue-dependent parts are skipped and the
+5. JOB METRICS, when the site's metrics mode is not "off": for each RUNNING job with a cgroup on this node, the
+   `metrics/job_<id>.prom` node-exporter textfile (GPU and CPU memory, `user` and `project` from the queue), and
+   no such file for a job that is not running. The agent measures and writes them itself because `metrics/` is
+   writable by SlurmUser alone: a file in a world-writable directory could name any job or user, and a killed
+   job wrapper would leave its file for ever. When `nvidia-smi` does not answer the files stay as they are
+   (unknown is not zero) and the error is recorded.
+6. HEARTBEAT `agent/agent.json`. When `squeue` does not answer, the queue-dependent parts are skipped and the
    state is kept: the agent never acts on a queue it cannot see.
 
 The requests directory is sticky and world-writable, and the installer makes SlurmUser its owner, which lets the agent
@@ -50,6 +56,7 @@ BOOT_ID_FILE = Path("/proc/sys/kernel/random/boot_id")
 #: slurmctld must have been up this long before the nodes are re-registered (it needs time to read its state).
 CTLD_SETTLE_S = 30.0
 NOTIFY_TIMEOUT_S = 30
+MIB = 1024 * 1024
 #: How many ended jobs and recorded restorations are remembered.
 ENDED_KEPT = 5000
 RESTORED_KEPT = 20
@@ -158,6 +165,22 @@ NOTICES_EVERY_S = 30.0
 NOTICES_PER_LOOK = 3
 
 
+def _label(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
+def metrics_text(job: gpu_jobs.QueuedJob, gpu_mib: float, mem_bytes: int) -> str:
+    """The job's two gauges in Prometheus text format; project is the first `:` field of the job name."""
+    project = job.name.split(":", 1)[0] if ":" in job.name else "(other)"
+    labels = f'jobid="{_label(job.job_id)}",user="{_label(job.user)}",project="{_label(project)}"'
+    return (
+        "# TYPE gpujobs_job_gpu_memory_bytes gauge\n"
+        f"gpujobs_job_gpu_memory_bytes{{{labels}}} {int(gpu_mib * MIB)}\n"
+        "# TYPE gpujobs_job_cpu_memory_bytes gauge\n"
+        f"gpujobs_job_cpu_memory_bytes{{{labels}}} {mem_bytes}\n"
+    )
+
+
 def _strings(value: object) -> list[str]:
     return [str(item) for item in value] if isinstance(value, list) else []
 
@@ -179,9 +202,13 @@ class Agent:
             [], dict[str, dict[str, str]] | None
         ] = gpu_jobs.completion_records,
         notify: Callable[[list[str], dict[str, str]], None] = notify_run,
+        gpu_usage: Callable[[], dict[int, float] | None] = gpu_jobs.gpu_usage,
+        cgroup_root: Path = gpu_jobs.CGROUP_ROOT,
     ) -> None:
         self.site = site
+        self.gpu_usage, self.cgroup_root = gpu_usage, cgroup_root
         self.dir = state_dir / "agent"
+        self.metrics = state_dir / "metrics"
         self.requests = state_dir / "requests"
         self.read_queue, self.scontrol, self.ctld_active_s = (
             read_queue,
@@ -236,6 +263,8 @@ class Agent:
         if now - self._notices_at >= NOTICES_EVERY_S:
             self._notices_at = now
             self._failure_notices(errors)
+        if queue is not None and self.site.metrics.mode != site_config.MetricsMode.OFF:
+            self._job_metrics(queue, errors)
         if errors:
             self.last_error, self.last_error_at = "; ".join(errors), int(now)
         return self._persist(now)
@@ -474,6 +503,38 @@ class Agent:
             self.notify(list(self.site.notify_command), env)
         except (OSError, subprocess.SubprocessError) as exc:
             errors.append(f"notify command for job {job_id} failed: {exc}")
+
+    # -- 5. job metrics -------------------------------------------------------------------------------------
+
+    def _job_cgroup(self, job_id: str) -> Path | None:
+        """The job's cgroup under slurm's scope (`system.slice/<node>_slurmstepd.scope`); None on another node."""
+        return next(iter(self.cgroup_root.glob(f"system.slice/*_slurmstepd.scope/job_{job_id}")), None)
+
+    def _job_metrics(self, queue: list[gpu_jobs.QueuedJob], errors: list[str]) -> None:
+        usage = self.gpu_usage()
+        if usage is None:
+            errors.append("nvidia-smi did not answer; the job metrics files stay as they are")
+            return
+        texts: dict[str, str] = {}
+        for job in queue:
+            cgroup = self._job_cgroup(job.job_id) if job.state == gpu_jobs.State.RUNNING else None
+            if cgroup is None:
+                continue
+            pids = gpu_jobs.job_pids(cgroup, set(), job.job_id, set(usage))
+            mem = gpu_jobs.read_int(cgroup / "memory.current") or 0
+            gpu_mib = sum(mib for pid, mib in usage.items() if pid in pids)
+            texts[f"job_{job.job_id}.prom"] = metrics_text(job, gpu_mib, mem)
+        try:
+            self.metrics.mkdir(exist_ok=True)
+            for name, text in texts.items():
+                temp = self.metrics / f"{name}.tmp"
+                temp.write_text(text, encoding="utf-8")  # write, then rename: the exporter never reads half a file
+                temp.replace(self.metrics / name)
+            for path in self.metrics.glob("job_*.prom*"):
+                if path.name not in texts:
+                    gpu_jobs.remove_quietly(path)
+        except OSError as exc:
+            errors.append(f"job metrics: {exc}")
 
 
 def main() -> int:

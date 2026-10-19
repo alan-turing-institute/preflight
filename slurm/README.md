@@ -260,7 +260,7 @@ read-only access and embedding turned on when the portal is on; the first admin 
 `/etc/grafana/gpujobs.env`, mode 0600). Files include `/usr/local/jobstats/` (the `jobstats` command, linked at
 `/usr/local/bin/jobstats`), slurm prolog and epilog scripts under `/etc/slurm/prolog.d/` and `epilog.d/`
 (GPUs only), `/usr/local/sbin/slurmctldepilog.sh`, and lines added to `slurm.conf` for them. Per-job GPU memory
-from our job wrapper is written as node-exporter textfiles in `state_dir/metrics/`. With the portal on, the
+is measured by the agent and written as node-exporter textfiles in `state_dir/metrics/`. With the portal on, the
 helper app is installed at `/var/www/ood/apps/sys/jobstats`.
 
 The three exporters listen on all interfaces without authentication, because Prometheus scrapes them by node name (on a site with several nodes, over the network). They expose job ids, user names, projects and per-job use, and Grafana shows them without a login when the portal is on. Set `metrics.allow_from` to the networks that should reach them (on several nodes, include the Prometheus host); with it empty, any network that reaches the machine does.
@@ -367,7 +367,7 @@ prints a job's last measured peak memory. `gpujobs-status` and `gpujobs-audit` t
   | `jobs/` | 1777 | root | one sidecar record per job |
   | `events/` | 1777 | root | pause, resume, kill and failure events, one file each (0644) |
   | `footprints/` | 1777 | root | measured memory use per run |
-  | `metrics/` | 1777 | root | node-exporter textfiles for running jobs |
+  | `metrics/` | 0755 | the slurm user | node-exporter textfiles for running jobs, written by the agent alone |
   | `logs/` | 1777 | root | each job's log, when `submit` is not given `--log` |
   | `scripts/` | 1777 | root | each job's batch script |
   | `manifests/` | 1777 | root | the DGX gate's code manifest per job (the directory is always created; used only with `dgx_gate`) |
@@ -386,7 +386,7 @@ prints a job's last measured peak memory. `gpujobs-status` and `gpujobs-audit` t
   - `urgent` does not check the admin group, and takes the built-in service list (`service-a`, `service-b`) for
     what yields the card.
   - `submit` requires the lease keeper's heartbeat, and gates every `--entry` job with the DGX gate.
-  - The job wrapper turns the host memory guard on, and metrics count as off.
+  - The job wrapper turns the host memory guard on.
 
 ## 9. Uninstall
 

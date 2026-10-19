@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import subprocess
 import sys
@@ -42,6 +43,9 @@ class World:
         self.fail: set[str] = set()  # scontrol subcommands that answer with an error
         self.records: dict[str, dict[str, str]] = {}
         self.notify_command: tuple[str, ...] = ()
+        self.metrics_mode = "off"
+        self.smi: dict[int, float] | None = {}  # nvidia-smi's GPU MiB per pid; None when it does not answer
+        self.cgroups = tmp_path / "cgroup"
         (tmp_path / "agent").mkdir()
         (tmp_path / "agent" / "boot_id").write_text(
             "boot-1\n"
@@ -66,7 +70,7 @@ class World:
 
     def new_agent(self) -> agent_module.Agent:
         site = site_config.parse(
-            {"name": "t", "nodes": [], "notify_command": list(self.notify_command)}
+            {"name": "t", "nodes": [], "notify_command": list(self.notify_command), "metrics": {"mode": self.metrics_mode}}
         )
         return agent_module.Agent(
             site,
@@ -77,6 +81,8 @@ class World:
             clock=lambda: self.t,
             boot_id=lambda: self.boot,
             completion=lambda: self.records,
+            gpu_usage=lambda: self.smi,
+            cgroup_root=self.cgroups,
         )
 
     def step(self) -> dict[str, object]:
@@ -103,6 +109,33 @@ def test_a_fresh_install_notices_its_first_failure_and_an_unanswered_sacct_is_no
     world.t += agent_module.NOTICES_EVERY_S
     world.step()
     assert [(e.job, e.action) for e in gpu_jobs.events()] == [("5", "failed")]
+
+
+def test_the_agent_writes_the_metrics_of_running_jobs_with_the_queues_user_and_removes_the_rest(world: World) -> None:
+    scope = world.cgroups / "system.slice" / "n1_slurmstepd.scope"
+    (scope / "job_5" / "step_0").mkdir(parents=True)
+    (scope / "job_5" / "step_0" / "cgroup.procs").write_text("10\n")
+    (scope / "job_5" / "memory.current").write_text("4096\n")
+    (scope / "job_7").mkdir()  # job 7 is being torn down: its cgroup lingers, its series should not
+    world.metrics_mode, world.smi = "local", {10: 300.0, 20: 50.0}
+    world.agent = world.new_agent()
+    metrics = world.dir / "metrics"
+    metrics.mkdir()
+    for planted in ("job_5.prom", "job_9.prom", "job_8.prom.tmp"):  # another user's forgery, a dead job's file, a stale temp
+        (metrics / planted).write_text("forged\n")
+    running = dataclasses.replace(job("5"), user="ann", name="proj:train")
+    world.queue = [running, job("7", "COMPLETING"), dataclasses.replace(job("6"), user="bob")]
+    world.step()
+    assert sorted(path.name for path in metrics.iterdir()) == ["job_5.prom"]  # job 6 runs, but on another node (no cgroup here), 7 is ending, the rest is gone
+    text = (metrics / "job_5.prom").read_text()
+    assert 'jobid="5",user="ann",project="proj"' in text  # the queue's user, never the writer's
+    assert f"}} {300 * agent_module.MIB}\n" in text and "} 4096\n" in text  # pid 20 is nobody's here
+    world.queue, world.smi = [], None  # job 5 ended, but nvidia-smi is silent: unknown is not zero
+    assert "nvidia-smi did not answer" in str(world.step())
+    assert (metrics / "job_5.prom").exists()
+    world.smi = {}
+    world.step()
+    assert not list(metrics.iterdir())
 
 
 def test_slurmctld_uptime_probe_reads_the_monotonic_timestamp() -> None:
