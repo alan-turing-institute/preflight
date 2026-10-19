@@ -34,7 +34,7 @@ def lines(queue: list[gpu_jobs.QueuedJob] | None) -> list[str]:
         return out
     if not queue:
         out.append("[status] no jobs in slurm")
-    records = all_sidecars()
+    records = all_sidecars({job.job_id: job.user for job in queue})
     by_id = {job.job_id: job for job in queue}
     events = gpu_jobs.events()
     for job in queue:

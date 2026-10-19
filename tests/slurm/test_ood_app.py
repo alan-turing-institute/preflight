@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import io
 import json
+import os
+import signal
 import sys
 from datetime import date
 from pathlib import Path
@@ -29,10 +31,11 @@ class Fake:
 
     def __init__(self, viewer: str = "alice", admin: bool = False, name: str = "proj:normal:train") -> None:
         self.ran: list[list[str]] = []
+        self.asked: list[tuple[str, str | None]] = []  # (job id, the slurm user the record must belong to)
         record = {"what": "a run", "job_class": "normal", "mem": "4G", "project": "proj", "command": ["python", "x.py"], "log": "/logs/x.log"}
         self.backend = app.Backend(
             queue=lambda: [queued("7", "alice", name), queued("8", "bob", partition="steady")],
-            record=lambda _j: record,
+            record=lambda job_id, user=None: self.asked.append((job_id, user)) or record,
             events=lambda _j: [gpu_jobs.Event("7", "pause", "alice", 1_700_000_000_000_000_000)],
             elapsed=lambda: {"7": "1:00"},
             efficiency=lambda job_id, record=None: jobs_view.Efficiency(job_id, 4 * 1024**3, None, None, 0.5),
@@ -76,8 +79,11 @@ def call(fake: Fake, path: str, method: str = "GET", body: object | None = None,
     ],
 )
 def test_every_get_route_answers(path: str) -> None:
-    status, body = call(Fake(), path)
+    fake = Fake()
+    status, body = call(fake, path)
     assert status == "200 OK", body
+    # a queued job's record is asked for as the user slurm says owns the job, so a record another user wrote is ignored
+    assert all(user == {"7": "alice", "8": "bob"}[job_id] for job_id, user in fake.asked)
 
 
 def test_unknown_things_are_not_found_or_bad() -> None:
@@ -119,6 +125,26 @@ def test_accepted_posts_run_exactly_the_expected_argv() -> None:
         ["py", "/slurm/kill.py", "7"],
         ["py", "/slurm/pause.py", "7", "--dry-run"],
     ]
+
+
+def test_a_fifo_script_and_a_bad_content_length_never_hang_or_run(tmp_path: Path) -> None:
+    fifo = tmp_path / "job.sbatch"
+    os.mkfifo(fifo)
+    fake = Fake()
+    fake.backend.record = lambda _j, user=None: {"script": str(fifo), "command": ["x"]}
+    signal.signal(signal.SIGALRM, lambda *_: pytest.fail("the job page blocked on the script"))
+    signal.alarm(5)
+    try:
+        status, page = call(fake, "/job/7")
+    finally:
+        signal.alarm(0)
+    assert status == "200 OK" and app.NOT_SHOWN in page
+    for length, refused in (("-1", "400"), ("x", "400"), (str(app.MAX_BODY + 1), "413")):
+        status, _ = call(fake, "/api/job/7/pause", "POST", {}, {"CONTENT_LENGTH": length})
+        assert status.startswith(refused)
+    assert fake.ran == []
+    assert call(Fake(), "/api/job/7/log?errors=0")[1].endswith("None False\"}")  # only errors=1 turns the filter on
+    assert call(Fake(), "/api/job/7/log?errors=1")[1].endswith("None True\"}")
 
 
 def test_values_are_html_escaped() -> None:

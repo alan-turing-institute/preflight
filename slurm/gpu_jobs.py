@@ -16,6 +16,7 @@ import json
 import os
 import pwd
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -206,17 +207,49 @@ def write_json(path: Path, payload: dict[str, object]) -> None:
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
-    os.fchmod(fd, 0o644)  # mkstemp creates 0600
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=1, sort_keys=True)
-    Path(temp).replace(path)
-
-
-def read_json(path: Path) -> dict[str, object] | None:
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        os.fchmod(fd, 0o644)  # mkstemp creates 0600
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=1, sort_keys=True)
+        Path(temp).replace(path)
+    except OSError as error:
+        remove_quietly(Path(temp))
+        if not os.path.lexists(path):
+            raise
+        # In a sticky directory a rename over another user's file is refused: say whose file is in the way.
+        msg = f"{path} exists and belongs to {_owner(path)}; it cannot be replaced ({error.strerror})"
+        raise OSError(error.errno, msg) from error
+
+
+#: A record is a few kilobytes; a bigger file is not one.
+MAX_RECORD_BYTES = 1 << 20
+
+
+def read_json(path: Path, user: str | None = None) -> dict[str, object] | None:
+    """The JSON object in `path`, or None for anything else, whatever the file is.
+
+    The state directories are sticky and writable by everyone, so any user can leave a FIFO, a symlink, a huge or
+    hostile file under a name another user's job will use. It is opened without blocking or following a link, and
+    only a regular file of at most `MAX_RECORD_BYTES` is read. With `user`, a file that user does not own is
+    ignored too: the owner is the identity, never the content (plan 3.3).
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    except OSError:
         return None
+    try:
+        status = os.fstat(fd)
+        if not stat.S_ISREG(status.st_mode):
+            return None
+        if user and _user_name(status.st_uid) != user:
+            return None
+        with os.fdopen(fd, "rb", closefd=False) as handle:
+            raw = handle.read(MAX_RECORD_BYTES + 1)  # never more, whatever the file's size or growth
+        data = json.loads(raw.decode("utf-8")) if len(raw) <= MAX_RECORD_BYTES else None
+    except (OSError, ValueError, RecursionError):  # ValueError: bad JSON or bad UTF-8
+        return None
+    finally:
+        os.close(fd)
     return data if isinstance(data, dict) else None
 
 
@@ -230,23 +263,35 @@ def sidecar_path(job_id: str) -> Path:
     return STATE_DIR / "jobs" / f"{job_id}.json"
 
 
-def read_sidecar(job_id: str) -> dict[str, object] | None:
-    return read_json(sidecar_path(job_id))
+def read_sidecar(job_id: str, user: str | None = None) -> dict[str, object] | None:
+    """The job's record. Pass the job's slurm `user` whenever it is known: a record some other user wrote (anyone can
+    create `jobs/<id>.json` for an id not yet issued) is then ignored."""
+    return read_json(sidecar_path(job_id), user)
 
 
 def update_sidecar(job_id: str, **fields: object) -> None:
-    """Merge fields into a job's sidecar (read, update, atomic write)."""
-    record = read_sidecar(job_id) or {"job_id": job_id}
+    """Merge fields into a job's sidecar (read, update, atomic write). Only this user's own record is merged into."""
+    record = read_sidecar(job_id, current_user()) or {"job_id": job_id}
     record.update(fields)
     write_json(sidecar_path(job_id), record)
 
 
+def record_queued_job(job_id: str, tool: str, **fields: object) -> None:
+    """`update_sidecar` for a job `sbatch` has just queued: the job is real whatever happens here, so a record that
+    cannot be written (another user's file in the way, a full disk) is a warning that names the job, not a crash."""
+    try:
+        update_sidecar(job_id, **fields)
+    except OSError as error:
+        print(f"[{tool}] WARNING: job {job_id} is queued but its record was not written ({error}); "
+              "it runs, without a record", file=sys.stderr)
+
+
 def needs_the_card(job: QueuedJob) -> bool:
-    """A job the background services must step aside for: a GPU job, or any urgent job (design 3.2)."""
-    if job.partition == Partition.URGENT:
-        return True
-    record = read_sidecar(job.job_id)
-    return bool(record and record.get("gpu"))
+    """A job the background services must step aside for: one that holds GPUs, or any urgent job (design 3.2).
+
+    Decided from what slurm says (`gres`), never from the job's sidecar: any user can leave a record under an id.
+    """
+    return job.partition == Partition.URGENT or job.gpus > 0
 
 
 def pid_alive(pid: object) -> bool:
@@ -318,17 +363,28 @@ def completion_records(job_ids: Iterable[str] | None = None) -> dict[str, dict[s
 
 
 def measured_peak_bytes(name: str) -> int | None:
-    """The footprint of the newest finished run called `name`: GPU plus CPU side, from its sidecar."""
+    """The footprint of the newest run called `name` that finished cleanly (exit 0, no signal): GPU plus CPU side.
+
+    Only this user's own sidecars count: another user's file with the name could understate the peak, and a crashed
+    or pre-empted leg stopped early, so its peak is too low to size the next run on.
+    """
     best: tuple[int, int] | None = None
+    me = current_user()
     for path in (STATE_DIR / "jobs").glob("*.json"):
-        record = read_json(path) or {}
-        leg = record.get("last_leg")
-        if record.get("name") != name or not isinstance(leg, dict) or "peak_gpu_mib" not in leg:
+        record = read_json(path, me) or {}
+        if record.get("name") != name:
             continue
-        total = int(float(leg["peak_gpu_mib"]) * 1024 * 1024) + int(leg.get("peak_mem_bytes") or 0)
-        ended = int(leg.get("ended_at") or 0)
-        if best is None or ended > best[0]:
-            best = (ended, total)
+        legs = record.get("legs")
+        for leg in legs if isinstance(legs, list) else [record.get("last_leg")]:
+            if not isinstance(leg, dict) or "peak_gpu_mib" not in leg or leg.get("exit") != 0 or leg.get("signals"):
+                continue
+            try:
+                total = int(float(leg["peak_gpu_mib"]) * 1024 * 1024) + int(leg.get("peak_mem_bytes") or 0)
+                ended = int(leg.get("ended_at") or 0)
+            except (TypeError, ValueError):
+                continue
+            if best is None or ended > best[0]:
+                best = (ended, total)
     return None if best is None else best[1]
 
 
@@ -376,12 +432,19 @@ def write_event(job_id: str, action: EventAction, **fields: object) -> Path:
     return path
 
 
-def _owner(path: Path) -> str:
-    uid = path.lstat().st_uid  # a symlink is its creator's, never its target's owner's
+def _user_name(uid: int) -> str:
     try:
         return pwd.getpwuid(uid).pw_name
     except KeyError:
         return str(uid)
+
+
+def current_user() -> str:
+    return _user_name(os.getuid())
+
+
+def _owner(path: Path) -> str:
+    return _user_name(path.lstat().st_uid)  # a symlink is its creator's, never its target's owner's
 
 
 def events(job_id: str | None = None) -> list[Event]:
@@ -389,8 +452,10 @@ def events(job_id: str | None = None) -> list[Event]:
     found = []
     for path in (STATE_DIR / "events").glob("*.json" if job_id is None else f"{job_id}-*.json"):
         match = re.fullmatch(r"(.+)-(\d+)-([a-z_]+)\.json", path.name)
+        if not match or (job_id is not None and match[1] != job_id):
+            continue  # judged by the name before the file is opened
         record = read_json(path)
-        if not match or record is None or (job_id is not None and match[1] != job_id):
+        if record is None:
             continue
         extra = {k: v for k, v in record.items() if k not in {"job", "action", "at"}}
         try:

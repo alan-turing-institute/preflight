@@ -13,20 +13,20 @@ import resume
 import urgent
 
 
-def job(job_id: str, partition: str, state: str = "RUNNING") -> gpu_jobs.QueuedJob:
-    return gpu_jobs.QueuedJob(job_id, partition, state, "None", f"p:x:{job_id}")
+def job(job_id: str, partition: str, state: str = "RUNNING", gpus: int = 1) -> gpu_jobs.QueuedJob:
+    return gpu_jobs.QueuedJob(job_id, partition, state, "None", f"p:x:{job_id}", gpus=gpus)
 
 
 @pytest.fixture(autouse=True)
 def sidecars(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(gpu_jobs, "STATE_DIR", tmp_path)
     monkeypatch.setattr(urgent, "elapsed", lambda _job: "1:00")
-    for job_id, gpu in [("1", True), ("2", True), ("3", False), ("4", True)]:
+    for job_id, gpu in [("1", True), ("2", True), ("3", True), ("4", True)]:  # what slurm grants decides, not this flag
         gpu_jobs.update_sidecar(job_id, gpu=gpu, what=f"job {job_id}")
 
 
 def test_classes_of_what_is_in_the_way() -> None:
-    queue = [job("1", "normal"), job("2", "steady"), job("3", "normal"), job("4", "urgent", "PENDING")]
+    queue = [job("1", "normal"), job("2", "steady"), job("3", "normal", gpus=0), job("4", "urgent", "PENDING")]
     lines, victims, steady, wait_only = urgent.plan(
         queue, gpu=True, whole_box=False,
         leases=[("service-a", False), ("service-b", False), ("service-c", False), ("slurm", False)],
@@ -43,7 +43,7 @@ def test_classes_of_what_is_in_the_way() -> None:
 
 def test_whole_box_puts_every_running_job_in_the_way() -> None:
     _, victims, _, _ = urgent.plan(
-        [job("1", "normal"), job("3", "normal")], gpu=True, whole_box=True, leases=[], unregistered=[]
+        [job("1", "normal"), job("3", "normal", gpus=0)], gpu=True, whole_box=True, leases=[], unregistered=[]
     )
     assert victims == ["1", "3"]
 
@@ -88,9 +88,8 @@ def test_site_admin_check_multi_gpu_plan_and_request_file(
 ) -> None:
     queue = [
         gpu_jobs.QueuedJob("5", "normal", "RUNNING", "None", "p:x:5", gpus=2),
-        gpu_jobs.QueuedJob("6", "normal", "PENDING", "Resources", "p:x:6"),
+        gpu_jobs.QueuedJob("6", "normal", "PENDING", "Resources", "p:x:6", gpus=1),
     ]
-    gpu_jobs.update_sidecar("6", gpu=True, what="job 6")
     monkeypatch.setattr(gpu_jobs, "read_queue", lambda: queue)
     monkeypatch.setattr(urgent, "other_leases", lambda: [("svc", False)])
     monkeypatch.setattr(urgent.audit, "unregistered", list)
