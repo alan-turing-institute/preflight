@@ -121,6 +121,8 @@ def test_oidc_renders_with_secret_only_in_the_root_only_file(tmp_path):
     # a secret written straight into the site file is not an accepted setting
     inline = make_site(tmp_path, auth="oidc", client_secret=SECRET)
     assert any("unknown key" in r and "client_secret" in r for r in portal.refusals(inline))
+    loose = make_site(tmp_path, auth="oidc", client_secret_file=secret_file(tmp_path, "loose", SECRET, 0o644))
+    assert any("must be root-only" in r for r in portal.refusals(loose))
 
 
 @pytest.mark.parametrize("field", ["email", "userID", "hash"])
@@ -143,6 +145,7 @@ def test_dex_default_account_is_refused(tmp_path, field):
             "Linux user",
         ),
         (lambda t: {"crypto_passphrase_file": str(t / "none")}, "cookie passphrase file"),
+        (lambda t: {"crypto_passphrase_file": secret_file(t, "pp", "a" * 64, 0o644)}, "must be root-only"),
         (lambda t: {"typo_key": "x"}, "unknown key"),
     ],
 )

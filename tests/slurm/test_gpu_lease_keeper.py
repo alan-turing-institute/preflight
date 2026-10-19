@@ -11,7 +11,8 @@ from pathlib import Path
 
 import gpu_jobs
 import pytest
-from gpu_lease_keeper import Keeper, Phase, remove_leases_from_before_boot
+import submit
+from gpu_lease_keeper import Keeper, Phase, beat, remove_leases_from_before_boot
 from localmodels.lease import GpuLease
 
 
@@ -59,10 +60,13 @@ def test_no_jobs_no_lease(tmp_path: Path) -> None:
     assert world.lease() is None
 
 
-def test_active_gpu_job_with_a_free_card_is_admitted_at_once(tmp_path: Path) -> None:
+def test_active_gpu_job_with_a_free_card_is_admitted_at_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(gpu_jobs, "STATE_DIR", tmp_path / "state")
     world = World(tmp_path)
     world.queue = [job("1")]
-    state = world.step()
+    state = beat(world.keeper, gpu_jobs.keeper_state_path())
+    assert submit.keeper_running(now=world.t + 5)  # what the keeper writes is what every submitter reads as alive
+    assert not submit.keeper_running(now=world.t + 10_000)
     assert state["phase"] == Phase.ADMITTED
     lease = world.lease()
     assert lease["pid"] == os.getpid()

@@ -31,6 +31,7 @@ class Fake:
 
     def __init__(self, viewer: str = "alice", admin: bool = False, name: str = "proj:normal:train") -> None:
         self.ran: list[list[str]] = []
+        self.headers: dict[str, str] = {}  # of the last response
         self.asked: list[tuple[str, str | None]] = []  # (job id, the slurm user the record must belong to)
         record = {"what": "a run", "job_class": "normal", "mem": "4G", "project": "proj", "command": ["python", "x.py"], "log": "/logs/x.log"}
         self.backend = app.Backend(
@@ -67,7 +68,12 @@ def call(fake: Fake, path: str, method: str = "GET", body: object | None = None,
         else:
             environ.pop(key, None)
     seen: list[str] = []
-    out = b"".join(fake.application(environ, lambda status, _h: seen.append(status)))
+
+    def start_response(status: str, response_headers: list[tuple[str, str]]) -> None:
+        seen.append(status)
+        fake.headers = dict(response_headers)
+
+    out = b"".join(fake.application(environ, start_response))
     return seen[0], out.decode()
 
 
@@ -82,6 +88,8 @@ def test_every_get_route_answers(path: str) -> None:
     fake = Fake()
     status, body = call(fake, path)
     assert status == "200 OK", body
+    assert fake.headers["Cache-Control"] == "no-store" and fake.headers["X-Content-Type-Options"] == "nosniff"
+    assert "default-src 'self'" in fake.headers["Content-Security-Policy"]
     # a queued job's record is asked for as the user slurm says owns the job, so a record another user wrote is ignored
     assert all(user == {"7": "alice", "8": "bob"}[job_id] for job_id, user in fake.asked)
 
@@ -93,6 +101,8 @@ def test_unknown_things_are_not_found_or_bad() -> None:
     assert call(fake, "/history?since=x;rm")[0].startswith("400")
     assert call(fake, "/api/job/7/pause")[0].startswith("403")  # GET on an action
     assert call(fake, "/", method="POST")[0].startswith("405")
+    assert call(fake, "/api/job/7/pause", "POST", [1])[0].startswith("400")  # a JSON body that is not an object
+    assert fake.ran == []
 
 
 def test_action_posts_are_refused_unless_origin_json_and_id_are_right() -> None:
@@ -103,6 +113,9 @@ def test_action_posts_are_refused_unless_origin_json_and_id_are_right() -> None:
         call(fake, url, "POST", body, {"HTTP_ORIGIN": ""}),
         call(fake, url, "POST", body, {"HTTP_ORIGIN": "http://evil.example"}),
         call(fake, url, "POST", body, {"HTTP_ORIGIN": "null"}),
+        call(fake, url, "POST", body, {"HTTP_ORIGIN": f"http://{HOST}.evil.example"}),
+        call(fake, url, "POST", body, {"HTTP_ORIGIN": f"http://evil.example/{HOST}"}),
+        call(fake, url, "POST", body, {"HTTP_ORIGIN": f"http://{HOST}@evil.example"}),
         call(fake, url, "POST", body, {"CONTENT_TYPE": "text/plain"}),
         call(fake, "/api/job/7;rm/kill", "POST", body),
         call(fake, "/api/job/abc/kill", "POST", body),

@@ -152,6 +152,13 @@ def remove_leases_from_before_boot(lease_dir: Path, booted_at: float) -> list[st
     return removed
 
 
+def beat(keeper: Keeper, state_path: Path) -> dict[str, object]:
+    """One look at the queue, and the state file `submit.keeper_running` reads as the heartbeat."""
+    state = keeper.step()
+    gpu_jobs.write_json(state_path, state)
+    return state
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--interval", type=float, default=5.0, help="seconds between looks at the queue")
@@ -173,13 +180,12 @@ def main() -> int:
     # No cleanup on exit: a lease left by a dead keeper names a dead pid, which every reader ignores,
     # while removing it at a restart would open exactly the gap this keeper exists to close.
     while True:
-        state = keeper.step()
+        state = beat(keeper, state_path)
         summary = (state["phase"], tuple(state["blockers"]), state["note"])
         if summary != last:
             print(f"[keeper] {state['phase']}; jobs {state['jobs']}; blockers {state['blockers']} {state['note']}",
                   flush=True)
             last = summary
-        gpu_jobs.write_json(state_path, state)
         time.sleep(arguments.interval)
 
 

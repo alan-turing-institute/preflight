@@ -170,13 +170,6 @@ def submit_for_real(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *extra: str
     return {**(gpu_jobs.read_sidecar("77") or {}), **seen}
 
 
-def test_no_site_file_checks_keeper_and_gate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    record = submit_for_real(monkeypatch, tmp_path)
-    assert record["keeper"] is True
-    assert record["gate"] is True
-    assert (record["gpu"], record["gpus"]) == (True, 2)
-
-
 def test_a_record_that_cannot_be_written_after_sbatch_is_a_warning_naming_the_job(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -185,16 +178,18 @@ def test_a_record_that_cannot_be_written_after_sbatch_is_a_warning_naming_the_jo
     assert "job 77 is queued but its record was not written" in capsys.readouterr().err
 
 
-def test_a_site_without_lease_or_gate_skips_both(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    fake_site(monkeypatch, tmp_path, lease=None, dgx_gate=False)
+@pytest.mark.parametrize(
+    ("site", "keeper", "gate"),
+    [(None, True, True), ({"lease": None, "dgx_gate": False}, False, False), ({"lease": object(), "dgx_gate": True}, True, True)],
+    ids=["no site file", "no lease or gate", "lease and gate"],
+)
+def test_the_keeper_and_gate_are_checked_only_where_the_site_has_them(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, site: dict[str, object] | None, keeper: bool, gate: bool
+) -> None:
+    if site is not None:
+        fake_site(monkeypatch, tmp_path, **site)
     record = submit_for_real(monkeypatch, tmp_path)
-    assert record["keeper"] is False
-    assert record["gate"] is False
-    assert record["manifest"] is None
-
-
-def test_a_site_with_lease_and_gate_checks_both(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    fake_site(monkeypatch, tmp_path, lease=object(), dgx_gate=True)
-    record = submit_for_real(monkeypatch, tmp_path)
-    assert record["keeper"] is True
-    assert record["gate"] is True
+    assert (record["keeper"], record["gate"]) == (keeper, gate)
+    assert (record["gpu"], record["gpus"]) == (True, 2)
+    if not gate:
+        assert record["manifest"] is None
