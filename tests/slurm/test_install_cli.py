@@ -108,10 +108,11 @@ def test_apply_then_check_against_a_temp_root(env):
     # plan 3.3, every state directory's (mode, owner): the shared ones sticky and open, requests/ the agent's own
     dirs = {a[-1]: (a[3], a[a.index("-o") + 1] if "-o" in a else None) for a in fake.calls if a[:2] == ["install", "-d"]}
     state = "/var/lib/gpujobs"
-    sticky = ("jobs", "events", "footprints", "metrics", "logs", "scripts", "manifests")  # submit.py writes logs, scripts
+    sticky = ("jobs", "events", "footprints", "logs", "scripts", "manifests")  # submit.py writes logs, scripts
     assert {d: m for d, m in dirs.items() if d.startswith(state)} == {
         state: ("0755", "root"),
         f"{state}/agent": ("0755", "slurm"),
+        f"{state}/metrics": ("0755", "slurm"),  # only the agent writes the per-job textfiles
         f"{state}/keeper": ("0755", USER),  # its heartbeat's home
         f"{state}/requests": ("1777", "slurm"),
         **{f"{state}/{name}": ("1777", None) for name in sticky},

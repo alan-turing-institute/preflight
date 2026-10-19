@@ -100,25 +100,12 @@ def test_footprint_sums_all_gpus_and_counts_labelled_containers(tmp_path: Path, 
     assert row["mem_current"] == 4096
 
 
-def test_metrics_textfile_is_written_atomically_and_removed_with_the_job(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setattr(job_wrapper.gpu_jobs, "STATE_DIR", tmp_path)
-    monkeypatch.setenv("SLURM_JOB_NAME", "proj:train")
-    job_wrapper.write_metrics("7", {"gpu_mib": 2.0, "mem_current": 99})
-    text = job_wrapper.metrics_file("7").read_text()
-    labels = text.split("{")[1].split("}")[0]
-    assert 'jobid="7"' in labels and 'project="proj"' in labels and "user=" in labels
-    assert f"}} {2 * 1024 * 1024}\n" in text and "} 99\n" in text
-    assert not list((tmp_path / "metrics").glob("*.tmp"))
-    monkeypatch.delenv("SLURM_JOB_NAME")
-    assert 'project="(other)"' in job_wrapper.metrics_text("7", {"gpu_mib": 0.0, "mem_current": None})
-
-
 SITE = 'name = "t"\n[[nodes]]\nname = "n"\ncpus = 1\nreal_memory_mb = 1\n[metrics]\nmode = "%s"\n'
 SEEN = "import time, sys, pathlib; time.sleep(0.7); pathlib.Path(sys.argv[2]).write_text(str(pathlib.Path(sys.argv[1]).exists()))"
 
 
 def run_wrapper(tmp_path: Path, job: str, mode: str) -> tuple[str, bool]:
-    """(whether the job saw its textfile while running, whether it is still there afterwards)."""
+    """(whether the job saw a metrics textfile while running, whether one is there afterwards)."""
     env = dict(os.environ, SLURM_GPU_STATE_DIR=str(tmp_path / "state"), SLURM_JOB_ID=job,
                GPUJOBS_SITE=str(tmp_path / "site.toml"))
     (tmp_path / "site.toml").write_text(SITE % mode)
@@ -129,9 +116,9 @@ def run_wrapper(tmp_path: Path, job: str, mode: str) -> tuple[str, bool]:
     return seen.read_text(), prom.exists()
 
 
-def test_metrics_mode_decides_whether_a_textfile_is_written_and_it_is_gone_at_the_end(tmp_path: Path) -> None:
-    assert run_wrapper(tmp_path, "81", "off") == ("False", False)
-    assert run_wrapper(tmp_path, "82", "local") == ("True", False)
+def test_the_wrapper_writes_no_metrics_textfile_whatever_the_site_says(tmp_path: Path) -> None:
+    # the agent writes `metrics/job_<id>.prom` (tests/slurm/test_agent.py); the wrapper's user must not
+    assert run_wrapper(tmp_path, "82", "local") == ("False", False)
 
 
 CHILD = """
@@ -201,7 +188,7 @@ def test_an_unverifiable_manifest_refuses_the_launch(tmp_path: Path) -> None:
 
 def test_bookkeeping_that_cannot_be_written_never_fails_the_job(tmp_path: Path) -> None:
     state = tmp_path / "state"
-    for blocked in ("footprints/79.jsonl", "jobs/79.json", "metrics/job_79.prom.tmp"):
+    for blocked in ("footprints/79.jsonl", "jobs/79.json"):
         (state / blocked).mkdir(parents=True)  # stand in for another user's files in the sticky directories
     (tmp_path / "site.toml").write_text(SITE % "local")
     env = dict(os.environ, SLURM_GPU_STATE_DIR=str(state), SLURM_JOB_ID="79", GPUJOBS_SITE=str(tmp_path / "site.toml"))
@@ -210,7 +197,7 @@ def test_bookkeeping_that_cannot_be_written_never_fails_the_job(tmp_path: Path) 
         env=env, check=False, capture_output=True, text=True,
     )
     assert done.returncode == 3  # the command's own status
-    assert all(f"warning: {what} not recorded" in done.stderr for what in ("footprint", "metrics", "sidecar"))
+    assert all(f"warning: {what} not recorded" in done.stderr for what in ("footprint", "sidecar"))
 
 
 @pytest.mark.parametrize(("lease", "code", "refused"), [(False, 0, False), (True, job_wrapper.Exit.CARD_NOT_READY, True)])
