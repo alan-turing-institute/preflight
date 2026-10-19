@@ -590,7 +590,9 @@ def post_install(site: Site) -> list[list[str]]:
         steps += [["systemctl", "enable", DEX_UNIT], ["systemctl", "restart", DEX_UNIT]]
     elif site.portal.auth is AuthMode.PROXY:
         # A machine switched from a Dex login still has Dex running, with a login nobody uses any more.
-        steps.append(["sh", "-c", f"if systemctl cat {DEX_UNIT} >/dev/null 2>&1; then systemctl disable --now {DEX_UNIT}; fi"])
+        # Dex exits non-zero when stopped, which leaves the unit "failed" (harness, 2026-10-19); reset-failed clears it.
+        stop = f"systemctl disable --now {DEX_UNIT}; systemctl reset-failed {DEX_UNIT} 2>/dev/null || true"
+        steps.append(["sh", "-c", f"if systemctl cat {DEX_UNIT} >/dev/null 2>&1; then {stop}; fi"])
     steps += [["systemctl", "enable", "apache2"], ["systemctl", "restart", "apache2"]]
     # Each user's running web server keeps the environment Apache gave it at start, including OOD_ALLOWED_HOSTS
     # (the server name): after a rename the dashboard refused every page with "Blocked hosts" (measured 2026-10-19).

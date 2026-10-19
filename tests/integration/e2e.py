@@ -601,7 +601,10 @@ def login(user: str, password: str | None = None) -> tuple[bool, str]:
         f"{CURL} -L -c {jar} -b {jar} -o /tmp/login-{user}.html -w '%{{http_code}} %{{url_effective}}' "
         f"--data-urlencode login={user}@harness.test --data-urlencode password={shlex.quote(password or PASSWORDS[user])} {shlex.quote(url)}"
     ).out.strip()
-    return got.startswith("200") and got.endswith("/pun/sys/dashboard"), f"{url.split('?')[0]} -> {got}"
+    # the portal opens on the jobs page (root_uri); on a fresh install OOD first shows its 'Initialize App' page there
+    code, _, landed = got.partition(" ")
+    first_visit = code == "404" and "/nginx/init" in sh(f"cat /tmp/login-{user}.html").out
+    return (code == "200" or first_visit) and landed.endswith("/pun/sys/gpujobs/"), f"{url.split('?')[0]} -> {got}"
 
 
 def get(user: str, path: str, *extra: str) -> tuple[int, str]:
@@ -627,7 +630,7 @@ def stage_portal() -> None:
     check("Dex local login: a wrong password does not log in", not wrong, evidence)
     for user in USERS:
         good, evidence = login(user)
-        check(f"Dex local login over HTTPS: {user} logs in and lands on the dashboard (REMOTE_USER maps to Linux user {user})", good, evidence)
+        check(f"Dex local login over HTTPS: {user} logs in and lands on the jobs page (REMOTE_USER maps to Linux user {user})", good, evidence)
     # the first visit to a new app in a user's own nginx shows OOD's 'Initialize App' page
     first, body = get("alice", "/")
     check("first visit of the app in alice's per-user nginx asks to initialize it (OOD behaviour, README)",
@@ -761,7 +764,8 @@ def stage_proxy() -> None:
     code, _, jobs = sh(f"{CURL} {keyed} -w '\\n%{{http_code}}' {app}").out.rpartition("\n")[::-1]
     check("with the key, /api/jobs returns JSON, served as the configured user", code == "200" and isinstance(json.loads(jobs).get("jobs"), list),
           f"HTTP {code} {jobs[:80]}")
-    puns = sh("ps -eo user:20,args | grep '[n]ginx: master' | awk '{print $1}' | sort -u").out.split()
+    # OOD runs each per-user nginx master as root, labelled with its user: "nginx: master process (alice) -c ..."
+    puns = sorted(set(re.findall(r"nginx: master process \((\S+)\)", sh("ps -eo args").out)))
     check("the app runs as the configured user only (no per-user server for bob, carol or www-data was started by these requests)",
           "alice" in puns and not {"bob", "carol", "dave"} & set(puns), f"users with a per-user server: {puns}")
 
