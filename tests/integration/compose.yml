@@ -1,0 +1,30 @@
+# Integration test cluster: one container running systemd, slurm (controller, node, accounting) and MariaDB.
+# Project name gpujobs-test. Driven by run.sh; do not start it with a bare `docker compose up`.
+name: gpujobs-test
+
+services:
+  cluster:
+    image: gpujobs-testcluster:dev
+    build:
+      context: .
+    hostname: testnode
+    # Torn down with `run.sh down`; nothing here outlives a test run.
+    labels:
+      lifecycle: ephemeral
+    # The box runs real GPU jobs: cap the harness well under it, and give it no GPU, no host network, no published ports.
+    mem_limit: 8g
+    memswap_limit: 8g
+    cpus: 4
+    pids_limit: 2048
+    # systemd as PID 1 without --privileged: its own cgroup namespace (Docker's default on cgroup v2) with a writable
+    # /sys/fs/cgroup, a tmpfs /run and /tmp, and SIGRTMIN+3 for a clean stop (set in the Dockerfile).
+    cgroup: private
+    security_opt:
+      - writable-cgroups=true
+    tmpfs:
+      - /run
+      - /run/lock
+      - /tmp
+    # The repository, read-only, where the installer and the tools are exercised from.
+    volumes:
+      - ../..:/src:ro

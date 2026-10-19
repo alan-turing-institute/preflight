@@ -1,0 +1,13 @@
+[Unit]
+Description=Harness: give the OS user slurm a MariaDB login (unix_socket) and its database
+After=mariadb.service
+Requires=mariadb.service
+Before=slurmdbd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/libexec/gpujobs-harness/db-init.sh
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,4 @@
+# Values slurmdbd asks for (as the box's 90-slurm.cnf); a smaller buffer pool, the harness holds a few test jobs.
+[mysqld]
+innodb_buffer_pool_size=256M
+innodb_lock_wait_timeout=900
