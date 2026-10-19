@@ -127,6 +127,23 @@ def test_site_admin_check_multi_gpu_plan_and_request_file(
     monkeypatch.setattr(urgent, "other_leases", list)
     assert urgent.run([*argv, "--", "true"]) == 0
 
+    # a refused submission releases what it held; a steady job in the way stops it unless --requeue-steady
+    calls: list[list[str]] = []
+
+    def refusing_sbatch(command: list[str], **_kwargs: object) -> object:
+        calls.append(command)
+        return type("Done", (), {"returncode": int(command[0] == "sbatch"), "stdout": "", "stderr": "no"})()
+
+    monkeypatch.setattr(urgent.subprocess, "run", refusing_sbatch)
+    assert urgent.run([*argv, "--", "true"]) == 1
+    assert ["scontrol", "hold", "6"] in calls and calls[-1] == ["scontrol", "release", "6"]
+    queue[:] = [gpu_jobs.QueuedJob("2", "steady", "RUNNING", "None", "p:x:2", gpus=2)]
+    calls.clear()
+    assert urgent.run([*argv, "--", "true"]) == 1
+    assert calls == []
+    assert urgent.run([*argv, "--requeue-steady", "--", "true"]) == 1  # sbatch still refuses
+    assert ["scontrol", "requeue", "2"] in calls
+
 
 class FakeSlurm:
     """Stands in for every scontrol/scancel call: records them, fails when told to."""
@@ -156,6 +173,14 @@ def test_pause_dry_run_acts_on_nothing_and_a_pause_is_recorded(
     assert pause.main() == 0
     assert capsys.readouterr().out.strip() == "[pause] a steady job cannot resume: a pause loses everything it has done so far"
     assert slurm.calls == [] and actions("2") == []
+
+    monkeypatch.setattr("sys.argv", ["pause.py", "2"])  # a steady job loses its whole run: not without being told so
+    assert pause.main() == 1
+    assert slurm.calls == [] and actions("2") == []
+    monkeypatch.setattr("sys.argv", ["pause.py", "2", "--lose-progress"])
+    assert pause.main() == 0
+    assert slurm.calls == [["scontrol", "requeuehold", "2"]]
+    slurm.calls.clear()
 
     monkeypatch.setattr("sys.argv", ["pause.py", "1", "--reason", "need the card"])
     assert pause.main() == 0
