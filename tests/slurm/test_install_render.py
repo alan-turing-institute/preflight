@@ -33,6 +33,8 @@ EXPECTED_DIFF = {
         "+# No multifactor priority: it recomputes every pending job's priority from age, and after a reboot that wiped the",
         "+# priority a hold had restored.",
         "+PriorityType=priority/basic",
+        "-# Pre-emption by partition priority, no accounting database: an `urgent` job takes resources from `normal` jobs,",
+        "+# Pre-emption by partition priority (accounting is through slurmdbd, below): an `urgent` job takes resources from `normal` jobs,",
         "-# (stage C, 2026-10-16). It also records each job's GPU use (`sacct`), which this box's ledger never had.",
         "+# (stage C, 2026-10-16). It also keeps the finished-job history that `sacct` reads.",
         "+# Keep each job's --comment in the accounting record.",
@@ -51,7 +53,7 @@ EXPECTED_DIFF = {
         "-# The GB10's one GPU as a schedulable token. Its memory is system RAM (unified), so no memory is declared here.",
         "-NodeName=gpu-node-1 Name=gpu File=/dev/nvidia0",
         "+# Each GPU as a schedulable token, typed to match the node's Gres= in slurm.conf. No NVML autodetect: Ubuntu's slurm",
-        "+# ships no NVML plugin. On a unified-memory machine (the GB10) the GPU's memory is system RAM, so none is declared.",
+        "+# ships no NVML plugin. On a unified-memory machine (one whose GPU shares system RAM, such as the GB10) the GPU's memory is system RAM, so none is declared.",
         "+NodeName=gpu-node-1 Name=gpu Type=gb10 File=/dev/nvidia0",
     ],
     "slurmdbd.conf": [
@@ -63,12 +65,16 @@ EXPECTED_DIFF = {
     "mariadb-slurm.cnf": [
         "-# some sites use: on this box the RAM is also the GPU's memory, and this database holds one node's job records.",
         "-# Installed to /etc/mysql/mariadb.conf.d/90-slurm.cnf by install_slurm.py.",
-        "+# some sites use: on a unified-memory machine (the GB10) the RAM is also the GPU's memory, and this database holds one node's job records.",
+        "+# some sites use: on a unified-memory machine (a GPU that shares system RAM, such as the GB10) the RAM is also the GPU's memory, and this database holds one node's job records.",
         "+# Installed to /etc/mysql/mariadb.conf.d/90-slurm.cnf by slurm/install/install.py.",
+    ],
+    "cgroup.conf": [
+        "-# CPU-side memory is capped at its --mem (GPU memory is not charged to the cgroup on the GB10, trial B2, so the",
+        "+# CPU-side memory is capped at its --mem (GPU memory is not charged to the cgroup on a unified-memory GPU such as the GB10 (trial B2), so the",
     ],
     "10-restart-protect.conf": [
         "-# slurmctld, slurmd and munge by install_slurm.py.",
-        "+# slurmctld, slurmd and munge by slurm/install/install.py.",
+        "+# slurmctld, slurmd, slurmdbd and munge by slurm/install/install.py.",
     ],
 }
 

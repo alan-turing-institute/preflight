@@ -17,13 +17,14 @@ Plan 3.5 (`plan notes`). One system service, run as SlurmUser
    again only after the urgent job; one slurm did not pre-empt never stopped). A file owned by a non-admin, or
    naming no urgent job, is ignored.
 4. FAILURE NOTICES for jobs that ended FAILED, OUT_OF_MEMORY, TIMEOUT or NODE_FAIL: a `FAILED` event, and the
-   site's `notify_command` if any (argv, no shell, 30 s).
+   site's `notify_command` if any (argv, no shell, 30 s). Slurm's accounting is asked at most every 30 s
+   (`NOTICES_EVERY_S`).
 5. HEARTBEAT `agent/agent.json`. When `squeue` does not answer, the queue-dependent parts are skipped and the
    state is kept: the agent never acts on a queue it cannot see.
 
-The requests directory is sticky and world-writable and SlurmUser owns none of its files, so the agent cannot
-rewrite or (as a rule) delete a request: what it has learnt about one (victims seen paused, request already
-released) lives in `agent/state.json`, and deleting the file is tried but not relied on.
+The requests directory is sticky and world-writable, and the installer makes SlurmUser its owner, which lets the agent
+delete a request but not rewrite one (SlurmUser owns none of the files): what it has learnt about one (victims seen
+paused, request already released) lives in `agent/state.json`, and deleting the file is tried but not relied on.
 """
 
 from __future__ import annotations
