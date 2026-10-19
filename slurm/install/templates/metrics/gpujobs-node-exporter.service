@@ -1,0 +1,13 @@
+[Unit]
+Description=Prometheus node exporter for the gpujobs metrics (textfile directory ${textfile_dir})
+After=network-online.target
+
+[Service]
+# Its own instance on its own port, so it never collides with a node exporter already on 9100.
+DynamicUser=yes
+NoNewPrivileges=yes
+ExecStart=${bin_dir}/node_exporter --web.listen-address=:${node_port} --collector.textfile.directory=${textfile_dir}
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

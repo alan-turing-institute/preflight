@@ -1,0 +1,11 @@
+[Unit]
+Description=Jobstats cgroup exporter (per-job CPU and memory from slurm's cgroups)
+After=slurmd.service
+
+[Service]
+# Root: it reads the job cgroups of every user.
+ExecStart=${bin_dir}/run-cgroup-exporter ${cgroup_port}
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

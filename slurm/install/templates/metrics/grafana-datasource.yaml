@@ -1,0 +1,11 @@
+apiVersion: 1
+datasources:
+  - name: ${datasource_name}
+    uid: ${datasource_name}
+    type: prometheus
+    access: proxy
+    url: ${prometheus_url}
+    isDefault: true
+    editable: false
+    jsonData:
+      timeInterval: ${scrape_interval}s
