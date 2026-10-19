@@ -5,6 +5,7 @@ import stat
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -125,3 +126,14 @@ def test_migrate_keeps_owner_and_mode_and_never_overwrites(env):
     assert moved.read_text() == "e"
     assert stat.S_IMODE(moved.stat().st_mode) == stat.S_IMODE((old / "events/e.json").stat().st_mode)
     assert moved.stat().st_uid == os.getuid()
+
+
+def test_apt_flags_apply_only_to_the_component_that_asks():
+    plain = SimpleNamespace(packages=lambda _s: ["slurm-wlm"])
+    lean = SimpleNamespace(packages=lambda _s: ["prometheus"], apt_flags=lambda _s: ["--no-install-recommends"])
+    none = SimpleNamespace(packages=lambda _s: [])
+    assert cli.apt_install_commands([plain, lean, none], site=None) == [
+        ["apt-get", "install", "-y", "slurm-wlm"],
+        ["apt-get", "install", "-y", "--no-install-recommends", "prometheus"],
+    ]
+

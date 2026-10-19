@@ -136,6 +136,19 @@ def cmd_check(site, args, modules) -> int:
     return 1 if diff else 0
 
 
+def apt_install_commands(modules, site) -> list[list[str]]:
+    """One `apt-get install` per distinct set of flags, in component order.
+
+    A component may ask for flags with an optional `apt_flags(site)` (the metrics component wants
+    `--no-install-recommends`, so `prometheus` does not pull in a second node exporter); the others keep apt's defaults.
+    """
+    groups: dict[tuple[str, ...], list[str]] = {}
+    for m in modules:
+        if packages := m.packages(site):
+            groups.setdefault(tuple(getattr(m, "apt_flags", lambda _site: [])(site)), []).extend(packages)
+    return [["apt-get", "install", "-y", *flags, *packages] for flags, packages in groups.items()]
+
+
 def cmd_apply(site, args, modules, chown: Chown | None = _chown) -> int:
     refusals = [r for m in modules for r in m.refusals(site)]
     if refusals:
@@ -146,9 +159,7 @@ def cmd_apply(site, args, modules, chown: Chown | None = _chown) -> int:
     if sources:
         write_files(args.root, sources, chown)
         _run_all([["apt-get", "update"]])
-    packages = [p for m in modules for p in m.packages(site)]
-    if packages:
-        _run_all([["apt-get", "install", "-y", *packages]])
+    _run_all(apt_install_commands(modules, site))
     files = _all(modules, site, "files")
     write_files(args.root, files, chown)
     _run_all([argv for m in modules for argv in m.post_install(site)])
