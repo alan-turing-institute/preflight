@@ -684,6 +684,8 @@ def stage_portal() -> None:
     none = post("alice", f"/api/job/{aj}/pause", None)
     check("Origin reaches the app: a foreign Origin and a missing Origin are both refused (403) and the job is untouched",
           evil[0] == HTTPStatus.FORBIDDEN and none[0] == HTTPStatus.FORBIDDEN and state(aj) == "RUNNING", f"foreign: {evil[0]} {evil[1][:90]}; none: {none[0]}")
+    dry = get("alice", f"/api/job/{aj}/pause-preview")  # while it runs: a pending job's pause loses nothing
+    check("the pause preview shows what a pause loses", dry[0] == HTTPStatus.OK and "resumes from its last checkpoint" in dry[1], dry[1][:160])
     ok_pause = post("alice", f"/api/job/{aj}/pause", PORTAL)
     held = wait_for(lambda: state(aj) == "PENDING" and priority(aj) == 0, 60)
     check("Host reaches the app unchanged: a pause POST whose Origin equals the portal's host is accepted, and the job is held",
@@ -692,8 +694,6 @@ def stage_portal() -> None:
     ok_resume = post("alice", f"/api/job/{aj}/resume", PORTAL)
     back = wait_for(lambda: priority(aj) > 0, 40)
     check("resume through the portal releases the job", ok_resume[0] == HTTPStatus.OK and '"ok": true' in ok_resume[1] and bool(back), f"{ok_resume[1][:100]} priority={priority(aj)}")
-    dry = get("alice", f"/api/job/{aj}/pause-preview")
-    check("the pause preview shows what a pause loses", dry[0] == HTTPStatus.OK and "resumes from its last checkpoint" in dry[1], dry[1][:160])
     clear_queue()
 
 

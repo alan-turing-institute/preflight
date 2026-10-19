@@ -187,7 +187,7 @@ def test_pause_dry_run_acts_on_nothing_and_a_pause_is_recorded(
     assert slurm.calls == [["scontrol", "requeuehold", "1"]]
     assert [(e.action, e.fields) for e in gpu_jobs.events("1")] == [("pause", {"reason": "need the card"})]
 
-    # slurm refuses to requeue a pending job; one that has not started loses nothing, steady or not
+    # slurm refuses to requeue a pending job; a pending job loses nothing, steady or not
     monkeypatch.setattr("sys.argv", ["pause.py", "3"])
     assert pause.main() == 0
     assert slurm.calls[-1] == ["scontrol", "uhold", "3"] and actions("3") == ["pause"]

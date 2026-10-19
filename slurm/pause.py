@@ -5,7 +5,7 @@
 
 `scontrol requeuehold` requeues and holds in one step (a separate requeue then hold could start the job again
 in between). A `normal` job resumes from its last checkpoint when released (`slurm/resume.py JOBID`); a
-`steady` job cannot resume, so pausing one needs `--lose-progress`. A job that has not started loses nothing:
+`steady` job cannot resume, so pausing one needs `--lose-progress`. A pending job (not running) loses nothing:
 slurm refuses to requeue a pending job (`ESLURM_JOB_PENDING`), so it gets `scontrol uhold`, a hold its owner may
 release even when an admin set it. Its dependents keep waiting. `--dry-run`
 prints only what the pause would lose and acts on nothing. Who may pause is slurm's rule (owner or admin):
@@ -42,7 +42,7 @@ def main() -> int:
     pending = job.state == gpu_jobs.State.PENDING
     steady = job.partition == gpu_jobs.Partition.STEADY and not pending
     if pending:
-        loss = "[pause] it has not started, so a pause loses nothing; it waits held until released (slurm/resume.py)"
+        loss = "[pause] it is not running, so a pause loses nothing; it waits held until released (slurm/resume.py)"
     elif steady:
         loss = "[pause] a steady job cannot resume: a pause loses everything it has done so far"
     else:
