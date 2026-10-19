@@ -143,7 +143,7 @@ def sbatch_script(
     ]
     if mem:
         lines.append(f"#SBATCH --mem={mem}")
-    gpus = getattr(arguments, "gpus", None) or int(arguments.gpu)  # urgent.py's arguments carry no `gpus`
+    gpus = arguments.gpus or int(arguments.gpu)
     if gpus:
         lines.append(f"#SBATCH --gres=gpu:{gpus}")
     if getattr(arguments, "what", None):

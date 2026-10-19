@@ -200,8 +200,6 @@ def run(argv: list[str]) -> int:
     stamp = time.strftime("%Y%m%d-%H%M%S")
     log = arguments.log or gpu_jobs.STATE_DIR / "logs" / f"{arguments.name}-{stamp}.log"
     extra = [f"--time={arguments.time}"] + (["--exclusive"] if whole_box else [])
-    if arguments.gpus > 1:
-        extra.append(f"--gres=gpu:{arguments.gpus}")  # after submit.py's own gpu:1 directive, so it wins
     mem = "0" if whole_box else arguments.mem  # --mem=0: all of the node's memory
     script = submit.sbatch_script(
         arguments, mem=mem, log=log, manifest=None, partition=gpu_jobs.Partition.URGENT, extra=tuple(extra),
