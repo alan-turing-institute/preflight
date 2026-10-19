@@ -1,4 +1,4 @@
-# The job layer's agent: boot re-registration, released-job priorities, restore order, failure notices.
+# The job layer's agent: boot re-registration, released-job priorities, restore order, failure notices, per-job metrics.
 # Rendered from the site file by slurm/install/components/agent.py; do not edit by hand.
 [Unit]
 Description=lifecycle=service gpujobs agent ($install_dir/slurm/agent.py)

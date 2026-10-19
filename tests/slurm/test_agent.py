@@ -38,6 +38,7 @@ class World:
         self.dir = tmp_path
         self.queue: list[gpu_jobs.QueuedJob] | None = []
         self.t, self.boot, self.ctld_s = 1000.0, "boot-1", 60.0
+        self.has_gpus = True
         self.nodes = {"n1": "IDLE", "n2": "IDLE+DRAIN"}
         self.writes: list[list[str]] = []  # every scontrol update / release, failed ones included
         self.fail: set[str] = set()  # scontrol subcommands that answer with an error
@@ -69,8 +70,10 @@ class World:
         return done(argv, int(argv[1] in self.fail))
 
     def new_agent(self) -> agent_module.Agent:
+        gpus = [{"index": 0, "uuid": "GPU-x", "device": "/dev/nvidia0", "type": "t"}] if self.has_gpus else []
+        nodes = [{"name": "n1", "cpus": 4, "real_memory_mb": 1000, "gpus": gpus}]
         site = site_config.parse(
-            {"name": "t", "nodes": [], "notify_command": list(self.notify_command), "metrics": {"mode": self.metrics_mode}}
+            {"name": "t", "nodes": nodes, "notify_command": list(self.notify_command), "metrics": {"mode": self.metrics_mode}}
         )
         return agent_module.Agent(
             site,
@@ -136,6 +139,10 @@ def test_the_agent_writes_the_metrics_of_running_jobs_with_the_queues_user_and_r
     world.smi = {}
     world.step()
     assert not list(metrics.iterdir())
+    world.queue, world.has_gpus, world.smi = [running], False, None  # a site without GPUs has no nvidia-smi: CPU memory only, no error
+    world.agent = world.new_agent()
+    world.step()  # without GPUs nothing waits for nvidia-smi, so the file is written
+    assert "} 0\n" in (metrics / "job_5.prom").read_text() and "} 4096\n" in (metrics / "job_5.prom").read_text()
 
 
 def test_slurmctld_uptime_probe_reads_the_monotonic_timestamp() -> None:

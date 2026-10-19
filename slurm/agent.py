@@ -511,7 +511,8 @@ class Agent:
         return next(iter(self.cgroup_root.glob(f"system.slice/*_slurmstepd.scope/job_{job_id}")), None)
 
     def _job_metrics(self, queue: list[gpu_jobs.QueuedJob], errors: list[str]) -> None:
-        usage = self.gpu_usage()
+        # a site without GPUs has no nvidia-smi to ask: its jobs' GPU memory is 0, not unknown
+        usage = self.gpu_usage() if any(node.gpus for node in self.site.nodes) else {}
         if usage is None:
             errors.append("nvidia-smi did not answer; the job metrics files stay as they are")
             return
