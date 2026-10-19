@@ -69,6 +69,14 @@ def test_apply_then_check_against_a_temp_root(env):
     assert stat.S_IMODE((root / "etc/slurm/slurmdbd.conf").stat().st_mode) == 0o600
     assert stat.S_IMODE((root / "usr/local/bin/gpujobs-submit").stat().st_mode) == 0o755
     assert stat.S_IMODE((root / "opt/gpujobs/slurm/ood_app/bin/python").stat().st_mode) == 0o755  # OOD runs it
+    # The installed wrapper runs a job with only what the install put there (this site leaves hostguard off).
+    assert not (root / "opt/gpujobs/hostguard").exists()
+    job = dict(os.environ, GPUJOBS_SITE=str(site), SLURM_GPU_STATE_DIR=str(tmp / "state"), SLURM_JOB_ID="1")
+    wrapper = [sys.executable, str(root / "opt/gpujobs/slurm/job_wrapper.py"), "--", "true"]
+    assert subprocess.run(wrapper, env=job, check=False).returncode == 0
+    gated = SimpleNamespace(install_dir=Path("/opt/gpujobs"), hostguard=False, dgx_gate=True)
+    shipped = components.load(gated, ["tools"])[0].files(gated)
+    assert {"/opt/gpujobs/hostguard/hostguard.py", "/opt/gpujobs/dgx/dgx_submit.sh"} <= shipped.keys()
     assert ((root / "etc/slurm/slurmdbd.conf"), "slurm") in owned
     assert (root / "etc/gpujobs/site.toml", "root") in owned
     (root / "etc/slurm/slurmdbd.conf").chmod(0o644)  # same content, but readable by everyone

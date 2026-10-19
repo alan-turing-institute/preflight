@@ -124,8 +124,8 @@ TOML. Tables: the top level, `[[nodes]]` with `[[nodes.gpus]]`, `[lease]` with `
 | `install_dir` | `/opt/gpujobs` | Where the tools are installed (`install_dir/slurm/`). |
 | `admin_group` | `gpujobs-admin` | Unix group of administrators. Also the group allowed to submit to the `urgent` partition. |
 | `unified_memory` | `false` | True when the GPU shares system memory with the host (`nvidia-smi` reports total memory as `[N/A]`). `detect` sets it. Read and checked, but no tool acts on it yet. |
-| `hostguard` | `false` | Meant for the host memory guard on GPU jobs. Read and checked, but no tool acts on it yet (the job wrapper loads the guard regardless). |
-| `dgx_gate` | `false` | Require the DGX submission gate for jobs submitted with `--entry`. |
+| `hostguard` | `false` | The job wrapper marks every job as the preferred out-of-memory victim (`oom_score_adj` 800, through the host memory guard in `hostguard/hostguard.py`), so a memory shortage ends a job rather than a login session. The `tools` component installs the guard when this is on. |
+| `dgx_gate` | `false` | Require the DGX submission gate for jobs submitted with `--entry`. The `tools` component installs the gate (`dgx/`) and the host memory guard it checks when this is on. |
 | `notify_command` | `[]` | Command (list of arguments, no shell) run with a failure notice as its last argument when a job ends FAILED, OUT_OF_MEMORY, TIMEOUT or NODE_FAIL. Empty means no notification. |
 | `nodes` | required | One `[[nodes]]` table per compute node; at least one. |
 | `lease` | absent | Optional table; leave it out when no other service shares the GPU through the lease. Without it the `lease` component is not installed. |
@@ -229,7 +229,8 @@ partitions: `normal` (default; pre-emptable, resumes from its checkpoint), `stea
 defaults, not set by this installer.
 
 **`tools`** (always on). Copies the `*.py` files directly under `slurm/` and everything under `slurm/ood_app/`
-to `install_dir/slurm/`, and installs one small shim per tool in `/usr/local/bin`: `gpujobs-submit`,
+to `install_dir/slurm/` (plus `hostguard/hostguard.py` to `install_dir/hostguard/` when `hostguard` or `dgx_gate` is
+on, and `dgx/` to `install_dir/dgx/` when `dgx_gate` is on), and installs one small shim per tool in `/usr/local/bin`: `gpujobs-submit`,
 `gpujobs-status`, `gpujobs-pause`, `gpujobs-resume`, `gpujobs-kill`, `gpujobs-urgent`, `gpujobs-wait`,
 `gpujobs-footprint`, `gpujobs-audit`. Each runs the tool with `/usr/bin/python3`.
 

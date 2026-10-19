@@ -43,9 +43,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "hostguard"))
 import gpu_jobs  # noqa: E402 - path set just above
 import site_config
 
-# Importing hostguard only arms a hook on torch's import; the wrapper never imports torch.
-from hostguard import mark_preferred_victim
-
 PREFLIGHT = Path(__file__).resolve().parents[1]
 PARITY = PREFLIGHT / "dgx" / "assert_code_parity.py"
 CGROUP_ROOT = Path("/sys/fs/cgroup")
@@ -243,11 +240,6 @@ def run_and_measure(
     # (stage C test 3): on pre-emption slurm signals only the job script's own process when the job has no
     # `srun` steps (`man slurm.conf`, GraceTime: the signals go to "the tasks and the containing batch
     # script"), so a child that is not told never saves; it is SIGKILLed when KillWait ends.
-    # The job is what a memory shortage should end, not a session: 2026-10-18 13:57 earlyoom ended three
-    # Claude sessions while a training job holding 68.5 GB of the unified pool sat at oom_score_adj 0 (GPU
-    # memory is not in RSS, so its score saw 2.8 GB). Raised here, inherited by the command, so every slurm
-    # job is marked whatever environment it loads; hostguard marks only processes in a guarded venv.
-    mark_preferred_victim()
     child = subprocess.Popen(command, start_new_session=True)
 
     def forward(signum: int, _frame: object) -> None:
@@ -340,6 +332,16 @@ def main() -> int:
     footprint = gpu_jobs.STATE_DIR / "footprints" / f"{job_id}.jsonl"
     started = int(time.time())
     metrics_on = site is not None and site.metrics.mode != site_config.MetricsMode.OFF
+    if site is None or site.hostguard:
+        # The job is what a memory shortage should end, not a session: 2026-10-18 13:57 earlyoom ended three
+        # Claude sessions while a training job holding 68.5 GB of the unified pool sat at oom_score_adj 0 (GPU
+        # memory is not in RSS, so its score saw 2.8 GB). Raised here, inherited by the command, so every slurm
+        # job is marked whatever environment it loads; hostguard marks only processes in a guarded venv.
+        # Imported only here: an install carries hostguard only for a site that turns it on (tools component).
+        # Importing it only arms a hook on torch's import; the wrapper never imports torch.
+        from hostguard import mark_preferred_victim  # noqa: PLC0415
+
+        mark_preferred_victim()
     outcome = run_and_measure(command, footprint, cgroup, arguments.sample, job_id, metrics_on)
     outcome.update(leg=restart, started_at=started, ended_at=int(time.time()))
     record = gpu_jobs.read_sidecar(job_id) or {}
