@@ -87,6 +87,7 @@ class Portal:
 @dataclass(frozen=True)
 class Site:
     name: str
+    cluster_name: str  # slurm's ClusterName; Open OnDemand names its cluster file after it
     state_dir: Path
     install_dir: Path
     admin_group: str
@@ -149,6 +150,7 @@ def parse(raw: dict[str, Any]) -> Site:
         "top level",
         {"name", "nodes"},
         {
+            "cluster_name": None,
             "state_dir": "/var/lib/gpujobs",
             "install_dir": "/opt/gpujobs",
             "admin_group": "gpujobs-admin",
@@ -182,6 +184,7 @@ def parse(raw: dict[str, Any]) -> Site:
     )
     return Site(
         name=top["name"],
+        cluster_name=top["cluster_name"] or top["name"],
         state_dir=Path(top["state_dir"]),
         install_dir=Path(top["install_dir"]),
         admin_group=top["admin_group"],

@@ -396,7 +396,8 @@ def _grafana(site: Site) -> dict[str, Any] | None:
 def _cluster_file(site: Site) -> FileSpec:
     grafana = _grafana(site)
     custom = "\n".join(["  custom:", "    grafana:", *_yaml(grafana, 6)]) if grafana else ""
-    text = Template((TEMPLATE_DIR / "cluster.yml").read_text()).substitute(title=_quote(site.name), custom_block=custom)
+    template = Template((TEMPLATE_DIR / "cluster.yml").read_text())
+    text = template.substitute(title=_quote(site.cluster_name), custom_block=custom)
     return FileSpec(text.rstrip("\n") + "\n", FILE_MODE, "root")
 
 
@@ -404,8 +405,8 @@ def refusals(site: Site) -> list[str]:
     if not enabled(site):
         return []
     problems: list[str] = []
-    if not _NAME_RE.match(site.name):
-        problems.append(f"site name {site.name!r} cannot name a cluster file")
+    if not _NAME_RE.match(site.cluster_name):
+        problems.append(f"cluster name {site.cluster_name!r} cannot name a cluster file")
     if _installing(site):
         problems.extend(_build_portal_yml(site)[1])
     return problems
@@ -415,8 +416,8 @@ def files(site: Site) -> dict[str, FileSpec]:
     if not enabled(site):
         return {}
     out: dict[str, FileSpec] = {}
-    if _NAME_RE.match(site.name):
-        out[f"{CLUSTER_DIR}/{site.name}.yml"] = _cluster_file(site)
+    if _NAME_RE.match(site.cluster_name):  # OOD's Slurm docs: the cluster file is named after slurm's ClusterName
+        out[f"{CLUSTER_DIR}/{site.cluster_name}.yml"] = _cluster_file(site)
     if _installing(site):
         text, problems = _build_portal_yml(site)
         if not problems:  # never write a config that is missing a secret, whatever the caller checked

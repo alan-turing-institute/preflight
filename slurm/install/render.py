@@ -52,6 +52,7 @@ def _slurm(site: Site, extra: dict[str, str]) -> dict[str, FileSpec]:
     values = {
         "site_name": site.name,
         "head_node": names[0],
+        "cluster_name": site.cluster_name,
         "partition_nodes": ",".join(names),
         "node_lines": "".join(_node_line(n) for n in site.nodes),
         "gres_lines": gres_lines,

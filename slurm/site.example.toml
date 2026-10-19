@@ -4,6 +4,9 @@
 
 # Short name of this site (required).
 name = "example-host"
+# slurm's ClusterName, also the name of Open OnDemand's cluster file. Default: the site name. Never change it on
+# a running cluster: slurmctld refuses to start when ClusterName differs from the one in its saved state.
+# cluster_name = "example-host"
 # Where the job layer keeps records and events. Default: /var/lib/gpujobs
 state_dir = "/var/lib/gpujobs"
 # Where the code is installed. Default: /opt/gpujobs
