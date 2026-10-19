@@ -1,0 +1,12 @@
+---
+# Rendered from the site file by slurm/install/components/portal.py. Do not edit by hand.
+# Holds secrets read from root-only files: keep this file root:root 0600.
+servername: ${servername}
+ssl:
+${ssl_lines}
+security_strict_transport: ${hsts}
+oidc_crypto_passphrase: ${passphrase}
+auth:
+  - "AuthType openid-connect"
+  - "Require valid-user"
+${auth_block}
