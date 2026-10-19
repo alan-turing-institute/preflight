@@ -3,7 +3,7 @@
 
 Design 3.6 (`design notes`).
 
-    slurm/urgent.py --project P --what '...' --time 2:00:00 [--mem M | --whole-box] [--gpu] \
+    slurm/urgent.py --project P --what '...' --time 2:00:00 [--mem M | --whole-box] [--gpu | --gpus N] \
         [--wait] [--requeue-steady] [--dry-run] -- <command...>
 
 1. THE PLAN, printed before acting, classifies everything in the urgent job's way:
@@ -17,12 +17,13 @@ Design 3.6 (`design notes`).
    the services step aside because an urgent job is keeper demand, with or without `--gpu`.
 4. ORDER AFTERWARDS: a requeued job cannot start for the requeue wait, so an urgent job shorter than that
    would hand the card to another queued job first. Other pending tier-1 GPU jobs are held and recorded in
-   `restore_order.json`; the keeper releases them once every pre-empted job is running again or has left.
+   `requests/restore_order-<ns>.json`; the keeper releases them once every pre-empted job is running again or has left.
 """
 
 from __future__ import annotations
 
 import argparse
+import getpass
 import subprocess
 import sys
 import time
@@ -32,6 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import audit  # noqa: E402 - path set just above
 import gpu_jobs  # noqa: E402
+import site_config  # noqa: E402
 import submit  # noqa: E402
 
 #: Background services in the lease protocol that yield to a waiting lease, and how fast (design section 2).
@@ -41,7 +43,7 @@ YIELDING_SERVICES = {
 }
 #: slurm's own delay from an urgent submission to its start, measured in the trial (build notes).
 SLURM_START_S = (31, 46)
-RESTORE_ORDER = "restore_order.json"
+ADMIN_REMEDY = "sudo slurm/install/install.py admin add USER"
 
 
 def elapsed(job_id: str) -> str:
@@ -50,13 +52,17 @@ def elapsed(job_id: str) -> str:
 
 
 def free_memory_mb() -> int | None:
-    """Memory slurm has not allocated on the node (`RealMemory - AllocMem`), or None if unknown."""
-    done = subprocess.run(["scontrol", "show", "node", "gpu-node-1"], capture_output=True, text=True, check=False)
-    fields = dict(part.split("=", 1) for part in done.stdout.split() if "=" in part)
-    try:
-        return int(fields["RealMemory"]) - int(fields["AllocMem"])
-    except (KeyError, ValueError):
-        return None
+    """Memory slurm has not allocated across every node (`RealMemory - AllocMem`, summed), or None if unknown."""
+    total = 0
+    names = gpu_jobs.nodes()
+    for name in names:
+        done = subprocess.run(["scontrol", "show", "node", name], capture_output=True, text=True, check=False)
+        fields = dict(part.split("=", 1) for part in done.stdout.split() if "=" in part)
+        try:
+            total += int(fields["RealMemory"]) - int(fields["AllocMem"])
+        except (KeyError, ValueError):
+            return None
+    return total if names else None
 
 
 def mem_mb(text: str) -> int:
@@ -69,22 +75,27 @@ def mem_mb(text: str) -> int:
 def plan(
     queue: list[gpu_jobs.QueuedJob], *, gpu: bool, whole_box: bool, leases: list[tuple[str, bool]],
     unregistered: list[tuple[int, float, str]], memory_short: bool = False,
+    services: dict[str, str] | None = None,
 ) -> tuple[list[str], list[str], list[str], list[str]]:
     """(lines to print, normal victims, steady blockers, other wait-only blockers).
 
     `memory_short`: the urgent job's memory does not fit in what slurm has left, so every running job is in
-    its way (slurm picks which `normal` ones to pre-empt).
+    its way (slurm picks which `normal` ones to pre-empt). `services`: service name -> yield text (default
+    `YIELDING_SERVICES`; a site passes its own, possibly empty). A GPU urgent job puts every running `normal`
+    job holding GPUs in the way, on any node.
     """
+    services = YIELDING_SERVICES if services is None else services
     lines, victims, steady, wait_only = [], [], [], []
     for job in queue:
         record = gpu_jobs.read_sidecar(job.job_id) or {}
-        in_way = whole_box or memory_short or (gpu and bool(record.get("gpu")))
+        in_way = whole_box or memory_short or (gpu and (bool(record.get("gpu")) or job.gpus > 0))
         if not in_way or not (job.active or job.partition == gpu_jobs.Partition.URGENT):
             continue
         what = f"{job.job_id} {job.name} ({record.get('what', 'no sidecar')}), running {elapsed(job.job_id)}"
         if job.partition == gpu_jobs.Partition.NORMAL:
             victims.append(job.job_id)
-            lines.append(f"[urgent] PAUSABLE  {what}: requeued; loses at most the time since its last checkpoint")
+            lines.append(f"[urgent] PAUSABLE  {what}: may be pre-empted (slurm picks as many as the urgent job needs); "
+                         "loses at most the time since its last checkpoint")
         elif job.partition == gpu_jobs.Partition.STEADY:
             steady.append(job.job_id)
             lines.append(f"[urgent] WAIT-ONLY {what}: cannot resume; requeueing it loses all of that run")
@@ -94,8 +105,8 @@ def plan(
     for project, waiting in leases:
         if project == gpu_jobs.LEASE_PROJECT:
             continue
-        if project in YIELDING_SERVICES:
-            lines.append(f"[urgent] PAUSABLE  service {project}: {YIELDING_SERVICES[project]}")
+        if project in services:
+            lines.append(f"[urgent] PAUSABLE  service {project}: {services[project]}")
         else:
             wait_only.append(f"lease:{project}")
             state = "waiting for the card" if waiting else "holds the card"
@@ -125,7 +136,9 @@ def parser() -> argparse.ArgumentParser:
     size = p.add_mutually_exclusive_group()
     size.add_argument("--mem", default=None, help="memory it needs; default: the whole box")
     size.add_argument("--whole-box", action="store_true")
-    p.add_argument("--gpu", action="store_true")
+    count = p.add_mutually_exclusive_group()
+    count.add_argument("--gpu", action="store_true", help="one GPU (same as --gpus 1)")
+    count.add_argument("--gpus", type=int, default=None, metavar="N", help="N GPUs, N >= 1")
     p.add_argument("--wait", action="store_true", help="accept waiting behind what cannot be paused")
     p.add_argument("--requeue-steady", action="store_true", help="requeue steady jobs in the way (loses them)")
     p.add_argument("--cpus", type=int, default=4)
@@ -148,8 +161,18 @@ def run(argv: list[str]) -> int:
     if not arguments.command:
         print("[urgent] REFUSED: no command after --", file=sys.stderr)
         return 1
+    if arguments.gpus is not None and arguments.gpus < 1:
+        print("[urgent] REFUSED: --gpus must be an integer >= 1", file=sys.stderr)
+        return 1
+    site = site_config.load() if site_config.SITE_FILE.exists() else None
+    if site and not site_config.is_admin(site, getpass.getuser()):
+        print(f"[urgent] REFUSED: only members of {site.admin_group} may submit urgent work; "
+              f"an admin adds you with: {ADMIN_REMEDY}", file=sys.stderr)
+        return 1
+    services = YIELDING_SERVICES if site is None else site.lease.services if site.lease else {}
     whole_box = arguments.whole_box or arguments.mem is None
-    arguments.gpu = arguments.gpu or whole_box
+    arguments.gpu = arguments.gpu or arguments.gpus is not None or whole_box
+    arguments.gpus = arguments.gpus or int(arguments.gpu)
     arguments.name = arguments.name or Path(arguments.command[0]).name
     arguments.job_class, arguments.after = "urgent", []
     queue = gpu_jobs.read_queue()
@@ -160,7 +183,7 @@ def run(argv: list[str]) -> int:
     memory_short = bool(arguments.mem) and free is not None and mem_mb(arguments.mem) > free
     lines, victims, steady, wait_only = plan(
         queue, gpu=arguments.gpu, whole_box=whole_box, leases=other_leases(), unregistered=audit.unregistered(),
-        memory_short=memory_short,
+        memory_short=memory_short, services=services,
     )
     if arguments.mem and free is not None:
         print(f"[urgent] memory: needs {mem_mb(arguments.mem)} MB, slurm has {free} MB unallocated"
@@ -177,6 +200,8 @@ def run(argv: list[str]) -> int:
     stamp = time.strftime("%Y%m%d-%H%M%S")
     log = arguments.log or gpu_jobs.STATE_DIR / "logs" / f"{arguments.name}-{stamp}.log"
     extra = [f"--time={arguments.time}"] + (["--exclusive"] if whole_box else [])
+    if arguments.gpus > 1:
+        extra.append(f"--gres=gpu:{arguments.gpus}")  # after submit.py's own gpu:1 directive, so it wins
     mem = "0" if whole_box else arguments.mem  # --mem=0: all of the node's memory
     script = submit.sbatch_script(
         arguments, mem=mem, log=log, manifest=None, partition=gpu_jobs.Partition.URGENT, extra=tuple(extra),
@@ -199,7 +224,13 @@ def run(argv: list[str]) -> int:
     ]
     if victims and held:
         subprocess.run(["scontrol", "hold", ",".join(held)], check=True)
-        gpu_jobs.write_json(gpu_jobs.STATE_DIR / RESTORE_ORDER, {"victims": {v: False for v in victims}, "held": held})
+        requests = gpu_jobs.STATE_DIR / "requests"
+        requests.mkdir(parents=True, exist_ok=True)
+        gpu_jobs.write_json(
+            requests / f"restore_order-{time.time_ns()}.json", {"victims": {v: False for v in victims}, "held": held}
+        )
+        for job_id in held:
+            gpu_jobs.write_event(job_id, gpu_jobs.EventAction.URGENT_HOLD, urgent=f"{arguments.name}: {arguments.what}")
         print(f"[urgent] held {held} until the pre-empted jobs {victims} run again")
     path = gpu_jobs.STATE_DIR / "scripts" / f"{arguments.name}-{stamp}.sbatch"
     path.parent.mkdir(parents=True, exist_ok=True)
