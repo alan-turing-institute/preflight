@@ -56,6 +56,7 @@ COMMENT_MAX = 200
 AUTO_MARGIN = 0.10
 #: --mem with no measured run, for a GPU job: slurm's "all of the memory on each node".
 WHOLE_BOX = "0"
+DEFAULT_CPUS = 4  # a CPU-only job, or any job when no site file says what the box has
 _DURATION = re.compile(r"^(\d+(?:\.\d+)?)([smh]?)$")
 _UNIT_S = {"": 1, "s": 1, "m": 60, "h": 3600}
 
@@ -178,6 +179,20 @@ def sbatch_script(
     return "\n".join(lines) + "\n"
 
 
+def resolve_cpus(asked: int | None, gpus: int, site: site_config.Site | None) -> int:
+    """`--cpus`, else for a GPU job its GPUs' share of the GPU node's cores, else DEFAULT_CPUS.
+
+    A GPU job given the old flat 4 cores was CPU-bound: the same inference timing ran 2-14x slower than with all 20
+    (slurm jobs 254 and 258, 2026-10-19), while the other cores sat idle behind the one GPU.
+    """
+    if asked is not None:
+        return asked
+    node = next((n for n in site.nodes if n.gpus), None) if site is not None else None
+    if not gpus or node is None:
+        return DEFAULT_CPUS
+    return max(1, node.cpus * min(gpus, len(node.gpus)) // len(node.gpus))
+
+
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--project", required=True)
@@ -191,7 +206,9 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--entry", default=None, help="the Python entry script, relative to --repo (runs the gate)")
     p.add_argument("--repo", type=Path, default=None)
     p.add_argument("--after", action="append", default=[], metavar="JOBID")
-    p.add_argument("--cpus", type=int, default=4)
+    p.add_argument("--cpus", type=int, default=None,
+                   help=f"default: a GPU job gets its GPUs' share of the GPU node's cores (all of them on a one-GPU box), "
+                        f"other jobs {DEFAULT_CPUS}")
     p.add_argument("--name", default=None)
     p.add_argument("--log", type=Path, default=None)
     p.add_argument("--workdir", type=Path, default=Path.cwd())
@@ -230,6 +247,7 @@ def submit(argv: list[str]) -> str:
         raise Refused(msg)
     seconds(arguments.wait_limit)
     mem = resolve_mem(arguments.mem, named, arguments.gpu)
+    arguments.cpus = resolve_cpus(arguments.cpus, arguments.gpus, site)
     stamp = time.strftime("%Y%m%d-%H%M%S")
     log = arguments.log or gpu_jobs.STATE_DIR / "logs" / f"{arguments.name}-{stamp}.log"
     gated = bool(arguments.entry) and (site is None or site.dgx_gate)

@@ -21,11 +21,11 @@ def no_site_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def fake_site(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, lease: object, dgx_gate: bool) -> None:
-    """A site file that exists; `load` returns just the two fields submit.py reads."""
+    """A site file that exists; `load` returns just the fields submit.py reads."""
     present = tmp_path / "site.toml"
     present.write_text("")
     monkeypatch.setattr(site_config, "SITE_FILE", present)
-    monkeypatch.setattr(site_config, "load", lambda *_path: SimpleNamespace(lease=lease, dgx_gate=dgx_gate))
+    monkeypatch.setattr(site_config, "load", lambda *_path: SimpleNamespace(lease=lease, dgx_gate=dgx_gate, nodes=()))
 
 
 def dry(*argv: str) -> str:
@@ -97,6 +97,28 @@ def test_a_first_gpu_run_with_no_mem_takes_the_whole_box(mem: list[str], tmp_pat
     script = dry("--project", "p", "--what", "w", "--class", "restart", "--gpu", *mem, "--name", "never-ran",
                  "--", "x")
     assert f"{DIRECTIVE} --mem=0" in script
+
+
+@pytest.mark.parametrize(
+    ("site_cpus", "argv", "cpus"),
+    [
+        (None, ["--gpu"], 4),  # no site file: the old default
+        (20, ["--gpu"], 20),  # one-GPU box: all of it
+        (20, [], 4),  # a CPU job keeps the small default
+        (20, ["--gpu", "--cpus", "8"], 8),  # asked for wins
+        (24, ["--gpus", "2"], 12),  # four GPUs: two of them get half the cores
+    ],
+)
+def test_a_gpu_job_gets_its_gpus_share_of_the_cores(site_cpus: int | None, argv: list[str], cpus: int, tmp_path: Path,
+                                                    monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(gpu_jobs, "STATE_DIR", tmp_path)
+    if site_cpus is not None:
+        fake_site(monkeypatch, tmp_path, lease=None, dgx_gate=False)
+        gpus = (object(),) * (4 if "--gpus" in argv else 1)
+        node = SimpleNamespace(cpus=site_cpus, gpus=gpus)
+        monkeypatch.setattr(site_config, "load", lambda *_p: SimpleNamespace(lease=None, dgx_gate=False, nodes=(node,)))
+    script = dry("--project", "p", "--what", "w", "--class", "restart", "--mem", "4G", *argv, "--", "x")
+    assert f"{DIRECTIVE} --cpus-per-task={cpus}" in script
 
 
 def test_a_first_cpu_run_with_no_mem_gets_slurms_default(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
