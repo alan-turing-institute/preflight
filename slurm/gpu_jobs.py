@@ -1,4 +1,4 @@
-"""Shared pieces of the GPU-job tools on gpu-node-1: where their state lives, and what slurm says.
+"""Shared pieces of the GPU-job tools: where their state lives, and what slurm says.
 
 Design: `design notes` (revision 2). Every GPU job on this
 box goes through slurm; each submission leaves a SIDECAR record (project, class, GPU or not, command),

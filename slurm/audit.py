@@ -11,6 +11,7 @@ unregistered. Prints only; the in-job occupancy check is what blocks a launch.
 
 from __future__ import annotations
 
+import argparse
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -92,6 +93,7 @@ def report(found: list[tuple[int, float, str]]) -> list[str]:
 
 
 def main() -> int:
+    argparse.ArgumentParser(description=__doc__.splitlines()[0]).parse_args()
     print("\n".join(report(unregistered())))
     return 0
 

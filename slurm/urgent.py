@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run urgent work on gpu-node-1 now: show what is in its way and what a pause loses, then pre-empt and submit.
+"""Run urgent work now: show what is in its way and what a pause loses, then pre-empt and submit.
 
 Design 3.6 (`design notes`).
 

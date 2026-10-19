@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run one slurm job's command on gpu-node-1: wait for the card, re-check the code, run, measure, record.
+"""Run one slurm job's command: wait for the card, re-check the code, run, measure, record.
 
 Design 3.4-3.5 (`design notes`). `submit.py` writes an
 sbatch script whose only line runs this wrapper. In order:

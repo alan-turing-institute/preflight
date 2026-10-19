@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import sys
 from pathlib import Path
 
@@ -49,6 +50,7 @@ def lines(queue: list[gpu_jobs.QueuedJob] | None) -> list[str]:
 
 
 def main() -> int:
+    argparse.ArgumentParser(description=__doc__.splitlines()[0]).parse_args()
     print("\n".join(lines(gpu_jobs.read_queue())))
     return 0
 
