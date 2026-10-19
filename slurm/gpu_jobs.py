@@ -14,17 +14,39 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import pwd
 import re
 import subprocess
 import tempfile
-from dataclasses import dataclass
+import time
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 
-#: Where the tools keep their records (sidecars, footprints, the keeper's state). Overridable for tests.
-STATE_DIR = Path(os.environ.get("SLURM_GPU_STATE_DIR", "~/.local/state/slurm-gpu")).expanduser()
+import site_config
+
+_LEGACY_STATE_DIR = Path("~/.local/state/slurm-gpu")
+_LEGACY_LEASE_DIR = Path("~/.local/state/gpu-lease")
+
+
+def _site_dirs() -> tuple[Path, Path | None]:
+    """(state dir, lease dir) from env, then the site file, then the pre-site-file locations.
+
+    Never fails for a missing site file: until the installer writes one, the box keeps its legacy paths.
+    """
+    state, lease = os.environ.get("SLURM_GPU_STATE_DIR"), os.environ.get("GPU_LEASE_DIR")
+    site = site_config.load() if site_config.SITE_FILE.exists() and not (state and lease) else None
+    state_dir = Path(state) if state else site.state_dir if site else _LEGACY_STATE_DIR
+    lease_dir = Path(lease) if lease else site.lease.lease_dir if site and site.lease else _LEGACY_LEASE_DIR
+    return state_dir.expanduser(), lease_dir.expanduser()
+
+
+_STATE, _LEASE = _site_dirs()
+#: Where the tools keep their records (sidecars, events, footprints, the keeper's state). Overridable for tests.
+STATE_DIR = _STATE
 #: The cross-project GPU lease directory (service-c's protocol document); same override as localmodels.
-LEASE_DIR = Path(os.environ.get("GPU_LEASE_DIR", "~/.local/state/gpu-lease")).expanduser()
+LEASE_DIR = _LEASE
 #: The project name slurm's keeper holds the lease under.
 LEASE_PROJECT = "slurm"
 #: slurm's completion log on this box (`JobCompLoc` in machine/slurm/slurm.conf).
@@ -71,7 +93,8 @@ HELD_REASONS = frozenset(
 #: The pending reason of a job waiting for the jobs it depends on (`man squeue`, JOB REASON CODES).
 DEPENDENCY_REASON = "Dependency"
 
-_SQUEUE_FORMAT = "%i|%P|%T|%r|%E|%j"
+#: Name last, so a `|` inside it is kept. User, priority and GRES (`%b`) follow the original six fields.
+_SQUEUE_FORMAT = "%i|%P|%T|%r|%E|%u|%Q|%b|%j"
 #: Explicit, because with MinJobAge a day slurm keeps finished jobs listable; these tools want unfinished ones only.
 _UNFINISHED = ",".join(state.lower() for state in State)
 
@@ -86,6 +109,9 @@ class QueuedJob:
     reason: str
     name: str
     dependency: str = ""  # squeue's %E, e.g. "afterok:65(unfulfilled)"; "(null)" or "" for none
+    user: str = ""
+    priority: int = 0
+    gpus: int = 0
 
     @property
     def depends_on(self) -> tuple[str, ...]:
@@ -107,14 +133,29 @@ class QueuedJob:
         return self.state == State.PENDING and self.reason not in HELD_REASONS
 
 
+def parse_gpus(gres: str) -> int:
+    """GPUs in squeue's `%b`: `gres/gpu:2`, `gpu:gb10:2`, `gres/gpu:gb10:2`; `gres/gpu` alone is 1; `N/A` is 0."""
+    total = 0
+    for item in gres.split(","):
+        match = re.fullmatch(r"(?:gres/)?gpu(?::[A-Za-z][\w.-]*)?(?::(\d+))?(?:\(.*\))?", item.strip())
+        if match:
+            total += int(match[1] or 1)
+    return total
+
+
 def parse_squeue(text: str) -> list[QueuedJob]:
-    """Rows of `squeue -h -o '%i|%P|%T|%r|%E|%j'`; the name is last, so a `|` inside it is kept."""
+    """Rows of `squeue -h -o _SQUEUE_FORMAT`; the name is last, so a `|` inside it is kept."""
     jobs = []
     for line in text.splitlines():
-        parts = line.strip().split("|", 5)
-        if len(parts) == 6:  # noqa: PLR2004 - the six fields of _SQUEUE_FORMAT
-            job_id, partition, state, reason, dependency, name = parts
-            jobs.append(QueuedJob(job_id, partition, state, reason, name, dependency))
+        parts = line.strip().split("|", 8)
+        if len(parts) == 9:  # noqa: PLR2004 - the nine fields of _SQUEUE_FORMAT
+            job_id, partition, state, reason, dependency, user, priority, gres, name = parts
+            jobs.append(
+                QueuedJob(
+                    job_id, partition, state, reason, name, dependency, user,
+                    int(priority) if priority.isdigit() else 0, parse_gpus(gres),
+                )
+            )
     return jobs
 
 
@@ -250,3 +291,93 @@ def node_state() -> str:
     """The node's state and reason (`ReturnToService=1` leaves it DOWN after a reboot)."""
     done = subprocess.run(["sinfo", "-h", "-N", "-o", "%T|%E"], capture_output=True, text=True, check=False)
     return done.stdout.splitlines()[0] if done.returncode == 0 and done.stdout else "unknown (sinfo failed)"
+
+
+class EventAction(StrEnum):
+    """What happened to a job, as recorded in `STATE_DIR/events/`."""
+
+    PAUSE = "pause"
+    RESUME = "resume"
+    KILL = "kill"
+    URGENT_HOLD = "urgent_hold"
+    RELEASE = "release"
+    FAILED = "failed"
+
+
+@dataclass(frozen=True)
+class Event:
+    """One event file. `actor` is the file's owner, read from `stat`, never from the content."""
+
+    job: str
+    action: str
+    actor: str
+    at: int  # time_ns, from the file name
+    fields: dict[str, object] = field(default_factory=dict)
+
+
+def write_event(job_id: str, action: EventAction, **fields: object) -> Path:
+    """Record an event as `events/<job>-<time_ns>-<action>.json` (0644; the directory is sticky and shared)."""
+    at = time.time_ns()
+    path = STATE_DIR / "events" / f"{job_id}-{at}-{action}.json"
+    write_json(path, {"job": job_id, "action": str(action), "at": at, **fields})
+    path.chmod(0o644)
+    return path
+
+
+def _owner(path: Path) -> str:
+    uid = path.stat().st_uid
+    try:
+        return pwd.getpwuid(uid).pw_name
+    except KeyError:
+        return str(uid)
+
+
+def events(job_id: str | None = None) -> list[Event]:
+    """Every event (of one job, if given), oldest first. Who did it comes from file ownership alone."""
+    found = []
+    for path in (STATE_DIR / "events").glob("*.json"):
+        match = re.fullmatch(r"(.+)-(\d+)-([a-z_]+)\.json", path.name)
+        record = read_json(path)
+        if not match or record is None or (job_id is not None and match[1] != job_id):
+            continue
+        extra = {k: v for k, v in record.items() if k not in {"job", "action", "at"}}
+        try:
+            found.append(Event(match[1], match[3], _owner(path), int(match[2]), extra))
+        except OSError:
+            continue
+    return sorted(found, key=lambda event: event.at)
+
+
+def _docker_label(container_id: str, label: str) -> str:
+    done = subprocess.run(
+        ["docker", "inspect", "-f", f'{{{{index .Config.Labels "{label}"}}}}', container_id],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return done.stdout.strip() if done.returncode == 0 else ""
+
+
+_DOCKER_SCOPE = re.compile(r"/docker-([0-9a-f]{64})\.scope$")
+
+
+def container_label(cgroup: str, label: str, runner: Callable[[str, str], str] = _docker_label) -> str:
+    """The `label` of the docker container whose scope ends `cgroup`; "" if it is not one or docker fails."""
+    match = _DOCKER_SCOPE.search(cgroup)
+    if not match:
+        return ""
+    try:
+        return runner(match[1], label)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def nodes(runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run) -> list[str]:
+    """Node names slurm knows (`scontrol show nodes -o`); [] when slurm does not answer."""
+    try:
+        done = runner(["scontrol", "show", "nodes", "-o"], capture_output=True, text=True, timeout=30, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if done.returncode != 0:
+        return []
+    return [m[1] for line in done.stdout.splitlines() if (m := re.search(r"(?:^|\s)NodeName=(\S+)", line))]
