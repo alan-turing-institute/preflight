@@ -1,25 +1,18 @@
-"""site.py: the shipped site files load, defaults hold, typos and a missing file are refused."""
+"""site_config.py: the shipped site files load, defaults hold, typos and a missing file are refused."""
 
 from __future__ import annotations
 
 import grp
-import importlib.util
 import pwd
 import re
-import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import site_config as gpujobs_site
 
 ROOT = Path(__file__).resolve().parents[2]
 
-# `site` is a stdlib module that is already imported at interpreter start, so load ours by path.
-_spec = importlib.util.spec_from_file_location("gpujobs_site", ROOT / "slurm" / "site.py")
-assert _spec and _spec.loader
-gpujobs_site = importlib.util.module_from_spec(_spec)
-sys.modules["gpujobs_site"] = gpujobs_site
-_spec.loader.exec_module(gpujobs_site)
 
 MINIMAL = """
 name = "x"
@@ -41,7 +34,7 @@ def test_this_box_site_file_loads() -> None:
     site = gpujobs_site.load(ROOT / "machine/slurm/site.toml")
     assert site.name == "gpu-node-1" and site.unified_memory and site.hostguard and site.dgx_gate
     gpu = site.nodes[0].gpus[0]
-    assert (site.nodes[0].real_memory_mb, gpu.device, gpu.type) == (104000, "/dev/nvidia0", "gb10")
+    assert (site.nodes[0].real_memory_mb, gpu.device, gpu.type) == (100000, "/dev/nvidia0", "gb10")
     assert set(site.lease.services) == {"service-a", "service-b"}
     assert site.lease.lease_dir == Path("/home/user1/.local/state/gpu-lease")
     assert (site.metrics.mode, site.metrics.grafana_port) == (gpujobs_site.MetricsMode.LOCAL, 3001)
