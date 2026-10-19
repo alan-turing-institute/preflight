@@ -6,7 +6,10 @@ import json
 from pathlib import Path
 
 import gpu_jobs
+import kill
+import pause
 import pytest
+import resume
 import urgent
 
 
@@ -114,3 +117,77 @@ def test_site_admin_check_multi_gpu_plan_and_request_file(
     request = next((tmp_path / "requests").glob("restore_order-*.json"))
     assert json.loads(request.read_text()) == {"victims": {"5": False}, "held": ["6"]}
     assert [e.action for e in gpu_jobs.events("6")] == ["urgent_hold"]
+
+
+class FakeSlurm:
+    """Stands in for every scontrol/scancel call: records them, fails when told to."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, returncode: int = 0) -> None:
+        self.calls: list[list[str]] = []
+        self.returncode = returncode
+        monkeypatch.setattr(pause.subprocess, "run", self)
+
+    def __call__(self, command: list[str], **_kwargs: object) -> object:
+        self.calls.append(command)
+        err = "scontrol: error: Access/permission denied" if self.returncode else ""
+        return type("Done", (), {"returncode": self.returncode, "stdout": "", "stderr": err})()
+
+
+def actions(job_id: str) -> list[str]:
+    return [event.action for event in gpu_jobs.events(job_id)]
+
+
+def test_pause_dry_run_acts_on_nothing_and_a_pause_is_recorded(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(gpu_jobs, "read_queue", lambda: [job("1", "normal"), job("2", "steady")])
+    slurm = FakeSlurm(monkeypatch)
+    monkeypatch.setattr(pause, "elapsed", lambda _job: "1:00")
+    monkeypatch.setattr("sys.argv", ["pause.py", "2", "--dry-run"])
+    assert pause.main() == 0
+    assert capsys.readouterr().out.strip() == "[pause] a steady job cannot resume: a pause loses everything it has done so far"
+    assert slurm.calls == [] and actions("2") == []
+
+    monkeypatch.setattr("sys.argv", ["pause.py", "1", "--reason", "need the card"])
+    assert pause.main() == 0
+    assert slurm.calls == [["scontrol", "requeuehold", "1"]]
+    assert [(e.action, e.fields) for e in gpu_jobs.events("1")] == [("pause", {"reason": "need the card"})]
+
+
+def test_a_failing_scontrol_prints_slurms_text_and_records_nothing(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(gpu_jobs, "read_queue", lambda: [job("1", "normal")])
+    FakeSlurm(monkeypatch, returncode=1)
+    monkeypatch.setattr("sys.argv", ["pause.py", "1"])
+    assert pause.main() == 1
+    assert "Access/permission denied" in capsys.readouterr().err
+    monkeypatch.setattr("sys.argv", ["resume.py", "1"])
+    assert resume.main() == 1
+    monkeypatch.setattr("sys.argv", ["kill.py", "1"])
+    assert kill.main() == 1
+    assert actions("1") == []
+
+
+def test_resume_and_kill_write_their_events_and_resume_node_covers_every_node(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    slurm = FakeSlurm(monkeypatch)
+    monkeypatch.setattr(gpu_jobs, "node_state", lambda: "idle|")
+    monkeypatch.setattr(gpu_jobs, "nodes", lambda: ["n1", "n2"])
+    monkeypatch.setattr("sys.argv", ["resume.py", "1", "3"])
+    assert resume.main() == 0
+    assert (actions("1"), actions("3")) == (["resume"], ["resume"])
+    monkeypatch.setattr("sys.argv", ["kill.py", "1", "--reason", "wrong config"])
+    assert kill.main() == 0
+    assert actions("1") == ["resume", "kill"]
+    assert slurm.calls[-1] == ["scancel", "1"]
+
+    slurm.calls.clear()
+    monkeypatch.setattr("sys.argv", ["resume.py", "--node"])
+    assert resume.main() == 0
+    assert [c[-2] for c in slurm.calls] == ["nodename=n1", "nodename=n2"]
+    slurm.calls.clear()
+    monkeypatch.setattr("sys.argv", ["resume.py", "--node", "n2"])
+    assert resume.main() == 0
+    assert [c[-2] for c in slurm.calls] == ["nodename=n2"]
