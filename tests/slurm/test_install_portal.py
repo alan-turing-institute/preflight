@@ -77,6 +77,12 @@ def no_metrics_module(monkeypatch):
     monkeypatch.setattr(portal, "_metrics_module", lambda: None)
 
 
+@pytest.fixture(autouse=True)
+def empty_apt(tmp_path, monkeypatch):
+    """No test reads the host's own /etc/apt (this box has NodeSource configured by hand)."""
+    monkeypatch.setattr(portal, "APT_DIR", tmp_path / "no-apt")
+
+
 def test_dex_local_renders_users_and_runs_update_with_insecure(tmp_path):
     site = make_site(tmp_path)
     spec_ = portal.files(site)[portal.PORTAL_YML]
@@ -250,7 +256,7 @@ def test_existing_mode_writes_only_cluster_file_and_app_link(tmp_path):
     assert not portal.enabled(off) and portal.files(off) == {} and portal.post_install(off) == []
 
 
-def test_install_links_our_app_after_the_restart_and_ships_the_repo_keys(tmp_path):
+def test_install_links_our_app_after_the_restart_and_ships_the_repo_keys(tmp_path, monkeypatch):
     site = make_site(tmp_path)
     steps = portal.post_install(site)
     assert steps[-1] == ["ln", "-sfT", "/opt/gpujobs/slurm/ood_app", "/var/www/ood/apps/sys/gpujobs"]
@@ -264,3 +270,13 @@ def test_install_links_our_app_after_the_restart_and_ships_the_repo_keys(tmp_pat
     assert sources[portal.NODE_LIST].content.endswith("https://deb.nodesource.com/node_22.x nodistro main\n")
     for keyring in (portal.OOD_KEYRING, portal.NODE_KEYRING):
         assert sources[keyring].content.startswith("-----BEGIN PGP PUBLIC KEY BLOCK-----")
+    # a source the machine already has (NodeSource added by hand, deb822 format) is used as it is, never doubled:
+    # apt refuses one source with two signing keys, and every apt-get update then fails (gpu-node-1, 2026-10-19)
+    apt = tmp_path / "apt"
+    (apt / "sources.list.d").mkdir(parents=True)
+    (apt / "sources.list.d" / "nodesource.sources").write_text(
+        "Types: deb\nURIs: https://deb.nodesource.com/node_22.x\nSuites: nodistro\nSigned-By: /usr/share/keyrings/nodesource.gpg\n"
+    )
+    (apt / "sources.list.d" / "gpujobs-ondemand-web.list").write_text("ours, from an earlier apply\n")
+    monkeypatch.setattr(portal, "APT_DIR", apt)
+    assert sorted(portal.apt_sources(site)) == sorted([portal.OOD_KEYRING, portal.OOD_LIST])

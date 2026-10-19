@@ -444,21 +444,41 @@ def files(site: Site) -> dict[str, FileSpec]:
     return out
 
 
+#: Where the machine's apt sources are (patched in tests).
+APT_DIR = Path("/etc/apt")
+
+
+def _configured_elsewhere(uri: str, own: str) -> bool:
+    """Whether an apt source file other than our `own` one already names `uri`.
+
+    apt refuses one source defined twice with different signing keys ("Conflicting values set for option Signed-By"),
+    and every later `apt-get update` on the machine fails: measured on gpu-node-1 on 2026-10-19, where NodeSource
+    had been added by hand (`nodesource.sources`). Such a source is then used as it is.
+    """
+    sources = APT_DIR / "sources.list.d"
+    for path in [APT_DIR / "sources.list", *sorted(sources.glob("*.list")), *sorted(sources.glob("*.sources"))]:
+        if path.name == Path(own).name:
+            continue
+        try:
+            if uri in path.read_text(encoding="utf-8", errors="replace"):
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def apt_sources(site: Site) -> dict[str, FileSpec]:
     if not _installing(site):
         return {}
-    return {
-        OOD_KEYRING: FileSpec((TEMPLATE_DIR / "ondemand-web.asc").read_text(), FILE_MODE, "root"),
-        NODE_KEYRING: FileSpec((TEMPLATE_DIR / "nodesource.asc").read_text(), FILE_MODE, "root"),
-        OOD_LIST: FileSpec(
-            Template((TEMPLATE_DIR / "ondemand-web.list").read_text()).substitute(keyring=OOD_KEYRING),
-            FILE_MODE,
-            "root",
-        ),
-        NODE_LIST: FileSpec(
-            Template((TEMPLATE_DIR / "nodesource.list").read_text()).substitute(keyring=NODE_KEYRING), FILE_MODE, "root"
-        ),
-    }
+    out: dict[str, FileSpec] = {}
+    for name, keyring, listing in (("ondemand-web", OOD_KEYRING, OOD_LIST), ("nodesource", NODE_KEYRING, NODE_LIST)):
+        line = Template((TEMPLATE_DIR / f"{name}.list").read_text()).substitute(keyring=keyring)
+        uri = line.split("] ", 1)[1].split()[0]
+        if _configured_elsewhere(uri, listing):
+            continue
+        out[keyring] = FileSpec((TEMPLATE_DIR / f"{name}.asc").read_text(), FILE_MODE, "root")
+        out[listing] = FileSpec(line, FILE_MODE, "root")
+    return out
 
 
 def packages(site: Site) -> list[str]:
