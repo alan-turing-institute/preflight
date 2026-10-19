@@ -137,8 +137,10 @@ design choice. Whether a browser then renders the panels inside the portal was *
 - **A restore-order request naming jobs that have since left the queue keeps failing** (`releasing [...] failed; will retry` in
   `agent/agent.json`). Seen in passing, after the jobs of a request were cancelled by hand. Whether one gone id stops the others in
   the same `scontrol release` was not tested.
-- **A requeued job waits for `BeginTime` (about a minute) before it can start**, so "keeps its place" is about priority; the
-  check waits until the resumed job is eligible before it frees the card.
+- **A requeued job cannot start for about a minute** (`AuthInfo=cred_expire=60`), and `squeue` says `Resources`, not
+  `BeginTime`, while the card is also busy. In one run the check that freed the card 8 s after the pause saw the later job start
+  first (the backfill scheduler gave it the free GPU, the resumed job needed all four); it now frees the card 65 s after the pause.
+  So "keeps its place" is about priority, and holds from the moment the job is eligible.
 - **After `scontrol reconfigure`, jobs started dying at launch in one run** (`testnode_slurmstepd.scope/cgroup.controllers: No such
   file or directory`); the cause was not established, so the harness does not use it. The same happened once after the recovery
   scenario had killed every `slurmstepd`, including the `slurmstepd infinity` helper that keeps slurmd's systemd scope alive;

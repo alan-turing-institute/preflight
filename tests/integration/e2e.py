@@ -38,6 +38,7 @@ PASSWORDS: dict[str, str] = {u: f"pw-{u}-e2e" for u in (*USERS, "dave")}
 RESULTS: list[tuple[str, bool, str]] = []
 CHAIN_LENGTH = 3  # jobs in the chain S1 submits
 AGENT_LOOP_S = 5  # the agent's loop interval
+REQUEUE_DELAY_S = 60  # slurm.conf AuthInfo=cred_expire: how long before a requeued job may start again
 REQUEUE_WITHIN_S = 70  # the agent waits 30 s for slurmctld, then acts within one 5-s loop; slack for the restarts themselves
 SCRAPED_EXPORTERS = 2  # exporters Prometheus can scrape in the container (node, cgroup; the GPU one needs NVML)
 
@@ -420,6 +421,7 @@ def keeps_place(*, agent_on: bool) -> None:
             wait_for(lambda: agent_json("state.json").get("priorities", {}).get(ja), 40)
         recorded = agent_json("state.json").get("priorities", {}).get(ja) or priority(ja)
         paused = cl("gpujobs-pause", ja, "--reason", "e2e", user="alice")
+        paused_at = time.monotonic()
         held = wait_for(lambda: state(ja) == "PENDING" and priority(ja) == 0, 60)
         bob_runs = wait_state(jb, "RUNNING", 60)
         check(f"S3 ({tag}): alice pauses her own job; it is held and the next job runs",
@@ -433,14 +435,15 @@ def keeps_place(*, agent_on: bool) -> None:
             check(f"S3 ({tag}): after resume the agent puts the recorded priority back",
                   resumed.rc == 0 and bool(back) and priority(ja) > priority(jc),
                   f"job {ja}: recorded {recorded}, now {priority(ja)}; later job {jc}: {priority(jc)}; restored={agent_json('agent.json').get('restored')}")
-            # a released job may not start until slurm's requeue delay has passed (BeginTime); the place is kept for when it can
-            eligible = wait_for(lambda: jobinfo(ja).get("Reason") != "BeginTime", 120, 3)
+            # A requeued job may not start until slurm's requeue delay (AuthInfo=cred_expire=60 in slurm.conf) has passed, and
+            # squeue says "Resources", not "BeginTime", while the card is also busy. Free the card only after that delay, or
+            # the lower-priority job simply takes the card first.
+            time.sleep(max(0.0, REQUEUE_DELAY_S + 5 - (time.monotonic() - paused_at)))
             cl("scancel", jb, user="bob")
             first = wait_for(lambda: state(ja) == "RUNNING", 150, 3)
             check(f"S3 ({tag}): when the card frees, the resumed job starts before the job submitted after it",
-                  bool(eligible) and bool(first) and state(jc) == "PENDING", f"job {ja} {state(ja)}, job {jc} {state(jc)}; eligible={bool(eligible)}")
+                  bool(first) and state(jc) == "PENDING", f"job {ja} {state(ja)}, job {jc} {state(jc)}")
         else:
-            sh("true")
             time.sleep(12)
             check(f"S3 ({tag}): without the agent the released job lost its place (lower priority than the later job)",
                   resumed.rc == 0 and priority(ja) < priority(jc) and priority(ja) < recorded,
