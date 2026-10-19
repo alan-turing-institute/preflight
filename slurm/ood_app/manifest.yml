@@ -1,5 +1,6 @@
-# Open OnDemand system-app manifest; fields per
-# https://osc.github.io/ood-documentation/latest/how-tos/app-development/interactive/manifest.html
+# Open OnDemand system-app manifest. Fields: https://osc.github.io/ood-documentation/latest/how-tos/app-development/
+# interactive/manifest.html ("Every app (interactive and passenger) needs a manifest.yml"). The fas://<name> icon
+# form: OSC/ondemand apps/dashboard/app/models/concerns/icon_with_uri.rb:10 (checked 2026-10-19).
 ---
 name: GPU jobs
 category: Jobs
