@@ -1,0 +1,293 @@
+{
+ "jobs": [
+  {
+   "job_id": 202,
+   "partition": "normal",
+   "job_state": [
+    "RUNNING"
+   ],
+   "state_reason": "None",
+   "dependency": "",
+   "user_name": "user1",
+   "priority": {
+    "set": true,
+    "infinite": false,
+    "number": 1
+   },
+   "tres_per_node": "gres/gpu:1",
+   "name": "project-a:resume:swe32-multipatch-train"
+  },
+  {
+   "job_id": 217,
+   "partition": "steady",
+   "job_state": [
+    "PENDING"
+   ],
+   "state_reason": "Dependency",
+   "dependency": "afterok:216(unfulfilled)",
+   "user_name": "user1",
+   "priority": {
+    "set": true,
+    "infinite": false,
+    "number": 1
+   },
+   "tres_per_node": "",
+   "name": "project-a:restart:swe32-tables-eleven"
+  },
+  {
+   "job_id": 216,
+   "partition": "steady",
+   "job_state": [
+    "PENDING"
+   ],
+   "state_reason": "Dependency",
+   "dependency": "afterok:215(unfulfilled)",
+   "user_name": "user1",
+   "priority": {
+    "set": true,
+    "infinite": false,
+    "number": 1
+   },
+   "tres_per_node": "gres/gpu:1",
+   "name": "project-a:restart:swe32-multipatch-timing"
+  },
+  {
+   "job_id": 215,
+   "partition": "steady",
+   "job_state": [
+    "PENDING"
+   ],
+   "state_reason": "Dependency",
+   "dependency": "afterok:214(unfulfilled)",
+   "user_name": "user1",
+   "priority": {
+    "set": true,
+    "infinite": false,
+    "number": 1
+   },
+   "tres_per_node": "",
+   "name": "project-a:restart:swe32-multipatch-p8-post"
+  },
+  {
+   "job_id": 214,
+   "partition": "steady",
+   "job_state": [
+    "PENDING"
+   ],
+   "state_reason": "Dependency",
+   "dependency": "afterok:213(unfulfilled)",
+   "user_name": "user1",
+   "priority": {
+    "set": true,
+    "infinite": false,
+    "number": 1
+   },
+   "tres_per_node": "gres/gpu:1",
+   "name": "project-a:restart:swe32-multipatch-p8-compare-valid"
+  },
+  {
+   "job_id": 213,
+   "partition": "steady",
+   "job_state": [
+    "PENDING"
+   ],
+   "state_reason": "Dependency",
+   "dependency": "afterok:212(unfulfilled)",
+   "user_name": "user1",
+   "priority": {
+    "set": true,
+    "infinite": false,
+    "number": 1
+   },
+   "tres_per_node": "gres/gpu:1",
+   "name": "project-a:restart:swe32-multipatch-p8-compare-test"
+  },
+  {
+   "job_id": 212,
+   "partition": "steady",
+   "job_state": [
+    "PENDING"
+   ],
+   "state_reason": "Dependency",
+   "dependency": "afterok:211(unfulfilled)",
+   "user_name": "user1",
+   "priority": {
+    "set": true,
+    "infinite": false,
+    "number": 1
+   },
+   "tres_per_node": "gres/gpu:1",
+   "name": "project-a:restart:swe32-multipatch-p8-rank"
+  },
+  {
+   "job_id": 211,
+   "partition": "steady",
+   "job_state": [
+    "PENDING"
+   ],
+   "state_reason": "Dependency",
+   "dependency": "afterok:210(unfulfilled)",
+   "user_name": "user1",
+   "priority": {
+    "set": true,
+    "infinite": false,
+    "number": 1
+   },
+   "tres_per_node": "",
+   "name": "project-a:restart:swe32-multipatch-p2-post"
+  },
+  {
+   "job_id": 210,
+   "partition": "steady",
+   "job_state": [
+    "PENDING"
+   ],
+   "state_reason": "Dependency",
+   "dependency": "afterok:209(unfulfilled)",
+   "user_name": "user1",
+   "priority": {
+    "set": true,
+    "infinite": false,
+    "number": 1
+   },
+   "tres_per_node": "gres/gpu:1",
+   "name": "project-a:restart:swe32-multipatch-p2-compare-valid"
+  },
+  {
+   "job_id": 209,
+   "partition": "steady",
+   "job_state": [
+    "PENDING"
+   ],
+   "state_reason": "Dependency",
+   "dependency": "afterok:208(unfulfilled)",
+   "user_name": "user1",
+   "priority": {
+    "set": true,
+    "infinite": false,
+    "number": 1
+   },
+   "tres_per_node": "gres/gpu:1",
+   "name": "project-a:restart:swe32-multipatch-p2-compare-test"
+  },
+  {
+   "job_id": 208,
+   "partition": "steady",
+   "job_state": [
+    "PENDING"
+   ],
+   "state_reason": "Dependency",
+   "dependency": "afterok:207(unfulfilled)",
+   "user_name": "user1",
+   "priority": {
+    "set": true,
+    "infinite": false,
+    "number": 1
+   },
+   "tres_per_node": "gres/gpu:1",
+   "name": "project-a:restart:swe32-multipatch-p2-rank"
+  },
+  {
+   "job_id": 207,
+   "partition": "steady",
+   "job_state": [
+    "PENDING"
+   ],
+   "state_reason": "Dependency",
+   "dependency": "afterok:206(unfulfilled)",
+   "user_name": "user1",
+   "priority": {
+    "set": true,
+    "infinite": false,
+    "number": 1
+   },
+   "tres_per_node": "",
+   "name": "project-a:restart:swe32-multipatch-p4-post"
+  },
+  {
+   "job_id": 206,
+   "partition": "steady",
+   "job_state": [
+    "PENDING"
+   ],
+   "state_reason": "Dependency",
+   "dependency": "afterok:205(unfulfilled)",
+   "user_name": "user1",
+   "priority": {
+    "set": true,
+    "infinite": false,
+    "number": 1
+   },
+   "tres_per_node": "gres/gpu:1",
+   "name": "project-a:restart:swe32-multipatch-p4-compare-valid"
+  },
+  {
+   "job_id": 205,
+   "partition": "steady",
+   "job_state": [
+    "PENDING"
+   ],
+   "state_reason": "Dependency",
+   "dependency": "afterok:204(unfulfilled)",
+   "user_name": "user1",
+   "priority": {
+    "set": true,
+    "infinite": false,
+    "number": 1
+   },
+   "tres_per_node": "gres/gpu:1",
+   "name": "project-a:restart:swe32-multipatch-p4-compare-test"
+  },
+  {
+   "job_id": 204,
+   "partition": "steady",
+   "job_state": [
+    "PENDING"
+   ],
+   "state_reason": "Dependency",
+   "dependency": "afterok:203(unfulfilled)",
+   "user_name": "user1",
+   "priority": {
+    "set": true,
+    "infinite": false,
+    "number": 1
+   },
+   "tres_per_node": "gres/gpu:1",
+   "name": "project-a:restart:swe32-multipatch-p4-rank"
+  },
+  {
+   "job_id": 203,
+   "partition": "steady",
+   "job_state": [
+    "PENDING"
+   ],
+   "state_reason": "Dependency",
+   "dependency": "afterok:202(unfulfilled)",
+   "user_name": "user1",
+   "priority": {
+    "set": true,
+    "infinite": false,
+    "number": 1
+   },
+   "tres_per_node": "",
+   "name": "project-a:restart:swe32-multipatch-views"
+  },
+  {
+   "job_id": 201,
+   "partition": "normal",
+   "job_state": [
+    "COMPLETED"
+   ],
+   "state_reason": "None",
+   "dependency": "",
+   "user_name": "user1",
+   "priority": {
+    "set": true,
+    "infinite": false,
+    "number": 1
+   },
+   "tres_per_node": "gres/gpu:1",
+   "name": "project-a:resume:swe32-earlier"
+  }
+ ]
+}

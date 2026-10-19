@@ -18,7 +18,7 @@ from jobs_view import Bucket
 FIXTURES = Path(__file__).parent / "fixtures" / "jobs_view"
 SACCT_X = (FIXTURES / "sacct_x.txt").read_text()
 SACCT_STEPS = (FIXTURES / "sacct_steps.txt").read_text()
-QUEUE = {job.job_id: job for job in gpu_jobs.parse_squeue((FIXTURES / "squeue.txt").read_text())}
+QUEUE = {job.job_id: job for job in gpu_jobs.parse_squeue((FIXTURES / "squeue.json").read_text())}
 HEADER = "JobID|JobName|User|Partition|State|ExitCode|Submit|Start|End|ElapsedRaw|AllocTRES|ReqMem\n"
 
 

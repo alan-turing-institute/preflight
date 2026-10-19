@@ -19,7 +19,7 @@ import re
 import subprocess
 import tempfile
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -49,8 +49,6 @@ STATE_DIR = _STATE
 LEASE_DIR = _LEASE
 #: The project name slurm's keeper holds the lease under.
 LEASE_PROJECT = "slurm"
-#: slurm's completion log on this box (`JobCompLoc` in machine/slurm/slurm.conf).
-JOBCOMP_LOG = Path(os.environ.get("SLURM_GPU_JOBCOMP", "/var/log/slurm/jobcomp.log"))
 
 
 class Partition(StrEnum):
@@ -93,8 +91,6 @@ HELD_REASONS = frozenset(
 #: The pending reason of a job waiting for the jobs it depends on (`man squeue`, JOB REASON CODES).
 DEPENDENCY_REASON = "Dependency"
 
-#: Name last, so a `|` inside it is kept. User, priority and GRES (`%b`) follow the original six fields.
-_SQUEUE_FORMAT = "%i|%P|%T|%r|%E|%u|%Q|%b|%j"
 #: Explicit, because with MinJobAge a day slurm keeps finished jobs listable; these tools want unfinished ones only.
 _UNFINISHED = ",".join(state.lower() for state in State)
 
@@ -144,18 +140,27 @@ def parse_gpus(gres: str) -> int:
 
 
 def parse_squeue(text: str) -> list[QueuedJob]:
-    """Rows of `squeue -h -o _SQUEUE_FORMAT`; the name is last, so a `|` inside it is kept."""
+    """The unfinished jobs in `squeue --json` output; raises ValueError when it is not that.
+
+    JSON, never a `-o` text format: slurm keeps a newline (or a form feed, NEL, ...) in a job name, and an owner may
+    rename their job at any time, so a name could forge whole rows, and the agent acts on rows as an operator
+    (measured on 23.11.4, review R). `-t` was not applied with --json there either (finished jobs came back), so
+    the states are filtered here.
+    """
     jobs = []
-    for line in text.splitlines():
-        parts = line.strip().split("|", 8)
-        if len(parts) == 9:  # noqa: PLR2004 - the nine fields of _SQUEUE_FORMAT
-            job_id, partition, state, reason, dependency, user, priority, gres, name = parts
-            jobs.append(
-                QueuedJob(
-                    job_id, partition, state, reason, name, dependency, user,
-                    int(priority) if priority.isdigit() else 0, parse_gpus(gres),
-                )
+    for raw in json.loads(text)["jobs"]:
+        states = raw.get("job_state") or [""]
+        state = states[0] if isinstance(states, list) else str(states)  # the base state; flags follow it
+        if state not in set(State):
+            continue
+        priority = raw.get("priority") or {}
+        jobs.append(
+            QueuedJob(
+                str(raw["job_id"]), raw.get("partition", ""), state, raw.get("state_reason", ""), raw.get("name", ""),
+                raw.get("dependency", ""), raw.get("user_name", ""),
+                int(priority.get("number", 0)) if priority.get("set") else 0, parse_gpus(raw.get("tres_per_node") or ""),
             )
+        )
     return jobs
 
 
@@ -176,7 +181,7 @@ def read_queue() -> list[QueuedJob] | None:
     """Every job slurm knows that has not finished, or None when slurm does not answer."""
     try:
         done = subprocess.run(
-            ["squeue", "-h", "-t", _UNFINISHED, "-o", _SQUEUE_FORMAT],
+            ["squeue", "--json", "-t", _UNFINISHED],
             capture_output=True,
             text=True,
             timeout=30,
@@ -184,7 +189,12 @@ def read_queue() -> list[QueuedJob] | None:
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
-    return parse_squeue(done.stdout) if done.returncode == 0 else None
+    if done.returncode != 0:
+        return None
+    try:
+        return parse_squeue(done.stdout)
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return None
 
 
 def write_json(path: Path, payload: dict[str, object]) -> None:
@@ -269,17 +279,35 @@ def remove_quietly(path: Path) -> None:
         path.unlink(missing_ok=True)
 
 
-def completion_records(log: Path | None = None) -> dict[str, dict[str, str]]:
-    """The LAST completion record of each job id in slurm's `jobcomp/filetxt` log (one leg per line)."""
-    records: dict[str, dict[str, str]] = {}
+def _sacct_jobs(*selection: str) -> list[dict[str, object]] | None:
     try:
-        lines = (log or JOBCOMP_LOG).read_text(encoding="utf-8", errors="replace").splitlines()
-    except OSError:
-        return records
-    for line in lines:
-        fields = dict(part.split("=", 1) for part in line.split() if "=" in part)
-        if "JobId" in fields:
-            records[fields["JobId"]] = fields
+        done = subprocess.run(["sacct", "--json", "-X", "-a", *selection], capture_output=True, text=True, timeout=60,
+                              check=False)
+        return json.loads(done.stdout)["jobs"] if done.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired, ValueError, KeyError, TypeError):
+        return None
+
+
+def completion_records(job_ids: Iterable[str] | None = None) -> dict[str, dict[str, str]]:
+    """The latest accounting record of each job, `{id: {"JobId", "JobState", "Name", "UserId"}}`; without ids, every
+    job of the last day. Empty when sacct does not answer.
+
+    From `sacct --json`. These tools read slurm's jobcomp/filetxt log before, which writes a job name unescaped, so a
+    name with a newline forged whole records (another user's job "FAILED"; measured on 23.11.4, review R). A time
+    window alone can return an earlier leg of a requeued job (measured), so it only gives the ids, and `-j` their
+    latest records. The keys keep the log's field names.
+    """
+    ids = sorted(set(job_ids)) if job_ids is not None else None
+    if ids is None:
+        recent = _sacct_jobs("-S", "now-1days")
+        ids = sorted({str(job["job_id"]) for job in recent or []})
+    if not ids:
+        return {}
+    records: dict[str, dict[str, str]] = {}
+    for job in _sacct_jobs("-j", ",".join(ids)) or []:
+        states = job.get("state", {}).get("current") or [""]
+        records[str(job["job_id"])] = {"JobId": str(job["job_id"]), "JobState": states[0],
+                                       "Name": str(job.get("name", "")), "UserId": str(job.get("user", ""))}
     return records
 
 

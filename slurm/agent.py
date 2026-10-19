@@ -55,7 +55,7 @@ Runner = Callable[..., subprocess.CompletedProcess[str]]
 
 
 class EndedBadly(StrEnum):
-    """The `JobState` values of slurm's completion log that earn a failure notice."""
+    """The `JobState` values of a job's latest accounting record (`gpu_jobs.completion_records`) that earn a failure notice."""
 
     FAILED = "FAILED"
     OUT_OF_MEMORY = "OUT_OF_MEMORY"
@@ -63,7 +63,7 @@ class EndedBadly(StrEnum):
     NODE_FAIL = "NODE_FAIL"
 
 
-#: States the completion log shows for a job that has not ended (a requeued job's leg is logged as PENDING).
+#: States of a job that has not ended (a requeued job's latest record is PENDING).
 _NOT_ENDED = frozenset(
     {
         *gpu_jobs.State,

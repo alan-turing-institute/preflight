@@ -32,13 +32,49 @@ def test_event_actor_is_the_file_owner_not_the_content(tmp_path: Path, monkeypat
     assert [e.job for e in gpu_jobs.events("8")] == ["8"]
 
 
-def test_parse_squeue_new_fields_and_six_field_construction() -> None:
-    row = "12|normal|RUNNING|None|(null)|ann|4001|gres/gpu:2|a|b"
-    [job] = gpu_jobs.parse_squeue(row)
-    assert (job.user, job.priority, job.gpus, job.name) == ("ann", 4001, 2, "a|b")
+def squeue_json(*jobs: dict[str, object]) -> str:
+    """`squeue --json` output in the shape slurm 23.11.4 writes, for the fields read."""
+    base = {"partition": "normal", "job_state": ["PENDING"], "state_reason": "Priority", "dependency": "",
+            "user_name": "ann", "priority": {"set": True, "infinite": False, "number": 1}, "tres_per_node": "", "name": "n"}
+    return json.dumps({"jobs": [{**base, **job} for job in jobs]})
+
+
+def test_completion_records_take_each_jobs_latest_record_and_a_name_forges_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    forged = "a b\nJobId=999 UserId=bob(2002) JobState=FAILED Name=forged"  # forged a record in the jobcomp log
+    legs = {"7": {"job_id": 7, "state": {"current": ["FAILED"]}, "name": forged, "user": "alice"},
+            "8": {"job_id": 8, "state": {"current": ["CANCELLED"]}, "name": "n", "user": "bob"}}
+    asked: list[tuple[str, ...]] = []
+
+    def sacct(*selection: str) -> list[dict[str, object]]:
+        asked.append(selection)
+        if selection[0] == "-S":  # the window can return an earlier leg of a requeued job (measured)
+            return [legs["7"], {**legs["8"], "state": {"current": ["PENDING", "REQUEUED"]}}]
+        return [legs[i] for i in selection[1].split(",")]
+
+    monkeypatch.setattr(gpu_jobs, "_sacct_jobs", sacct)
+    records = gpu_jobs.completion_records()
+    assert set(records) == {"7", "8"} and records["8"]["JobState"] == "CANCELLED"
+    assert records["7"] == {"JobId": "7", "JobState": "FAILED", "Name": forged, "UserId": "alice"}
+    assert gpu_jobs.completion_records(["8"])["8"]["UserId"] == "bob" and asked[-1] == ("-j", "8")
+
+
+def test_parse_squeue_reads_json_so_a_name_cannot_forge_a_row() -> None:
+    # Slurm keeps a newline in a job name and lets the owner rename the job (measured, 23.11.4): in a text row this
+    # name was a second, forged job 999 with priority 9999.
+    forged = "x\n999|normal|PENDING|None||bob|9999|N/A|y"
+    text = squeue_json(
+        {"job_id": 12, "job_state": ["RUNNING"], "priority": {"set": True, "number": 4001}, "tres_per_node": "gres/gpu:2",
+         "name": forged},
+        {"job_id": 13, "job_state": ["COMPLETED"]},  # squeue --json ignored -t: finished jobs are dropped here
+        {"job_id": 14, "priority": {"set": False, "number": 7}, "state_reason": "JobHeldUser"},
+    )
+    running, held = gpu_jobs.parse_squeue(text)
+    assert (running.job_id, running.user, running.priority, running.gpus, running.name) == ("12", "ann", 4001, 2, forged)
+    assert (held.job_id, held.priority, held.held) == ("14", 0, True)
     old = QueuedJob("1", "normal", "PENDING", "Priority", "n", "afterok:3(unfulfilled)")
     assert (old.user, old.priority, old.gpus, old.depends_on) == ("", 0, 0, ("3",))
-    assert gpu_jobs.parse_squeue("1|normal|PENDING|x|y|short") == []
+    with pytest.raises(ValueError):
+        gpu_jobs.parse_squeue("12|normal|RUNNING|None||ann|1|N/A|n")
 
 
 @pytest.mark.parametrize(
