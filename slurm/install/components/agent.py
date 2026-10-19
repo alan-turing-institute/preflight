@@ -51,8 +51,11 @@ def refusals(site) -> list[str]:
 def post_install(site) -> list[list[str]]:
     state = Path(site.state_dir)
     dirs = [["install", "-d", "-m", "0755", "-o", "root", "-g", "root", str(state)]]
-    dirs += [["install", "-d", "-m", "1777", str(state / name)] for name in STICKY]
     user = slurm_user(site)
+    # requests/ belongs to the agent's user: in a sticky directory only a file's owner or the directory's owner may
+    # delete it, and the agent must delete the restore-order requests it has carried out.
+    dirs += [["install", "-d", "-m", "1777", *(["-o", user, "-g", user] if name == "requests" else []), str(state / name)]
+             for name in STICKY]
     dirs.append(["install", "-d", "-m", "0755", "-o", user, "-g", user, str(state / "agent")])
     return [
         ["groupadd", "-f", site.admin_group],

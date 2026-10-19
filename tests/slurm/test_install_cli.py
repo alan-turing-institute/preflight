@@ -81,7 +81,7 @@ def test_apply_then_check_against_a_temp_root(env):
     assert ["systemctl", "restart", "slurmctld", "slurmd"] in fake.calls
     assert ["systemctl", "enable", "--now", "gpujobs-agent.service"] in fake.calls
     assert ["systemctl", "--user", f"--machine={USER}@.host", "restart", "slurm-gpu-lease-keeper.service"] in fake.calls
-    assert any(a[:3] == ["install", "-d", "-m"] and a[-1].endswith("/requests") and a[3] == "1777" for a in fake.calls)
+    assert ["install", "-d", "-m", "1777", "-o", "slurm", "-g", "slurm"] in [a[:-1] for a in fake.calls if a[-1].endswith("/requests")]
 
 
 def test_apply_refuses_with_a_busy_queue_or_without_the_lease_client(env):
