@@ -297,6 +297,12 @@ def _anonymous_lines(site: Site) -> str:
     return "".join(f"Environment={s}\n" for s in settings)
 
 
+def _root_url_lines(site: Site) -> str:
+    # Behind a proxy Grafana must know the address browsers use, or its links and redirects point at its own port
+    # (Grafana docs, "Run Grafana behind a reverse proxy": set root_url).
+    return f"Environment=GF_SERVER_ROOT_URL={site.metrics.grafana_url}\n" if site.metrics.grafana_url else ""
+
+
 def _ip_filter_lines(site: Site) -> str:
     # Grafana and the exporters answer on every address and have no login of their own (Grafana's is off for the
     # portal's embedded panels), so a site can name the networks that may reach them. localhost always stays:
@@ -368,6 +374,7 @@ def _local_files(site: Site) -> dict[str, render.FileSpec]:
             _template(
                 "grafana.service.dropin.conf",
                 grafana_port=site.metrics.grafana_port,
+                root_url_lines=_root_url_lines(site),
                 anonymous_lines=_anonymous_lines(site),
                 ip_filter_lines=_ip_filter_lines(site),
                 admin_env_file=GRAFANA_ENV_FILE,

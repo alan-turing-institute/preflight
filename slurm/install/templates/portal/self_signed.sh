@@ -1,7 +1,12 @@
-# Generate the portal's self-signed pair once. Args: certificate, key, subject name, subjectAltName.
+# Generate the portal's self-signed pair once per server name (a renamed portal gets a new pair).
+# Args: certificate, key, subject name, subjectAltName.
 set -eu
 umask 077
-if [ -s "$1" ] && [ -s "$2" ]; then exit 0; fi
+# -checkip, not both: given a host name it prints "does match" for any certificate (openssl 3.0.13, measured).
+case "$4" in IP:*) check=-checkip ;; *) check=-checkhost ;; esac
+if [ -s "$1" ] && [ -s "$2" ] && openssl x509 -in "$1" -noout "$check" "$3" | grep -q ' does match'; then
+    exit 0
+fi
 install -d -m 0755 "$(dirname "$1")" "$(dirname "$2")"
 openssl req -x509 -newkey rsa:4096 -nodes -days 365 -keyout "$2" -out "$1" -subj "/CN=$3" -addext "subjectAltName=$4" \
     -addext "basicConstraints=critical,CA:FALSE" -addext "keyUsage=critical,digitalSignature,keyEncipherment" \

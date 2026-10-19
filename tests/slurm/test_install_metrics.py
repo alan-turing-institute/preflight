@@ -204,6 +204,9 @@ def test_portal_adds_the_ood_helper_and_anonymous_grafana(arch):
     assert "GF_AUTH_ANONYMOUS_ENABLED" not in metrics.files(off)[grafana].content
     for setting in ("GF_AUTH_ANONYMOUS_ENABLED=true", "GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer", "GF_SECURITY_ALLOW_EMBEDDING=true"):
         assert setting in metrics.files(on)[grafana].content
+    assert "GF_SERVER_ROOT_URL" not in metrics.files(on)[grafana].content  # no proxy address: Grafana's own
+    proxied = metrics.files(make_site(portal="install", grafana_url="https://g.example"))[grafana].content
+    assert "Environment=GF_SERVER_ROOT_URL=https://g.example\n" in proxied
     # Without a login, who may reach Grafana and the exporters is the site's list of networks, enforced by systemd
     units = [grafana, *(f"/etc/systemd/system/gpujobs-{e}-exporter.service" for e in ("node", "cgroup", "gpu"))]
     limited = metrics.files(make_site(portal="install", allow_from=["100.64.0.0/10", "fd7a:115c:a1e0::/48"]))
