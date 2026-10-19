@@ -1,0 +1,17 @@
+<form method="get" class="filters" aria-label="History filters">
+<label>Since <input name="since" value="$since" placeholder="YYYY-MM-DD"></label>
+<label>Until <input name="until" value="$until" placeholder="YYYY-MM-DD"></label>
+<label>User <input name="user" value="$user"></label>
+<label>Project <input name="project" value="$project"></label>
+<label>State <input name="state" value="$state"></label>
+<button type="submit">Show</button>
+</form>
+<table>
+<caption>$count job(s)</caption>
+<thead><tr><th scope="col">Job</th><th scope="col">Name</th><th scope="col">Project</th><th scope="col">User</th>
+<th scope="col">State</th><th scope="col">Exit</th><th scope="col">Start</th><th scope="col">Elapsed (s)</th>
+<th scope="col">GPUs</th><th scope="col">Peak CPU memory</th></tr></thead>
+<tbody>
+$rows
+</tbody>
+</table>

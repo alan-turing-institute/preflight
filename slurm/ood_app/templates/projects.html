@@ -1,0 +1,13 @@
+<form method="get" class="filters" aria-label="Use filters">
+<label>Since <input name="since" value="$since" placeholder="YYYY-MM-DD"></label>
+<label>Until <input name="until" value="$until" placeholder="YYYY-MM-DD"></label>
+<label>Per <select name="bucket">$bucket_options</select></label>
+<button type="submit">Show</button>
+</form>
+<table>
+<caption>GPU-hours per project</caption>
+<thead><tr><th scope="col">Period</th><th scope="col">Project</th><th scope="col">GPU-hours</th></tr></thead>
+<tbody>
+$rows
+</tbody>
+</table>
