@@ -71,7 +71,9 @@ PROMETHEUS_CONFIG = PurePosixPath("/etc/prometheus/gpujobs.yml")
 GRAFANA_DASHBOARDS = PurePosixPath("/etc/grafana/gpujobs-dashboards")
 GRAFANA_ENV_FILE = PurePosixPath("/etc/grafana/gpujobs.env")  # holds the first admin password, mode 0600
 GRAFANA_KEY = PurePosixPath("/etc/apt/keyrings/grafana.asc")  # Grafana install docs: apt repository section
-OOD_HELPER_DIR = PurePosixPath("/var/www/ood/apps/sys/ood-jobstats-helper")  # `ood-jobstats-helper/README.md:28,33`
+# The helper README says "drop in /var/www/ood/apps/sys" (`ood-jobstats-helper/README.md:28,33`); the directory is
+# named jobstats so the helper answers at /pun/sys/jobstats/<jobid>, as in Jobstats' README, where our app links.
+OOD_HELPER_DIR = PurePosixPath("/var/www/ood/apps/sys/jobstats")
 DATASOURCE_NAME = "gpujobs-prometheus"
 JOBSTATS_DASHBOARD_FILE = "jobstats-single-job.json"
 

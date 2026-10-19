@@ -199,7 +199,7 @@ def test_portal_adds_the_ood_helper_and_anonymous_grafana(arch):
     off, on = make_site(), make_site(portal="install")
     assert "ood-jobstats-helper" not in argv_text(metrics.post_install(off))
     on_text = argv_text(metrics.post_install(on))
-    assert "/var/www/ood/apps/sys/ood-jobstats-helper" in on_text and "--strip-components=2" in on_text
+    assert "/var/www/ood/apps/sys/jobstats" in on_text and "--strip-components=2" in on_text  # the app links there
     grafana = "/etc/systemd/system/grafana-server.service.d/10-gpujobs.conf"
     assert "GF_AUTH_ANONYMOUS_ENABLED" not in metrics.files(off)[grafana].content
     for setting in ("GF_AUTH_ANONYMOUS_ENABLED=true", "GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer", "GF_SECURITY_ALLOW_EMBEDDING=true"):
