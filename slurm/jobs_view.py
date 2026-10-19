@@ -1,7 +1,7 @@
 """What the jobs page and `status.py` show about a job: plain-language reasons, chains, efficiency, history, use.
 
-Design: `plan notes` section 3.4. Pure functions over text that slurm
-printed (`squeue`, `sacct`) and the records `gpu_jobs` reads; every slurm call goes through a `runner`
+Design: `plan notes` section 3.4. Pure functions over what slurm
+printed (`squeue --json`, `sacct --json`) and the records `gpu_jobs` reads; every slurm call goes through a `runner`
 argument so a test feeds recorded text. Nothing here writes, escalates or guesses a runtime.
 
 Stdlib only: the OOD app and the system `python3` tools import it.
@@ -9,6 +9,7 @@ Stdlib only: the OOD app and the system `python3` tools import it.
 
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 from collections.abc import Callable, Mapping, Sequence
@@ -29,10 +30,7 @@ NO_PERMISSION = "no permission to read this log"
 NO_LOG = "no log yet"
 ERROR_LINE = re.compile(r"(?i)\b(error|exception|traceback|warning|killed|out of memory|oom)\b")
 
-_HISTORY_FORMAT = "JobID,JobName,User,Partition,State,ExitCode,Submit,Start,End,ElapsedRaw,AllocTRES,ReqMem"
-_STEP_FORMAT = "JobID,MaxRSS,TotalCPU,NCPUS,ElapsedRaw,ReqMem"
-_UNITS = {"K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}
-_NO_TIME = {"", "None", "Unknown"}
+_NEVER = 2**32 - 2  # sacct's start time for a job that never started
 
 
 class Bucket(StrEnum):
@@ -210,84 +208,76 @@ def chain(
     return ChainNode(root.job_id, root.name, root.state, root.before, below.after)
 
 
-def parse_bytes(text: str) -> int | None:
-    """`4G`, `100000M`, `528880K`, `4Gn` (old per-node suffix) -> bytes; None when empty or unreadable."""
-    match = re.fullmatch(r"(\d+(?:\.\d+)?)([KMGT])[nc]?", text.strip())
-    return int(float(match[1]) * _UNITS[match[2]]) if match else None
+def _field(record: object, *path: str) -> object:
+    """`record[path[0]][path[1]]...`, None when any step is missing or not a mapping."""
+    for key in path:
+        record = record.get(key) if isinstance(record, dict) else None
+    return record
 
 
-def parse_cpu_seconds(text: str) -> float | None:
-    """sacct's `[D-][HH:]MM:SS[.mmm]` -> seconds."""
-    match = re.fullmatch(r"(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+(?:\.\d+)?)", text.strip())
-    if not match:
-        return None
-    days, hours, minutes, seconds = match.groups(default="0")
-    return ((int(days) * 24 + int(hours)) * 60 + int(minutes)) * 60 + float(seconds)
+def _tres_count(tres: object, kind: str, name: str = "") -> int | None:
+    """The count of the first `{type, name, count}` entry of kind (and name, `gpu:a100` counting as `gpu`)."""
+    for entry in tres if isinstance(tres, list) else ():
+        if _field(entry, "type") == kind and str(_field(entry, "name")).split(":")[0] == name:
+            count = _field(entry, "count")
+            return count if isinstance(count, int) else None
+    return None
 
 
-def parse_gres_gpus(alloc_tres: str) -> int:
-    """GPUs in sacct's `AllocTRES` (`billing=4,cpu=4,gres/gpu=1,mem=4G,node=1`); 0 when none."""
-    match = re.search(r"(?:^|,)gres/gpu(?::[^=,]*)?=(\d+)", alloc_tres)
-    return int(match[1]) if match else 0
+def _time(epoch: object) -> datetime | None:
+    """Slurm's epoch seconds as the local time its text output printed; 0 and the never-started marker are None."""
+    return datetime.fromtimestamp(epoch) if isinstance(epoch, int) and 0 < epoch < _NEVER else None
 
 
-def _table(text: str) -> list[dict[str, str]]:
-    """Rows of sacct's `-P` output keyed by the header line."""
-    lines = [line for line in text.splitlines() if line.strip()]
-    if not lines:
-        return []
-    header = lines[0].split("|")
-    return [dict(zip(header, line.split("|"), strict=False)) for line in lines[1:]]
+def _sacct(runner: Runner, *selection: str) -> list[dict[str, object]]:
+    """The job records of `sacct --json -a <selection>`, steps nested in each; [] when slurm does not answer.
 
-
-def _time(text: str) -> datetime | None:
-    if text in _NO_TIME:
-        return None
+    JSON, not `-P` text: a job name may hold `|` and newlines, which in text shift columns or forge rows.
+    """
     try:
-        return datetime.fromisoformat(text)
-    except ValueError:
-        return None
+        jobs = json.loads(runner(["sacct", "--json", "-a", *selection]))["jobs"]
+    except (ValueError, KeyError, TypeError):
+        return []
+    return [job for job in jobs if isinstance(job, dict)] if isinstance(jobs, list) else []
 
 
-def _sacct(runner: Runner, fmt: str, since: str, until: str | None, *, steps: bool) -> list[dict[str, str]]:
-    argv = ["sacct", "-a", "-P", "-S", since, *(["-E", until] if until else []), f"--format={fmt}"]
-    return _table(runner(argv if steps else [*argv[:2], "-X", *argv[2:]]))
+def _peak_rss(job: Mapping[str, object]) -> int | None:
+    """Largest max-RSS (bytes) over the job's steps; None when no step reports one."""
+    steps = job.get("steps")
+    peaks = [_tres_count(_field(step, "tres", "requested", "max"), "mem") for step in steps or () if isinstance(step, dict)]
+    return max((peak for peak in peaks if peak), default=None)
+
+
+def _mib(mebibytes: int | None) -> int | None:
+    return mebibytes * 1024**2 if mebibytes else None
 
 
 def _rows(runner: Runner, since: str, until: str | None) -> list[HistoryRow]:
     rows = []
-    for row in _sacct(runner, _HISTORY_FORMAT, since, until, steps=False):
-        name = row.get("JobName", "")
-        elapsed = row.get("ElapsedRaw", "")
+    for job in _sacct(runner, "-S", since, *(["-E", until] if until else [])):
+        name = str(job.get("name", ""))
+        states = _field(job, "state", "current")
+        elapsed = _field(job, "time", "elapsed")
         rows.append(
             HistoryRow(
-                job_id=row.get("JobID", ""),
+                job_id=str(job.get("job_id", "")),
                 name=name,
                 project=project_of(name),
-                user=row.get("User", ""),
-                partition=row.get("Partition", ""),
-                state=(row.get("State") or "UNKNOWN").split()[0],
-                exit_code=row.get("ExitCode", ""),
-                submit=_time(row.get("Submit", "")),
-                start=_time(row.get("Start", "")),
-                end=_time(row.get("End", "")),
-                elapsed_s=int(elapsed) if elapsed.isdigit() else 0,
-                gpus=parse_gres_gpus(row.get("AllocTRES", "")),
-                req_mem_bytes=parse_bytes(row.get("ReqMem", "")),
+                user=str(job.get("user", "")),
+                partition=str(job.get("partition", "")),
+                state=str(states[0]) if isinstance(states, list) and states else "UNKNOWN",
+                exit_code=f"{_field(job, 'exit_code', 'return_code', 'number') or 0}:"
+                f"{_field(job, 'exit_code', 'signal', 'id', 'number') or 0}",
+                submit=_time(_field(job, "time", "submission")),
+                start=_time(_field(job, "time", "start")),
+                end=_time(_field(job, "time", "end")),
+                elapsed_s=elapsed if isinstance(elapsed, int) else 0,
+                gpus=_tres_count(_field(job, "tres", "allocated"), "gres", "gpu") or 0,
+                req_mem_bytes=_mib(_tres_count(_field(job, "tres", "requested"), "mem")),
+                max_rss_bytes=_peak_rss(job),
             )
         )
     return rows
-
-
-def _peak_rss(steps: list[dict[str, str]]) -> dict[str, int]:
-    """Largest MaxRSS over the steps of each job."""
-    peaks: dict[str, int] = {}
-    for row in steps:
-        rss = parse_bytes(row.get("MaxRSS", ""))
-        if rss is not None:
-            job = row.get("JobID", "").split(".")[0]
-            peaks[job] = max(peaks.get(job, 0), rss)
-    return peaks
 
 
 def history(
@@ -299,9 +289,8 @@ def history(
     runner: Runner = run_command,
 ) -> list[HistoryRow]:
     """Finished and running jobs in the window (`YYYY-MM-DD[THH:MM:SS]`), filtered, with their peak CPU memory."""
-    peaks = _peak_rss(_sacct(runner, "JobID,MaxRSS", since, until, steps=True))
     return [
-        HistoryRow(**{**row.__dict__, "max_rss_bytes": peaks.get(row.job_id)})
+        row
         for row in _rows(runner, since, until)
         if (user is None or row.user == user)
         and (project is None or row.project == project)
@@ -312,7 +301,7 @@ def history(
 def project_usage(
     since: str, until: str | None = None, bucket: Bucket = Bucket.DAY, runner: Runner = run_command
 ) -> list[UsageRow]:
-    """GPU-hours per project per day or week: GPUs in `AllocTRES` x `ElapsedRaw` / 3600, by the day the job started."""
+    """GPU-hours per project per day or week: allocated GPUs x elapsed seconds / 3600, by the day the job started."""
     totals: dict[tuple[date, str], float] = {}
     for row in _rows(runner, since, until):
         if not row.gpus or row.start is None:
@@ -332,18 +321,20 @@ def efficiency(
 
     Peak GPU memory comes from the job's record (the wrapper's footprint samples), max over its legs.
     """
-    rows = _table(runner(["sacct", "-a", "-P", "-j", job_id, f"--format={_STEP_FORMAT}"]))
-    whole = next((r for r in rows if r.get("JobID") == job_id), {})
-    elapsed, cpus = whole.get("ElapsedRaw", ""), whole.get("NCPUS", "")
-    used = parse_cpu_seconds(whole.get("TotalCPU", ""))
-    available = int(elapsed) * int(cpus) if elapsed.isdigit() and cpus.isdigit() else 0
+    job = next((j for j in _sacct(runner, "-j", job_id) if str(j.get("job_id")) == job_id), {})
+    elapsed = _field(job, "time", "elapsed")
+    cpus = _tres_count(_field(job, "tres", "allocated"), "cpu")
+    cpu_seconds = _field(job, "time", "total", "seconds")
+    cpu_micros = _field(job, "time", "total", "microseconds")
+    available = elapsed * cpus if isinstance(elapsed, int) and cpus else 0
+    used = cpu_seconds + (cpu_micros if isinstance(cpu_micros, int) else 0) / 1e6 if isinstance(cpu_seconds, int) else None
     stored = record if record is not None else gpu_jobs.read_sidecar(job_id) or {}
     legs = [leg for leg in (stored.get("legs") or [stored.get("last_leg")]) if isinstance(leg, dict)]
     gpu = [float(leg["peak_gpu_mib"]) for leg in legs if "peak_gpu_mib" in leg]
     return Efficiency(
         job_id,
-        parse_bytes(whole.get("ReqMem", "")),
-        _peak_rss(rows).get(job_id),
+        _mib(_tres_count(_field(job, "tres", "requested"), "mem")),
+        _peak_rss(job),
         max(gpu) if gpu else None,
         used / available if used is not None and available else None,
     )
