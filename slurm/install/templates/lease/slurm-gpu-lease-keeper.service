@@ -1,0 +1,13 @@
+# One long-lived process holds the cross-project GPU lease for slurm as a whole.
+# A user unit of $keeper_user (needs linger to run from boot). Rendered from the site file by
+# slurm/install/components/lease.py; do not edit by hand.
+[Unit]
+Description=lifecycle=service slurm's GPU lease keeper ($install_dir/slurm/gpu_lease_keeper.py)
+
+[Service]
+ExecStart=$python $install_dir/slurm/gpu_lease_keeper.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

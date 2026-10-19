@@ -7,6 +7,7 @@ import site_config
 
 ROOT = Path(__file__).resolve().parents[2]
 MACHINE = ROOT / "machine" / "slurm"
+GOLDEN = Path(__file__).parent / "fixtures" / "render" / "golden"
 spec = importlib.util.spec_from_file_location("render", ROOT / "slurm" / "install" / "render.py")
 render = importlib.util.module_from_spec(spec)
 sys.modules["render"] = render  # dataclasses looks its module up here
@@ -76,7 +77,7 @@ def test_golden_matches_tracked_files_except_the_planned_lines():
     files = render.render(site, "slurm")
     assert set(files) == set(TRACKED)
     for target, name in TRACKED.items():
-        got = _changed_lines((MACHINE / name).read_text(), files[target].content)
+        got = _changed_lines((GOLDEN / name).read_text(), files[target].content)
         assert got == EXPECTED_DIFF.get(name, []), name
     assert (files["/etc/slurm/slurmdbd.conf"].mode, files["/etc/slurm/slurmdbd.conf"].owner) == (0o600, "slurm")
     others = {(f.mode, f.owner) for t, f in files.items() if t != "/etc/slurm/slurmdbd.conf"}
