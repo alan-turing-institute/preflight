@@ -89,7 +89,7 @@ def plan(
     lines, victims, steady, wait_only = [], [], [], []
     for job in queue:
         record = gpu_jobs.read_sidecar(job.job_id, job.user) or {}
-        in_way = whole_box or memory_short or (gpu and (bool(record.get("gpu")) or job.gpus > 0))
+        in_way = whole_box or memory_short or (gpu and job.gpus > 0)
         if not in_way or not (job.active or job.partition == gpu_jobs.Partition.URGENT):
             continue
         what = f"{job.job_id} {job.name} ({record.get('what', 'no sidecar')}), running {elapsed(job.job_id)}"
@@ -221,7 +221,7 @@ def run(argv: list[str]) -> int:
     held = [
         job.job_id for job in queue
         if job.waiting and job.partition != gpu_jobs.Partition.URGENT and job.job_id not in victims
-        and (gpu_jobs.read_sidecar(job.job_id, job.user) or {}).get("gpu")
+        and job.gpus > 0
     ]
     if victims and held:
         subprocess.run(["scontrol", "hold", ",".join(held)], check=True)

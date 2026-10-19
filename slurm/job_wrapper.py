@@ -374,7 +374,8 @@ def main() -> int:
     outcome = run_and_measure(command, footprint, cgroup, arguments.sample, job_id, metrics_on)
     outcome.update(leg=restart, started_at=started, ended_at=int(time.time()))
     record = gpu_jobs.read_sidecar(job_id, gpu_jobs.current_user()) or {}
-    legs = [*(record.get("legs") or []), outcome]
+    earlier = record.get("legs")
+    legs = [*(earlier if isinstance(earlier, list) else []), outcome]
     best_effort("sidecar", lambda: gpu_jobs.update_sidecar(job_id, legs=legs, last_leg=outcome))
     print(f"[job] exit {outcome['exit']}; signals {outcome['signals']}; peak GPU {outcome['peak_gpu_mib']:.0f} MiB",
           flush=True)

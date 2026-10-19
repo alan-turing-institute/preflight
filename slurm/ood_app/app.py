@@ -14,6 +14,7 @@ import os
 import pwd
 import re
 import shlex
+import stat
 import subprocess
 import sys
 from collections.abc import Callable, Iterable, Mapping
@@ -37,6 +38,7 @@ JSON_TYPE = "application/json"
 HTML_TYPE = "text/html; charset=utf-8"
 MAX_BODY = 4096
 MAX_SCRIPT_BYTES = 65536
+NOT_SHOWN = "(job script not shown: not a regular file, or unreadable)"
 ACTION_TIMEOUT_S = 60
 DEFAULT_WINDOW_DAYS = 7
 SECURITY_HEADERS = [
@@ -243,16 +245,28 @@ def _events_html(events: list[gpu_jobs.Event]) -> str:
     )
 
 
+def _script_text(path: str) -> str:
+    """The job script, read without ever blocking: the record's path may be a FIFO, a link or a device."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    except OSError:
+        return NOT_SHOWN
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return NOT_SHOWN
+        return os.read(fd, MAX_SCRIPT_BYTES).decode("utf-8", errors="replace")
+    except OSError:
+        return NOT_SHOWN
+    finally:
+        os.close(fd)
+
+
 def _command_text(record: Mapping[str, object]) -> str:
     command = record.get("command")
     text = shlex.join(str(c) for c in command) if isinstance(command, list) else ""
     script = record.get("script")
     if isinstance(script, str):
-        try:
-            with open(script, encoding="utf-8", errors="replace") as handle:
-                text += ("\n\n" if text else "") + handle.read(MAX_SCRIPT_BYTES)
-        except OSError:
-            pass
+        text += ("\n\n" if text else "") + _script_text(script)
     return text or "no command recorded"
 
 
@@ -367,7 +381,14 @@ def _check_post(environ: Mapping[str, object]) -> None:
 
 def _read_json(environ: Mapping[str, object]) -> dict[str, object]:
     try:
-        length = min(int(str(environ.get("CONTENT_LENGTH") or 0)), MAX_BODY)
+        length = int(str(environ.get("CONTENT_LENGTH") or 0))
+    except ValueError:
+        length = -1
+    if length < 0:
+        raise Refused("400 Bad Request", "Content-Length must be a non-negative integer")
+    if length > MAX_BODY:
+        raise Refused("413 Payload Too Large", f"body is larger than {MAX_BODY} bytes")
+    try:
         data = json.loads(environ["wsgi.input"].read(length) or b"{}")  # type: ignore[attr-defined]
     except (ValueError, KeyError, UnicodeDecodeError):
         raise Refused("400 Bad Request", "body must be JSON") from None
@@ -413,7 +434,7 @@ def _api(backend: Backend, environ: Mapping[str, object], path: str, query: Mapp
         record = backend.record(job_id, user=job.user if job else None) or {}
         path_text = str(record.get("log") or "")
         text = (query.get("text") or [""])[0] or None
-        log = backend.log_tail(path_text, text=text, errors_only=bool(query.get("errors"))) if path_text else jobs_view.NO_LOG
+        log = backend.log_tail(path_text, text=text, errors_only=query.get("errors") == ["1"]) if path_text else jobs_view.NO_LOG
         return _json({"log": log})
     raise Refused("404 Not Found", "no such route")
 

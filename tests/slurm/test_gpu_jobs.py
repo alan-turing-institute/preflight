@@ -55,8 +55,24 @@ def test_a_hostile_or_foreign_record_is_ignored_and_never_blocks(tmp_path: Path,
     assert gpu_jobs.read_sidecar("6", me) == {"gpu": True, "name": "n", "what": "forged"}
     assert gpu_jobs.read_sidecar("6", "somebody-else") is None  # the file's owner is its writer's identity
     job = QueuedJob("6", "normal", "PENDING", "None", "n", user="somebody-else")
-    assert not gpu_jobs.needs_the_card(job)
-    assert gpu_jobs.needs_the_card(QueuedJob("6", "normal", "PENDING", "None", "n", user=me))
+    assert not gpu_jobs.needs_the_card(job)  # the record says gpu, slurm granted none
+    assert gpu_jobs.needs_the_card(QueuedJob("7", "normal", "PENDING", "None", "n", gpus=1))  # no record needed
+    assert gpu_jobs.needs_the_card(QueuedJob("7", "urgent", "PENDING", "None", "n"))
+    events = tmp_path / "events"
+    events.mkdir()
+    (events / "7-100-kill.json").write_text("[" * 200_000)
+    os.mkfifo(events / "9-100-kill.json")
+    signal.alarm(5)
+    try:
+        (events / "junk.json").write_text("[" * 200_000)
+        opened: list[Path] = []
+        real = gpu_jobs.read_json
+        monkeypatch.setattr(gpu_jobs, "read_json", lambda path, user=None: opened.append(path.name) or real(path, user))
+        assert gpu_jobs.events() == [] and gpu_jobs.events("7") == []
+        assert "junk.json" not in opened  # judged by its name: a file that is not an event is never opened
+        assert gpu_jobs.events("8") == []
+    finally:
+        signal.alarm(0)
     assert wait.all_sidecars({"6": "somebody-else"})["6"] == {}
     monkeypatch.setattr(status.gpu_jobs, "node_state", lambda: "idle")
     monkeypatch.setattr(status.audit, "unregistered", list)
@@ -80,6 +96,8 @@ def test_the_peak_for_mem_auto_comes_from_clean_finished_legs_only(tmp_path: Pat
     legs = [done, preempted, crashed]
     (tmp_path / "jobs" / "1.json").write_text(json.dumps({"name": "n", "legs": legs, "last_leg": crashed}))
     assert gpu_jobs.measured_peak_bytes("n") == 1024 * 1024**2
+    (tmp_path / "jobs" / "2.json").write_text(json.dumps({"name": "n", "legs": 5, "last_leg": {"peak_gpu_mib": "x", "exit": 0}}))
+    assert gpu_jobs.measured_peak_bytes("n") == 1024 * 1024**2  # wrong types inside a valid record are skipped
     monkeypatch.setattr(gpu_jobs, "current_user", lambda: "somebody-else")  # the file is not theirs
     assert gpu_jobs.measured_peak_bytes("n") is None
 

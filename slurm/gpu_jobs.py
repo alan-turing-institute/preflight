@@ -287,11 +287,11 @@ def record_queued_job(job_id: str, tool: str, **fields: object) -> None:
 
 
 def needs_the_card(job: QueuedJob) -> bool:
-    """A job the background services must step aside for: a GPU job, or any urgent job (design 3.2)."""
-    if job.partition == Partition.URGENT:
-        return True
-    record = read_sidecar(job.job_id, job.user)
-    return bool(record and record.get("gpu"))
+    """A job the background services must step aside for: one that holds GPUs, or any urgent job (design 3.2).
+
+    Decided from what slurm says (`gres`), never from the job's sidecar: any user can leave a record under an id.
+    """
+    return job.partition == Partition.URGENT or job.gpus > 0
 
 
 def pid_alive(pid: object) -> bool:
@@ -374,11 +374,15 @@ def measured_peak_bytes(name: str) -> int | None:
         record = read_json(path, me) or {}
         if record.get("name") != name:
             continue
-        for leg in record.get("legs") or [record.get("last_leg")]:
+        legs = record.get("legs")
+        for leg in legs if isinstance(legs, list) else [record.get("last_leg")]:
             if not isinstance(leg, dict) or "peak_gpu_mib" not in leg or leg.get("exit") != 0 or leg.get("signals"):
                 continue
-            total = int(float(leg["peak_gpu_mib"]) * 1024 * 1024) + int(leg.get("peak_mem_bytes") or 0)
-            ended = int(leg.get("ended_at") or 0)
+            try:
+                total = int(float(leg["peak_gpu_mib"]) * 1024 * 1024) + int(leg.get("peak_mem_bytes") or 0)
+                ended = int(leg.get("ended_at") or 0)
+            except (TypeError, ValueError):
+                continue
             if best is None or ended > best[0]:
                 best = (ended, total)
     return None if best is None else best[1]
@@ -448,8 +452,10 @@ def events(job_id: str | None = None) -> list[Event]:
     found = []
     for path in (STATE_DIR / "events").glob("*.json" if job_id is None else f"{job_id}-*.json"):
         match = re.fullmatch(r"(.+)-(\d+)-([a-z_]+)\.json", path.name)
+        if not match or (job_id is not None and match[1] != job_id):
+            continue  # judged by the name before the file is opened
         record = read_json(path)
-        if not match or record is None or (job_id is not None and match[1] != job_id):
+        if record is None:
             continue
         extra = {k: v for k, v in record.items() if k not in {"job", "action", "at"}}
         try:

@@ -43,3 +43,4 @@ def test_attribution_by_job_cgroup_service_cgroup_and_ancestry(tmp_path: Path) -
 def test_chain_follows_dependents_transitively() -> None:
     sidecars = {"1": {}, "2": {"after": ["1"]}, "3": {"after": ["2"]}, "4": {"after": ["9"]}}
     assert wait.chain("1", sidecars) == ["1", "2", "3"]
+    assert wait.chain("1", {"1": {}, "2": {"after": "1"}, "3": {"after": 1}}) == ["1"]  # only a list names dependencies

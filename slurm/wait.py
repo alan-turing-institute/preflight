@@ -28,7 +28,8 @@ def chain(job_id: str, sidecars: dict[str, dict[str, object]]) -> list[str]:
     while frontier:
         current = frontier.pop()
         for other, record in sidecars.items():
-            if other not in found and current in (record.get("after") or []):
+            after = record.get("after")
+            if other not in found and isinstance(after, list) and current in after:
                 found.append(other)
                 frontier.append(other)
     return found

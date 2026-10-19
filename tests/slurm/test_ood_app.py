@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import io
 import json
+import os
+import signal
 import sys
 from datetime import date
 from pathlib import Path
@@ -123,6 +125,26 @@ def test_accepted_posts_run_exactly_the_expected_argv() -> None:
         ["py", "/slurm/kill.py", "7"],
         ["py", "/slurm/pause.py", "7", "--dry-run"],
     ]
+
+
+def test_a_fifo_script_and_a_bad_content_length_never_hang_or_run(tmp_path: Path) -> None:
+    fifo = tmp_path / "job.sbatch"
+    os.mkfifo(fifo)
+    fake = Fake()
+    fake.backend.record = lambda _j, user=None: {"script": str(fifo), "command": ["x"]}
+    signal.signal(signal.SIGALRM, lambda *_: pytest.fail("the job page blocked on the script"))
+    signal.alarm(5)
+    try:
+        status, page = call(fake, "/job/7")
+    finally:
+        signal.alarm(0)
+    assert status == "200 OK" and app.NOT_SHOWN in page
+    for length, refused in (("-1", "400"), ("x", "400"), (str(app.MAX_BODY + 1), "413")):
+        status, _ = call(fake, "/api/job/7/pause", "POST", {}, {"CONTENT_LENGTH": length})
+        assert status.startswith(refused)
+    assert fake.ran == []
+    assert call(Fake(), "/api/job/7/log?errors=0")[1].endswith("None False\"}")  # only errors=1 turns the filter on
+    assert call(Fake(), "/api/job/7/log?errors=1")[1].endswith("None True\"}")
 
 
 def test_values_are_html_escaped() -> None:
