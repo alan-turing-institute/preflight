@@ -60,7 +60,7 @@ allow_from = []         # networks that may reach Grafana and the exporters, e.g
 
 [portal]
 mode = "off"            # install (Open OnDemand here), existing (reuse one), or off. Default: off
-auth = "dex-local"      # oidc, dex-ldap or dex-local. Default: dex-local
+auth = "dex-local"      # oidc, dex-ldap, dex-local or proxy (no sign-in page; see below). Default: dex-local
 server_name = ""        # host name the portal answers to; required when mode = "install". Default: empty
 tls_cert = ""           # path to the certificate; empty means none. Default: empty
 tls_key = ""            # path to its key; empty means none. Default: empty
@@ -69,3 +69,18 @@ allow_from = []         # networks that may reach the portal (include the portal
 
 # Extra settings for the chosen auth mode, as string keys and values. Default: none
 [portal.auth_settings]
+# oidc:      issuer, client_id, client_secret_file, then optional remote_user_claim, scope, user_map_match
+# dex-ldap:  host, user_base_dn, then optional bind_dn, bind_pw_file, user_filter, username_attr, email_attr, root_ca, start_tls
+# dex-local: users_file
+# oidc, dex-ldap and dex-local also take the optional crypto_passphrase_file.
+# proxy:     no sign-in page. A reverse proxy you trust (on a private network, e.g. Caddy on a Tailscale host) adds a
+#            secret header, X-Frontdoor-Key, to every request; the portal refuses (403) any request without the
+#            right one, removes the header before the apps see it, and serves every request as one Linux user.
+#            Needs portal.allow_from set to the proxy's address, or anyone who can reach the portal is that user.
+#            user:     the Linux user every request is served as (required)
+#            key_file: absolute path of a root-only file holding the key (16 or more characters, no spaces), made
+#                      with: openssl rand -hex 32 | sudo install -m 0600 /dev/stdin /etc/gpujobs/portal/proxy_key
+#                      Put the same value in the proxy, e.g. Caddy: header_up X-Frontdoor-Key <the key>
+#            Only the key's SHA-1 digest goes into the portal's Apache config, never the key itself.
+# user = "alice"
+# key_file = "/etc/gpujobs/portal/proxy_key"

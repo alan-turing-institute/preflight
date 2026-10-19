@@ -177,7 +177,7 @@ TOML. Tables: the top level, `[[nodes]]` with `[[nodes.gpus]]`, `[lease]` with `
 | Field | Default | Meaning |
 |---|---|---|
 | `mode` | `off` | `install` sets up Open OnDemand here; `existing` writes only the cluster file and links our page into a portal that is already there; `off` installs nothing. |
-| `auth` | `dex-local` | Login method: `oidc`, `dex-ldap` or `dex-local`. |
+| `auth` | `dex-local` | Login method: `oidc`, `dex-ldap`, `dex-local`, or `proxy` (no sign-in page; below). |
 | `server_name` | `""` | Host name or IP address the portal answers to. Required when `mode = "install"`. |
 | `tls_cert` | `""` | Path to the certificate. Empty (with `tls_key` empty) makes the installer generate a self-signed pair. Set both or neither. |
 | `tls_key` | `""` | Path to its key. |
@@ -221,6 +221,15 @@ For **`dex-local`** (accounts held by Dex itself):
 |---|---|---|---|
 | `users_file` | yes | | Root-only JSON file: a non-empty list of `{"username", "email", "hash", "userID"}` objects. `hash` is a bcrypt hash (never a password), `userID` a UUID, and the part of `email` before `@` is the Linux user. Dex's built-in default account (`ood@localhost`) is refused. |
 | `crypto_passphrase_file` | no | `/etc/gpujobs/portal/crypto_passphrase` | As above. Create it with `openssl rand -hex 32 \| sudo install -m 0600 /dev/stdin /etc/gpujobs/portal/crypto_passphrase`. |
+
+For **`proxy`** (no sign-in: a reverse proxy you trust vouches for every request). Needs `allow_from` set to the proxy's address:
+
+| Key | Required | Default | Meaning |
+|---|---|---|---|
+| `user` | yes | | The Linux user every request is served as. |
+| `key_file` | yes | | Root-only file with the key (16 or more characters, no spaces), the value of the `X-Frontdoor-Key` header the proxy adds to every request. Create it with `openssl rand -hex 32 \| sudo install -m 0600 /dev/stdin /etc/gpujobs/portal/proxy_key`. A request without the right key is refused with 403 and the header is removed before the apps see it. Only the key's SHA-1 digest is written to Apache's configuration. |
+
+The installer stops and disables `ondemand-dex` in this mode if it is running (a machine switched from a Dex login).
 
 ## 5. What each component installs
 

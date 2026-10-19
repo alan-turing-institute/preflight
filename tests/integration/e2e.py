@@ -6,7 +6,7 @@
 
 Runs on the host and drives the container through `run.sh shell`. Every check prints PASS or FAIL with its
 evidence as it happens; the exit status is 1 when any check failed. Stages: install, jobs, urgent, failure,
-recovery, portal, lease, host (in this order; `--only` takes a subset, later stages need `install` to have run once).
+recovery, portal, proxy, lease, host (in this order; `--only` takes a subset, later stages need `install` to have run once).
 """
 
 from __future__ import annotations
@@ -601,7 +601,10 @@ def login(user: str, password: str | None = None) -> tuple[bool, str]:
         f"{CURL} -L -c {jar} -b {jar} -o /tmp/login-{user}.html -w '%{{http_code}} %{{url_effective}}' "
         f"--data-urlencode login={user}@harness.test --data-urlencode password={shlex.quote(password or PASSWORDS[user])} {shlex.quote(url)}"
     ).out.strip()
-    return got.startswith("200") and got.endswith("/pun/sys/dashboard"), f"{url.split('?')[0]} -> {got}"
+    # the portal opens on the jobs page (root_uri); on a fresh install OOD first shows its 'Initialize App' page there
+    code, _, landed = got.partition(" ")
+    first_visit = code == "404" and "/nginx/init" in sh(f"cat /tmp/login-{user}.html").out
+    return (code == "200" or first_visit) and landed.endswith("/pun/sys/gpujobs/"), f"{url.split('?')[0]} -> {got}"
 
 
 def get(user: str, path: str, *extra: str) -> tuple[int, str]:
@@ -627,7 +630,7 @@ def stage_portal() -> None:
     check("Dex local login: a wrong password does not log in", not wrong, evidence)
     for user in USERS:
         good, evidence = login(user)
-        check(f"Dex local login over HTTPS: {user} logs in and lands on the dashboard (REMOTE_USER maps to Linux user {user})", good, evidence)
+        check(f"Dex local login over HTTPS: {user} logs in and lands on the jobs page (REMOTE_USER maps to Linux user {user})", good, evidence)
     # the first visit to a new app in a user's own nginx shows OOD's 'Initialize App' page
     first, body = get("alice", "/")
     check("first visit of the app in alice's per-user nginx asks to initialize it (OOD behaviour, README)",
@@ -639,7 +642,7 @@ def stage_portal() -> None:
     link = sh("readlink /var/www/ood/apps/sys/gpujobs; grep passenger_app_root /var/lib/ondemand-nginx/config/apps/sys/gpujobs.conf")
     page_code, page = get("alice", "/")
     check("symlinked OOD sys app: Passenger serves the app through /var/www/ood/apps/sys/gpujobs -> install_dir",
-          page_code == HTTPStatus.OK and "Signed in as alice" in page and "/opt/gpujobs/slurm/ood_app" in link.out, link.text[:200])
+          page_code == HTTPStatus.OK and "Signed in as <strong>alice</strong>" in page and "/opt/gpujobs/slurm/ood_app" in link.out, link.text[:200])
 
     # Passenger runs our bin/python: put a marker in the installed launcher, restart alice's app, look
     sh("cp -p /opt/gpujobs/slurm/ood_app/bin/python /root/bin-python.orig && printf '%s\\n' '#!/bin/sh' "
@@ -664,21 +667,21 @@ def stage_portal() -> None:
     check("the app lists every user's jobs, with the project and description from the record",
           aj in listed and bj in listed and listed.get(bj, {}).get("user") == "bob" and listed.get(bj, {}).get("project") == "e2e"
           and listed.get(bj, {}).get("description") == "e2e portal-b", json.dumps(listed.get(bj, {}))[:250])
-    for path, needle in (("/", "GPU jobs"), ("/history", "History"), ("/projects", "GPU-hours"), (f"/job/{aj}", "Dependency chain"),
+    for path, needle in (("/", "GPU jobs"), ("/history", "History"), ("/projects", "GPU-hours"), (f"/job/{aj}", "Dependencies"),
                          ("/static/app.js", "function")):
         code, body = get("alice", path)
         check(f"the app's page {path} loads (200)", code == HTTPStatus.OK and needle in body, f"HTTP {code}, {len(body)} bytes")
     code, own = get("alice", f"/job/{aj}")
     _, other = get("alice", f"/job/{bj}")
     check("S4: the app shows alice's buttons on her own job and hides them on bob's",
-          'data-action="pause"' in own and 'data-action="pause"' not in other and "You cannot act on this job." in other,
-          f"own has pause button={'data-action=\"pause\"' in own}; bob's job page says cannot act={'You cannot act' in other}")
+          'data-action="pause"' in own and 'data-action="pause"' not in other and "owner or an admin can pause" in other,
+          f"own has pause button={'data-action=\"pause\"' in own}; bob's job page says who can act={'owner or an admin can pause' in other}")
     forced = post("alice", f"/api/job/{bj}/pause", PORTAL)
     check("S4: even if the button is bypassed, a pause of bob's job through the portal is refused by slurm and bob's job runs on",
           forced[0] == HTTPStatus.OK and '"ok": false' in forced[1] and state(bj) == "RUNNING", f"HTTP {forced[0]} {forced[1][:200]}")
     code, admin_view = get("carol", f"/job/{bj}")
     check("the app shows an admin the buttons on anyone's job ('Signed in as carol (admin)')",
-          'data-action="pause"' in admin_view and "carol (admin)" in admin_view, f"HTTP {code}")
+          'data-action="pause"' in admin_view and "<strong>carol</strong>" in admin_view and 'class="role">admin' in admin_view, f"HTTP {code}")
 
     # Origin / Host reach the app unchanged
     evil = post("alice", f"/api/job/{aj}/pause", "https://evil.example")
@@ -696,6 +699,86 @@ def stage_portal() -> None:
     back = wait_for(lambda: priority(aj) > 0, 40)
     check("resume through the portal releases the job", ok_resume[0] == HTTPStatus.OK and '"ok": true' in ok_resume[1] and bool(back), f"{ok_resume[1][:100]} priority={priority(aj)}")
     clear_queue()
+
+
+# -- stage: proxy -------------------------------------------------------------------------------------------------
+
+PROXY_KEY_FILE = "/etc/gpujobs/portal/proxy_key"
+PROXY_SITE = "/root/proxy.site.toml"
+PROBE_APP = "/var/www/ood/apps/sys/hdrprobe"
+# A throwaway portal app that answers with the request headers it received (the real app has no such page).
+PROBE_WSGI = """import json
+def application(environ, start_response):
+    headers = sorted(k for k in environ if k.startswith("HTTP_"))
+    body = json.dumps({"headers": headers}).encode()
+    start_response("200 OK", [("Content-Type", "application/json"), ("Content-Length", str(len(body)))])
+    return [body]
+"""
+PROBE_MANIFEST = "---\nname: Header probe\ncategory: Test\ndescription: Echoes the request header names.\n"
+
+
+def stage_proxy() -> None:
+    section("proxy: the portal with no sign-in page, behind a trusted proxy's key (switches the portal from Dex)")
+    sh(f"openssl rand -hex 32 | install -m 0600 /dev/stdin {PROXY_KEY_FILE}")
+    key = sh(f"cat {PROXY_KEY_FILE}").out.strip()
+    own = sh("hostname -i").out.split()[0]
+    site = Path(HERE / "harness.site.toml").read_text()
+    site = site.replace('auth = "dex-local"', f'auth = "proxy"\nallow_from = ["{own}/32"]  # the proxy: this container')
+    site = site.replace('users_file = "/etc/gpujobs/portal/users.json"', f'user = "alice"\nkey_file = "{PROXY_KEY_FILE}"')
+    put(PROXY_SITE, site)
+
+    dex_before = sh("systemctl is-active ondemand-dex").out.strip()
+    loose = sh(f"chmod 0644 {PROXY_KEY_FILE}; {INSTALL} --site {PROXY_SITE} apply --component portal; rc=$?; chmod 0600 {PROXY_KEY_FILE}; exit $rc")
+    check("a key file others can read is refused, and nothing is applied", loose.rc != 0 and "must be root-only" in loose.text, loose.text[-200:])
+    applied = sh(f"{INSTALL} --site {PROXY_SITE} apply --component portal", timeout=900)
+    check("apply of the portal with auth = proxy succeeds", applied.rc == 0 and "installed" in applied.out, applied.text[-300:])
+    dex_after = sh("systemctl is-active ondemand-dex; systemctl is-enabled ondemand-dex")
+    check("Dex was running before and is stopped and disabled by the switch",
+          dex_before == "active" and dex_after.out.split() == ["inactive", "disabled"], f"before={dex_before} after={dex_after.text}")
+    apache = sh("systemctl is-active apache2")
+    conf = sh("stat -c '%a %U:%G' /etc/apache2/sites-available/ood-portal.conf; "
+              f"grep -c {key} /etc/apache2/sites-available/ood-portal.conf; "
+              "grep -c \"sha1(req('X-Frontdoor-Key'))\" /etc/apache2/sites-available/ood-portal.conf; "
+              "grep -c -i -E 'openid|oidc|\\bdex\\b' /etc/apache2/sites-available/ood-portal.conf")
+    mode, wrote_key, gates, login = (conf.out.split("\n") + ["", "", "", ""])[:4]
+    check("Apache is up with the allow_from restriction; the portal config is 0640 root:www-data, holds the key's digest but not the key, "
+          "and has no OIDC or Dex directives", apache.out.strip() == "active" and mode == "640 root:www-data"
+          and wrote_key == "0" and int(gates or 0) >= 2 and login == "0", f"{apache.out.strip()} | {conf.text}")
+
+    base = f"{CURL} -o /dev/null -w '%{{http_code}}'"
+    app = f"{PORTAL}/pun/sys/gpujobs/api/jobs"
+    none = sh(f"{base} {app}").out
+    wrong = sh(f"{base} -H 'X-Frontdoor-Key: {'0' * 64}' {app}").out
+    empty = sh(f"{base} -H 'X-Frontdoor-Key:' {app}").out
+    public = sh(f"{base} {PORTAL}/public/favicon.ico").out
+    init = sh(f"{base} {PORTAL}/nginx/init?redir=%2fpun%2fsys%2fgpujobs%2f").out
+    check("no key, a wrong key and an empty key are each refused with 403, on the app, /public and /nginx",
+          [none, wrong, empty, public, init] == ["403"] * 5, f"none={none} wrong={wrong} empty={empty} public={public} nginx={init}")
+
+    keyed = f"-H 'X-Frontdoor-Key: {key}'"
+    sh(f"{base} {keyed} '{PORTAL}/nginx/init?redir=%2fpun%2fsys%2fgpujobs%2f' -L")  # first visit in a restarted per-user server
+    page = sh(f"{CURL} -L {keyed} -w '\\n%{{http_code}} %{{url_effective}}' {APP}/").out
+    body, _, tail = page.rpartition("\n")
+    check("with the key, the portal opens straight on the jobs page: no login page, no redirect to Dex",
+          tail.startswith("200") and tail.endswith("/pun/sys/gpujobs/") and "Signed in as <strong>alice</strong>" in body, tail)
+    code, _, jobs = sh(f"{CURL} {keyed} -w '\\n%{{http_code}}' {app}").out.rpartition("\n")[::-1]
+    check("with the key, /api/jobs returns JSON, served as the configured user", code == "200" and isinstance(json.loads(jobs).get("jobs"), list),
+          f"HTTP {code} {jobs[:80]}")
+    # OOD runs each per-user nginx master as root, labelled with its user: "nginx: master process (alice) -c ..."
+    puns = sorted(set(re.findall(r"nginx: master process \((\S+)\)", sh("ps -eo args").out)))
+    check("the app runs as the configured user only (no per-user server for bob, carol or www-data was started by these requests)",
+          "alice" in puns and not {"bob", "carol", "dave"} & set(puns), f"users with a per-user server: {puns}")
+
+    # the header must not reach the app: a probe app that lists the HTTP_* variables it received
+    put(f"{PROBE_APP}/manifest.yml", PROBE_MANIFEST)
+    put(f"{PROBE_APP}/passenger_wsgi.py", PROBE_WSGI)
+    put(f"{PROBE_APP}/bin/python", "#!/bin/sh\nexec /usr/bin/python3 \"$@\"\n", "0755")
+    sh(f"{CURL} -L -o /dev/null {keyed} '{PORTAL}/nginx/init?redir=%2fpun%2fsys%2fhdrprobe%2f'")
+    echoed = sh(f"{CURL} {keyed} -H 'X-Probe: kept' {PORTAL}/pun/sys/hdrprobe/").out
+    seen = json.loads(echoed).get("headers", []) if echoed.startswith("{") else []
+    check("the key header does not reach the app (a control header sent with it does)",
+          "HTTP_X_PROBE" in seen and "HTTP_X_FRONTDOOR_KEY" not in seen, f"{echoed[:200]}")
+    sh(f"rm -rf {PROBE_APP}; /opt/ood/nginx_stage/sbin/nginx_stage nginx_clean --force")
 
 
 # -- stage: lease -------------------------------------------------------------------------------------------------
@@ -785,6 +868,7 @@ STAGES: dict[str, Callable[[], None]] = {
     "failure": stage_failure,
     "recovery": stage_recovery,
     "portal": stage_portal,
+    "proxy": stage_proxy,
     "lease": stage_lease,
     "host": stage_host,
 }

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import sys
@@ -19,6 +20,7 @@ sys.modules["portal"] = portal
 spec.loader.exec_module(portal)
 
 SECRET = "s3cr3t-client-value"
+KEY = "k" * 32
 HASH = "$2a$12$iKLecAIN9MrxOZ0UltRb.OQOms/bgQbs5F.qCehq15oc3CvGFYzLy"
 USER = {"username": "alice", "email": "alice@localhost", "hash": HASH, "userID": "D642A38C-402F-47AA-879B-FEC95745F5BA"}
 # Dex's built-in account as the generator hardcodes it (ood-portal-generator/lib/ood_portal_generator/dex.rb:257-261).
@@ -47,6 +49,9 @@ def make_site(tmp_path: Path, mode: str = "install", auth: str = "dex-local", tl
     defaults = {"crypto_passphrase_file": secret_file(tmp_path, "pass", "p" * 32)}
     if auth == "dex-local":
         defaults["users_file"] = secret_file(tmp_path, "users.json", json.dumps([USER]))
+    elif auth == "proxy":
+        defaults = {"user": "alice", "key_file": secret_file(tmp_path, "key", KEY)}
+        portal_extra = {"allow_from": ["192.0.2.8/32"], **(portal_extra or {})}
     elif auth == "oidc":
         defaults |= {
             "issuer": "https://idp.example.org",
@@ -142,6 +147,34 @@ def test_oidc_renders_with_secret_only_in_the_root_only_file(tmp_path):
     assert any("unknown key" in r and "client_secret" in r for r in portal.refusals(inline))
     loose = make_site(tmp_path, auth="oidc", client_secret_file=secret_file(tmp_path, "loose", SECRET, 0o644))
     assert any("must be root-only" in r for r in portal.refusals(loose))
+
+
+def test_proxy_serves_everyone_as_one_user_behind_the_key_and_runs_no_login(tmp_path):
+    site = make_site(tmp_path, auth="proxy")
+    text = portal.files(site)[portal.PORTAL_YML].content
+    digest = hashlib.sha1(KEY.encode()).hexdigest()
+    assert portal.refusals(site) == []
+    # the key is checked on every OOD location and on `/`, and the header never goes on to the app
+    assert text.count(f"sha1(req('X-Frontdoor-Key')) == '{digest}'") == 2 and text.count("RequestHeader unset X-Frontdoor-Key") == 2
+    assert 'user_env: "GPUJOBS_PORTAL_USER"' in text and '"SetEnv GPUJOBS_PORTAL_USER alice"' in text and "dex: false" in text
+    assert KEY not in text and "openid-connect" not in text and "oidc_" not in text  # only the digest is written
+    assert "ondemand-dex" not in portal.packages(site) and "libapache2-mod-auth-openidc" not in portal.packages(site)
+    steps = portal.post_install(site)
+    assert ["a2enmod", "auth_openidc"] not in steps and [portal.UPDATE_OOD_PORTAL, "--force"] in steps
+    assert not any("ondemand-dex" in c and c[:2] != ["sh", "-c"] for c in steps)  # no Dex enabled or restarted
+    stop = next(c for c in steps if c[:2] == ["sh", "-c"])  # a machine switched from Dex stops it, one without it skips
+    assert "systemctl cat ondemand-dex" in stop[2] and "disable --now ondemand-dex" in stop[2]
+    assert not any("ondemand-dex" in f for f in portal.files(site))  # no Dex drop-in either
+    for setup, expect in (
+        ({"portal_extra": {"allow_from": []}}, "allow_from"),
+        ({"user": "Not A User"}, "Linux user"),
+        ({"key_file": secret_file(tmp_path, "loose", KEY, 0o644)}, "must be root-only"),
+        ({"key_file": secret_file(tmp_path, "short", "short")}, "unusable value"),
+        ({"crypto_passphrase_file": "/x"}, "unknown key"),
+    ):
+        refused = make_site(tmp_path, auth="proxy", **setup)
+        assert any(expect in r for r in portal.refusals(refused)), setup
+        assert portal.PORTAL_YML not in portal.files(refused)
 
 
 @pytest.mark.parametrize("field", ["email", "userID", "hash"])

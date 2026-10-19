@@ -36,6 +36,7 @@ class AuthMode(StrEnum):
     OIDC = "oidc"
     DEX_LDAP = "dex-ldap"
     DEX_LOCAL = "dex-local"
+    PROXY = "proxy"  # no sign-in: a trusted reverse proxy vouches for every request (see portal.py)
 
 
 class SiteError(Exception):
