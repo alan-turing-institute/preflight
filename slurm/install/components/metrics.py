@@ -38,8 +38,6 @@ if TYPE_CHECKING:
 NAME = "metrics"
 TEMPLATES = render.TEMPLATES / NAME
 
-# Must equal ClusterName in templates/slurm/slurm.conf: Jobstats selects every series by `cluster=` (jobstats.py).
-CLUSTER_NAME = "spark"
 SCRAPE_INTERVAL_S = 30  # `prometheus.md:18`; jobstats' SAMPLING_PERIOD must match (`jobstats_command.md:90`)
 
 
@@ -284,7 +282,8 @@ def _targets(site: Site) -> str:
     gpu = [f"{n.name}:{Port.GPU}" for n in site.nodes if n.gpus]
     groups = [
         {
-            "labels": {"cluster": CLUSTER_NAME},
+            # Jobstats selects every series by `cluster=` (jobstats.py), which must equal slurm's ClusterName.
+            "labels": {"cluster": site.cluster_name},
             "targets": [f"{n.name}:{port}" for n in site.nodes for port in (Port.NODE, Port.CGROUP)] + gpu,
         }
     ]

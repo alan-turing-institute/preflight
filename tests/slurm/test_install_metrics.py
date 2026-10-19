@@ -118,10 +118,10 @@ def test_retention_ports_and_textfile_directory_are_substituted():
     assert "url: http://127.0.0.1:9090" in out["/etc/grafana/provisioning/datasources/gpujobs.yaml"].content
     # Jobstats selects series by cluster label and node name; the targets carry both.
     (group,) = json.loads(out["/etc/gpujobs/prometheus_targets.json"].content)
-    assert group["labels"] == {"cluster": metrics.CLUSTER_NAME}
+    assert group["labels"] == {"cluster": site.cluster_name}
     assert group["targets"] == ["n1:9101", "n1:9306", "n1:9445"]
-    slurm_conf = (INSTALL / "templates" / "slurm" / "slurm.conf").read_text()
-    assert f"ClusterName={metrics.CLUSTER_NAME}\n" in slurm_conf
+    slurm_conf = render.render(site, "slurm")["/etc/slurm/slurm.conf"].content
+    assert f"ClusterName={site.cluster_name}\n" in slurm_conf
 
 
 def test_slurm_conf_lines_match_the_jobstats_docs_and_render_into_slurm_conf():
