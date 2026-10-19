@@ -28,10 +28,15 @@ def _tree() -> list[Path]:
     return found
 
 
+def _mode(path: Path) -> int:
+    """Executable in the repository (the app's bin/python launcher) stays executable; everything else is 0644."""
+    return SHIM_MODE if path.stat().st_mode & 0o100 else FILE_MODE
+
+
 def files(site) -> dict[str, render.FileSpec]:
     dest = site.install_dir / "slurm"
     out = {
-        str(dest / p.relative_to(SLURM_DIR)): render.FileSpec(p.read_text(), FILE_MODE, "root") for p in _tree()
+        str(dest / p.relative_to(SLURM_DIR)): render.FileSpec(p.read_text(), _mode(p), "root") for p in _tree()
     }
     for tool in TOOLS:
         shim = SHIM.format(install_dir=site.install_dir, tool=tool)

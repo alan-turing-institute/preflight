@@ -68,6 +68,7 @@ def test_apply_then_check_against_a_temp_root(env):
     assert run(site, root, "check") == 0
     assert stat.S_IMODE((root / "etc/slurm/slurmdbd.conf").stat().st_mode) == 0o600
     assert stat.S_IMODE((root / "usr/local/bin/gpujobs-submit").stat().st_mode) == 0o755
+    assert stat.S_IMODE((root / "opt/gpujobs/slurm/ood_app/bin/python").stat().st_mode) == 0o755  # OOD runs it
     assert ((root / "etc/slurm/slurmdbd.conf"), "slurm") in owned
     assert (root / "etc/gpujobs/site.toml", "root") in owned
     (root / "etc/slurm/slurmdbd.conf").chmod(0o644)  # same content, but readable by everyone

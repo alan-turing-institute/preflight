@@ -1,0 +1,4 @@
+#!/bin/sh
+# Open OnDemand runs a Passenger app with `python` from the app's bin/ when present (its nginx_stage bin/python
+# wrapper); Ubuntu 24.04 has no `python`, only python3.
+exec /usr/bin/python3 "$@"
