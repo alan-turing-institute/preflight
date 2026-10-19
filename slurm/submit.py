@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Submit one job to slurm on gpu-node-1: the one command every project uses for GPU work on this box.
+"""Submit one job to slurm: the one command every project uses for GPU work on this machine.
 
 Design 3.3 (`design notes`).
 
-    slurm/submit.py --project P --what 'one line' --class resume|restart [--mem 24G|auto] [--gpu] \
+    slurm/submit.py --project P --what 'one line' --class resume|restart [--mem 24G|auto] [--gpu|--gpus N] \
         [--entry script.py --repo DIR] [--after JOBID]... [--cpus N] [--name NAME] [--log FILE] \
         [--workdir DIR] [--wait-limit 1h] [--resume-ok] -- <command...>
 
@@ -12,11 +12,11 @@ run plus 10%; with no measured run (or no `--name`) a GPU job asks for the whole
 
 REFUSES: a class outside
 the closed set; a `resume` job without `--resume-ok` (the caller's statement that running the command
-again continues from its latest checkpoint); `--after` on a job slurm no longer knows; any submission
-while the lease keeper is not running.
+again continues from its latest checkpoint); `--after` on a job slurm no longer knows; `--gpu` together with `--gpus`; any submission
+while the lease keeper is not running (checked only when the site file declares a lease, or there is no site file).
 
 AT SUBMISSION, before anything is queued (a fault must surface before the queue wait, not after it):
-with `--entry`, the DGX gate in check-only mode against this box (code parity, the entry script's
+with `--entry` (and a site with `dgx_gate`, or no site file), the DGX gate in check-only mode against this box (code parity, the entry script's
 import, the host memory guard), its GPU leg deferred to launch, where the job wrapper runs it; the
 manifest it writes is copied per job, so two queued jobs with one entry script cannot overwrite each
 other's. Then `audit.py`, and the job's sidecar record.
@@ -43,10 +43,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import audit  # noqa: E402 - path set just above
 import gpu_jobs  # noqa: E402
+import site_config
 
 HERE = Path(__file__).resolve().parent
 GATE = HERE.parent / "dgx" / "dgx_submit.sh"
 KEEPER_UNIT = "slurm-gpu-lease-keeper"
+#: Longest `--comment` we write: our choice (it keeps `squeue` output readable), not a slurm limit.
+COMMENT_MAX = 200
 #: --mem auto: the measured peak, plus this share, rounded up to whole GiB.
 AUTO_MARGIN = 0.10
 #: --mem with no measured run, for a GPU job: slurm's "all of the memory on each node".
@@ -79,6 +82,11 @@ def resolve_mem(mem: str | None, name: str | None, gpu: bool) -> str | None:
     if peak is not None:
         return f"{math.ceil(peak * (1 + AUTO_MARGIN) / 1024**3)}G"
     return WHOLE_BOX if gpu else None
+
+
+def comment(what: str) -> str:
+    """The `--what` text as a one-line slurm comment, cut to `COMMENT_MAX` characters."""
+    return what.replace("\r", " ").replace("\n", " ")[:COMMENT_MAX]
 
 
 def keeper_running() -> bool:
@@ -135,8 +143,11 @@ def sbatch_script(
     ]
     if mem:
         lines.append(f"#SBATCH --mem={mem}")
-    if arguments.gpu:
-        lines.append("#SBATCH --gres=gpu:1")
+    gpus = getattr(arguments, "gpus", None) or int(arguments.gpu)  # urgent.py's arguments carry no `gpus`
+    if gpus:
+        lines.append(f"#SBATCH --gres=gpu:{gpus}")
+    if getattr(arguments, "what", None):
+        lines.append(f"#SBATCH --comment={shlex.quote(comment(arguments.what))}")
     if arguments.after:
         lines.append(f"#SBATCH --dependency=afterok:{':'.join(arguments.after)}")
     lines += [f"#SBATCH {directive}" for directive in extra]
@@ -160,7 +171,9 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--class", dest="job_class", required=True, choices=[c.value for c in gpu_jobs.JobClass])
     p.add_argument("--mem", default=None,
                    help="e.g. 24G; default auto: the last measured run of --name plus 10%%, else the whole box (GPU)")
-    p.add_argument("--gpu", action="store_true")
+    gpu = p.add_mutually_exclusive_group()
+    gpu.add_argument("--gpu", action="store_true", help="one GPU (same as --gpus 1)")
+    gpu.add_argument("--gpus", type=int, default=None, metavar="N", help="N GPUs, N >= 1")
     p.add_argument("--entry", default=None, help="the Python entry script, relative to --repo (runs the gate)")
     p.add_argument("--repo", type=Path, default=None)
     p.add_argument("--after", action="append", default=[], metavar="JOBID")
@@ -187,6 +200,12 @@ def submit(argv: list[str]) -> str:
     if not arguments.command:
         msg = "no command after --"
         raise Refused(msg)
+    if arguments.gpus is not None and arguments.gpus < 1:
+        msg = f"--gpus {arguments.gpus}: ask for at least one GPU, or leave it out for a CPU job"
+        raise Refused(msg)
+    arguments.gpus = 1 if arguments.gpu else arguments.gpus or 0
+    arguments.gpu = arguments.gpus > 0
+    site = site_config.load() if site_config.SITE_FILE.exists() else None
     named = arguments.name
     arguments.name = arguments.name or Path(arguments.command[0]).name
     if arguments.job_class == gpu_jobs.JobClass.RESUME and not arguments.resume_ok:
@@ -199,18 +218,19 @@ def submit(argv: list[str]) -> str:
     mem = resolve_mem(arguments.mem, named, arguments.gpu)
     stamp = time.strftime("%Y%m%d-%H%M%S")
     log = arguments.log or gpu_jobs.STATE_DIR / "logs" / f"{arguments.name}-{stamp}.log"
-    manifest = gpu_jobs.STATE_DIR / "manifests" / f"{arguments.name}-{stamp}.json" if arguments.entry else None
+    gated = bool(arguments.entry) and (site is None or site.dgx_gate)
+    manifest = gpu_jobs.STATE_DIR / "manifests" / f"{arguments.name}-{stamp}.json" if gated else None
     script = sbatch_script(arguments, mem=mem, log=log, manifest=manifest)
     if arguments.dry_run:
         return script
-    if not keeper_running():
+    if (site is None or site.lease) and not keeper_running():
         msg = f"the lease keeper ({KEEPER_UNIT}) is not running; start it before submitting"
         raise Refused(msg)
     for job_id in arguments.after:
         if not known_to_slurm(job_id):
             msg = f"--after {job_id}: slurm no longer knows that job (finished over a day ago, or never existed)"
             raise Refused(msg)
-    if arguments.entry:
+    if gated:
         run_gate(arguments.repo.resolve(), arguments.entry, arguments.command, manifest)
     print("\n".join(audit.report(audit.unregistered())))
     path = gpu_jobs.STATE_DIR / "scripts" / f"{arguments.name}-{stamp}.sbatch"
@@ -229,6 +249,7 @@ def submit(argv: list[str]) -> str:
         job_class=arguments.job_class,
         name=arguments.name,
         gpu=arguments.gpu,
+        gpus=arguments.gpus,
         mem=mem,
         command=arguments.command,
         log=str(log),
