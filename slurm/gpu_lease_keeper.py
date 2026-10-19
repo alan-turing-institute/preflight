@@ -24,7 +24,7 @@ On start it deletes lease files written before this boot (their pids belong to t
 be reused) and reports the node's state, since `ReturnToService=1` leaves it DOWN after a reboot.
 State for the other tools: `~/.local/state/slurm-gpu/keeper.json`.
 
-Run by `machine/slurm/slurm-gpu-lease-keeper.service` under `~/dev/localmodels/.venv/bin/python`.
+Run by the `slurm-gpu-lease-keeper.service` user unit (`slurm/install/templates/lease/`) under the site's lease python.
 """
 
 from __future__ import annotations

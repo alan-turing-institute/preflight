@@ -62,7 +62,13 @@ EXPECTED_DIFF = {
     ],
     "mariadb-slurm.cnf": [
         "-# some sites use: on this box the RAM is also the GPU's memory, and this database holds one node's job records.",
+        "-# Installed to /etc/mysql/mariadb.conf.d/90-slurm.cnf by install_slurm.py.",
         "+# some sites use: on a unified-memory machine (the GB10) the RAM is also the GPU's memory, and this database holds one node's job records.",
+        "+# Installed to /etc/mysql/mariadb.conf.d/90-slurm.cnf by slurm/install/install.py.",
+    ],
+    "10-restart-protect.conf": [
+        "-# slurmctld, slurmd and munge by install_slurm.py.",
+        "+# slurmctld, slurmd and munge by slurm/install/install.py.",
     ],
 }
 

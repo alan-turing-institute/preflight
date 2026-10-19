@@ -69,6 +69,9 @@ def test_apply_then_check_against_a_temp_root(env):
     assert stat.S_IMODE((root / "usr/local/bin/gpujobs-submit").stat().st_mode) == 0o755
     assert ((root / "etc/slurm/slurmdbd.conf"), "slurm") in owned
     assert (root / "etc/gpujobs/site.toml", "root") in owned
+    (root / "etc/slurm/slurmdbd.conf").chmod(0o644)  # same content, but readable by everyone
+    assert run(site, root, "check") == 1
+    (root / "etc/slurm/slurmdbd.conf").chmod(0o600)
     (root / "etc/slurm/gres.conf").write_text("edited\n")
     assert run(site, root, "check") == 1
     # the argv order: refusals' probes, packages, then post-install

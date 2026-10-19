@@ -18,6 +18,7 @@ import grp
 import os
 import pwd
 import shutil
+import stat
 import sys
 import tempfile
 from collections.abc import Callable
@@ -28,11 +29,11 @@ for path in (HERE, HERE.parent, HERE.parents[1] / "machine" / "earlyoom"):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-import components
-import detect
-import render
-import site_config
-from install_earlyoom import differing, install
+import components  # noqa: E402 - paths set just above
+import detect  # noqa: E402
+import render  # noqa: E402
+import site_config  # noqa: E402
+from install_earlyoom import differing, install  # noqa: E402
 
 MIGRATED = ("jobs", "footprints", "events")
 OPERATOR = "Operator"
@@ -101,6 +102,24 @@ def cmd_render(site, args, modules) -> int:
     return 0
 
 
+def _wrong_mode_or_owner(root: Path, files: dict[str, render.FileSpec], *, check_owner: bool) -> list[str]:
+    """Installed files whose mode, or owner (only checkable as root, where apply sets it), is not the rendered one.
+
+    Content alone is not enough: slurmdbd refuses a config readable by others, and a shim must stay executable.
+    """
+    out = []
+    for target, spec in files.items():
+        dest = _under(root, target)
+        if not dest.exists():
+            continue  # already reported by the content check
+        info = dest.stat()
+        if stat.S_IMODE(info.st_mode) != spec.mode:
+            out.append(f"{dest} (mode {stat.S_IMODE(info.st_mode):04o}, want {spec.mode:04o})")
+        elif check_owner and pwd.getpwuid(info.st_uid).pw_name != spec.owner:
+            out.append(f"{dest} (owner {pwd.getpwuid(info.st_uid).pw_name}, want {spec.owner})")
+    return out
+
+
 def cmd_check(site, args, modules) -> int:
     files = _all(modules, site, "files")
     with tempfile.TemporaryDirectory() as tmp:
@@ -109,6 +128,7 @@ def cmd_check(site, args, modules) -> int:
         except PermissionError as error:  # slurmdbd.conf is 0600 slurm, as slurmdbd requires
             print(f"cannot read {error.filename}: run the check with sudo", file=sys.stderr)
             return 2
+    diff += _wrong_mode_or_owner(args.root, files, check_owner=os.geteuid() == 0)
     for d in diff:
         print(f"DIFFERS  {d}")
     if not diff:
