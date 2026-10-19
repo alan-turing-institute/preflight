@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""What every GPU job on gpu-node-1 is, how it pauses, and who holds the card (design 3.3, 3.8)."""
+"""What every GPU job is, how it pauses, and who holds the card (design 3.3, 3.8)."""
 
 from __future__ import annotations
 
@@ -10,6 +10,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import audit  # noqa: E402 - path set just above
 import gpu_jobs  # noqa: E402
+import jobs_view  # noqa: E402
+from wait import all_sidecars
 
 #: How a job in each partition pauses, for the table.
 PAUSES = {
@@ -31,13 +33,16 @@ def lines(queue: list[gpu_jobs.QueuedJob] | None) -> list[str]:
         return out
     if not queue:
         out.append("[status] no jobs in slurm")
+    records = all_sidecars()
+    by_id = {job.job_id: job for job in queue}
+    events = gpu_jobs.events()
     for job in queue:
-        record = gpu_jobs.read_sidecar(job.job_id) or {}
-        held = " <- HELD after repeated requeues: look, then slurm/resume.py" if job.reason == "JobHeldAdmin" else ""
+        record = records.get(job.job_id, {})
+        why = jobs_view.waiting_reason(job, by_id, records, events)
         out.append(
-            f"[status] {job.job_id} {job.state:<10} {job.reason:<22} {job.name}"
-            f" | {'GPU' if record.get('gpu') else 'CPU'}, {record.get('mem') or 'default mem'},"
-            f" {PAUSES.get(job.partition, job.partition)} | {record.get('what', '(no sidecar)')}{held}"
+            f"[status] {job.job_id} {job.state:<10} {job.user or '?':<10} {job.gpus} GPU {job.name}"
+            f" | {record.get('mem') or 'default mem'}, {PAUSES.get(job.partition, job.partition)}"
+            f" | {record.get('what', '(no sidecar)')}{f' | {why}' if why else ''}"
         )
     out += audit.report(audit.unregistered())
     return out

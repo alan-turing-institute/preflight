@@ -35,7 +35,7 @@ def test_attribution_by_job_cgroup_service_cgroup_and_ancestry(tmp_path: Path) -
     fake_proc(proc, 107, f"/system.slice/docker-{bare}.scope", 2)
     labels = {labelled: "service-a", other: "service-b"}
     usage = {101: 100.0, 102: 200.0, 103: 300.0, 104: 400.0, 105: 1.0, 106: 2.0, 107: 3.0}
-    found = audit.unregistered(usage, leases, proc, lambda cid: labels.get(cid, ""))
+    found = audit.unregistered(usage, leases, proc, lambda cgroup, _label: next((v for k, v in labels.items() if k in cgroup), ""))
     assert [(pid, mib) for pid, mib, _ in found] == [(104, 400.0), (106, 2.0), (107, 3.0)]
     assert "patch4" in found[0][2]
 
