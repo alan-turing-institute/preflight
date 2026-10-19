@@ -38,7 +38,8 @@ class World:
         self.queue: list[gpu_jobs.QueuedJob] | None = []
         self.t, self.boot, self.ctld_s = 1000.0, "boot-1", 60.0
         self.nodes = {"n1": "IDLE", "n2": "IDLE+DRAIN"}
-        self.writes: list[list[str]] = []  # every scontrol update / release
+        self.writes: list[list[str]] = []  # every scontrol update / release, failed ones included
+        self.fail: set[str] = set()  # scontrol subcommands that answer with an error
         self.records: dict[str, dict[str, str]] = {}
         self.notify_command: tuple[str, ...] = ()
         (tmp_path / "agent").mkdir()
@@ -61,7 +62,7 @@ class World:
                     out=f"NodeName={argv[3]} State={self.nodes[argv[3]]} Reason=x\n",
                 )
         self.writes.append(argv[1:])
-        return done(argv)
+        return done(argv, int(argv[1] in self.fail))
 
     def new_agent(self) -> agent_module.Agent:
         site = site_config.parse(
@@ -126,7 +127,11 @@ def test_nodes_are_undrained_once_per_boot_after_slurmctld_settles_and_drained_o
         world.writes == []
         and (world.dir / "agent" / "boot_id").read_text() == "boot-1\n"
     )  # waits for slurmctld
-    world.ctld_s = 60.0
+    world.ctld_s, world.fail = 60.0, {"update"}
+    world.step()  # the undrain fails: the boot is not marked reconciled, so the next look tries again
+    assert (world.dir / "agent" / "boot_id").read_text() == "boot-1\n"
+    world.fail = set()
+    world.writes.clear()
     beat = world.step()
     assert world.writes == [
         ["update", "nodename=n1", "state=undrain"]
@@ -158,6 +163,10 @@ def test_priority_returns_only_to_jobs_the_agent_saw_held_and_survives_a_restart
         job("5", "PENDING", "Resources", 1),
         job("6", "PENDING", "Resources", 50),
     ]  # 5 released, re-ranked
+    world.fail = {"update"}
+    assert world.step()["restored"] == []  # the restore fails: 5 stays on the list of jobs seen held
+    world.fail = set()
+    world.writes.clear()
     beat = world.step()
     assert world.writes == [["update", "jobid=5", "priority=100"]]
     assert beat["restored"] == [{"job": "5", "from": 1, "to": 100, "at": int(world.t)}]
@@ -182,7 +191,7 @@ def test_restore_order_ignores_a_non_admin_then_releases_for_an_admin_once_the_u
     world: World,
 ) -> None:
     # Victim 1 is pre-empted; victim 2 is one slurm did not need and never stops; urgent job 9.
-    path = world.request("9", ["1", "2"], ["7"])
+    path = world.request("9", ["1", "2"], ["7", "-x", "7 8"])  # only a plain job id reaches scontrol
     world.admins = set()
     world.queue = [job("1"), job("2")]
     world.step()  # not an admin's request: ignored whatever the queue says
@@ -197,6 +206,11 @@ def test_restore_order_ignores_a_non_admin_then_releases_for_an_admin_once_the_u
     world.step()  # the urgent job ended, the victim has not started again yet
     assert world.writes == []
     world.queue = [job("1"), job("2")]
+    world.fail = {"release"}
+    world.step()  # the release fails: the request stays, to be tried again
+    assert path.exists()
+    world.fail = set()
+    world.writes.clear()
     world.step()  # victim 2 never stopped, and still does not keep job 7 held
     assert world.writes == [["release", "7"]] and not path.exists()
     path = world.request("10", ["3"], ["8"])
