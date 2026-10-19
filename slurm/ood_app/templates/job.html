@@ -1,0 +1,46 @@
+<section aria-labelledby="h-record">
+<h2 id="h-record">Record</h2>
+<table><tbody>
+$record_rows
+</tbody></table>
+$jobstats
+</section>
+<section aria-labelledby="h-actions">
+<h2 id="h-actions">Actions</h2>
+$buttons
+<p id="action-result" role="status" aria-live="polite"></p>
+</section>
+<section aria-labelledby="h-command">
+<h2 id="h-command">Command</h2>
+<pre>$command</pre>
+</section>
+<section aria-labelledby="h-chain">
+<h2 id="h-chain">Dependency chain</h2>
+$chain
+</section>
+<section aria-labelledby="h-eff">
+<h2 id="h-eff">Efficiency</h2>
+$efficiency
+</section>
+<section aria-labelledby="h-events">
+<h2 id="h-events">Events</h2>
+$events
+</section>
+<section aria-labelledby="h-log">
+<h2 id="h-log">Log</h2>
+<form id="log-viewer" data-job="$job_id">
+<label>Only lines containing <input name="text" type="text"></label>
+<label><input name="errors" type="checkbox"> Errors and warnings only</label>
+<button type="submit">Refresh</button>
+</form>
+<pre id="log-output" tabindex="0" aria-label="Log of job $job_id">loading</pre>
+</section>
+<dialog id="confirm" aria-labelledby="confirm-title">
+<form method="dialog">
+<h2 id="confirm-title"></h2>
+<pre id="confirm-detail"></pre>
+<p id="confirm-lose-label" hidden><label><input id="confirm-lose" type="checkbox"> I accept losing this job's progress</label></p>
+<button id="confirm-no" value="no">Cancel</button>
+<button id="confirm-yes" value="yes" class="danger">Confirm</button>
+</form>
+</dialog>

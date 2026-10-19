@@ -1,0 +1,7 @@
+# Open OnDemand system-app manifest; fields per
+# https://osc.github.io/ood-documentation/latest/how-tos/app-development/interactive/manifest.html
+---
+name: GPU jobs
+category: Jobs
+description: Every GPU job on this machine, its waiting reason, log and efficiency, with pause, resume and kill.
+icon: fas://microchip
