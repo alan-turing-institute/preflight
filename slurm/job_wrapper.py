@@ -4,9 +4,10 @@
 Design 3.4-3.5 (`design notes`). `submit.py` writes an
 sbatch script whose only line runs this wrapper. In order:
 
-1. WAIT (GPU and urgent jobs) until the keeper holds slurm's GPU lease (`gpu_lease_keeper.py`) and the
-   card shows no compute process (the DGX gate's occupancy check, `dgx/assert_gpu_free.py`, one job:
-   run before this job's own command starts, so anything it finds belongs to something else). Polls
+1. WAIT (GPU and urgent jobs) until the keeper holds slurm's GPU lease (`gpu_lease_keeper.py`; only when
+   the site has a lease, or there is no site file) and the job's own GPUs show no compute process outside
+   its cgroup (`nvidia-smi` inside the job sees only the GPUs slurm gave it; run before this job's own
+   command starts, so any other process belongs to something else). Polls
    every `--poll` s up to `--wait-limit` s, then exits non-zero saying what it waited for: the job ends
    FAILED and, under `kill_invalid_depend`, its dependents are cancelled. A SIGTERM here ends it at once.
 2. RE-CHECK the submission's manifest (`dgx/assert_code_parity.py --check-manifest`) when there is one,
@@ -15,9 +16,10 @@ sbatch script whose only line runs this wrapper. In order:
    sample it. On SIGTERM it passes the signal to the whole group (slurm signals only the job script's own
    process: stage C test 3), records it, and keeps waiting while the child saves its checkpoint, until
    `KillWait` ends.
-4. MEASURE every `--sample` s: GPU memory per process of this job's cgroup (`nvidia-smi`) and the
-   cgroup's `memory.current`/`memory.peak` (the CPU side; GPU memory is not charged to the cgroup on the
-   GB10, trial B2), appended to `footprints/<job id>.jsonl`.
+4. MEASURE every `--sample` s: GPU memory, over all the job's GPUs, of the processes in this job's cgroup
+   and of docker containers labelled `slurm-job=<id>` (`nvidia-smi`), and the cgroup's `memory.current`/`memory.peak` (the CPU side; GPU memory is not charged to the cgroup on the
+   GB10, trial B2), appended to `footprints/<job id>.jsonl`. When the site's metrics mode is not "off" the
+   same numbers go to `metrics/job_<id>.prom` (a node-exporter textfile), removed when the job ends.
 5. RECORD the leg's outcome in the job's sidecar (exit status, signal, restart count, peaks).
 """
 
@@ -27,6 +29,7 @@ import argparse
 import contextlib
 import json
 import os
+import pwd
 import signal
 import subprocess
 import sys
@@ -38,14 +41,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "hostguard"))
 
 import gpu_jobs  # noqa: E402 - path set just above
+import site_config
 
 # Importing hostguard only arms a hook on torch's import; the wrapper never imports torch.
 from hostguard import mark_preferred_victim
 
 PREFLIGHT = Path(__file__).resolve().parents[1]
-GPU_FREE = PREFLIGHT / "dgx" / "assert_gpu_free.py"
 PARITY = PREFLIGHT / "dgx" / "assert_code_parity.py"
 CGROUP_ROOT = Path("/sys/fs/cgroup")
+#: The docker label `submit.py`-launched containers carry so their GPU memory counts toward the job.
+JOB_LABEL = "slurm-job"
+MIB = 1024 * 1024
 
 
 class Exit(IntEnum):
@@ -56,11 +62,39 @@ class Exit(IntEnum):
     CODE_CHANGED = 4  # the manifest re-check failed
 
 
-def card_is_free(max_jobs: int = 1) -> tuple[bool, str]:
-    done = subprocess.run(
-        [sys.executable, str(GPU_FREE), "--max-jobs", str(max_jobs)], capture_output=True, text=True, check=False
-    )
-    return done.returncode == 0, (done.stdout + done.stderr).strip()
+def foreign_gpu_processes(own_pids: set[int], output: str | None = None) -> list[tuple[int, str]]:
+    """(pid, gpu uuid) of every compute process on this job's GPUs that is not in `own_pids`."""
+    if output is None:
+        try:
+            done = subprocess.run(
+                ["nvidia-smi", "--query-compute-apps=pid,gpu_uuid", "--format=csv,noheader"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return []
+        output = done.stdout
+    found: list[tuple[int, str]] = []
+    for line in output.splitlines():
+        pid, _, uuid = line.partition(",")
+        try:
+            if int(pid) not in own_pids:
+                found.append((int(pid), uuid.strip()))
+        except ValueError:
+            continue
+    return found
+
+
+def card_is_free(own_pids: set[int], max_jobs: int = 1) -> tuple[bool, str]:
+    """Free when no compute process outside this job's cgroup is on its GPUs; declared sharing skips the check."""
+    if max_jobs > 1:
+        return True, ""
+    foreign = foreign_gpu_processes(own_pids)
+    if not foreign:
+        return True, ""
+    return False, "compute process(es) outside this job: " + ", ".join(f"pid {p} on {u}" for p, u in foreign)
 
 
 def wait_for_card(
@@ -112,6 +146,7 @@ def cgroup_pids(cgroup: Path) -> set[int]:
 
 
 def gpu_mib_by_pid() -> dict[int, float]:
+    """GPU memory (MiB) per pid, summed over every GPU the pid uses."""
     try:
         done = subprocess.run(
             ["nvidia-smi", "--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits"],
@@ -126,7 +161,7 @@ def gpu_mib_by_pid() -> dict[int, float]:
     for line in done.stdout.splitlines():
         pid, _, mib = line.partition(",")
         try:
-            usage[int(pid)] = float(mib)
+            usage[int(pid)] = usage.get(int(pid), 0.0) + float(mib)
         except ValueError:
             continue
     return usage
@@ -139,9 +174,21 @@ def read_int(path: Path) -> int | None:
         return None
 
 
-def sample(cgroup: Path | None, fallback_pids: set[int]) -> dict[str, object]:
-    pids = cgroup_pids(cgroup) if cgroup else fallback_pids
-    gpu = {pid: mib for pid, mib in gpu_mib_by_pid().items() if pid in pids}
+def job_pids(cgroup: Path | None, fallback_pids: set[int], job_id: str, gpu_pids: set[int]) -> set[int]:
+    """The cgroup's pids plus those of `gpu_pids` running in a docker container labelled `slurm-job=<id>`."""
+    import audit  # lazy: audit imports this module
+
+    pids = cgroup_pids(cgroup) if cgroup else set(fallback_pids)
+    for pid in gpu_pids - pids:
+        if gpu_jobs.container_label(audit.cgroup_of(pid), JOB_LABEL) == job_id:
+            pids.add(pid)
+    return pids
+
+
+def sample(cgroup: Path | None, fallback_pids: set[int], job_id: str = "") -> dict[str, object]:
+    usage = gpu_mib_by_pid()
+    pids = job_pids(cgroup, fallback_pids, job_id, set(usage))
+    gpu = {pid: mib for pid, mib in usage.items() if pid in pids}
     return {
         "t": int(time.time()),
         "gpu_mib": sum(gpu.values()),
@@ -151,7 +198,45 @@ def sample(cgroup: Path | None, fallback_pids: set[int]) -> dict[str, object]:
     }
 
 
-def run_and_measure(command: list[str], footprint: Path, cgroup: Path | None, sample_s: float) -> dict[str, object]:
+def metrics_file(job_id: str) -> Path:
+    return gpu_jobs.STATE_DIR / "metrics" / f"job_{job_id}.prom"
+
+
+def _label(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
+def metrics_text(job_id: str, row: dict[str, object]) -> str:
+    """The job's two gauges in Prometheus text format; project is the first `:` field of the job name."""
+    name = os.environ.get("SLURM_JOB_NAME", "")
+    project = name.split(":", 1)[0] if ":" in name else "(other)"
+    uid = os.getuid()
+    try:
+        user = pwd.getpwuid(uid).pw_name
+    except KeyError:
+        user = str(uid)
+    labels = f'jobid="{_label(job_id)}",user="{_label(user)}",project="{_label(project)}"'
+    gpu_bytes = int(float(row["gpu_mib"]) * MIB)  # type: ignore[arg-type]
+    return (
+        "# TYPE gpujobs_job_gpu_memory_bytes gauge\n"
+        f"gpujobs_job_gpu_memory_bytes{{{labels}}} {gpu_bytes}\n"
+        "# TYPE gpujobs_job_cpu_memory_bytes gauge\n"
+        f"gpujobs_job_cpu_memory_bytes{{{labels}}} {int(row['mem_current'] or 0)}\n"  # type: ignore[call-overload]
+    )
+
+
+def write_metrics(job_id: str, row: dict[str, object]) -> None:
+    """Write-then-rename, so the exporter never reads half a file."""
+    target = metrics_file(job_id)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temp = target.with_suffix(".prom.tmp")
+    temp.write_text(metrics_text(job_id, row), encoding="utf-8")
+    os.replace(temp, target)
+
+
+def run_and_measure(
+    command: list[str], footprint: Path, cgroup: Path | None, sample_s: float, job_id: str = "", metrics: bool = False
+) -> dict[str, object]:
     received: list[int] = []
 
     # The command runs in its own process group, and SIGTERM is passed on to all of it. Measured 2026-10-16
@@ -173,18 +258,23 @@ def run_and_measure(command: list[str], footprint: Path, cgroup: Path | None, sa
     signal.signal(signal.SIGTERM, forward)
     peak_gpu, peak_mem = 0.0, 0
     footprint.parent.mkdir(parents=True, exist_ok=True)
-    with footprint.open("a", encoding="utf-8") as out:
-        while True:
-            try:
-                status = child.wait(timeout=sample_s)
-                break
-            except subprocess.TimeoutExpired:
-                pass
-            row = sample(cgroup, {child.pid})
-            out.write(json.dumps(row) + "\n")
-            out.flush()
-            peak_gpu = max(peak_gpu, float(row["gpu_mib"]))
-            peak_mem = max(peak_mem, int(row["mem_peak"] or row["mem_current"] or 0))
+    try:
+        with footprint.open("a", encoding="utf-8") as out:
+            while True:
+                try:
+                    status = child.wait(timeout=sample_s)
+                    break
+                except subprocess.TimeoutExpired:
+                    pass
+                row = sample(cgroup, {child.pid}, job_id)
+                out.write(json.dumps(row) + "\n")
+                out.flush()
+                if metrics:
+                    write_metrics(job_id, row)
+                peak_gpu = max(peak_gpu, float(row["gpu_mib"]))
+                peak_mem = max(peak_mem, int(row["mem_peak"] or row["mem_current"] or 0))
+    finally:
+        gpu_jobs.remove_quietly(metrics_file(job_id))
     final = read_int(cgroup / "memory.peak") if cgroup else None
     return {
         "exit": status,
@@ -218,12 +308,18 @@ def main() -> int:
     if arguments.max_jobs > 1:
         print(f"[job] DECLARED SHARING: up to {arguments.max_jobs} GPU jobs on the card", flush=True)
 
+    site = site_config.load() if site_config.SITE_FILE.exists() else None
+    cgroup = job_cgroup(job_id)
     if arguments.needs_lease or arguments.needs_card:
         ok, reason = wait_for_card(
-            needs_lease=arguments.needs_lease,
+            needs_lease=arguments.needs_lease and (site is None or site.lease is not None),
             limit_s=arguments.wait_limit,
             poll_s=arguments.poll,
-            card_free=(lambda: card_is_free(arguments.max_jobs)) if arguments.needs_card else lambda: (True, ""),
+            card_free=(
+                (lambda: card_is_free(cgroup_pids(cgroup) if cgroup else {os.getpid()}, arguments.max_jobs))
+                if arguments.needs_card
+                else lambda: (True, "")
+            ),
         )
         if not ok:
             print(f"[job] REFUSED after {arguments.wait_limit:.0f} s: {reason}", file=sys.stderr, flush=True)
@@ -243,7 +339,8 @@ def main() -> int:
 
     footprint = gpu_jobs.STATE_DIR / "footprints" / f"{job_id}.jsonl"
     started = int(time.time())
-    outcome = run_and_measure(command, footprint, job_cgroup(job_id), arguments.sample)
+    metrics_on = site is not None and site.metrics.mode != site_config.MetricsMode.OFF
+    outcome = run_and_measure(command, footprint, cgroup, arguments.sample, job_id, metrics_on)
     outcome.update(leg=restart, started_at=started, ended_at=int(time.time()))
     record = gpu_jobs.read_sidecar(job_id) or {}
     legs = list(record.get("legs") or [])
