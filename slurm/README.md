@@ -127,7 +127,7 @@ TOML. Tables: the top level, `[[nodes]]` with `[[nodes.gpus]]`, `[lease]` with `
 | `unified_memory` | `false` | True when the GPU shares system memory with the host (`nvidia-smi` reports total memory as `[N/A]`). `detect` sets it. Read and checked, but no tool acts on it yet. |
 | `hostguard` | `false` | The job wrapper marks every job as the preferred out-of-memory victim (`oom_score_adj` 800, through the host memory guard in `hostguard/hostguard.py`), so a memory shortage ends a job rather than a login session. The `tools` component installs the guard when this is on. |
 | `dgx_gate` | `false` | Require the DGX submission gate for jobs submitted with `--entry`. The `tools` component installs the gate (`dgx/`) and the host memory guard it checks when this is on. |
-| `notify_command` | `[]` | Command (list of arguments, no shell) run with a failure notice as its last argument when a job ends FAILED, OUT_OF_MEMORY, TIMEOUT or NODE_FAIL. Empty means no notification. |
+| `notify_command` | `[]` | Command (list of arguments, no shell, 30 s limit) the agent runs when a job ends FAILED, OUT_OF_MEMORY, TIMEOUT or NODE_FAIL, with the job in the environment: `GPUJOBS_JOB` (id), `GPUJOBS_STATE`, `GPUJOBS_USER`, `GPUJOBS_NAME`. Empty means no notification. |
 | `nodes` | required | One `[[nodes]]` table per compute node; at least one. |
 | `lease` | absent | Optional table; leave it out when no other service shares the GPU through the lease. Without it the `lease` component is not installed. |
 | `metrics` | all defaults below | Table. |

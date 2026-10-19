@@ -22,7 +22,8 @@ unified_memory = false
 hostguard = false
 # Require the DGX submission gate for DGX jobs. Default: false
 dgx_gate = false
-# Command (argv) run with a failure notice as its last argument; empty means no notification. Default: []
+# Command (argv, no shell) run when a job fails, with GPUJOBS_JOB, GPUJOBS_STATE, GPUJOBS_USER and GPUJOBS_NAME in its
+# environment; empty means no notification. Default: []
 notify_command = []
 
 # One [[nodes]] table per compute node (at least one is required).
