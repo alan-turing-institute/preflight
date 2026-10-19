@@ -118,10 +118,9 @@ def test_retention_ports_and_textfile_directory_are_substituted():
     assert "url: http://127.0.0.1:9090" in out["/etc/grafana/provisioning/datasources/gpujobs.yaml"].content
     # Jobstats selects series by cluster label and node name; the targets carry both.
     (group,) = json.loads(out["/etc/gpujobs/prometheus_targets.json"].content)
-    assert group["labels"] == {"cluster": metrics.CLUSTER_NAME}
+    assert group["labels"] == {"cluster": site.cluster_name}
     assert group["targets"] == ["n1:9101", "n1:9306", "n1:9445"]
-    slurm_conf = (INSTALL / "templates" / "slurm" / "slurm.conf").read_text()
-    assert f"ClusterName={metrics.CLUSTER_NAME}\n" in slurm_conf
+    assert f"ClusterName={site.cluster_name}\n" in render.render(site, "slurm")["/etc/slurm/slurm.conf"].content
 
 
 def test_slurm_conf_lines_match_the_jobstats_docs_and_render_into_slurm_conf():
@@ -189,7 +188,8 @@ def test_gpu_exporter_is_a_release_binary_on_x86_and_built_on_aarch64(monkeypatc
     assert {"golang-go", "gcc"} <= set(metrics.packages(site))
     assert "linux-arm64" in arm and "cgroup_exporter-arm64" in arm
     no_gpu = argv_text(metrics.post_install(make_site(gpus=False)))
-    assert "nvml_exporter" not in no_gpu and "gpustats_helper" not in no_gpu
+    assert "nvml_exporter" not in no_gpu
+    assert not any("gpustats_helper" in path for path in metrics.files(make_site(gpus=False)))
     assert "/etc/systemd/system/gpujobs-gpu-exporter.service" not in metrics.files(make_site(gpus=False))
     assert "golang-go" not in metrics.packages(make_site(gpus=False))
 
@@ -203,8 +203,10 @@ def test_portal_adds_the_ood_helper_and_anonymous_grafana(arch):
     assert "GF_AUTH_ANONYMOUS_ENABLED" not in metrics.files(off)[grafana].content
     for setting in ("GF_AUTH_ANONYMOUS_ENABLED=true", "GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer", "GF_SECURITY_ALLOW_EMBEDDING=true"):
         assert setting in metrics.files(on)[grafana].content
-    dash = metrics.GRAFANA_DASHBOARD
-    assert (dash["uid"], dash["panels"]) == ("HRLkiLS7k", {"cpu": 7, "memory": 9})
+    dash = metrics.GRAFANA_DASHBOARD  # OOD's custom.grafana block minus host
+    assert dash["orgId"] == 1 and dash["dashboard"]["uid"] == "HRLkiLS7k"
+    assert dash["dashboard"]["panels"] == {"cpu": 7, "memory": 9, "gpu-util": 2, "gpu-memory": 3}
+    assert metrics.apt_flags(on) == ["--no-install-recommends"]
 
 
 def test_refusals(arch, monkeypatch):
@@ -276,3 +278,45 @@ def test_templates_are_valid_and_jobstats_config_defines_what_jobstats_reads():
     assert required <= set(namespace) and namespace["NOTES"] == []
     key = (INSTALL / "templates" / "metrics" / "grafana.asc").read_bytes()
     assert hashlib.sha256(key).hexdigest() == "d8f5f6f4c174c3b9184cb6ebbf691a2ee69831a109425de4e821f5b43c53a2f8"
+
+
+def test_slurm_scripts_are_installed_with_the_files_and_do_what_the_jobstats_docs_describe(tmp_path):
+    out = metrics.files(make_site())
+    names = {"prolog": "/etc/slurm/prolog.d/gpustats_helper.sh", "epilog": "/etc/slurm/epilog.d/gpustats_helper.sh"}
+    ctld = "/usr/local/sbin/slurmctldepilog.sh"
+    assert all(out[path].mode == 0o755 for path in (*names.values(), ctld))  # in files(): there before slurm restarts
+    assert ctld in metrics.files(make_site(gpus=False)) and names["prolog"] not in metrics.files(make_site(gpus=False))
+    smi = tmp_path / "smi"
+    smi.write_text("#!/bin/sh\necho GPU-abc\n")
+    smi.chmod(0o755)
+    gpustat = tmp_path / "gpustat"
+    env = {
+        "PATH": "/usr/bin:/bin", "GPUSTAT_DIR": str(gpustat), "NVIDIA_SMI": str(smi), "SLURM_JOB_ID": "5",
+        "SLURM_JOB_UID": "1000", "CUDA_VISIBLE_DEVICES": "0",
+    }  # fmt: skip
+
+    def run(content: str, extra: dict[str, str] | None = None) -> None:
+        script = tmp_path / "script.sh"
+        script.write_text(content)
+        subprocess.run(["sh", str(script)], env={**env, **(extra or {})}, check=True)
+
+    run(out[names["prolog"]].content)  # docs/setup/gpu_node_scripts.md:23-44: "<jobid> <uid>" per ordinal and UUID
+    assert (gpustat / "0").read_text() == "5 1000\n" and (gpustat / "GPU-abc").read_text() == "5 1000\n"
+    run(out[names["epilog"]].content)
+    assert list(gpustat.iterdir()) == []
+    calls = tmp_path / "calls"
+    js = tmp_path / "jobstats"
+    js.write_text("#!/bin/sh\necho H4sIAAAA\n")
+    js.chmod(0o755)
+    acct = tmp_path / "sacctmgr"
+    acct.write_text(f'#!/bin/sh\necho "$@" >> {calls}\n')
+    acct.chmod(0o755)
+    tools = {"JOBSTATS": str(js), "SACCTMGR": str(acct), "SETTLE_SECONDS": "0"}
+    run(out[ctld].content, tools)
+    assert calls.read_text() == "-i update job where jobid=5 set AdminComment=JS1:H4sIAAAA\n"
+    run(out[ctld].content, {**tools, "SLURM_ARRAY_JOB_ID": "5", "SLURM_ARRAY_TASK_ID": "3"})
+    assert calls.read_text().endswith("-i update job where jobid=5_3 set AdminComment=JS1:H4sIAAAA\n")
+    js.write_text("#!/bin/sh\necho 'Failed to lookup job'\n")
+    calls.unlink()
+    run(out[ctld].content, tools)  # no summary: nothing stored, and the epilog still exits 0
+    assert not calls.exists()

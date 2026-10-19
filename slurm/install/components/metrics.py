@@ -4,8 +4,9 @@ Installs, as Jobstats' documentation specifies (https://princetonuniversity.gith
 the pinned commit, cited as `<file>:<line>`):
   - the node, cgroup (plazonic/cgroup_exporter) and GPU (plazonic/nvidia_gpu_prometheus_exporter) exporters
     (`docs/setup/overview.md:6`; `node.md:3`; `cgroups.md:16,71-74`; `gpu_node_scripts.md:3`);
-  - the slurm prolog and epilog that write `/run/gpustat/<gpu>` (`gpu_node_scripts.md:30-35`) and the slurmctld epilog
-    that stores each job's summary (`summaries.md:5-12`);
+  - the slurm prolog and epilog that write `/run/gpustat/<gpu>` (`gpu_node_scripts.md:23-44`) and the slurmctld epilog
+    that stores each job's summary (`summaries.md:5-12`): our own short scripts in `files()` doing what the docs
+    describe, so they exist before slurm is restarted and none of Jobstats' GPL scripts is copied or fetched;
   - the `jobstats` command and its `config.py` (`jobstats_command.md:31-56,69-81`);
   - mode "local": Prometheus (`prometheus.md:3-55`) and Grafana with the Jobstats dashboard (`grafana.md:5`);
   - the Open OnDemand helper app (`ood.md:3`), only when the portal is on.
@@ -16,7 +17,7 @@ preference: distro package (Prometheus, Python libraries), vendor apt repository
 publishes no binary).
 
 Interface (the installer loads it by name): NAME, enabled, files, packages, refusals, post_install, apt_sources,
-slurm_conf_lines. Import as `import metrics` with `slurm/install/` and `slurm/` on sys.path.
+apt_flags, slurm_conf_lines. Import as `import metrics` with `slurm/install/` and `slurm/` on sys.path.
 """
 
 from __future__ import annotations
@@ -38,8 +39,6 @@ if TYPE_CHECKING:
 NAME = "metrics"
 TEMPLATES = render.TEMPLATES / NAME
 
-# Must equal ClusterName in templates/slurm/slurm.conf: Jobstats selects every series by `cluster=` (jobstats.py).
-CLUSTER_NAME = "spark"
 SCRAPE_INTERVAL_S = 30  # `prometheus.md:18`; jobstats' SAMPLING_PERIOD must match (`jobstats_command.md:90`)
 
 
@@ -78,16 +77,19 @@ JOBSTATS_DASHBOARD_FILE = "jobstats-single-job.json"
 
 SERVICES = ("gpujobs-node-exporter", "gpujobs-cgroup-exporter", "gpujobs-gpu-exporter")
 
-# The Jobstats dashboard Open OnDemand's Active Jobs embeds (`grafana/Single_Job_Stats.json` at the pinned commit:
-# "uid", "title", and the graph panels "Job CPU Utilization" id 7 and "Job CPU Memory Utilization" id 9). `name` is the
-# last URL segment (Grafana's slug of the title); `labels` map OnDemand's cluster/host/jobid to the dashboard's
-# variables (the dashboard has `JobID` and `node`; OOD docs, customizations.rst "Grafana support": the values for
-# `labels` map Grafana labels to what OnDemand expects). Grafana's default organisation has id 1.
+# OOD's `custom.grafana` block minus `host` (the portal component adds it; OOD docs, customizations.rst "Grafana
+# support", lines 1331-1356). The dashboard is Jobstats' (`grafana/Single_Job_Stats.json` at the pinned commit): "uid",
+# slug `name` of its title, and its graph panels "Job CPU Utilization" id 7, "Job CPU Memory Utilization" id 9,
+# "GPU Utilization" id 2, "GPU Memory utilization" id 3 (those two sit in a collapsed row; on a unified-memory GPU the
+# memory one has no data). `labels` map OOD's cluster/host/jobid to the dashboard's variables (it has `JobID` and
+# `node`, no cluster). Grafana's default organisation has id 1.
 GRAFANA_DASHBOARD = {
-    "uid": "HRLkiLS7k",
-    "name": "single-job-stats",
     "orgId": 1,
-    "panels": {"cpu": 7, "memory": 9},
+    "dashboard": {
+        "name": "single-job-stats",
+        "uid": "HRLkiLS7k",
+        "panels": {"cpu": 7, "memory": 9, "gpu-util": 2, "gpu-memory": 3},
+    },
     "labels": {"cluster": "cluster", "host": "node", "jobid": "JobID"},
 }
 OWN_DASHBOARD = {"uid": "gpujobs-job-memory", "title": "GPU memory by job"}
@@ -130,21 +132,6 @@ DOWNLOADS: tuple[Download, ...] = (
         "output_formatters.py",
         "output_formatters.py",
         "262e9d5d4000332e858ff0281c766b0fbdb0f284b2431f6949fb4eb0eba4f3c7",
-    ),
-    _jobstats_raw(
-        "slurmctldepilog.sh",
-        "slurm/slurmctldepilog.sh",
-        "de554b42c1ceb0d4e78c80f3647190989ef511484d02f663a19c98fb3a675811",
-    ),
-    _jobstats_raw(
-        "prolog-gpustats_helper.sh",
-        "slurm/prolog.d/gpustats_helper.sh",
-        "40eddf8bedbc5e4be233200c1201e3e4e4d8624bd7eb8992942d8f4c02352ee6",
-    ),
-    _jobstats_raw(
-        "epilog-gpustats_helper.sh",
-        "slurm/epilog.d/gpustats_helper.sh",
-        "cb9ec2876b01f7347933e82a77496a567ab3702202ee205bc94b44ee7421e8e2",
     ),
     _jobstats_raw(
         "Single_Job_Stats.json",
@@ -253,6 +240,12 @@ def packages(site: Site) -> list[str]:
     return pkgs
 
 
+def apt_flags(site: Site) -> list[str]:
+    # The Ubuntu `prometheus` package Recommends prometheus-node-exporter, which would start on port 9100 (this
+    # component runs its own node exporter elsewhere) and can fail where something already listens there.
+    return ["--no-install-recommends"]
+
+
 def apt_sources(site: Site) -> dict[str, render.FileSpec]:
     # Grafana's own apt repository, key and one-line source exactly as its install guide gives them (key saved as
     # /etc/apt/keyrings/grafana.asc, `deb [signed-by=...] https://apt.grafana.com stable main`). The key is
@@ -284,7 +277,8 @@ def _targets(site: Site) -> str:
     gpu = [f"{n.name}:{Port.GPU}" for n in site.nodes if n.gpus]
     groups = [
         {
-            "labels": {"cluster": CLUSTER_NAME},
+            # jobstats selects every series by `cluster=`, which is slurm's ClusterName
+            "labels": {"cluster": site.cluster_name},
             "targets": [f"{n.name}:{port}" for n in site.nodes for port in (Port.NODE, Port.CGROUP)] + gpu,
         }
     ]
@@ -328,8 +322,11 @@ def files(site: Site) -> dict[str, render.FileSpec]:
             _template("gpujobs-cgroup-exporter.service", **unit_values)
         ),
         str(BIN_DIR / "run-cgroup-exporter"): _spec((TEMPLATES / "run-cgroup-exporter.sh").read_text(), 0o755),
+        str(SLURMCTLD_EPILOG): _spec((TEMPLATES / "slurmctld-epilog.sh").read_text(), 0o755),
     }
     if _has_gpus(site):
+        out[str(PROLOG_DIR / "gpustats_helper.sh")] = _spec((TEMPLATES / "gpustat-prolog.sh").read_text(), 0o755)
+        out[str(EPILOG_DIR / "gpustats_helper.sh")] = _spec((TEMPLATES / "gpustat-epilog.sh").read_text(), 0o755)
         out["/etc/systemd/system/gpujobs-gpu-exporter.service"] = _spec(
             _template("gpujobs-gpu-exporter.service", **unit_values)
         )
@@ -447,13 +444,7 @@ def _jobstats_steps(site: Site) -> list[list[str]]:
         _install(_cached(_BY_NAME["jobstats.py"]), JOBSTATS_DIR / "jobstats.py", "0644"),
         _install(_cached(_BY_NAME["output_formatters.py"]), JOBSTATS_DIR / "output_formatters.py", "0644"),
         ["ln", "-sf", str(JOBSTATS_DIR / "jobstats"), str(JOBSTATS_LINK)],
-        _install(_cached(_BY_NAME["slurmctldepilog.sh"]), SLURMCTLD_EPILOG, "0755"),
     ]
-    if _has_gpus(site):
-        steps += [
-            _install(_cached(_BY_NAME["prolog-gpustats_helper.sh"]), PROLOG_DIR / "gpustats_helper.sh", "0755"),
-            _install(_cached(_BY_NAME["epilog-gpustats_helper.sh"]), EPILOG_DIR / "gpustats_helper.sh", "0755"),
-        ]
     return steps
 
 
@@ -488,9 +479,8 @@ def post_install(site: Site) -> list[list[str]]:
     arch = _arch()
     if not enabled(site) or arch is None:
         return []
-    wanted = ["jobstats", "jobstats.py", "output_formatters.py", "slurmctldepilog.sh", f"node-exporter-{arch}", "cgroup-exporter"]
+    wanted = ["jobstats", "jobstats.py", "output_formatters.py", f"node-exporter-{arch}", "cgroup-exporter"]
     if _has_gpus(site):
-        wanted += ["prolog-gpustats_helper.sh", "epilog-gpustats_helper.sh"]
         wanted.append("gpu-exporter-x86_64" if arch == Arch.X86_64 else "gpu-exporter-source")
     if _is_local(site):
         wanted.append("Single_Job_Stats.json")
