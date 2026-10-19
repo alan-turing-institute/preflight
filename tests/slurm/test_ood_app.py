@@ -54,7 +54,7 @@ class Fake:
             keeper=lambda: {"blockers": []},
             live_memory=lambda _j: {"gpu": 3 * 1024**3},
             finished=lambda _j: None,
-            now=lambda: datetime(2026, 10, 19, 12, 0),
+            now=lambda: datetime(2026, 10, 19, 12, 0),  # noqa: DTZ001 - local, like the times sacct prints
             project_order=lambda: ["proj"],
         )
         self.application = app.make_application(self.backend)
