@@ -248,8 +248,11 @@ def stage_install() -> None:
           and "[[nodes]]" in detected.out, detected.text[:200])
     rendered = sh(f"rm -rf /tmp/rendered && {INSTALL} --site {SITE} render --out /tmp/rendered && "
                   "find /tmp/rendered -type f | wc -l && grep -c Gres=gpu:fake:4 /tmp/rendered/etc/slurm/slurm.conf")
-    check("install.py render writes every component's files (slurm.conf names the four fake GPUs)",
-          rendered.rc == 0 and rendered.out.split()[-1] == "1", rendered.text[-200:])
+    said = re.search(r"rendered (\d+) file", rendered.out)
+    on_disk = rendered.out.split()[-2:-1]
+    check("install.py render writes as many files as it reports, and slurm.conf names the four fake GPUs",
+          rendered.rc == 0 and bool(said) and on_disk == [said.group(1)] and rendered.out.split()[-1] == "1",
+          rendered.text[-200:])
     pre = sh(f"{INSTALL} --site {SITE} check")
     check("check before apply: exit 1 and a DIFFERS line", pre.rc == 1 and "DIFFERS" in pre.out, pre.text[:200])
 
@@ -728,7 +731,8 @@ def stage_lease() -> None:
     sub = cl("env", "GPUJOBS_SITE=/tmp/lease-good.toml", "gpujobs-submit", "--project", "e2e", "--what", "lease", "--class", "restart",
              "--name", "lease", "--mem", "200M", "--gpu", "--", *sleep_cmd(3), user="bob")
     beat = sh("stat -c %U /var/lib/gpujobs/keeper/keeper.json").out.strip()
-    check("lease: the keeper writes its heartbeat as its own user into the directory the installer made for it",
+    check("lease: the installer made keeper/ writable by the keeper's user (a stand-in writes the file; the real keeper's "
+          "heartbeat is read back by test_gpu_lease_keeper.py)",
           beat == "dave", beat)
     check("lease: a user other than the keeper's can submit while the keeper's heartbeat is fresh",
           "REFUSED" not in sub.text and sub.rc == 0, sub.text[:220])
