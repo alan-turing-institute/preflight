@@ -87,6 +87,10 @@ def test_apply_then_check_against_a_temp_root(env):
     (root / "etc/slurm/slurmdbd.conf").chmod(0o644)  # same content, but readable by everyone
     assert run(site, root, "check") == 1
     (root / "etc/slurm/slurmdbd.conf").chmod(0o600)
+    # the owner is only checkable as root, so the test asks directly: a file no real user owns is reported
+    ghost = {"/etc/slurm/gres.conf": cli.render.FileSpec("x", (root / "etc/slurm/gres.conf").stat().st_mode & 0o7777, "no-such-user-gpujobs")}
+    assert cli._wrong_mode_or_owner(root, ghost, check_owner=True)
+    assert not cli._wrong_mode_or_owner(root, ghost, check_owner=False)
     (root / "etc/slurm/gres.conf").write_text("edited\n")
     assert run(site, root, "check") == 1
     # the argv order: refusals' probes, packages, then post-install
@@ -101,13 +105,17 @@ def test_apply_then_check_against_a_temp_root(env):
                     ["sacctmgr", "-i", "add", "account", "gpujobs", "Cluster=t", "Description=gpujobs", "Organization=gpujobs"]]
     assert ["systemctl", "enable", "--now", "gpujobs-agent.service"] in fake.calls
     assert ["systemctl", "--user", f"--machine={USER}@.host", "restart", "slurm-gpu-lease-keeper.service"] in fake.calls
-    assert ["install", "-d", "-m", "0755", "-o", USER, "/var/lib/gpujobs/keeper"] in fake.calls  # its heartbeat's home
-    assert ["install", "-d", "-m", "1777", "-o", "slurm", "-g", "slurm"] in [a[:-1] for a in fake.calls if a[-1].endswith("/requests")]
-    # submit.py writes a job's log and batch script there as the submitting user
-    made = {a[-1].rsplit("/", 1)[1] for a in fake.calls if a[:4] == ["install", "-d", "-m", "1777"]}
-    assert {"logs", "scripts", "manifests"} <= made
-
-
+    # plan 3.3, every state directory's (mode, owner): the shared ones sticky and open, requests/ the agent's own
+    dirs = {a[-1]: (a[3], a[a.index("-o") + 1] if "-o" in a else None) for a in fake.calls if a[:2] == ["install", "-d"]}
+    state = "/var/lib/gpujobs"
+    sticky = ("jobs", "events", "footprints", "metrics", "logs", "scripts", "manifests")  # submit.py writes logs, scripts
+    assert {d: m for d, m in dirs.items() if d.startswith(state)} == {
+        state: ("0755", "root"),
+        f"{state}/agent": ("0755", "slurm"),
+        f"{state}/keeper": ("0755", USER),  # its heartbeat's home
+        f"{state}/requests": ("1777", "slurm"),
+        **{f"{state}/{name}": ("1777", None) for name in sticky},
+    }
 def test_apply_refuses_with_a_busy_queue_or_without_the_lease_client(env):
     tmp, site, fake = env
     fake.queue = "123 gpu job user R\n"
@@ -145,8 +153,10 @@ def test_user_and_admin_argv(env):
     ]
 
 
-def test_migrate_keeps_owner_and_mode_and_never_overwrites(env):
+def test_migrate_keeps_owner_and_mode_and_never_overwrites(env, monkeypatch):
     tmp, site, _ = env
+    chowned = []
+    monkeypatch.setattr(os, "chown", lambda path, uid, gid: chowned.append((Path(path).name, uid, gid)))  # not root here
     old, root = tmp / "old", tmp / "root"
     (old / "jobs").mkdir(parents=True)
     (old / "jobs/1.json").write_text("new")
@@ -157,18 +167,22 @@ def test_migrate_keeps_owner_and_mode_and_never_overwrites(env):
     secret = tmp / "secret"
     secret.write_text("not the user's to copy")
     (old / "events/link.json").symlink_to(secret)  # root copies from a user's directory: never through a link
-    (old / "footprints").symlink_to(tmp)
+    (old / "footprints").mkdir()
+    (old / "footprints/x.jsonl").write_text("f")
+    (old / "metrics").symlink_to(tmp)  # a linked directory is not walked, whatever it is called
     existing = root / "var/lib/gpujobs/jobs/1.json"
     existing.parent.mkdir(parents=True)
     existing.write_text("keep")
     assert run(site, root, "migrate-state", "--from", str(old)) == 0
     assert existing.read_text() == "keep"
     assert not (root / "var/lib/gpujobs/events/link.json").exists()
-    assert not (root / "var/lib/gpujobs/footprints").exists()
+    assert not (root / "var/lib/gpujobs/metrics").exists()
+    assert (root / "var/lib/gpujobs/footprints/x.jsonl").read_text() == "f"
     moved = root / "var/lib/gpujobs/events/e.json"
     assert moved.read_text() == "e"
     assert stat.S_IMODE(moved.stat().st_mode) == stat.S_IMODE((old / "events/e.json").stat().st_mode)
-    assert moved.stat().st_uid == os.getuid()
+    source = (old / "events/e.json").stat()
+    assert ("e.json", source.st_uid, source.st_gid) in chowned  # root keeps each file's writer as its owner
 
 
 def test_apt_flags_apply_only_to_the_component_that_asks():
