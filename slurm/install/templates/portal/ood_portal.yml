@@ -2,6 +2,8 @@
 # Rendered from the site file by slurm/install/components/portal.py. Do not edit by hand.
 # Holds secrets read from root-only files: keep this file root:root 0600.
 servername: ${servername}
+# Open the GPU jobs page, not OOD's dashboard, which is empty until a site configures it.
+root_uri: ${root_uri}
 ssl:
 ${ssl_lines}
 security_strict_transport: ${hsts}
