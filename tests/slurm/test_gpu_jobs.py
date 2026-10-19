@@ -137,10 +137,14 @@ def test_parse_squeue_reads_json_so_a_name_cannot_forge_a_row() -> None:
          "name": forged},
         {"job_id": 13, "job_state": ["COMPLETED"]},  # squeue --json ignored -t: finished jobs are dropped here
         {"job_id": 14, "priority": {"set": False, "number": 7}, "state_reason": "JobHeldUser"},
+        # Still saving after a pause (requeued) or a kill: COMPLETING is a flag after the base state in JSON.
+        {"job_id": 15, "job_state": ["PENDING", "COMPLETING"]},
+        {"job_id": 16, "job_state": ["CANCELLED", "COMPLETING"]},
     )
-    running, held = gpu_jobs.parse_squeue(text)
+    running, held, paused, killed = gpu_jobs.parse_squeue(text)
     assert (running.job_id, running.user, running.priority, running.gpus, running.name) == ("12", "ann", 4001, 2, forged)
     assert (held.job_id, held.priority, held.held) == ("14", 0, True)
+    assert [(j.job_id, j.state, j.active) for j in (paused, killed)] == [("15", "COMPLETING", True), ("16", "COMPLETING", True)]
     old = QueuedJob("1", "normal", "PENDING", "Priority", "n", "afterok:3(unfulfilled)")
     assert (old.user, old.priority, old.gpus, old.depends_on) == ("", 0, 0, ("3",))
     with pytest.raises(ValueError):

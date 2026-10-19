@@ -149,7 +149,7 @@ def actions(job_id: str) -> list[str]:
 def test_pause_dry_run_acts_on_nothing_and_a_pause_is_recorded(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    monkeypatch.setattr(gpu_jobs, "read_queue", lambda: [job("1", "normal"), job("2", "steady")])
+    monkeypatch.setattr(gpu_jobs, "read_queue", lambda: [job("1", "normal"), job("2", "steady"), job("3", "steady", "PENDING")])
     slurm = FakeSlurm(monkeypatch)
     monkeypatch.setattr(pause, "elapsed", lambda _job: "1:00")
     monkeypatch.setattr("sys.argv", ["pause.py", "2", "--dry-run"])
@@ -161,6 +161,11 @@ def test_pause_dry_run_acts_on_nothing_and_a_pause_is_recorded(
     assert pause.main() == 0
     assert slurm.calls == [["scontrol", "requeuehold", "1"]]
     assert [(e.action, e.fields) for e in gpu_jobs.events("1")] == [("pause", {"reason": "need the card"})]
+
+    # slurm refuses to requeue a pending job; one that has not started loses nothing, steady or not
+    monkeypatch.setattr("sys.argv", ["pause.py", "3"])
+    assert pause.main() == 0
+    assert slurm.calls[-1] == ["scontrol", "uhold", "3"] and actions("3") == ["pause"]
 
 
 def test_a_failing_scontrol_prints_slurms_text_and_records_nothing(
@@ -176,6 +181,11 @@ def test_a_failing_scontrol_prints_slurms_text_and_records_nothing(
     monkeypatch.setattr("sys.argv", ["kill.py", "1"])
     assert kill.main() == 1
     assert actions("1") == []
+    capsys.readouterr()
+    monkeypatch.setattr(gpu_jobs, "read_queue", lambda: None)  # squeue down: said so, not "not in the queue"
+    monkeypatch.setattr("sys.argv", ["pause.py", "1"])
+    assert pause.main() == 1
+    assert "slurm does not answer" in capsys.readouterr().err
 
 
 def test_resume_and_kill_write_their_events_and_resume_node_covers_every_node(

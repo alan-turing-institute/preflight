@@ -1,12 +1,12 @@
 """Shared pieces of the GPU-job tools: where their state lives, and what slurm says.
 
-Design: `design notes` (revision 2). Every GPU job on this
-box goes through slurm; each submission leaves a SIDECAR record (project, class, GPU or not, command),
+Design: `design notes` (revision 2). Every GPU job on the
+machine goes through slurm; each submission leaves a SIDECAR record (project, class, GPU or not, command),
 because slurm's own completion records carry no GPU field, no project and no comment (review finding 15).
 The lease keeper, the in-job wrapper, `status.py` and `wait.py` read the same files through this module.
 
-Stdlib only: every tool here runs under the system `python3`, except the keeper, which runs under
-`~/dev/localmodels/.venv` so it can use the lease protocol's one implementation.
+Stdlib only: every tool here runs under the system `python3`, except the keeper, which runs under the site's
+`[lease] python` so it can use the lease protocol's one implementation (localmodels).
 """
 
 from __future__ import annotations
@@ -54,7 +54,7 @@ LEASE_PROJECT = "slurm"
 
 
 class Partition(StrEnum):
-    """The three partitions of machine/slurm/slurm.conf."""
+    """The three partitions of the rendered `slurm.conf` (`slurm/install/templates/slurm/slurm.conf`)."""
 
     NORMAL = "normal"  # resumes from its own checkpoint; pre-emptable
     STEADY = "steady"  # cannot resume; never pre-empted
@@ -152,7 +152,11 @@ def parse_squeue(text: str) -> list[QueuedJob]:
     jobs = []
     for raw in json.loads(text)["jobs"]:
         states = raw.get("job_state") or [""]
-        state = states[0] if isinstance(states, list) else str(states)  # the base state; flags follow it
+        states = states if isinstance(states, list) else [str(states)]
+        # The base state comes first and flags follow (23.11.4 `parsers.c`, JOB_STATE). COMPLETING and CONFIGURING
+        # are flags there, and win over the base state as in slurm's text output (`job_state_string`): a cancelled
+        # or requeued job still holds its GPU while it saves and stops, so it must stay active.
+        state = next((flag for flag in (State.COMPLETING, State.CONFIGURING) if flag in states), states[0])
         if state not in set(State):
             continue
         priority = raw.get("priority") or {}

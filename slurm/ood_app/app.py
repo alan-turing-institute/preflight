@@ -272,7 +272,8 @@ def _command_text(record: Mapping[str, object]) -> str:
 
 def _buttons_html(job: QueuedJob, steady: bool) -> str:
     ident = esc(job.job_id)
-    pause = (
+    pause = (  # a held job is paused already
+        "" if job.held else
         f'<button type="button" data-action="pause" data-job="{ident}" data-steady="{int(steady)}">Pause job {ident}</button>'
     )
     resume = f'<button type="button" data-action="resume" data-job="{ident}">Resume job {ident}</button>'
@@ -311,7 +312,8 @@ def job_page(backend: Backend, job_id: str) -> str | None:
     )
     buttons = ""
     if job is not None and jobs_view.can_act(job, viewer, backend.is_admin(viewer)):
-        buttons = _buttons_html(job, job.partition == gpu_jobs.Partition.STEADY)
+        # only a started steady job loses its run to a pause (pause.py)
+        buttons = _buttons_html(job, job.partition == gpu_jobs.Partition.STEADY and job.state != gpu_jobs.State.PENDING)
     body = _template("job.html").substitute(
         job_id=esc(job_id),
         record_rows=record_rows,

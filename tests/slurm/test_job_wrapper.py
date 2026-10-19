@@ -146,7 +146,9 @@ time.sleep(30)
 """
 
 
-def test_sigterm_is_passed_to_the_child_which_saves_then_the_leg_is_recorded(tmp_path: Path) -> None:
+def test_sigterm_is_passed_to_the_child_which_saves_then_the_leg_is_recorded(
+    tmp_path: Path, monkeypatch
+) -> None:
     saved, up = tmp_path / "saved", tmp_path / "up"
     env = dict(os.environ, SLURM_GPU_STATE_DIR=str(tmp_path / "state"), SLURM_JOB_ID="77")
     wrapper = subprocess.Popen(
@@ -164,6 +166,24 @@ def test_sigterm_is_passed_to_the_child_which_saves_then_the_leg_is_recorded(tmp
     assert record["last_leg"]["signals"] == ["SIGTERM"]
     assert record["last_leg"]["exit"] == 0
     assert (tmp_path / "state" / "footprints" / "77.jsonl").exists()
+
+    # A SIGTERM that lands before the child exists is passed on as soon as it does, not lost.
+    real_popen, sent = subprocess.Popen, []
+
+    def popen_after_a_sigterm(*args, **kwargs):  # the first start only: sampling runs subprocesses too
+        if not sent:
+            sent.append(True)
+            os.kill(os.getpid(), signal.SIGTERM)
+        return real_popen(*args, **kwargs)
+
+    monkeypatch.setattr(job_wrapper.gpu_jobs, "STATE_DIR", tmp_path / "state")
+    monkeypatch.setattr(subprocess, "Popen", popen_after_a_sigterm)
+    before = signal.signal(signal.SIGTERM, lambda *_: None)  # stands in for "no handler yet": the signal is lost
+    try:
+        leg = job_wrapper.run_and_measure([sys.executable, "-c", "import time; time.sleep(5)"], tmp_path / "f.jsonl", None, 0.2)
+    finally:
+        signal.signal(signal.SIGTERM, before)
+    assert (leg["signals"], leg["exit"]) == (["SIGTERM"], -signal.SIGTERM)
 
 
 def test_an_unverifiable_manifest_refuses_the_launch(tmp_path: Path) -> None:

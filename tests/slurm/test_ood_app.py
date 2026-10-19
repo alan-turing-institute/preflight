@@ -161,4 +161,6 @@ def test_values_are_html_escaped() -> None:
 def test_buttons_follow_can_act(viewer: str, admin: bool, shown: bool) -> None:
     _, page = call(Fake(viewer, admin), "/job/7")
     assert ('data-action="kill"' in page) is shown
+    held = gpu_jobs.QueuedJob("9", "steady", "PENDING", "JobHeldUser", "n")
+    assert 'data-action="pause"' not in app._buttons_html(held, steady=False)  # paused already
     assert "../../jobstats/7" in page

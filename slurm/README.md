@@ -340,11 +340,17 @@ prints a job's last measured peak memory. `gpujobs-status` and `gpujobs-audit` t
   portal's cluster file points at `http://SERVER_NAME:grafana_port`, and a browser blocks that as mixed content
   inside the HTTPS portal. Set `metrics.grafana_url` to an HTTPS address of a Grafana that serves TLS (for
   example behind a TLS proxy) for the embedded panels to work.
+- **A job's docker containers are its own to stop.** The wrapper counts a container labelled `slurm-job=JOBID`
+  toward the job's GPU memory, but the container runs outside the job's cgroup, so slurm's final SIGKILL reaches
+  only the `docker` client. A job that starts a container must stop it on SIGTERM (an attached `docker run`
+  passes SIGTERM on; `docker run -d` does not); a container left running holds the GPU outside slurm and the
+  lease, and the job's next run waits for the card it holds. Nothing stops leftover containers for you yet.
 - **Reboot recovery.** The agent's boot step runs once per boot (it compares `agent/boot_id` with the kernel's
   boot id): 30 seconds after `slurmctld` started, it runs `scontrol update nodename=N state=undrain` for every
   node that was not drained on purpose, so slurm registers the nodes again and purges the jobs they lost
   (otherwise that takes about 32 minutes). Jobs the agent saw held keep their place: when one is released at
-  a lower priority, the recorded priority is put back. Separately, `slurm.conf` sets `ReturnToService=1`, so a
+  a lower priority, the recorded priority is put back, once (an admin who releases a job and lowers its priority
+  at once must lower it again after the agent's next look). Separately, `slurm.conf` sets `ReturnToService=1`, so a
   node that went DOWN after an unexpected reboot stays DOWN until a person runs `gpujobs-resume --node`, so a
   job that wedged the machine is not restarted into the same wedge.
 - **Where state lives.** `state_dir` (default `/var/lib/gpujobs`), root-owned, mode 0755. Inside:

@@ -37,7 +37,8 @@ import gpu_jobs  # noqa: E402
 import site_config  # noqa: E402
 import submit  # noqa: E402
 
-#: Background services in the lease protocol that yield to a waiting lease, and how fast (design section 2).
+#: Background services in the lease protocol that yield to a waiting lease, and how fast (design section 2). Used
+#: only without a site file; a site lists its own in `[lease] services`.
 YIELDING_SERVICES = {
     "service-a": "yields within about 1 min (30-s poll, then its stop)",
     "service-b": "yields at its next job boundary, up to ~15 min (an inference runs up to 900 s)",

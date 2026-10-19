@@ -267,14 +267,24 @@ def run_and_measure(
     # (stage C test 3): on pre-emption slurm signals only the job script's own process when the job has no
     # `srun` steps (`man slurm.conf`, GraceTime: the signals go to "the tasks and the containing batch
     # script"), so a child that is not told never saves; it is SIGKILLed when KillWait ends.
-    child = subprocess.Popen(command, start_new_session=True)
+    # The handler is set before the child starts, so a SIGTERM in between is not lost: it waits in `missed` and is
+    # passed on once, as soon as the child exists.
+    child: subprocess.Popen[bytes] | None = None
+    missed: list[int] = []
 
     def forward(signum: int, _frame: object) -> None:
         received.append(signum)
+        if child is None:
+            missed.append(signum)
+            return
         with contextlib.suppress(ProcessLookupError):
             os.killpg(child.pid, signum)
 
     signal.signal(signal.SIGTERM, forward)
+    child = subprocess.Popen(command, start_new_session=True)
+    if missed:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(child.pid, missed[0])
     peak_gpu, peak_mem = 0.0, 0
     out = best_effort("footprint", open_footprint, footprint)
     try:

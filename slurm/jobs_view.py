@@ -236,7 +236,7 @@ def _tres_count(tres: object, kind: str, name: str = "") -> int | None:
 
 def _time(epoch: object) -> datetime | None:
     """Slurm's epoch seconds as the local time its text output printed; 0 and the never-started marker are None."""
-    return datetime.fromtimestamp(epoch) if isinstance(epoch, int) and 0 < epoch < _NEVER else None
+    return datetime.fromtimestamp(epoch) if isinstance(epoch, int) and 0 < epoch < _NEVER else None  # noqa: DTZ006 - local, as sacct printed
 
 
 def _sacct(runner: Runner, *selection: str) -> list[dict[str, object]]:
@@ -338,7 +338,8 @@ def efficiency(
     cpu_micros = _field(job, "time", "total", "microseconds")
     available = elapsed * cpus if isinstance(elapsed, int) and cpus else 0
     used = cpu_seconds + (cpu_micros if isinstance(cpu_micros, int) else 0) / 1e6 if isinstance(cpu_seconds, int) else None
-    stored = record if record is not None else gpu_jobs.read_sidecar(job_id) or {}
+    owner = job.get("user") if isinstance(job.get("user"), str) else None  # a record someone else left is not read
+    stored = record if record is not None else gpu_jobs.read_sidecar(job_id, owner or None) or {}
     legs = [leg for leg in (stored.get("legs") or [stored.get("last_leg")]) if isinstance(leg, dict)]
     gpu = [float(leg["peak_gpu_mib"]) for leg in legs if "peak_gpu_mib" in leg]
     return Efficiency(

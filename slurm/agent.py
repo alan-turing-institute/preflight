@@ -9,8 +9,9 @@ Plan 3.5 (`plan notes`). One system service, run as SlurmUser
    30 s, `scontrol update nodename=N state=undrain` for every node not drained on purpose. That makes slurmd
    register again, which is what makes slurm purge the jobs the node lost (otherwise it waits ~32 minutes).
 2. A RELEASED JOB KEEPS ITS PLACE: the priority of each pending or running job is recorded. A job the agent saw
-   held that is later pending and not held at a lower priority gets its recorded priority back. A job the agent
-   never saw held is never touched, so an admin's deliberate change stays.
+   held that is later pending and not held at a lower priority gets its recorded priority back, once. A job the
+   agent never saw held is never touched, so an admin's deliberate change stays; but an admin who releases a held
+   job and lowers its priority within one look (5 s) sees the first lowering undone, and must lower it again.
 3. RESTORE ORDER after urgent work: `requests/restore_order-*.json` written by an admin names the urgent job
    (`urgent`), the jobs it may pre-empt (`victims`) and the jobs held meanwhile (`held`). The held jobs are released
    once the urgent job has left the queue and every victim is running, gone or held (a pre-empted victim can run
