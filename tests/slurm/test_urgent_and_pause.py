@@ -118,6 +118,16 @@ def test_site_admin_check_multi_gpu_plan_and_request_file(
     assert json.loads(request.read_text()) == {"victims": {"5": False}, "held": ["6"]}
     assert [e.action for e in gpu_jobs.events("6")] == ["urgent_hold"]
 
+    # the keeper is required only where the site has a lease (end-to-end on a lease-less site: urgent always refused)
+    monkeypatch.setattr(urgent.submit, "keeper_running", lambda: False)
+    assert urgent.run([*argv, "--", "true"]) == 1
+    assert "lease keeper" in capsys.readouterr().err
+    (tmp_path / "site.toml").write_text(
+        'name = "t"\nadmin_group = "admins"\n[[nodes]]\nname = "n1"\ncpus = 4\nreal_memory_mb = 1000\n', encoding="utf-8"
+    )
+    monkeypatch.setattr(urgent, "other_leases", list)
+    assert urgent.run([*argv, "--", "true"]) == 0
+
 
 class FakeSlurm:
     """Stands in for every scontrol/scancel call: records them, fails when told to."""

@@ -208,7 +208,7 @@ def run(argv: list[str]) -> int:
     if arguments.dry_run:
         print(script)
         return 0
-    if not submit.keeper_running():
+    if (site is None or site.lease) and not submit.keeper_running():  # as submit.py: no lease, no keeper
         print(f"[urgent] REFUSED: the lease keeper ({submit.KEEPER_UNIT}) is not running", file=sys.stderr)
         return 1
     if arguments.requeue_steady:

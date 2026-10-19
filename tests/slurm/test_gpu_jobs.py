@@ -21,6 +21,8 @@ def test_event_actor_is_the_file_owner_not_the_content(tmp_path: Path, monkeypat
     forged.write_text(json.dumps({"job": "7", "action": "kill", "actor": "mallory", "at": 100, "why": "x"}))
     path = gpu_jobs.write_event("7", EventAction.PAUSE, why="urgent")
     assert path.stat().st_mode & 0o777 == 0o644
+    gpu_jobs.update_sidecar("7", what="x")  # a record, like a request or the agent's state, is read by other users
+    assert gpu_jobs.sidecar_path("7").stat().st_mode & 0o777 == 0o644
     found = gpu_jobs.events("7")
     assert [e.action for e in found] == ["kill", "pause"]  # sorted by the time in the name
     assert {e.actor for e in found} == {Path(os.path.expanduser("~")).owner()}

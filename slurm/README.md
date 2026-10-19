@@ -349,6 +349,9 @@ prints a job's last measured peak memory. `gpujobs-status` and `gpujobs-audit` t
   | `events/` | 1777 | root | pause, resume, kill and failure events, one file each (0644) |
   | `footprints/` | 1777 | root | measured memory use per run |
   | `metrics/` | 1777 | root | node-exporter textfiles for running jobs |
+  | `logs/` | 1777 | root | each job's log, when `submit` is not given `--log` |
+  | `scripts/` | 1777 | root | each job's batch script |
+  | `manifests/` | 1777 | root | the DGX gate's code manifest per job (only with `dgx_gate`) |
   | `requests/` | 1777 | the slurm user | restore-order requests written by admins; the agent ignores files owned by a non-admin |
   | `agent/` | 0755 | the slurm user | the agent's heartbeat and what it has learnt |
 

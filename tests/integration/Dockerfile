@@ -6,11 +6,13 @@ FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# systemd + dbus: PID 1 and what `systemctl` talks to. sudo and python3: the installer's requirements. procps: ps/pgrep
-# for tests that look at job processes.
+# systemd + dbus: PID 1 and what `systemctl` talks to. libpam-systemd and dbus-user-session, with logind left unmasked:
+# `systemctl --user --machine=USER@.host` (the lease component's way to reach a user's systemd) starts a PAM login
+# session for USER and connects to that user's own D-Bus socket. sudo and python3: the installer's requirements. procps:
+# ps/pgrep for tests that look at job processes.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      systemd systemd-sysv dbus \
+      systemd systemd-sysv dbus libpam-systemd dbus-user-session \
       slurm-wlm slurmdbd mariadb-server munge \
       sudo python3 procps ca-certificates \
  && rm -rf /var/lib/apt/lists/*
@@ -39,7 +41,7 @@ RUN chown slurm:slurm /etc/slurm/slurmdbd.conf && chmod 600 /etc/slurm/slurmdbd.
  && install -d /var/spool/slurmd \
  && chmod 755 /usr/local/libexec/gpujobs-harness/*.sh \
  && systemctl enable mariadb munge slurmdbd slurmctld slurmd gpujobs-db-init gpujobs-accounts-init \
- && systemctl mask getty.target console-getty.service systemd-logind.service systemd-udevd.service \
+ && systemctl mask getty.target console-getty.service systemd-udevd.service \
       systemd-udev-trigger.service systemd-remount-fs.service sys-kernel-debug.mount sys-kernel-tracing.mount
 
 STOPSIGNAL SIGRTMIN+3

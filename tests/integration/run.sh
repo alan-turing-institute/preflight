@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Integration test cluster driver: run.sh up | down | smoke | shell [-u USER] [CMD...]
+# Integration test cluster driver: run.sh up | down | smoke | e2e [ARGS] | shell [-u USER] [CMD...]
 # Every command that talks to slurm inside the container lives here.
 set -euo pipefail
 
@@ -31,8 +31,28 @@ wait_ready() {
     return 1
 }
 
+# `docker exec` puts its process in the container's init cgroup. If one lands there before systemd has moved itself into
+# init.scope and enabled the cpu/memory/cpuset controllers for its children, the kernel refuses ("device or resource
+# busy": a cgroup with processes cannot enable controllers) and slurmd then dies at boot with "memory cgroup controller
+# is not available". So nothing is exec'd until the container's init is in init.scope with the memory controller on
+# (read from the host's /proc and cgroup files, which does not touch the container).
+wait_booted() {
+    local pid cgroup waited=0
+    pid=$(docker inspect -f '{{.State.Pid}}' "$("${COMPOSE[@]}" ps -q "$SERVICE")")
+    while (( waited < READY_TIMEOUT * 2 )); do
+        cgroup=$(cut -d: -f3 "/proc/$pid/cgroup" 2>/dev/null || true)
+        if [[ $cgroup == */init.scope ]] && grep -qw memory "/sys/fs/cgroup${cgroup%/init.scope}/cgroup.subtree_control" 2>/dev/null; then
+            return 0
+        fi
+        sleep 0.5; waited=$((waited + 1))
+    done
+    echo "systemd did not enable the cgroup controllers (init cgroup: ${cgroup:-none})" >&2
+    return 1
+}
+
 cmd_up() {
     "${COMPOSE[@]}" up -d --build
+    wait_booted
     wait_ready
 }
 
@@ -80,6 +100,14 @@ cmd_smoke() {
     echo "SMOKE OK"
 }
 
+# The end-to-end run (README, "End-to-end run"): a fresh cluster, then every stage of e2e.py; exits 1 on any failed check.
+# ARGS go to e2e.py (`--only install,jobs` for a subset, which reuses what is installed only with `python3 e2e.py`).
+cmd_e2e() {
+    cmd_down
+    cmd_up
+    python3 "$HERE/e2e.py" "$@"
+}
+
 # Interactive shell, or one command, in the container: run.sh shell [-u USER] [CMD...]
 cmd_shell() {
     local user=root
@@ -95,6 +123,7 @@ case "${1:-}" in
     up) cmd_up ;;
     down) cmd_down ;;
     smoke) cmd_smoke ;;
+    e2e) shift; cmd_e2e "$@" ;;
     shell) shift; cmd_shell "$@" ;;
-    *) echo "usage: run.sh up|down|smoke|shell [-u USER] [CMD...]" >&2; exit 2 ;;
+    *) echo "usage: run.sh up|down|smoke|e2e [ARGS]|shell [-u USER] [CMD...]" >&2; exit 2 ;;
 esac

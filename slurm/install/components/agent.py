@@ -13,7 +13,9 @@ import components
 NAME = "agent"
 SITE_COPY = "/etc/gpujobs/site.toml"
 UNIT = "gpujobs-agent.service"
-STICKY = ("jobs", "events", "footprints", "metrics", "requests")  # plan 3.3: each file owned by its writer
+# plan 3.3: each file owned by its writer; logs, scripts and manifests are where submit.py and urgent.py write a job's
+# log, batch script and gate manifest when the caller gives no --log
+STICKY = ("jobs", "events", "footprints", "metrics", "requests", "logs", "scripts", "manifests")
 FILE_MODE = 0o644
 
 
