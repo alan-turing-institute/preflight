@@ -6,7 +6,7 @@
 
 Runs on the host and drives the container through `run.sh shell`. Every check prints PASS or FAIL with its
 evidence as it happens; the exit status is 1 when any check failed. Stages: install, jobs, urgent, failure,
-recovery, portal, lease, host (in this order; `--only` takes a subset, later stages need `install` to have run once).
+recovery, portal, proxy, lease, host (in this order; `--only` takes a subset, later stages need `install` to have run once).
 """
 
 from __future__ import annotations
@@ -698,6 +698,85 @@ def stage_portal() -> None:
     clear_queue()
 
 
+# -- stage: proxy -------------------------------------------------------------------------------------------------
+
+PROXY_KEY_FILE = "/etc/gpujobs/portal/proxy_key"
+PROXY_SITE = "/root/proxy.site.toml"
+PROBE_APP = "/var/www/ood/apps/sys/hdrprobe"
+# A throwaway portal app that answers with the request headers it received (the real app has no such page).
+PROBE_WSGI = """import json
+def application(environ, start_response):
+    headers = sorted(k for k in environ if k.startswith("HTTP_"))
+    body = json.dumps({"headers": headers}).encode()
+    start_response("200 OK", [("Content-Type", "application/json"), ("Content-Length", str(len(body)))])
+    return [body]
+"""
+PROBE_MANIFEST = "---\nname: Header probe\ncategory: Test\ndescription: Echoes the request header names.\n"
+
+
+def stage_proxy() -> None:
+    section("proxy: the portal with no sign-in page, behind a trusted proxy's key (switches the portal from Dex)")
+    sh(f"openssl rand -hex 32 | install -m 0600 /dev/stdin {PROXY_KEY_FILE}")
+    key = sh(f"cat {PROXY_KEY_FILE}").out.strip()
+    own = sh("hostname -i").out.split()[0]
+    site = Path(HERE / "harness.site.toml").read_text()
+    site = site.replace('auth = "dex-local"', f'auth = "proxy"\nallow_from = ["{own}/32"]  # the proxy: this container')
+    site = site.replace('users_file = "/etc/gpujobs/portal/users.json"', f'user = "alice"\nkey_file = "{PROXY_KEY_FILE}"')
+    put(PROXY_SITE, site)
+
+    dex_before = sh("systemctl is-active ondemand-dex").out.strip()
+    loose = sh(f"chmod 0644 {PROXY_KEY_FILE}; {INSTALL} --site {PROXY_SITE} apply --component portal; rc=$?; chmod 0600 {PROXY_KEY_FILE}; exit $rc")
+    check("a key file others can read is refused, and nothing is applied", loose.rc != 0 and "must be root-only" in loose.text, loose.text[-200:])
+    applied = sh(f"{INSTALL} --site {PROXY_SITE} apply --component portal", timeout=900)
+    check("apply of the portal with auth = proxy succeeds", applied.rc == 0 and "installed" in applied.out, applied.text[-300:])
+    dex_after = sh("systemctl is-active ondemand-dex; systemctl is-enabled ondemand-dex")
+    check("Dex was running before and is stopped and disabled by the switch",
+          dex_before == "active" and dex_after.out.split() == ["inactive", "disabled"], f"before={dex_before} after={dex_after.text}")
+    apache = sh("systemctl is-active apache2")
+    conf = sh("stat -c '%a %U:%G' /etc/apache2/sites-available/ood-portal.conf; "
+              f"grep -c {key} /etc/apache2/sites-available/ood-portal.conf; "
+              "grep -c \"sha1(req('X-Frontdoor-Key'))\" /etc/apache2/sites-available/ood-portal.conf; "
+              "grep -c -i -E 'openid|oidc|\\bdex\\b' /etc/apache2/sites-available/ood-portal.conf")
+    mode, wrote_key, gates, login = (conf.out.split("\n") + ["", "", "", ""])[:4]
+    check("Apache is up with the allow_from restriction; the portal config is 0640 root:www-data, holds the key's digest but not the key, "
+          "and has no OIDC or Dex directives", apache.out.strip() == "active" and mode == "640 root:www-data"
+          and wrote_key == "0" and int(gates or 0) >= 2 and login == "0", f"{apache.out.strip()} | {conf.text}")
+
+    base = f"{CURL} -o /dev/null -w '%{{http_code}}'"
+    app = f"{PORTAL}/pun/sys/gpujobs/api/jobs"
+    none = sh(f"{base} {app}").out
+    wrong = sh(f"{base} -H 'X-Frontdoor-Key: {'0' * 64}' {app}").out
+    empty = sh(f"{base} -H 'X-Frontdoor-Key:' {app}").out
+    public = sh(f"{base} {PORTAL}/public/favicon.ico").out
+    init = sh(f"{base} {PORTAL}/nginx/init?redir=%2fpun%2fsys%2fgpujobs%2f").out
+    check("no key, a wrong key and an empty key are each refused with 403, on the app, /public and /nginx",
+          [none, wrong, empty, public, init] == ["403"] * 5, f"none={none} wrong={wrong} empty={empty} public={public} nginx={init}")
+
+    keyed = f"-H 'X-Frontdoor-Key: {key}'"
+    sh(f"{base} {keyed} '{PORTAL}/nginx/init?redir=%2fpun%2fsys%2fgpujobs%2f' -L")  # first visit in a restarted per-user server
+    page = sh(f"{CURL} -L {keyed} -w '\\n%{{http_code}} %{{url_effective}}' {APP}/").out
+    body, _, tail = page.rpartition("\n")
+    check("with the key, the portal opens straight on the jobs page: no login page, no redirect to Dex",
+          tail.startswith("200") and tail.endswith("/pun/sys/gpujobs/") and "Signed in as alice" in body, tail)
+    code, _, jobs = sh(f"{CURL} {keyed} -w '\\n%{{http_code}}' {app}").out.rpartition("\n")[::-1]
+    check("with the key, /api/jobs returns JSON, served as the configured user", code == "200" and isinstance(json.loads(jobs).get("jobs"), list),
+          f"HTTP {code} {jobs[:80]}")
+    puns = sh("ps -eo user:20,args | grep '[n]ginx: master' | awk '{print $1}' | sort -u").out.split()
+    check("the app runs as the configured user only (no per-user server for bob, carol or www-data was started by these requests)",
+          "alice" in puns and not {"bob", "carol", "dave"} & set(puns), f"users with a per-user server: {puns}")
+
+    # the header must not reach the app: a probe app that lists the HTTP_* variables it received
+    put(f"{PROBE_APP}/manifest.yml", PROBE_MANIFEST)
+    put(f"{PROBE_APP}/passenger_wsgi.py", PROBE_WSGI)
+    put(f"{PROBE_APP}/bin/python", "#!/bin/sh\nexec /usr/bin/python3 \"$@\"\n", "0755")
+    sh(f"{CURL} -L -o /dev/null {keyed} '{PORTAL}/nginx/init?redir=%2fpun%2fsys%2fhdrprobe%2f'")
+    echoed = sh(f"{CURL} {keyed} -H 'X-Probe: kept' {PORTAL}/pun/sys/hdrprobe/").out
+    seen = json.loads(echoed).get("headers", []) if echoed.startswith("{") else []
+    check("the key header does not reach the app (a control header sent with it does)",
+          "HTTP_X_PROBE" in seen and "HTTP_X_FRONTDOOR_KEY" not in seen, f"{echoed[:200]}")
+    sh(f"rm -rf {PROBE_APP}; /opt/ood/nginx_stage/sbin/nginx_stage nginx_clean --force")
+
+
 # -- stage: lease -------------------------------------------------------------------------------------------------
 
 LEASE_SITE = '\n[lease]\nlease_dir = "/var/lib/gpujobs/gpu-lease"\nkeeper_user = "dave"\npython = "%s"\n'
@@ -785,6 +864,7 @@ STAGES: dict[str, Callable[[], None]] = {
     "failure": stage_failure,
     "recovery": stage_recovery,
     "portal": stage_portal,
+    "proxy": stage_proxy,
     "lease": stage_lease,
     "host": stage_host,
 }

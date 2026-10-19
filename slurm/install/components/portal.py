@@ -12,6 +12,7 @@ repository or the site file: the site file names root-only files and `files` rea
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import ipaddress
 import json
@@ -44,7 +45,13 @@ APP_LINK = f"/var/www/ood/apps/sys/{APP_NAME}"
 APP_SOURCE = Path("slurm") / "ood_app"  # under site.install_dir; the tools component installs it
 UPDATE_OOD_PORTAL = "/opt/ood/ood-portal-generator/sbin/update_ood_portal"  # ondemand-dex postinst, line 3
 NGINX_STAGE = "/opt/ood/nginx_stage/sbin/nginx_stage"
+DEX_UNIT = "ondemand-dex"
 SECRET_FILE_MODE_MASK = stat.S_IRWXG | stat.S_IRWXO
+
+# Sign-in mode `proxy`: the shared key the trusted reverse proxy adds to every request, and the Apache variable that
+# carries the Linux user to OOD (`user_env`, ood_portal_example.yml; read by mod_ood_proxy/lib/pun_proxy.lua:20).
+PROXY_KEY_HEADER = "X-Frontdoor-Key"
+PROXY_USER_ENV = "GPUJOBS_PORTAL_USER"
 
 # Package repository: docs "1. Install Software", Ubuntu 24.04 tab. Its release .deb
 # (https://apt.osc.edu/ondemand/4.2/ondemand-release-web_4.2.0-noble_all.deb) carries exactly these two source lines
@@ -74,6 +81,7 @@ _AUTH_KEYS: dict[AuthMode, tuple[set[str], set[str]]] = {
         | _COMMON_OPTIONAL,
     ),
     AuthMode.DEX_LOCAL: ({"users_file"}, _COMMON_OPTIONAL),
+    AuthMode.PROXY: ({"user", "key_file"}, set()),
 }
 
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -328,6 +336,60 @@ def _local_block(site: Site, problems: list[str]) -> list[str]:
     return _yaml({"dex": {"static_passwords": users}}, 0) if users else []
 
 
+def _proxy_block(site: Site, problems: list[str]) -> list[str]:
+    """Open OnDemand with no sign-in: every request is served as one Linux user, and only a request carrying the
+    proxy's key gets in.
+
+    Why this shape (all from the v4.2.5 source on this machine):
+    - The generator uses the full vhost template only when `auth` is non-empty (view.rb `auth?`, application.rb
+      `generate`), so the key check is the `auth` list; the template puts it inside every OOD `<Location>`. The same two
+      lines guard `/` too, so the public assets are not served without the key either.
+    - mod_ood_proxy takes the user from `r.user`, or from the Apache variable `OOD_USER_ENV` names (pun_proxy.lua:20,
+      nginx.lua:22, node_proxy.lua:12), and maps it with the default `.*` user map. `SetEnv` of a constant therefore
+      serves everyone as that user without a login module.
+    - `dex: false` keeps the generator from enabling Dex when the `ondemand-dex` package is installed (application.rb
+      `Dex.installed? && dex.enabled?`).
+    - Apache cannot compare in constant time, so the comparison is on the SHA-1 of the header: an attacker controls the
+      header, not its hash, so how long the comparison takes says nothing about the key. The key itself is never
+      written to the portal config; only its digest is.
+    """
+    s = site.portal.auth_settings
+    user = s.get("user", "")
+    if not _UNIX_USER_RE.match(user):
+        problems.append("auth_settings.user must be the Linux user name every request is served as")
+    if not site.portal.allow_from:
+        problems.append(
+            "auth proxy serves everyone who reaches the portal as one user: set portal.allow_from to the proxy's "
+            "address, e.g. allow_from = [\"192.0.2.8/32\"]"
+        )
+    key_file = s.get("key_file", "")
+    key = _secret(key_file, "proxy key file", _TOKEN_RE, problems)
+    if key is None:
+        problems.append(f"create it with: openssl rand -hex 32 | sudo install -m 0600 /dev/stdin {key_file or '<path>'}")
+    digest = hashlib.sha1((key or "").encode()).hexdigest()  # Apache expressions offer sha1/md5 only
+    gate = [f"Require expr \"sha1(req('{PROXY_KEY_HEADER}')) == '{digest}'\"", f"RequestHeader unset {PROXY_KEY_HEADER}"]
+    return _yaml(
+        {
+            "user_env": PROXY_USER_ENV,
+            "dex": False,
+            "auth": gate,
+            "custom_vhost_directives": [f"SetEnv {PROXY_USER_ENV} {user}", '<Location "/">', *gate, "</Location>"],
+        },
+        0,
+    )
+
+
+def _login_lines(site: Site, problems: list[str]) -> str:
+    """The YAML that makes the portal ask for a sign-in (or, for `proxy`, not to): cookie passphrase, session, `auth`."""
+    if site.portal.auth is AuthMode.PROXY:
+        return "\n".join(_proxy_block(site, problems))
+    passphrase = _passphrase(site.portal.auth_settings, problems)
+    return (
+        f"oidc_crypto_passphrase: {_quote(passphrase or '')}\n{_session_lines(site)}"
+        'auth:\n  - "AuthType openid-connect"\n  - "Require valid-user"'
+    )
+
+
 def _tls(site: Site, problems: list[str]) -> tuple[Path, Path]:
     cert, key = site.portal.tls_cert, site.portal.tls_key
     if _self_signed(site):
@@ -368,17 +430,16 @@ def _build_portal_yml(site: Site) -> tuple[str, list[str]]:
     servername = _server_name(site, problems)
     cert, key = _tls(site, problems)
     _check_keys(site, problems)
-    passphrase = _passphrase(site.portal.auth_settings, problems)
+    login_lines = _login_lines(site, problems)
     builders = {AuthMode.OIDC: _oidc_block, AuthMode.DEX_LDAP: _ldap_block, AuthMode.DEX_LOCAL: _local_block}
-    auth_lines = builders[site.portal.auth](site, problems)
+    auth_lines = builders[site.portal.auth](site, problems) if site.portal.auth in builders else []
     # docs "4. Secure Apache httpd": servername plus ssl directives; the HTTP vhost then redirects to https.
     text = Template((TEMPLATE_DIR / "ood_portal.yml").read_text()).substitute(
         servername=_quote(servername),
         root_uri=_quote(f"/pun/sys/{APP_NAME}"),
         ssl_lines="\n".join(_yaml([f'SSLCertificateFile "{cert}"', f'SSLCertificateKeyFile "{key}"'], 2)),
         hsts="false" if _self_signed(site) else "true",
-        passphrase=_quote(passphrase or ""),
-        session_lines=_session_lines(site),
+        login_lines=login_lines,
         auth_block="\n".join(auth_lines),
     )
     return text, problems
@@ -441,7 +502,7 @@ def files(site: Site) -> dict[str, FileSpec]:
         if filtered := render.ip_filter_lines(site.portal.allow_from):
             # Apache serves the portal; Dex (behind it) also has a metrics port on every address.
             dropin = f"# Rendered from the site file by slurm/install/components/portal.py: [portal] allow_from.\n[Service]\n{filtered}"
-            for unit in ["apache2", *(["ondemand-dex"] if _dex(site) else [])]:
+            for unit in ["apache2", *([DEX_UNIT] if _dex(site) else [])]:
                 out[f"/etc/systemd/system/{unit}.service.d/10-gpujobs.conf"] = FileSpec(dropin, FILE_MODE, "root")
     return out
 
@@ -491,7 +552,7 @@ def packages(site: Site) -> list[str]:
     # python-is-python3: Passenger starts Python apps through nginx_stage/bin/python:11-14, which runs
     # `python` when the app has no bin/python, and Ubuntu 24.04 has no `python` without this package.
     names = ["apt-transport-https", "ca-certificates", "ondemand", "python-is-python3"]
-    names += ["ondemand-dex"] if _dex(site) else []
+    names += [DEX_UNIT] if _dex(site) else []
     names += ["libapache2-mod-auth-openidc"] if site.portal.auth is AuthMode.OIDC else []
     names += ["openssl"] if _self_signed(site) else []
     return names
@@ -515,7 +576,9 @@ def post_install(site: Site) -> list[list[str]]:
         steps.append(["update-ca-certificates"])
     # packaging/deb/postinst:17-23 enables rewrite, lua, headers, proxy, proxy_http, proxy_wstunnel but not ssl; the
     # auth_openidc.load file ships with libapache2-mod-auth-openidc (packages.ubuntu.com, noble filelist).
-    steps += [["a2enmod", "ssl"], ["a2enmod", "auth_openidc"]]
+    steps.append(["a2enmod", "ssl"])
+    if site.portal.auth is not AuthMode.PROXY:
+        steps.append(["a2enmod", "auth_openidc"])
     # --force: replace ood-portal.conf even if its checksum differs (the old file is backed up first,
     # application.rb:213-218). --insecure is what makes Dex use the users in ood_portal.yml at all
     # (application.rb:354, dex.rb:41-46); without it Dex's password database stays off. It is passed only for the
@@ -524,7 +587,10 @@ def post_install(site: Site) -> list[list[str]]:
     steps.append([*update, "--insecure"] if site.portal.auth is AuthMode.DEX_LOCAL else update)
     steps.append(["systemctl", "daemon-reload"])  # the allow_from drop-ins
     if _dex(site):
-        steps += [["systemctl", "enable", "ondemand-dex"], ["systemctl", "restart", "ondemand-dex"]]
+        steps += [["systemctl", "enable", DEX_UNIT], ["systemctl", "restart", DEX_UNIT]]
+    elif site.portal.auth is AuthMode.PROXY:
+        # A machine switched from a Dex login still has Dex running, with a login nobody uses any more.
+        steps.append(["sh", "-c", f"if systemctl cat {DEX_UNIT} >/dev/null 2>&1; then systemctl disable --now {DEX_UNIT}; fi"])
     steps += [["systemctl", "enable", "apache2"], ["systemctl", "restart", "apache2"]]
     # Each user's running web server keeps the environment Apache gave it at start, including OOD_ALLOWED_HOSTS
     # (the server name): after a rename the dashboard refused every page with "Blocked hosts" (measured 2026-10-19).
