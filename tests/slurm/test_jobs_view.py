@@ -7,6 +7,8 @@ Recorded GPU jobs list their GPU in `tres.allocated` as `{type: gres, name: gpu,
 from __future__ import annotations
 
 import json
+import os
+import signal
 import time
 from collections.abc import Iterator
 from datetime import date
@@ -126,6 +128,23 @@ def test_chain_walks_both_ways_and_stays_finite() -> None:
         "2": queued("Dependency", job_id="2", dependency="afterok:1"),
     }
     assert jobs_view.chain("1", loop, {}).before[0].before == ()
+    layers = {  # 40 layers of two jobs, each depending on both jobs below it: 2**40 paths, 80 jobs
+        str(2 * layer + side): queued(
+            "Dependency",
+            job_id=str(2 * layer + side),
+            dependency=f"afterok:{2 * layer + 2}:{2 * layer + 3}" if layer < 39 else "",
+        )
+        for layer in range(40)
+        for side in (1, 2)
+    }
+    top = jobs_view.chain("1", layers, {})
+
+    def count(n: jobs_view.ChainNode) -> int:
+        return 1 + sum(count(c) for c in n.before)
+
+    assert count(top) <= 80
+    deep = {str(i): queued("Dependency", job_id=str(i), dependency=f"afterok:{i + 1}") for i in range(1, 3000)}
+    assert count(jobs_view.chain("1", deep, {})) == jobs_view.MAX_CHAIN_DEPTH + 1  # not a RecursionError
 
 
 def test_project_usage_gpu_hours_per_day_and_week() -> None:
@@ -189,6 +208,14 @@ def test_log_tail_filters(tmp_path: Path) -> None:
     assert jobs_view.log_tail(str(log), text="warning", errors_only=True) == "WARNING: low disk"
     assert jobs_view.log_tail(str(log), max_bytes=20) == "terrors are fine"  # the cut-off first line is dropped
     assert jobs_view.log_tail(str(tmp_path / "missing.log")) == jobs_view.NO_LOG
+    fifo = tmp_path / "fifo.log"
+    os.mkfifo(fifo)
+    signal.signal(signal.SIGALRM, lambda *_: pytest.fail("log_tail blocked on a FIFO"))
+    signal.alarm(5)
+    try:
+        assert jobs_view.log_tail(str(fifo)) == jobs_view.NO_LOG  # a blocking open() would wait for a writer
+    finally:
+        signal.alarm(0)
 
 
 def test_unreadable_log_says_so(tmp_path: Path) -> None:

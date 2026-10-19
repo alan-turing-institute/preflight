@@ -10,7 +10,9 @@ Stdlib only: the OOD app and the system `python3` tools import it.
 from __future__ import annotations
 
 import json
+import os
 import re
+import stat
 import subprocess
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -25,6 +27,7 @@ Runner = Callable[[list[str]], str]
 
 OTHER_PROJECT = "(other)"
 SECONDS_PER_HOUR = 3600
+MAX_CHAIN_DEPTH = 100  # the walk and the page's recursion over it stay far from Python's recursion limit
 CLASS_AND_NAME = 2  # fields after the project in `P:class:name`
 NO_PERMISSION = "no permission to read this log"
 NO_LOG = "no log yet"
@@ -197,14 +200,21 @@ def chain(
         ids |= {j for j in records if other in after_of(j)}
         return tuple(sorted(ids, key=lambda i: (len(i), i)))
 
-    def node(other: str, ids_of: Callable[[str], tuple[str, ...]], seen: frozenset[str], *, up: bool) -> ChainNode:
+    def node(
+        other: str, ids_of: Callable[[str], tuple[str, ...]], seen: set[str], depth: int = 0, *, up: bool
+    ) -> ChainNode:
+        seen.add(other)  # shared by the whole walk: a job shows once, so cycles and diamonds stay small
         queued = queue.get(other)
         name = queued.name if queued else str(records.get(other, {}).get("name") or "")
-        links = tuple(node(i, ids_of, seen | {other}, up=up) for i in ids_of(other) if i not in seen)
+        links = (
+            tuple(node(i, ids_of, seen, depth + 1, up=up) for i in ids_of(other) if i not in seen)
+            if depth < MAX_CHAIN_DEPTH
+            else ()
+        )
         return ChainNode(other, name, queued.state if queued else "", links if up else (), () if up else links)
 
-    root = node(job_id, upstream_ids, frozenset(), up=True)
-    below = node(job_id, downstream_ids, frozenset(), up=False)
+    root = node(job_id, upstream_ids, set(), up=True)
+    below = node(job_id, downstream_ids, set(), up=False)
     return ChainNode(root.job_id, root.name, root.state, root.before, below.after)
 
 
@@ -343,7 +353,10 @@ def efficiency(
 def log_tail(path: str, max_bytes: int = 262144, text: str | None = None, errors_only: bool = False) -> str:
     """The last `max_bytes` of a log, optionally only lines containing `text` and/or looking like errors."""
     try:
-        with open(path, "rb") as handle:
+        # O_NONBLOCK: opening a FIFO for reading would otherwise wait for a writer, hanging the caller
+        with os.fdopen(os.open(path, os.O_RDONLY | os.O_NONBLOCK), "rb") as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                return NO_LOG
             size = handle.seek(0, 2)
             handle.seek(max(0, size - max_bytes))
             data = handle.read()
