@@ -23,6 +23,7 @@ import stat
 import sys
 import tempfile
 from collections.abc import Callable
+from enum import StrEnum
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -40,6 +41,11 @@ MIGRATED = ("jobs", "footprints", "events")
 OPERATOR = "Operator"
 NO_LEVEL = "None"
 Chown = Callable[[Path, str], None]
+
+
+class Action(StrEnum):
+    ADD = "add"
+    REMOVE = "remove"
 
 
 def _chown(path: Path, owner: str) -> None:
@@ -100,7 +106,15 @@ def _run_all(commands: list) -> None:
             raise SystemExit(f"FAILED ({done.returncode}): {' '.join(argv)}\n{done.stderr or ''}".rstrip())
 
 
+def _warn_portal_secrets(site: site_config.Site, modules: list) -> None:
+    """Without root the portal's root-only secrets cannot be read, and the files built from them are left out."""
+    if os.geteuid() != 0 and site.portal.mode is site_config.PortalMode.INSTALL and any(m.NAME == "portal" for m in modules):
+        print("warning: not root, so files that need the portal's root-only secrets are left out "
+              "(/etc/ood/config/ood_portal.yml); run with sudo for the full set", file=sys.stderr)
+
+
 def cmd_render(site, args, modules) -> int:
+    _warn_portal_secrets(site, modules)
     files = _all(modules, site, "files")
     write_files(args.out, files, None)
     print(f"rendered {len(files)} file(s) under {args.out}")
@@ -126,6 +140,7 @@ def _wrong_mode_or_owner(root: Path, files: dict[str, render.FileSpec], *, check
 
 
 def cmd_check(site, args, modules) -> int:
+    _warn_portal_secrets(site, modules)
     files = _all(modules, site, "files")
     with tempfile.TemporaryDirectory() as tmp:
         try:
@@ -173,7 +188,7 @@ def cmd_apply(site, args, modules, chown: Chown | None = _chown) -> int:
 
 
 def cmd_user(site, args, modules) -> int:
-    if args.action == "add":
+    if args.action is Action.ADD:
         _run_all(components.accounting_adds(site, args.user))
     else:
         _run_all([["sacctmgr", "-i", "delete", "user", f"name={args.user}", f"account={site.account}",
@@ -183,13 +198,13 @@ def cmd_user(site, args, modules) -> int:
 
 
 def cmd_admin(site, args, modules) -> int:
-    level = OPERATOR if args.action == "add" else NO_LEVEL
+    level = OPERATOR if args.action is Action.ADD else NO_LEVEL
     membership = (
         ["usermod", "-aG", site.admin_group, args.user]
-        if args.action == "add"
+        if args.action is Action.ADD
         else ["gpasswd", "-d", args.user, site.admin_group]
     )
-    joins = components.accounting_adds(site, args.user) if args.action == "add" else []  # an admin is a user too
+    joins = components.accounting_adds(site, args.user) if args.action is Action.ADD else []  # an admin is a user too
     _run_all([*joins, membership,
               ["sacctmgr", "-i", "modify", "user", f"name={args.user}", "set", f"adminlevel={level}"]])
     print(f"{args.user}: {args.action} admin ({site.admin_group}, slurm AdminLevel {level})")
@@ -259,7 +274,7 @@ def parser() -> argparse.ArgumentParser:
     )
     for name in ("user", "admin"):
         who = sub.add_parser(name, parents=[shared])
-        who.add_argument("action", choices=["add", "remove"])
+        who.add_argument("action", type=Action, choices=list(Action))
         who.add_argument("user")
     sub.add_parser("migrate-state", parents=[shared]).add_argument("--from", type=Path, required=True, dest="source")
     return ap
