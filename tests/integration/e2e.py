@@ -279,16 +279,10 @@ def stage_install() -> None:
     groups = sh("id -nG carol").out
     check("install.py admin add carol: slurm AdminLevel Operator and member of gpujobs-admin",
           admin.rc == 0 and level == "Operator" and "gpujobs-admin" in groups, f"{admin.text} level={level} groups={groups.strip()}")
-    check("OPEN (design): right after user add / admin add, slurmctld accepts the user's jobs (a user already in accounting "
-          "with another default account is refused 'Invalid account' until slurmctld reloads accounting)", not refused,
+    check("right after user add / admin add, slurmctld accepts each user's jobs (no reload needed)", not refused,
           f"refused straight after the add: {sorted(refused)}; slurm said: {next(iter(refused.values()), '')}")
-    # Harness workaround, so the scenarios below can run as these users: slurmctld reloads accounting when restarted.
-    # (Not `scontrol reconfigure`: after it, jobs started dying at launch in one run, "testnode_slurmstepd.scope/
-    # cgroup.controllers: No such file"; the cause was not established, so the harness does not use it.)
-    sh("systemctl restart slurmctld")
-    wait_for(lambda: all(can_submit(u)[0] for u in ("alice", "bob", "carol", "dave")), 90, 3)
-    still = [u for u in ("alice", "bob", "carol", "dave") if not can_submit(u)[0]]
-    check("after restarting slurmctld (harness workaround for the check above) alice, bob, carol and dave can submit", not still, str(still))
+    default = sh("sacctmgr -n -P show user alice format=defaultaccount").out.strip()
+    check("a user accounting already knew keeps their default account (alice: harness)", default == "harness", default)
 
     units = ("slurmctld", "slurmd", "slurmdbd", "mariadb", "munge", "gpujobs-agent", "gpujobs-node-exporter",
              "gpujobs-cgroup-exporter", "prometheus", "grafana-server", "ondemand-dex", "apache2")
@@ -700,7 +694,12 @@ def stage_portal() -> None:
 # -- stage: lease -------------------------------------------------------------------------------------------------
 
 LEASE_SITE = '\n[lease]\nlease_dir = "/var/lib/gpujobs/gpu-lease"\nkeeper_user = "dave"\npython = "%s"\n'
-LEASE_PYTHON = '#!/bin/sh\n# stands in for an interpreter with localmodels: answers the installer\'s `-c` probe, then idles as the keeper\n[ "$1" = -c ] && exit 0\nexec sleep infinity\n'
+LEASE_PYTHON = (
+    "#!/bin/sh\n# stands in for an interpreter with localmodels: answers the installer's `-c` probe, then, as the keeper,\n"
+    "# rewrites its heartbeat every 5 s where the real one does (gpu_jobs.keeper_state_path()); it exits if it cannot\n"
+    '[ "$1" = -c ] && exit 0\n'
+    "while :; do printf '{\"updated_at\": %s}\\n' \"$(date +%s)\" > /var/lib/gpujobs/keeper/keeper.json || exit 1; sleep 5; done\n"
+)
 
 
 def stage_lease() -> None:
@@ -723,8 +722,11 @@ def stage_lease() -> None:
           still == "active" and " dave dave " in owner, f"{still} {owner.strip()}")
     sub = cl("env", "GPUJOBS_SITE=/tmp/lease-good.toml", "gpujobs-submit", "--project", "e2e", "--what", "lease", "--class", "restart",
              "--name", "lease", "--mem", "200M", "--gpu", "--", *sleep_cmd(3), user="bob")
-    check("OPEN (design): with a lease in the site, a user other than the keeper's can submit although the keeper runs "
-          "(submit.py asks the submitter's own systemd, which has no keeper unit)", "REFUSED" not in sub.text and sub.rc == 0, sub.text[:220])
+    beat = sh("stat -c %U /var/lib/gpujobs/keeper/keeper.json").out.strip()
+    check("lease: the keeper writes its heartbeat as its own user into the directory the installer made for it",
+          beat == "dave", beat)
+    check("lease: a user other than the keeper's can submit while the keeper's heartbeat is fresh",
+          "REFUSED" not in sub.text and sub.rc == 0, sub.text[:220])
     clear_queue()
 
 

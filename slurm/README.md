@@ -91,7 +91,8 @@ and pass `--site` each time.
        sudo python3 slurm/install/install.py --site site.toml user add USER
 
    This adds USER to the site's `account` on the cluster (and the cluster and account themselves, if missing); a
-   user already there is left alone. `user remove USER` takes the user out of that account.
+   user already there is left alone, and a user slurm already knows from another account keeps that default account.
+   `user remove USER` takes the user out of that account.
 
 7. **Make someone an administrator** (section 6):
 
@@ -243,7 +244,8 @@ urgent work, failure notices, and a heartbeat (`agent/agent.json`). Enabled and 
 **`lease`** (only when `[lease]` is present). `slurm-gpu-lease-keeper.service`, a systemd **user** unit of
 `keeper_user`, written to that user's `~/.config/systemd/user/`. It needs that user's systemd instance running
 (login session or `loginctl enable-linger`). One long-lived process holds the cross-project GPU lease for slurm
-as a whole.
+as a whole. The component also makes `state_dir/keeper/`, owned by `keeper_user`, where the keeper rewrites its
+state every 5 s; `submit` and `urgent` refuse while that heartbeat is more than 60 s old.
 
 **`metrics`** (when `metrics.mode` is not `off`). Packages: `ca-certificates`, `curl`, `python3-requests`,
 `python3-blessed`; with `mode = "local"` also `prometheus` and `grafana` (from Grafana's apt repository); with
@@ -354,9 +356,9 @@ prints a job's last measured peak memory. `gpujobs-status` and `gpujobs-audit` t
   | `manifests/` | 1777 | root | the DGX gate's code manifest per job (only with `dgx_gate`) |
   | `requests/` | 1777 | the slurm user | restore-order requests written by admins; the agent ignores files owned by a non-admin |
   | `agent/` | 0755 | the slurm user | the agent's heartbeat and what it has learnt |
+  | `keeper/` | 0755 | `keeper_user` | the lease keeper's state and heartbeat (only with `[lease]`) |
 
-  The sticky bit (the leading 1) lets everyone write but lets only a file's owner delete it. The keeper's state
-  is read from `state_dir/keeper.json`.
+  The sticky bit (the leading 1) lets everyone write but lets only a file's owner delete it.
 - **Changing the site file** means running `apply` again; the services read the copy in `/etc/gpujobs/`.
 
 ## 9. Uninstall

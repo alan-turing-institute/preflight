@@ -146,21 +146,23 @@ design choice. Whether a browser then renders the panels inside the portal was *
   scenario had killed every `slurmstepd`, including the `slurmstepd infinity` helper that keeps slurmd's systemd scope alive;
   it now kills only the job's own processes.
 
-### Open bugs left for a design decision (their checks fail on purpose)
+### Bugs this run found that needed a design decision (fixed by the root after F1)
 
-1. **`user add` / `admin add` of a user slurm accounting already knows leaves slurmctld refusing that user's jobs.** Check "OPEN
-   (design): right after user add / admin add ...". Evidence: alice, bob and carol exist in accounting (account `harness`, default
-   account `harness`); right after `install.py user add alice` (it runs `sacctmgr add user alice Account=gpujobs
-   DefaultAccount=gpujobs Cluster=harness`) `sbatch` says "Invalid account or account/partition combination specified",
-   `scontrol show assoc_mgr users=alice flags=users` shows `DefAccount=(null)` while `sacctmgr show user` says `gpujobs`, and
-   slurmctld logs "User alice doesn't have a default account". Adding a brand-new user later, `systemctl restart slurmctld` and
-   `scontrol reconfigure` each heal it. A user who was new to accounting (dave, erin) was never affected. Fix options: leave an
-   existing user's default account alone, or make slurmctld reload after the change.
-2. **With a lease in the site, only the keeper's own user can submit.** Check "OPEN (design): with a lease in the site, a user
-   other than the keeper's can submit ...". `submit.keeper_running()` runs `systemctl --user is-active slurm-gpu-lease-keeper`
-   as the submitter; bob has no such user unit: "Failed to connect to bus", then "REFUSED: the lease keeper
-   (slurm-gpu-lease-keeper) is not running", while `systemctl --user --machine=dave@.host is-active` says `active`. `urgent.py`
-   behaves the same on a site with a lease. Fix options: read the keeper's heartbeat file instead, or ask the keeper user's systemd.
+1. **`user add` / `admin add` of a user slurm accounting already knew left slurmctld refusing that user's jobs.** Right after
+   `install.py user add alice` (then `sacctmgr add user alice Account=gpujobs DefaultAccount=gpujobs Cluster=harness`), `sbatch`
+   said "Invalid account or account/partition combination specified", `scontrol show assoc_mgr users=alice flags=users` showed
+   `DefAccount=(null)` while `sacctmgr show user` said `gpujobs`, and slurmctld logged "User alice doesn't have a default
+   account"; restarting slurmctld or `scontrol reconfigure` healed it. Users new to accounting were never affected. Fixed: a user
+   accounting already knows is added to the account without `DefaultAccount`, so their default stays; the checks "right after
+   user add / admin add ..." and "a user accounting already knew keeps their default account" cover it, and the harness no longer
+   restarts slurmctld after the adds.
+2. **With a lease in the site, only the keeper's own user could submit.** `submit.keeper_running()` ran `systemctl --user
+   is-active slurm-gpu-lease-keeper` as the submitter, whose systemd has no such unit ("Failed to connect to bus"); `urgent.py`
+   the same. The real keeper would also have failed to write its state into the root-owned state directory (this harness runs a
+   stand-in keeper, so it never showed). Fixed: the lease component makes `state_dir/keeper/` the keeper user's, the keeper
+   writes `keeper/keeper.json` there, and `keeper_running()` reads that heartbeat (fresh = under 60 s). The stand-in now writes
+   the heartbeat too; the checks "the keeper writes its heartbeat as its own user ..." and "a user other than the keeper's can
+   submit ..." cover it.
 
 ### Product fixes made by this task (separate commits)
 
@@ -171,7 +173,7 @@ design choice. Whether a browser then renders the panels inside the portal was *
 
 ### Checks shown to fail
 
-Besides the two open bugs, a patched copy of `e2e.py` was run once with one deliberate change per check, each of which should turn
+A patched copy of `e2e.py` was run once with one deliberate change per check, each of which should turn
 exactly its own check red: S1 expected reason "Priority"; S2 expected `gres/gpu=3`; S4 expected the pause to succeed; S5 expected
 "paused by dave" and an event actor `dave`; S6 expected urgent to succeed; S3 expected the later job to have the higher priority;
 S7 with the agent stopped; S8 with a job that exits 0; S9 started without the agent; S10 expected different process ids; the

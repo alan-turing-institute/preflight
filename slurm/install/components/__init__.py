@@ -67,7 +67,9 @@ def accounting_adds(site: Site, user: str | None = None) -> list[list[str]]:
     """The `sacctmgr add`s for what slurm's accounting lacks of the site's cluster, its account and (given) the user.
 
     `AccountingStorageEnforce=associations` admits only users with an association to an account, and `add` of a
-    record that exists exits 1 (measured, 23.11.4), so each is looked up first.
+    record that exists exits 1 (measured, 23.11.4), so each is looked up first. A user accounting already knows keeps
+    their default account: changing it left slurmctld refusing their jobs ("Invalid account") until it reloaded its
+    accounting (container cluster, F1), and silently moving an existing user's default is not ours to do.
     """
     cluster, account = site.cluster_name, site.account
     adds = []
@@ -77,8 +79,8 @@ def accounting_adds(site: Site, user: str | None = None) -> list[list[str]]:
         adds.append(["sacctmgr", "-i", "add", "account", account, f"Cluster={cluster}",
                      f"Description={account}", f"Organization={account}"])
     if user and _lacks("assoc", "where", f"cluster={cluster}", f"account={account}", f"user={user}", "format=user"):
-        adds.append(["sacctmgr", "-i", "add", "user", user, f"Account={account}", f"DefaultAccount={account}",
-                     f"Cluster={cluster}"])
+        default = [f"DefaultAccount={account}"] if _lacks("user", "where", f"name={user}", "format=user") else []
+        adds.append(["sacctmgr", "-i", "add", "user", user, f"Account={account}", *default, f"Cluster={cluster}"])
     return adds
 
 
