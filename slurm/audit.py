@@ -3,13 +3,18 @@
 
 Design 3.10. A GPU compute process is ACCOUNTED FOR when its cgroup is a slurm job's (`job_<id>` in
 its path), or it shares the systemd unit cgroup of a live lease's pid, or it descends from that pid
-(a lease names the OWNER process, a service's or a queue's, not the GPU process itself). Anything else
-is printed as unregistered. Prints only; the in-job occupancy check is what blocks a launch.
+(a lease names the OWNER process, a service's or a queue's, not the GPU process itself), or it runs in
+a docker container labelled `gpu-lease-project=<project>` while that project holds a live lease (a
+container's processes descend from containerd, not from the lease owner). Anything else is printed as
+unregistered. Prints only; the in-job occupancy check is what blocks a launch.
 """
 
 from __future__ import annotations
 
+import re
+import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -60,8 +65,24 @@ def command_of(pid: int, proc: Path = Path("/proc")) -> str:
         return "?"
 
 
+DOCKER_SCOPE = re.compile(r"/docker-([0-9a-f]{64})\.scope$")
+
+
+def container_lease_project(container_id: str) -> str:
+    result = subprocess.run(
+        ["docker", "inspect", "-f", '{{index .Config.Labels "gpu-lease-project"}}', container_id],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
 def unregistered(
-    usage: dict[int, float] | None = None, lease_dir: Path | None = None, proc: Path = Path("/proc")
+    usage: dict[int, float] | None = None,
+    lease_dir: Path | None = None,
+    proc: Path = Path("/proc"),
+    label_of: Callable[[str], str] = container_lease_project,
 ) -> list[tuple[int, float, str]]:
     usage = gpu_mib_by_pid() if usage is None else usage
     leases = lease_pids(lease_dir or gpu_jobs.LEASE_DIR)
@@ -70,6 +91,9 @@ def unregistered(
     for pid, mib in sorted(usage.items()):
         cgroup = cgroup_of(pid, proc)
         if "/job_" in cgroup or cgroup in lease_cgroups or any(descends_from(pid, owner, proc) for owner in leases):
+            continue
+        container = DOCKER_SCOPE.search(cgroup)
+        if container and label_of(container[1]) in leases.values():
             continue
         found.append((pid, mib, command_of(pid, proc)))
     return found
