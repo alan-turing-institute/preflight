@@ -1,0 +1,13 @@
+[Unit]
+Description=Harness: create the slurm cluster, account and users in the accounting database
+After=slurmdbd.service
+Requires=slurmdbd.service
+Before=slurmctld.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/libexec/gpujobs-harness/accounts-init.sh
+
+[Install]
+WantedBy=multi-user.target
