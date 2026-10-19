@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 
 import job_wrapper
+import pytest
 
 WRAPPER = Path(job_wrapper.__file__)
 
@@ -172,9 +173,10 @@ def test_an_unverifiable_manifest_refuses_the_launch(tmp_path: Path) -> None:
     manifest.write_text("{}")  # empty: the parity checker refuses it, as it refuses a changed file
     done = subprocess.run(
         [sys.executable, str(WRAPPER), "--manifest", str(manifest), "--repo", str(tmp_path), "--", "true"],
-        env=env, check=False,
+        env=env, check=False, capture_output=True, text=True,
     )
     assert done.returncode == job_wrapper.Exit.CODE_CHANGED
+    assert "records no files" in done.stderr  # the checker ran and refused; a checker that could not run says otherwise
 
 
 def test_bookkeeping_that_cannot_be_written_never_fails_the_job(tmp_path: Path) -> None:
@@ -189,3 +191,23 @@ def test_bookkeeping_that_cannot_be_written_never_fails_the_job(tmp_path: Path) 
     )
     assert done.returncode == 3  # the command's own status
     assert all(f"warning: {what} not recorded" in done.stderr for what in ("footprint", "metrics", "sidecar"))
+
+
+@pytest.mark.parametrize(("lease", "code", "refused"), [(False, 0, False), (True, job_wrapper.Exit.CARD_NOT_READY, True)])
+def test_a_lease_less_site_never_waits_for_a_keeper_that_does_not_exist(
+    tmp_path: Path, lease: bool, code: int, refused: bool
+) -> None:
+    leases = tmp_path / "leases"
+    leases.mkdir()
+    (tmp_path / "site.toml").write_text(
+        SITE % "off" + (f'[lease]\nlease_dir = "{leases}"\nkeeper_user = "k"\npython = "{sys.executable}"\n' if lease else "")
+    )
+    env = dict(os.environ, SLURM_GPU_STATE_DIR=str(tmp_path / "state"), SLURM_JOB_ID="80",
+               GPUJOBS_SITE=str(tmp_path / "site.toml"), GPU_LEASE_DIR=str(leases))
+    done = subprocess.run(
+        [sys.executable, str(WRAPPER), "--needs-lease", "--wait-limit", "0", "--poll", "0.1", "--", "true"],
+        env=env, check=False, capture_output=True, text=True,
+    )
+    assert done.returncode == code, done.stderr
+    record = json.loads((tmp_path / "state" / "jobs" / "80.json").read_text())
+    assert ("refused" in record["last_leg"]) is refused
