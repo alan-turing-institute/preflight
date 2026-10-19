@@ -81,9 +81,9 @@ class World:
     def step(self) -> dict[str, object]:
         return self.agent.step()
 
-    def request(self, victims: dict[str, bool], held: list[str]) -> Path:
+    def request(self, urgent: str, victims: list[str], held: list[str]) -> Path:
         path = self.dir / "requests" / "restore_order-1.json"
-        gpu_jobs.write_json(path, {"victims": victims, "held": held})
+        gpu_jobs.write_json(path, {"urgent": urgent, "victims": victims, "held": held})
         return path
 
 
@@ -170,7 +170,7 @@ def test_a_silent_squeue_keeps_the_state_and_acts_on_nothing(world: World) -> No
     world.step()
     saved = (world.dir / "agent" / "state.json").read_text()
     world.queue = None
-    world.request({"1": True}, ["7"])
+    world.request("9", ["1"], ["7"])
     world.admins = {gpu_jobs._owner(world.dir / "requests" / "restore_order-1.json")}
     beat = world.step()
     assert "squeue did not answer" in str(beat["last_error"])
@@ -178,36 +178,41 @@ def test_a_silent_squeue_keeps_the_state_and_acts_on_nothing(world: World) -> No
     assert [w for w in world.writes if w[0] == "release"] == []
 
 
-def test_restore_order_ignores_a_non_admin_then_releases_for_an_admin_once_the_victim_runs_again(
+def test_restore_order_ignores_a_non_admin_then_releases_for_an_admin_once_the_urgent_job_ended_and_victims_run(
     world: World,
 ) -> None:
-    path = world.request({"1": False}, ["7"])
-    world.queue = [job("1")]
-    world.step()
+    # Victim 1 is pre-empted; victim 2 is one slurm did not need and never stops; urgent job 9.
+    path = world.request("9", ["1", "2"], ["7"])
     world.admins = set()
-    world.queue = [
-        job("1", "PENDING", "BeginTime")
-    ]  # paused, but the request is not an admin's
-    world.step()
-    world.queue = [job("1")]
-    world.step()
+    world.queue = [job("1"), job("2")]
+    world.step()  # not an admin's request: ignored whatever the queue says
     assert world.writes == [] and path.exists()
     world.admins = {gpu_jobs._owner(path)}
-    world.queue = [job("1")]
-    world.step()  # running, never seen paused since the admin took over
+    world.queue = [job("9", "PENDING", "Resources"), job("1"), job("2")]
+    world.step()  # every victim still runs: the pre-emption has not happened yet
     assert world.writes == []
-    world.queue = [job("1", "PENDING", "BeginTime")]
-    world.step()
+    world.queue = [job("9"), job("1", "PENDING", "BeginTime"), job("2")]
+    world.step()  # the urgent job runs, the victim is requeued
+    world.queue = [job("1", "PENDING", "BeginTime"), job("2")]
+    world.step()  # the urgent job ended, the victim has not started again yet
     assert world.writes == []
-    world.queue = [job("1")]
-    world.step()
+    world.queue = [job("1"), job("2")]
+    world.step()  # victim 2 never stopped, and still does not keep job 7 held
     assert world.writes == [["release", "7"]] and not path.exists()
+    path = world.request("10", ["3"], ["8"])
+    world.queue = [job("3", "PENDING", "JobHeldAdmin", 0)]
+    world.step()  # a held victim will not start by itself: it must not keep job 8 held forever
+    assert world.writes[-1] == ["release", "8"]
+    gpu_jobs.write_json(path, {"victims": ["3"], "held": ["8"]})
+    world.writes.clear()
+    world.step()  # a request naming no urgent job is ignored
+    assert world.writes == []
 
 
 def test_restore_order_releases_once_when_the_victim_left_and_the_file_cannot_be_deleted(
     world: World, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    path = world.request({"1": False}, ["7", "8"])
+    path = world.request("9", ["1"], ["7", "8"])
     world.admins = {gpu_jobs._owner(path)}
     monkeypatch.setattr(
         gpu_jobs, "remove_quietly", lambda _path: None

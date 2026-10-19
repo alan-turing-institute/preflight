@@ -11,9 +11,11 @@ Plan 3.5 (`plan notes`). One system service, run as SlurmUser
 2. A RELEASED JOB KEEPS ITS PLACE: the priority of each pending or running job is recorded. A job the agent saw
    held that is later pending and not held at a lower priority gets its recorded priority back. A job the agent
    never saw held is never touched, so an admin's deliberate change stays.
-3. RESTORE ORDER after urgent work: `requests/restore_order-*.json` written by an admin lists the held jobs to
-   release (`held`) and the pre-empted jobs (`victims`); they are released once every victim has been seen out of
-   the running state and is running again, or has left the queue. A file owned by a non-admin is ignored.
+3. RESTORE ORDER after urgent work: `requests/restore_order-*.json` written by an admin names the urgent job
+   (`urgent`), the jobs it may pre-empt (`victims`) and the jobs held meanwhile (`held`). The held jobs are released
+   once the urgent job has left the queue and every victim is running, gone or held (a pre-empted victim can run
+   again only after the urgent job; one slurm did not pre-empt never stopped). A file owned by a non-admin, or
+   naming no urgent job, is ignored.
 4. FAILURE NOTICES for jobs that ended FAILED, OUT_OF_MEMORY, TIMEOUT or NODE_FAIL: a `FAILED` event, and the
    site's `notify_command` if any (argv, no shell, 30 s).
 5. HEARTBEAT `agent/agent.json`. When `squeue` does not answer, the queue-dependent parts are skipped and the
@@ -137,9 +139,6 @@ class State:
     ended_seen: list[str] | None = (
         None  # None until the first look: the log's history is not news
     )
-    paused_victims: dict[str, list[str]] = field(
-        default_factory=dict
-    )  # request file -> victims seen not running
     released_requests: list[str] = field(
         default_factory=list
     )  # "<file>:<mtime_ns>" released but not deletable
@@ -152,6 +151,9 @@ def _by_id(job_id: str) -> tuple[int, str]:
 
 #: Ended jobs are asked of slurm's accounting (sacct, through slurmdbd) at most this often, not every loop.
 NOTICES_EVERY_S = 30.0
+#: Failure notices sent per look; the rest wait for the next, so a burst and a slow notify command (30 s each) can
+#: never stall the loop (priority restore, restore order) for long.
+NOTICES_PER_LOOK = 3
 
 
 def _strings(value: object) -> list[str]:
@@ -193,16 +195,12 @@ class Agent:
         saved = gpu_jobs.read_json(self.dir / "state.json") or {}
         raw_priorities = saved.get("priorities")
         ended = saved.get("ended_seen")
-        raw_paused = saved.get("paused_victims")
         self.state = State(
             priorities={str(k): int(v) for k, v in raw_priorities.items()}
             if isinstance(raw_priorities, dict)
             else {},
             seen_held=_strings(saved.get("seen_held")),
             ended_seen=_strings(ended) if isinstance(ended, list) else None,
-            paused_victims={str(k): _strings(v) for k, v in raw_paused.items()}
-            if isinstance(raw_paused, dict)
-            else {},
             released_requests=_strings(saved.get("released_requests")),
         )
         beat = gpu_jobs.read_json(self.dir / "agent.json") or {}
@@ -248,7 +246,6 @@ class Agent:
                 "priorities": s.priorities,
                 "seen_held": s.seen_held,
                 "ended_seen": s.ended_seen,
-                "paused_victims": s.paused_victims,
                 "released_requests": s.released_requests,
             },
         )
@@ -393,17 +390,18 @@ class Agent:
             order = gpu_jobs.read_json(path)
             if not order or key in s.released_requests:
                 continue
-            raw = order.get("victims")
-            victims = list(raw) if isinstance(raw, dict) else []
-            # A victim must first be SEEN not running: the file is written while it still runs, so without
-            # that the first look would release the held jobs before the pre-emption had even happened.
-            paused = set(s.paused_victims.get(path.name, [])) | {
-                v for v in victims if raw[v] is True
-            }
-            paused |= {v for v in victims if v not in jobs or not jobs[v].active}
-            s.paused_victims[path.name] = sorted(paused, key=_by_id)
-            if not all(
-                v in paused and (v not in jobs or jobs[v].active) for v in victims
+            urgent = str(order.get("urgent", ""))
+            if not _JOB_ID.fullmatch(urgent):
+                if path.name not in self._ignored:
+                    self._ignored.add(path.name)
+                    print(f"[agent] ignoring {path}: it names no urgent job", file=sys.stderr, flush=True)
+                continue
+            victims = [v for v in _strings(order.get("victims")) if _JOB_ID.fullmatch(v)]
+            # A pre-empted victim is requeued and can run again only once the urgent job's resources are free; a
+            # victim slurm did not pre-empt never stopped. So: the urgent job gone, then each victim running, gone,
+            # or held (a held one does not start by itself, and must not keep the waiting jobs held forever).
+            if urgent in jobs or any(
+                v in jobs and not (jobs[v].active or jobs[v].held) for v in victims
             ):
                 continue
             held = [
@@ -421,14 +419,8 @@ class Agent:
                 continue
             print(f"[agent] released {held}: the pre-empted jobs run again", flush=True)
             s.released_requests.append(key)
-            s.paused_victims.pop(path.name, None)
             gpu_jobs.remove_quietly(path)
         s.released_requests = [key for key in s.released_requests if key in present]
-        s.paused_victims = {
-            name: v
-            for name, v in s.paused_victims.items()
-            if (self.requests / name).exists()
-        }
 
     # -- 4. failure notices ---------------------------------------------------------------------------------
 
@@ -450,7 +442,7 @@ class Agent:
             return
         # A job requeued after it ended (its latest record is a pending leg) may end again, and be news again.
         known = set(s.ended_seen) & set(ended) | (set(s.ended_seen) - set(records))
-        for job_id in sorted(set(ended) - known, key=_by_id):
+        for job_id in sorted(set(ended) - known, key=_by_id)[:NOTICES_PER_LOOK]:
             fields = ended[job_id]
             state = fields.get("JobState", "")
             if state in set(EndedBadly):

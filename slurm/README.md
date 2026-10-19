@@ -261,6 +261,8 @@ read-only access and embedding turned on when the portal is on; the first admin 
 from our job wrapper is written as node-exporter textfiles in `state_dir/metrics/`. With the portal on, the
 helper app is installed at `/var/www/ood/apps/sys/ood-jobstats-helper`.
 
+The three exporters listen on all interfaces without authentication, because Prometheus scrapes them by node name (on a site with several nodes, over the network). They expose job ids, user names, projects and per-job use, so allow ports 9101, 9306 and 9445 only from the Prometheus host (a firewall rule); with `mode = "local"` on one node, nothing outside the node needs them.
+
 **`portal`** (when `portal.mode` is `install` or `existing`). With `install`: Open OnDemand 4.2 and its NodeSource
 and OnDemand apt repositories, `python-is-python3`, plus `ondemand-dex` (Dex modes), `libapache2-mod-auth-openidc`
 (`oidc`) and `openssl` (self-signed certificate); the Apache modules `ssl` and `auth_openidc`; `/etc/ood/config/ood_portal.yml`

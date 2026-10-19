@@ -225,11 +225,6 @@ def run(argv: list[str]) -> int:
     ]
     if victims and held:
         subprocess.run(["scontrol", "hold", ",".join(held)], check=True)
-        requests = gpu_jobs.STATE_DIR / "requests"
-        requests.mkdir(parents=True, exist_ok=True)
-        gpu_jobs.write_json(
-            requests / f"restore_order-{time.time_ns()}.json", {"victims": {v: False for v in victims}, "held": held}
-        )
         for job_id in held:
             gpu_jobs.write_event(job_id, gpu_jobs.EventAction.URGENT_HOLD, urgent=f"{arguments.name}: {arguments.what}")
         print(f"[urgent] held {held} until the pre-empted jobs {victims} run again")
@@ -244,6 +239,12 @@ def run(argv: list[str]) -> int:
             subprocess.run(["scontrol", "release", ",".join(held)], check=False)
         return 1
     job_id = done.stdout.strip().split(";")[0]
+    if victims and held:  # written only now: a refused submission leaves no request to release jobs later
+        requests = gpu_jobs.STATE_DIR / "requests"
+        requests.mkdir(parents=True, exist_ok=True)
+        gpu_jobs.write_json(
+            requests / f"restore_order-{time.time_ns()}.json", {"urgent": job_id, "victims": victims, "held": held}
+        )
     gpu_jobs.update_sidecar(
         job_id, project=arguments.project, what=arguments.what, job_class="urgent", name=arguments.name,
         gpu=arguments.gpu, gpus=arguments.gpus, mem=mem, command=arguments.command, log=str(log), script=str(path), after=[],

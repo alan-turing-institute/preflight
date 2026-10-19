@@ -115,7 +115,7 @@ def test_site_admin_check_multi_gpu_plan_and_request_file(
     assert "--gres=gpu:2" in out
     assert urgent.run([*argv, "--", "true"]) == 0
     request = next((tmp_path / "requests").glob("restore_order-*.json"))
-    assert json.loads(request.read_text()) == {"victims": {"5": False}, "held": ["6"]}
+    assert json.loads(request.read_text()) == {"urgent": "9", "victims": ["5"], "held": ["6"]}
     assert [e.action for e in gpu_jobs.events("6")] == ["urgent_hold"]
 
     # the keeper is required only where the site has a lease (end-to-end on a lease-less site: urgent always refused)
