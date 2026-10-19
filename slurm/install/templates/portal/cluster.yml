@@ -1,0 +1,10 @@
+---
+# Rendered from the site file by slurm/install/components/portal.py. Do not edit by hand.
+v2:
+  metadata:
+    title: ${title}
+  job:
+    adapter: "slurm"
+    bin: "/usr/bin"
+    conf: "/etc/slurm/slurm.conf"
+${custom_block}
