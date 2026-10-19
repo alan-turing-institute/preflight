@@ -6,7 +6,7 @@ ssl:
 ${ssl_lines}
 security_strict_transport: ${hsts}
 oidc_crypto_passphrase: ${passphrase}
-auth:
+${session_lines}auth:
   - "AuthType openid-connect"
   - "Require valid-user"
 ${auth_block}

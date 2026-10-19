@@ -181,6 +181,8 @@ TOML. Tables: the top level, `[[nodes]]` with `[[nodes.gpus]]`, `[lease]` with `
 | `server_name` | `""` | Host name or IP address the portal answers to. Required when `mode = "install"`. |
 | `tls_cert` | `""` | Path to the certificate. Empty (with `tls_key` empty) makes the installer generate a self-signed pair. Set both or neither. |
 | `tls_key` | `""` | Path to its key. |
+| `session_days` | `0` | How long one sign-in lasts. `0` keeps Open OnDemand's own 8-hour browser session; a number of days keeps the session in an encrypted cookie (`client-cookie:persistent`, encrypted with the cookie passphrase) that survives browser restarts and reboots, so a person signs in once per browser for that long. |
+| `allow_from` | `[]` | IP networks that may reach the portal (Apache and Dex); empty: any network. systemd drops every other packet in both directions, so include the portal's own address (Apache fetches the login metadata from `server_name`) and, with `dex-ldap`, the LDAP server's. |
 | `auth_settings` | `{}` | `[portal.auth_settings]`: string keys and values for the chosen `auth`, below. Any key not listed for the mode is refused. |
 
 Every `*_file` setting names a **root-only file** (mode 0600, no group or other access); secrets never go in the

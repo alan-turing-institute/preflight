@@ -22,6 +22,7 @@ from pathlib import Path
 from string import Template
 from typing import TYPE_CHECKING, Any
 
+import render
 from render import FILE_MODE, SECRET_MODE, TEMPLATES, FileSpec
 from site_config import AuthMode, MetricsMode, PortalMode
 
@@ -348,6 +349,18 @@ def _server_name(site: Site, problems: list[str]) -> str:
     return name
 
 
+def _session_lines(site: Site) -> str:
+    """One sign-in for `session_days`: mod_auth_openidc keeps the session in an encrypted cookie that survives browser
+    restarts (`:persistent`, its expiry is the inactivity timeout), not in Apache's shared memory, which a restart or
+    reboot empties (auth_openidc.conf, OIDCSessionType and OIDCCacheType). The cookie is encrypted with the
+    site's stable crypto passphrase. 0 keeps OOD's own 8-hour browser session (ood_portal_example.yml)."""
+    if not site.portal.session_days:
+        return ""
+    seconds = site.portal.session_days * 86400
+    return (f"oidc_session_inactivity_timeout: {seconds}\noidc_session_max_duration: {seconds}\n"
+            'oidc_settings:\n  OIDCSessionType: "client-cookie:persistent"\n')
+
+
 def _build_portal_yml(site: Site) -> tuple[str, list[str]]:
     """The ood_portal.yml text and every reason it cannot be applied."""
     problems: list[str] = []
@@ -363,6 +376,7 @@ def _build_portal_yml(site: Site) -> tuple[str, list[str]]:
         ssl_lines="\n".join(_yaml([f'SSLCertificateFile "{cert}"', f'SSLCertificateKeyFile "{key}"'], 2)),
         hsts="false" if _self_signed(site) else "true",
         passphrase=_quote(passphrase or ""),
+        session_lines=_session_lines(site),
         auth_block="\n".join(auth_lines),
     )
     return text, problems
@@ -422,6 +436,11 @@ def files(site: Site) -> dict[str, FileSpec]:
         text, problems = _build_portal_yml(site)
         if not problems:  # never write a config that is missing a secret, whatever the caller checked
             out[PORTAL_YML] = FileSpec(text, SECRET_MODE, "root")
+        if filtered := render.ip_filter_lines(site.portal.allow_from):
+            # Apache serves the portal; Dex (behind it) also has a metrics port on every address.
+            dropin = f"# Rendered from the site file by slurm/install/components/portal.py: [portal] allow_from.\n[Service]\n{filtered}"
+            for unit in ["apache2", *(["ondemand-dex"] if _dex(site) else [])]:
+                out[f"/etc/systemd/system/{unit}.service.d/10-gpujobs.conf"] = FileSpec(dropin, FILE_MODE, "root")
     return out
 
 
@@ -481,6 +500,7 @@ def post_install(site: Site) -> list[list[str]]:
     # local-users mode, and `files`/`refusals` have already guaranteed the default account is not in the list.
     update = [UPDATE_OOD_PORTAL, "--force"]
     steps.append([*update, "--insecure"] if site.portal.auth is AuthMode.DEX_LOCAL else update)
+    steps.append(["systemctl", "daemon-reload"])  # the allow_from drop-ins
     if _dex(site):
         steps += [["systemctl", "enable", "ondemand-dex"], ["systemctl", "restart", "ondemand-dex"]]
     steps += [["systemctl", "enable", "apache2"], ["systemctl", "restart", "apache2"], link]

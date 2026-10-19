@@ -299,12 +299,9 @@ def _anonymous_lines(site: Site) -> str:
 
 def _ip_filter_lines(site: Site) -> str:
     # Grafana and the exporters answer on every address and have no login of their own (Grafana's is off for the
-    # portal's embedded panels), so a site can name the networks that may reach them: systemd drops every other
-    # packet of the service (`man systemd.resource-control`, IPAddressAllow=; checked first, then IPAddressDeny=).
-    # localhost always stays: Prometheus scrapes the exporters and Grafana reads Prometheus over 127.0.0.1.
-    if not site.metrics.allow_from:
-        return ""
-    return f"IPAddressDeny=any\nIPAddressAllow=localhost {' '.join(site.metrics.allow_from)}\n"
+    # portal's embedded panels), so a site can name the networks that may reach them. localhost always stays:
+    # Prometheus scrapes the exporters and Grafana reads Prometheus over 127.0.0.1.
+    return render.ip_filter_lines(site.metrics.allow_from)
 
 
 def files(site: Site) -> dict[str, render.FileSpec]:

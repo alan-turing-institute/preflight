@@ -40,6 +40,8 @@ def test_this_box_site_file_loads() -> None:
     assert (site.metrics.mode, site.metrics.grafana_port) == (gpujobs_site.MetricsMode.LOCAL, 3001)
     assert site.metrics.allow_from == ("100.64.0.0/10", "fd7a:115c:a1e0::/48")  # Tailscale only (owner, 2026-10-19)
     assert (site.portal.mode, site.portal.auth) == (gpujobs_site.PortalMode.INSTALL, gpujobs_site.AuthMode.DEX_LOCAL)
+    assert (site.portal.server_name, site.portal.session_days) == ("gpu-box.tailnet-example.ts.net", 365)  # its Tailscale name
+    assert site.portal.allow_from == site.metrics.allow_from  # Tailscale only, as Grafana
     assert site.portal.tls_cert is None and site.notify_command == ()
 
 
@@ -68,6 +70,8 @@ def test_example_loads_and_minimal_file_gets_every_default(tmp_path: Path) -> No
         (MINIMAL + "[metrics]\nmode = 'sideways'\n", "metrics.mode"),
         (MINIMAL + "[metrics]\nallow_from = ['tailnet']\n", "metrics.allow_from entry 'tailnet' is not an IP network"),
         (MINIMAL + "[metrics]\nallow_from = '100.64.0.0/10'\n", "metrics.allow_from must be a list"),
+        (MINIMAL + "[portal]\nsession_days = -1\n", "portal.session_days = -1"),
+        (MINIMAL + "[portal]\nallow_from = ['ts']\n", "portal.allow_from entry 'ts'"),
         ('name = "x"\n', "missing nodes"),
     ],
 )

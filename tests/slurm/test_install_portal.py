@@ -41,7 +41,8 @@ def secret_file(tmp_path: Path, name: str, text: str, mode: int = 0o600) -> str:
     return str(path)
 
 
-def make_site(tmp_path: Path, mode: str = "install", auth: str = "dex-local", tls: bool = True, **settings: str):
+def make_site(tmp_path: Path, mode: str = "install", auth: str = "dex-local", tls: bool = True,
+              portal_extra: dict | None = None, **settings: str):
     """A site whose secret files exist (root-only) unless a setting overrides the path."""
     defaults = {"crypto_passphrase_file": secret_file(tmp_path, "pass", "p" * 32)}
     if auth == "dex-local":
@@ -55,6 +56,7 @@ def make_site(tmp_path: Path, mode: str = "install", auth: str = "dex-local", tl
     else:
         defaults |= {"host": "ldap.example.org:636", "user_base_dn": "ou=People,dc=example,dc=org"}
     portal_table = {"mode": mode, "auth": auth, "server_name": "ood.example.org", "auth_settings": defaults | settings}
+    portal_table |= portal_extra or {}
     if tls:
         portal_table |= {
             "tls_cert": secret_file(tmp_path, "c.pem", "x"),
@@ -87,6 +89,16 @@ def test_dex_local_renders_users_and_runs_update_with_insecure(tmp_path):
     update = next(c for c in portal.post_install(site) if c[0] == portal.UPDATE_OOD_PORTAL)
     assert update == [portal.UPDATE_OOD_PORTAL, "--force", "--insecure"]
     assert ["systemctl", "restart", "ondemand-dex"] in portal.post_install(site)
+    assert "oidc_session" not in spec_.content and not any(".service.d/" in f for f in portal.files(site))  # defaults
+    # one sign-in for a year, in an encrypted cookie that outlives Apache restarts; only the listed networks get in
+    long = make_site(tmp_path, portal_extra={"session_days": 365, "allow_from": ["100.64.0.0/10"]})
+    text = portal.files(long)[portal.PORTAL_YML].content
+    assert "oidc_session_max_duration: 31536000" in text and 'OIDCSessionType: "client-cookie:persistent"' in text
+    for unit in ("apache2", "ondemand-dex"):
+        dropin = portal.files(long)[f"/etc/systemd/system/{unit}.service.d/10-gpujobs.conf"].content
+        assert "IPAddressDeny=any\nIPAddressAllow=localhost 100.64.0.0/10\n" in dropin
+    steps = portal.post_install(long)
+    assert steps.index(["systemctl", "daemon-reload"]) < steps.index(["systemctl", "restart", "apache2"])
 
 
 def test_dex_ldap_renders_connector_and_never_uses_insecure(tmp_path):

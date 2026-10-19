@@ -64,6 +64,8 @@ auth = "dex-local"      # oidc, dex-ldap or dex-local. Default: dex-local
 server_name = ""        # host name the portal answers to; required when mode = "install". Default: empty
 tls_cert = ""           # path to the certificate; empty means none. Default: empty
 tls_key = ""            # path to its key; empty means none. Default: empty
+session_days = 0        # how long one sign-in lasts, across browser restarts and reboots; 0 = OOD's 8 hours. Default: 0
+allow_from = []         # networks that may reach the portal (include the portal's own address). Default: empty (any)
 
 # Extra settings for the chosen auth mode, as string keys and values. Default: none
 [portal.auth_settings]

@@ -34,6 +34,17 @@ class FileSpec:
     owner: str
 
 
+def ip_filter_lines(networks: tuple[str, ...]) -> str:
+    """systemd lines that drop every packet of a service except to and from localhost and `networks` (empty: none).
+
+    `man systemd.resource-control`, IPAddressAllow=: the allow list is checked first, then IPAddressDeny=. It filters
+    both directions, so a service that connects out (Apache to its own server name) needs that address listed too.
+    """
+    if not networks:
+        return ""
+    return f"IPAddressDeny=any\nIPAddressAllow=localhost {' '.join(networks)}\n"
+
+
 def _template(component: str, name: str) -> Template:
     return Template((TEMPLATES / component / name).read_text())
 

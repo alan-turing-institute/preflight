@@ -84,6 +84,8 @@ class Portal:
     tls_cert: Path | None
     tls_key: Path | None
     auth_settings: dict[str, str]
+    session_days: int = 0  # how long one sign-in lasts, across browser restarts and reboots; 0 = OOD's 8 hours
+    allow_from: tuple[str, ...] = ()  # networks that may reach the portal; empty = any
 
 
 @dataclass(frozen=True)
@@ -197,8 +199,12 @@ def parse(raw: dict[str, Any]) -> Site:
             "tls_cert": "",
             "tls_key": "",
             "auth_settings": {},
+            "session_days": 0,
+            "allow_from": [],
         },
     )
+    if not isinstance(p["session_days"], int) or isinstance(p["session_days"], bool) or p["session_days"] < 0:
+        raise SiteError(f"site file: portal.session_days = {p['session_days']!r}; expected a whole number of days, 0 or more")
     return Site(
         name=top["name"],
         cluster_name=top["cluster_name"] or top["name"],
@@ -226,6 +232,8 @@ def parse(raw: dict[str, Any]) -> Site:
             _opt_path(p["tls_cert"]),
             _opt_path(p["tls_key"]),
             dict(p["auth_settings"]),
+            p["session_days"],
+            _networks(p["allow_from"], "portal.allow_from"),
         ),
         notify_command=tuple(top["notify_command"]),
     )
