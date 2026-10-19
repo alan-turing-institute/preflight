@@ -316,7 +316,7 @@ def files(site: Site) -> dict[str, render.FileSpec]:
         str(TARGETS_FILE): _spec(_targets(site)),
         str(JOBSTATS_DIR / "config.py"): _spec(
             _template(
-                "jobstats_config.py",
+                "jobstats_config.py.in",
                 site_name=site.name,
                 prometheus_server=_prometheus_server(site),
                 retention_days=site.metrics.retention_days,
