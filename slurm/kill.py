@@ -16,7 +16,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import gpu_jobs  # noqa: E402 - path set just above
-from pause import run_slurm  # noqa: E402
 
 
 def main() -> int:
@@ -24,7 +23,7 @@ def main() -> int:
     parser.add_argument("job_id")
     parser.add_argument("--reason", default="", help="why, recorded with the event")
     arguments = parser.parse_args()
-    status = run_slurm(["scancel", arguments.job_id])
+    status = gpu_jobs.run_slurm(["scancel", arguments.job_id])
     if status == 0:
         gpu_jobs.write_event(arguments.job_id, gpu_jobs.EventAction.KILL, reason=arguments.reason)
         print(f"[kill] {arguments.job_id} cancelled")

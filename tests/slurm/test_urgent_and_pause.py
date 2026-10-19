@@ -135,7 +135,7 @@ class FakeSlurm:
     def __init__(self, monkeypatch: pytest.MonkeyPatch, returncode: int = 0) -> None:
         self.calls: list[list[str]] = []
         self.returncode = returncode
-        monkeypatch.setattr(pause.subprocess, "run", self)
+        monkeypatch.setattr(gpu_jobs.subprocess, "run", self)
 
     def __call__(self, command: list[str], **_kwargs: object) -> object:
         self.calls.append(command)

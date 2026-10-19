@@ -323,12 +323,12 @@ def files(site: Site) -> dict[str, render.FileSpec]:
         "/etc/systemd/system/gpujobs-cgroup-exporter.service": _spec(
             _template("gpujobs-cgroup-exporter.service", **unit_values)
         ),
-        str(BIN_DIR / "run-cgroup-exporter"): _spec((TEMPLATES / "run-cgroup-exporter.sh").read_text(), 0o755),
-        str(SLURMCTLD_EPILOG): _spec((TEMPLATES / "slurmctld-epilog.sh").read_text(), 0o755),
+        str(BIN_DIR / "run-cgroup-exporter"): _spec((TEMPLATES / "run-cgroup-exporter.sh").read_text(), render.EXEC_MODE),
+        str(SLURMCTLD_EPILOG): _spec((TEMPLATES / "slurmctld-epilog.sh").read_text(), render.EXEC_MODE),
     }
     if _has_gpus(site):
-        out[str(PROLOG_DIR / "gpustats_helper.sh")] = _spec((TEMPLATES / "gpustat-prolog.sh").read_text(), 0o755)
-        out[str(EPILOG_DIR / "gpustats_helper.sh")] = _spec((TEMPLATES / "gpustat-epilog.sh").read_text(), 0o755)
+        out[str(PROLOG_DIR / "gpustats_helper.sh")] = _spec((TEMPLATES / "gpustat-prolog.sh").read_text(), render.EXEC_MODE)
+        out[str(EPILOG_DIR / "gpustats_helper.sh")] = _spec((TEMPLATES / "gpustat-epilog.sh").read_text(), render.EXEC_MODE)
         out["/etc/systemd/system/gpujobs-gpu-exporter.service"] = _spec(
             _template("gpujobs-gpu-exporter.service", **unit_values)
         )

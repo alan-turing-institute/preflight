@@ -101,6 +101,13 @@ def keeper_running(now: float | None = None) -> bool:
     return (time.time() if now is None else now) - updated < KEEPER_STALE_S
 
 
+def require_keeper(site: site_config.Site | None) -> None:
+    """Refuse when the site has a lease (or there is no site file) and the keeper's heartbeat is stale."""
+    if (site is None or site.lease) and not keeper_running():
+        msg = f"the lease keeper ({KEEPER_UNIT}) is not running; start it before submitting"
+        raise Refused(msg)
+
+
 def known_to_slurm(job_id: str) -> bool:
     done = subprocess.run(["scontrol", "show", "job", job_id], capture_output=True, text=True, check=False)
     return done.returncode == 0
@@ -212,7 +219,7 @@ def submit(argv: list[str]) -> str:
         raise Refused(msg)
     arguments.gpus = 1 if arguments.gpu else arguments.gpus or 0
     arguments.gpu = arguments.gpus > 0
-    site = site_config.load() if site_config.SITE_FILE.exists() else None
+    site = site_config.load_optional()
     named = arguments.name
     arguments.name = arguments.name or Path(arguments.command[0]).name
     if arguments.job_class == gpu_jobs.JobClass.RESUME and not arguments.resume_ok:
@@ -230,9 +237,7 @@ def submit(argv: list[str]) -> str:
     script = sbatch_script(arguments, mem=mem, log=log, manifest=manifest)
     if arguments.dry_run:
         return script
-    if (site is None or site.lease) and not keeper_running():
-        msg = f"the lease keeper ({KEEPER_UNIT}) is not running; start it before submitting"
-        raise Refused(msg)
+    require_keeper(site)
     for job_id in arguments.after:
         if not known_to_slurm(job_id):
             msg = f"--after {job_id}: slurm no longer knows that job (finished over a day ago, or never existed)"

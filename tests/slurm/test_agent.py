@@ -246,6 +246,9 @@ def test_failed_jobs_raise_an_event_and_run_the_notify_command_once(
         },
     }
     world.step()
+    assert gpu_jobs.events() == []  # accounting is asked at most every NOTICES_EVERY_S, not every loop
+    world.t += agent_module.NOTICES_EVERY_S
+    world.step()
     world.step()
     assert [(e.job, e.action, e.fields) for e in gpu_jobs.events()] == [
         ("9", "failed", {"state": "OUT_OF_MEMORY", "name": "p:resume:train"})

@@ -25,7 +25,7 @@ def fake_site(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, lease: object,
     present = tmp_path / "site.toml"
     present.write_text("")
     monkeypatch.setattr(site_config, "SITE_FILE", present)
-    monkeypatch.setattr(site_config, "load", lambda: SimpleNamespace(lease=lease, dgx_gate=dgx_gate))
+    monkeypatch.setattr(site_config, "load", lambda *_path: SimpleNamespace(lease=lease, dgx_gate=dgx_gate))
 
 
 def dry(*argv: str) -> str:

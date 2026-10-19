@@ -94,19 +94,21 @@ def _viewer() -> str:
     return pwd.getpwuid(os.getuid()).pw_name
 
 
-def _is_admin(user: str) -> bool:
+def _site() -> site_config.Site | None:
     try:
-        site = site_config.load()
+        return site_config.load()
     except site_config.SiteError:
-        return False
-    return site_config.is_admin(site, user)
+        return None
+
+
+def _is_admin(user: str) -> bool:
+    site = _site()
+    return site is not None and site_config.is_admin(site, user)
 
 
 def _metrics_on() -> bool:
-    try:
-        return site_config.load().metrics.mode != site_config.MetricsMode.OFF
-    except site_config.SiteError:
-        return False
+    site = _site()
+    return site is not None and site.metrics.mode != site_config.MetricsMode.OFF
 
 
 @dataclass

@@ -226,6 +226,12 @@ def load(path: Path | None = None) -> Site:
     return parse(raw)
 
 
+def load_optional(path: Path | None = None) -> Site | None:
+    """The site, or None when there is no site file: the tools then keep their single-machine defaults."""
+    path = path or SITE_FILE
+    return load(path) if path.exists() else None
+
+
 def is_admin(site: Site, user: str) -> bool:
     """True when `user` is in the admin group, by listed membership or as the primary group."""
     try:

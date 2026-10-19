@@ -249,7 +249,6 @@ def parser() -> argparse.ArgumentParser:
 COMMANDS = {
     "render": cmd_render,
     "check": cmd_check,
-    "apply": cmd_apply,
     "user": cmd_user,
     "admin": cmd_admin,
     "migrate-state": cmd_migrate,

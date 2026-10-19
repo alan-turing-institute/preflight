@@ -164,7 +164,7 @@ def run(argv: list[str]) -> int:
     if arguments.gpus is not None and arguments.gpus < 1:
         print("[urgent] REFUSED: --gpus must be an integer >= 1", file=sys.stderr)
         return 1
-    site = site_config.load() if site_config.SITE_FILE.exists() else None
+    site = site_config.load_optional()
     if site and not site_config.is_admin(site, getpass.getuser()):
         print(f"[urgent] REFUSED: only members of {site.admin_group} may submit urgent work; "
               f"an admin adds you with: {ADMIN_REMEDY}", file=sys.stderr)
@@ -208,8 +208,10 @@ def run(argv: list[str]) -> int:
     if arguments.dry_run:
         print(script)
         return 0
-    if (site is None or site.lease) and not submit.keeper_running():  # as submit.py: no lease, no keeper
-        print(f"[urgent] REFUSED: the lease keeper ({submit.KEEPER_UNIT}) is not running", file=sys.stderr)
+    try:
+        submit.require_keeper(site)
+    except submit.Refused as refused:
+        print(f"[urgent] REFUSED: {refused}", file=sys.stderr)
         return 1
     if arguments.requeue_steady:
         for job_id in steady:
@@ -243,7 +245,7 @@ def run(argv: list[str]) -> int:
     job_id = done.stdout.strip().split(";")[0]
     gpu_jobs.update_sidecar(
         job_id, project=arguments.project, what=arguments.what, job_class="urgent", name=arguments.name,
-        gpu=arguments.gpu, mem=mem, command=arguments.command, log=str(log), script=str(path), after=[],
+        gpu=arguments.gpu, gpus=arguments.gpus, mem=mem, command=arguments.command, log=str(log), script=str(path), after=[],
         preempts=victims, submitted_at=int(time.time()),
     )
     print(f"[urgent] job {job_id} submitted; log {log}")

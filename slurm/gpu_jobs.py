@@ -17,6 +17,7 @@ import os
 import pwd
 import re
 import subprocess
+import sys
 import tempfile
 import time
 from collections.abc import Callable, Iterable
@@ -36,7 +37,7 @@ def _site_dirs() -> tuple[Path, Path | None]:
     Never fails for a missing site file: until the installer writes one, the box keeps its legacy paths.
     """
     state, lease = os.environ.get("SLURM_GPU_STATE_DIR"), os.environ.get("GPU_LEASE_DIR")
-    site = site_config.load() if site_config.SITE_FILE.exists() and not (state and lease) else None
+    site = site_config.load_optional() if not (state and lease) else None
     state_dir = Path(state) if state else site.state_dir if site else _LEGACY_STATE_DIR
     lease_dir = Path(lease) if lease else site.lease.lease_dir if site and site.lease else _LEGACY_LEASE_DIR
     return state_dir.expanduser(), lease_dir.expanduser()
@@ -326,6 +327,14 @@ def measured_peak_bytes(name: str) -> int | None:
     return None if best is None else best[1]
 
 
+def run_slurm(command: list[str]) -> int:
+    """Run a slurm command; on failure print slurm's own message. Returns its exit status."""
+    done = subprocess.run(command, capture_output=True, text=True, check=False)
+    if done.returncode != 0:
+        print(done.stderr.strip() or done.stdout.strip() or f"{command[0]} failed", file=sys.stderr)
+    return done.returncode
+
+
 def node_state() -> str:
     """The node's state and reason (`ReturnToService=1` leaves it DOWN after a reboot)."""
     done = subprocess.run(["sinfo", "-h", "-N", "-o", "%T|%E"], capture_output=True, text=True, check=False)
@@ -373,7 +382,7 @@ def _owner(path: Path) -> str:
 def events(job_id: str | None = None) -> list[Event]:
     """Every event (of one job, if given), oldest first. Who did it comes from file ownership alone."""
     found = []
-    for path in (STATE_DIR / "events").glob("*.json"):
+    for path in (STATE_DIR / "events").glob("*.json" if job_id is None else f"{job_id}-*.json"):
         match = re.fullmatch(r"(.+)-(\d+)-([a-z_]+)\.json", path.name)
         record = read_json(path)
         if not match or record is None or (job_id is not None and match[1] != job_id):
@@ -386,14 +395,23 @@ def events(job_id: str | None = None) -> list[Event]:
     return sorted(found, key=lambda event: event.at)
 
 
+#: A container's labels never change, so each is asked of docker once (the job wrapper asks every sample).
+_LABELS: dict[tuple[str, str], str] = {}
+
+
 def _docker_label(container_id: str, label: str) -> str:
+    if (container_id, label) in _LABELS:
+        return _LABELS[container_id, label]
     done = subprocess.run(
         ["docker", "inspect", "-f", f'{{{{index .Config.Labels "{label}"}}}}', container_id],
         capture_output=True,
         text=True,
         check=False,
     )
-    return done.stdout.strip() if done.returncode == 0 else ""
+    if done.returncode != 0:  # docker down or the container gone: not remembered, asked again next time
+        return ""
+    _LABELS[container_id, label] = value = done.stdout.strip()
+    return value
 
 
 _DOCKER_SCOPE = re.compile(r"/docker-([0-9a-f]{64})\.scope$")

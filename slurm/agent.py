@@ -150,6 +150,10 @@ def _by_id(job_id: str) -> tuple[int, str]:
     return len(job_id), job_id
 
 
+#: Ended jobs are asked of slurm's accounting (sacct, through slurmdbd) at most this often, not every loop.
+NOTICES_EVERY_S = 30.0
+
+
 def _strings(value: object) -> list[str]:
     return [str(item) for item in value] if isinstance(value, list) else []
 
@@ -214,6 +218,7 @@ class Agent:
             set()
         )  # nodes handled this boot, so a retry after a partial failure skips them
         self._ignored: set[str] = set()  # requests already logged as not from an admin
+        self._notices_at = -NOTICES_EVERY_S  # the first step looks at once
 
     # -- one step -------------------------------------------------------------------------------------------
 
@@ -228,7 +233,9 @@ class Agent:
         else:
             self._keep_priorities(queue, now, errors)
             self._restore_order(queue, errors)
-        self._failure_notices(errors)
+        if now - self._notices_at >= NOTICES_EVERY_S:
+            self._notices_at = now
+            self._failure_notices(errors)
         if errors:
             self.last_error, self.last_error_at = "; ".join(errors), int(now)
         return self._persist(now)

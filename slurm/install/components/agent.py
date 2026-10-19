@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 from pathlib import Path
 from string import Template
 
@@ -16,29 +15,21 @@ UNIT = "gpujobs-agent.service"
 # plan 3.3: each file owned by its writer; logs, scripts and manifests are where submit.py and urgent.py write a job's
 # log, batch script and gate manifest when the caller gives no --log
 STICKY = ("jobs", "events", "footprints", "metrics", "requests", "logs", "scripts", "manifests")
-FILE_MODE = 0o644
 
 
 def enabled(site) -> bool:
     return True
 
 
-def slurm_user(site) -> str:
-    """SlurmUser from the rendered slurm.conf (default slurm)."""
-    conf = render.render(site, "slurm")["/etc/slurm/slurm.conf"].content
-    match = re.search(r"^SlurmUser=(\S+)", conf, re.MULTILINE)
-    return match.group(1) if match else "slurm"
-
-
 def files(site) -> dict[str, render.FileSpec]:
     if components.SITE_PATH is None:
         raise RuntimeError("components.SITE_PATH is not set")
     unit = Template((render.TEMPLATES / NAME / UNIT).read_text()).substitute(
-        slurm_user=slurm_user(site), site_file=SITE_COPY, install_dir=site.install_dir
+        slurm_user=render.SLURM_USER, site_file=SITE_COPY, install_dir=site.install_dir
     )
     return {
-        SITE_COPY: render.FileSpec(components.SITE_PATH.read_text(), FILE_MODE, "root"),
-        f"/etc/systemd/system/{UNIT}": render.FileSpec(unit, FILE_MODE, "root"),
+        SITE_COPY: render.FileSpec(components.SITE_PATH.read_text(), render.FILE_MODE, "root"),
+        f"/etc/systemd/system/{UNIT}": render.FileSpec(unit, render.FILE_MODE, "root"),
     }
 
 
@@ -53,7 +44,7 @@ def refusals(site) -> list[str]:
 def post_install(site) -> list[list[str]]:
     state = Path(site.state_dir)
     dirs = [["install", "-d", "-m", "0755", "-o", "root", "-g", "root", str(state)]]
-    user = slurm_user(site)
+    user = render.SLURM_USER
     # requests/ belongs to the agent's user: in a sticky directory only a file's owner or the directory's owner may
     # delete it, and the agent must delete the restore-order requests it has carried out.
     dirs += [["install", "-d", "-m", "1777", *(["-o", user, "-g", user] if name == "requests" else []), str(state / name)]

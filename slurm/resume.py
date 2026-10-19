@@ -15,7 +15,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import gpu_jobs  # noqa: E402 - path set just above
-from pause import run_slurm  # noqa: E402
 
 
 def main() -> int:
@@ -31,12 +30,12 @@ def main() -> int:
         print(f"[resume] node before: {gpu_jobs.node_state()}")
         status = 0
         for name in names:
-            status = run_slurm(["sudo", "scontrol", "update", f"nodename={name}", "state=resume"]) or status
+            status = gpu_jobs.run_slurm(["sudo", "scontrol", "update", f"nodename={name}", "state=resume"]) or status
         print(f"[resume] node after: {gpu_jobs.node_state()}")
         return status
     if not arguments.job_ids:
         parser.error("name a job, or --node")
-    status = run_slurm(["scontrol", "release", ",".join(arguments.job_ids)])
+    status = gpu_jobs.run_slurm(["scontrol", "release", ",".join(arguments.job_ids)])
     if status == 0:
         for job_id in arguments.job_ids:
             gpu_jobs.write_event(job_id, gpu_jobs.EventAction.RESUME)

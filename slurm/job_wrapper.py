@@ -300,7 +300,7 @@ def main() -> int:
     if arguments.max_jobs > 1:
         print(f"[job] DECLARED SHARING: up to {arguments.max_jobs} GPU jobs on the card", flush=True)
 
-    site = site_config.load() if site_config.SITE_FILE.exists() else None
+    site = site_config.load_optional()
     cgroup = job_cgroup(job_id)
     if arguments.needs_lease or arguments.needs_card:
         ok, reason = wait_for_card(

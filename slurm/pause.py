@@ -13,7 +13,6 @@ its refusal is printed as it is. A successful pause is recorded as a PAUSE event
 from __future__ import annotations
 
 import argparse
-import subprocess
 import sys
 from pathlib import Path
 
@@ -21,14 +20,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import gpu_jobs  # noqa: E402 - path set just above
 from urgent import elapsed  # noqa: E402
-
-
-def run_slurm(command: list[str]) -> int:
-    """Run a slurm command; on failure print slurm's own message. Returns its exit status."""
-    done = subprocess.run(command, capture_output=True, text=True, check=False)
-    if done.returncode != 0:
-        print(done.stderr.strip() or done.stdout.strip() or f"{command[0]} failed", file=sys.stderr)
-    return done.returncode
 
 
 def main() -> int:
@@ -58,7 +49,7 @@ def main() -> int:
     if steady and not arguments.lose_progress:
         print("[pause] STOPPED: pass --lose-progress to pause it anyway", file=sys.stderr)
         return 1
-    status = run_slurm(["scontrol", "requeuehold", job.job_id])
+    status = gpu_jobs.run_slurm(["scontrol", "requeuehold", job.job_id])
     if status == 0:
         gpu_jobs.write_event(job.job_id, gpu_jobs.EventAction.PAUSE, reason=arguments.reason)
     return status

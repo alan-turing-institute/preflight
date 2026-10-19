@@ -13,7 +13,6 @@ import components
 NAME = "lease"
 UNIT = "slurm-gpu-lease-keeper.service"
 CLIENT_CHECK = "from localmodels.lease import GpuLeaseClient"
-FILE_MODE = 0o644
 
 
 def enabled(site) -> bool:
@@ -32,7 +31,7 @@ def files(site) -> dict[str, render.FileSpec]:
     unit = Template((render.TEMPLATES / NAME / UNIT).read_text()).substitute(
         keeper_user=user, python=site.lease.python, install_dir=site.install_dir
     )
-    return {str(_home(user) / ".config/systemd/user" / UNIT): render.FileSpec(unit, FILE_MODE, user)}
+    return {str(_home(user) / ".config/systemd/user" / UNIT): render.FileSpec(unit, render.FILE_MODE, user)}
 
 
 def packages(site) -> list[str]:

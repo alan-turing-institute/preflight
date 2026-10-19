@@ -19,7 +19,12 @@ TEMPLATES = Path(__file__).resolve().parent / "templates"
 UNITS = ("slurmctld", "slurmd", "munge", "slurmdbd")
 DROPIN = "10-restart-protect.conf"
 FILE_MODE = 0o644
+EXEC_MODE = 0o755
 SECRET_MODE = 0o600
+#: slurm's SlurmUser; `templates/slurm/slurm.conf` sets the same name.
+SLURM_USER = "slurm"
+#: Slurm's default memory for a job that names none, capped below at the smallest node (bigger refuses such jobs).
+DEF_MEM_MB = 16384
 
 
 @dataclass(frozen=True)
@@ -57,6 +62,7 @@ def _slurm(site: Site, extra: dict[str, str]) -> dict[str, FileSpec]:
         "node_lines": "".join(_node_line(n) for n in site.nodes),
         "gres_lines": gres_lines,
         "admin_group": site.admin_group,
+        "def_mem_mb": min(DEF_MEM_MB, *(n.real_memory_mb for n in site.nodes)),
         "extra_slurm_conf": extra_conf if not extra_conf or extra_conf.endswith("\n") else extra_conf + "\n",
     }
     out = {
@@ -64,7 +70,7 @@ def _slurm(site: Site, extra: dict[str, str]) -> dict[str, FileSpec]:
         "/etc/slurm/cgroup.conf": FileSpec(_template("slurm", "cgroup.conf").substitute(values), FILE_MODE, "root"),
         "/etc/slurm/gres.conf": FileSpec(_template("slurm", "gres.conf").substitute(values), FILE_MODE, "root"),
         "/etc/slurm/slurmdbd.conf": FileSpec(
-            _template("slurm", "slurmdbd.conf").substitute(values), SECRET_MODE, "slurm"
+            _template("slurm", "slurmdbd.conf").substitute(values), SECRET_MODE, SLURM_USER
         ),
         "/etc/mysql/mariadb.conf.d/90-slurm.cnf": FileSpec(
             _template("slurm", "mariadb-slurm.cnf").substitute(values), FILE_MODE, "root"
