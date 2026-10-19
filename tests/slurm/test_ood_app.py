@@ -29,10 +29,11 @@ class Fake:
 
     def __init__(self, viewer: str = "alice", admin: bool = False, name: str = "proj:normal:train") -> None:
         self.ran: list[list[str]] = []
+        self.asked: list[tuple[str, str | None]] = []  # (job id, the slurm user the record must belong to)
         record = {"what": "a run", "job_class": "normal", "mem": "4G", "project": "proj", "command": ["python", "x.py"], "log": "/logs/x.log"}
         self.backend = app.Backend(
             queue=lambda: [queued("7", "alice", name), queued("8", "bob", partition="steady")],
-            record=lambda _j: record,
+            record=lambda job_id, user=None: self.asked.append((job_id, user)) or record,
             events=lambda _j: [gpu_jobs.Event("7", "pause", "alice", 1_700_000_000_000_000_000)],
             elapsed=lambda: {"7": "1:00"},
             efficiency=lambda job_id, record=None: jobs_view.Efficiency(job_id, 4 * 1024**3, None, None, 0.5),
@@ -76,8 +77,11 @@ def call(fake: Fake, path: str, method: str = "GET", body: object | None = None,
     ],
 )
 def test_every_get_route_answers(path: str) -> None:
-    status, body = call(Fake(), path)
+    fake = Fake()
+    status, body = call(fake, path)
     assert status == "200 OK", body
+    # a queued job's record is asked for as the user slurm says owns the job, so a record another user wrote is ignored
+    assert all(user == {"7": "alice", "8": "bob"}[job_id] for job_id, user in fake.asked)
 
 
 def test_unknown_things_are_not_found_or_bad() -> None:

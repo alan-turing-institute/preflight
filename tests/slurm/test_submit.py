@@ -74,7 +74,7 @@ def test_mem_auto_uses_the_last_measured_run_plus_a_margin(tmp_path: Path, monke
     monkeypatch.setattr(gpu_jobs, "STATE_DIR", tmp_path)
     (tmp_path / "jobs").mkdir()
     for job_id, ended, gpu_mib in [("1", 100, 30 * 1024), ("2", 200, 10 * 1024)]:
-        leg = {"peak_gpu_mib": gpu_mib, "peak_mem_bytes": 2 * 1024**3, "ended_at": ended}
+        leg = {"peak_gpu_mib": gpu_mib, "peak_mem_bytes": 2 * 1024**3, "ended_at": ended, "exit": 0, "signals": []}
         (tmp_path / "jobs" / f"{job_id}.json").write_text(json.dumps({"name": "n", "last_leg": leg}))
     script = dry("--project", "p", "--what", "w", "--class", "restart", "--gpu", "--mem", "auto", "--name", "n",
                  "--", "x")
@@ -84,7 +84,7 @@ def test_mem_auto_uses_the_last_measured_run_plus_a_margin(tmp_path: Path, monke
 def test_no_mem_reuses_the_last_measured_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(gpu_jobs, "STATE_DIR", tmp_path)
     (tmp_path / "jobs").mkdir()
-    leg = {"peak_gpu_mib": 10 * 1024, "peak_mem_bytes": 2 * 1024**3, "ended_at": 1}
+    leg = {"peak_gpu_mib": 10 * 1024, "peak_mem_bytes": 2 * 1024**3, "ended_at": 1, "exit": 0, "signals": []}
     (tmp_path / "jobs" / "1.json").write_text(json.dumps({"name": "n", "last_leg": leg}))
     script = dry("--project", "p", "--what", "w", "--class", "restart", "--gpu", "--name", "n", "--", "x")
     assert f"{DIRECTIVE} --mem=14G" in script
@@ -167,7 +167,7 @@ def submit_for_real(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *extra: str
     )
     submit.submit(["--project", "p", "--what", "w", "--class", "restart", "--mem", "1G", "--gpus", "2",
                    "--entry", "a.py", "--repo", str(tmp_path), *extra, "--", "x"])
-    return {**gpu_jobs.read_sidecar("77"), **seen}
+    return {**(gpu_jobs.read_sidecar("77") or {}), **seen}
 
 
 def test_no_site_file_checks_keeper_and_gate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -175,6 +175,14 @@ def test_no_site_file_checks_keeper_and_gate(tmp_path: Path, monkeypatch: pytest
     assert record["keeper"] is True
     assert record["gate"] is True
     assert (record["gpu"], record["gpus"]) == (True, 2)
+
+
+def test_a_record_that_cannot_be_written_after_sbatch_is_a_warning_naming_the_job(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    (tmp_path / "jobs" / "77.json").mkdir(parents=True)  # stands in for another user's file in the sticky directory
+    submit_for_real(monkeypatch, tmp_path)
+    assert "job 77 is queued but its record was not written" in capsys.readouterr().err
 
 
 def test_a_site_without_lease_or_gate_skips_both(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

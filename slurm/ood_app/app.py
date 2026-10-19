@@ -116,7 +116,7 @@ class Backend:
     """Everything the app reads or runs, so a test can replace it with fakes."""
 
     queue: Callable[[], list[QueuedJob] | None] = gpu_jobs.read_queue
-    record: Callable[[str], Mapping[str, object] | None] = gpu_jobs.read_sidecar
+    record: Callable[..., Mapping[str, object] | None] = gpu_jobs.read_sidecar  # (job id, user=None)
     events: Callable[[str | None], list[gpu_jobs.Event]] = gpu_jobs.events
     elapsed: Callable[[], Mapping[str, str]] = _elapsed_by_job
     efficiency: Callable[..., jobs_view.Efficiency] = jobs_view.efficiency
@@ -140,7 +140,7 @@ def _template(name: str) -> Template:
 
 
 def _records(backend: Backend, queue: list[QueuedJob]) -> dict[str, Mapping[str, object]]:
-    return {j.job_id: rec for j in queue if (rec := backend.record(j.job_id))}
+    return {j.job_id: rec for j in queue if (rec := backend.record(j.job_id, user=j.user))}
 
 
 def job_rows(backend: Backend) -> list[dict[str, object]]:
@@ -269,8 +269,8 @@ def _buttons_html(job: QueuedJob, steady: bool) -> str:
 def job_page(backend: Backend, job_id: str) -> str | None:
     queue = backend.queue() or []
     by_id = {j.job_id: j for j in queue}
-    record = backend.record(job_id) or {}
     job = by_id.get(job_id)
+    record = backend.record(job_id, user=job.user if job else None) or {}
     if job is None and not record:
         return None
     records = _records(backend, queue)
@@ -409,7 +409,8 @@ def _api(backend: Backend, environ: Mapping[str, object], path: str, query: Mapp
     if verb == PREVIEW:
         return _json(run_action(backend, PREVIEW, job_id, dry_run=True))
     if verb == LOG:
-        record = backend.record(job_id) or {}
+        job = next((j for j in backend.queue() or [] if j.job_id == job_id), None)
+        record = backend.record(job_id, user=job.user if job else None) or {}
         path_text = str(record.get("log") or "")
         text = (query.get("text") or [""])[0] or None
         log = backend.log_tail(path_text, text=text, errors_only=bool(query.get("errors"))) if path_text else jobs_view.NO_LOG

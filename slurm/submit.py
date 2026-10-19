@@ -254,8 +254,9 @@ def submit(argv: list[str]) -> str:
         msg = f"sbatch refused: {done.stderr.strip()}"
         raise Refused(msg)
     job_id = done.stdout.strip().split(";")[0]
-    gpu_jobs.update_sidecar(
+    gpu_jobs.record_queued_job(
         job_id,
+        "submit",
         project=arguments.project,
         what=arguments.what,
         job_class=arguments.job_class,

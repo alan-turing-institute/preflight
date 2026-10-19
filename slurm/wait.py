@@ -34,8 +34,13 @@ def chain(job_id: str, sidecars: dict[str, dict[str, object]]) -> list[str]:
     return found
 
 
-def all_sidecars() -> dict[str, dict[str, object]]:
-    return {p.stem: gpu_jobs.read_json(p) or {} for p in (gpu_jobs.STATE_DIR / "jobs").glob("*.json")}
+def all_sidecars(users: dict[str, str] | None = None) -> dict[str, dict[str, object]]:
+    """Every record. `users` maps job id to its slurm user for the jobs the caller has queued: a record of one of those
+    that another user wrote is ignored. The rest (finished jobs) are read as they are."""
+    users = users or {}
+    return {
+        p.stem: gpu_jobs.read_json(p, users.get(p.stem)) or {} for p in (gpu_jobs.STATE_DIR / "jobs").glob("*.json")
+    }
 
 
 def main() -> int:

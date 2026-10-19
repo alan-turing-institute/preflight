@@ -88,7 +88,7 @@ def plan(
     services = YIELDING_SERVICES if services is None else services
     lines, victims, steady, wait_only = [], [], [], []
     for job in queue:
-        record = gpu_jobs.read_sidecar(job.job_id) or {}
+        record = gpu_jobs.read_sidecar(job.job_id, job.user) or {}
         in_way = whole_box or memory_short or (gpu and (bool(record.get("gpu")) or job.gpus > 0))
         if not in_way or not (job.active or job.partition == gpu_jobs.Partition.URGENT):
             continue
@@ -221,7 +221,7 @@ def run(argv: list[str]) -> int:
     held = [
         job.job_id for job in queue
         if job.waiting and job.partition != gpu_jobs.Partition.URGENT and job.job_id not in victims
-        and (gpu_jobs.read_sidecar(job.job_id) or {}).get("gpu")
+        and (gpu_jobs.read_sidecar(job.job_id, job.user) or {}).get("gpu")
     ]
     if victims and held:
         subprocess.run(["scontrol", "hold", ",".join(held)], check=True)
@@ -244,8 +244,8 @@ def run(argv: list[str]) -> int:
             subprocess.run(["scontrol", "release", ",".join(held)], check=False)
         return 1
     job_id = done.stdout.strip().split(";")[0]
-    gpu_jobs.update_sidecar(
-        job_id, project=arguments.project, what=arguments.what, job_class="urgent", name=arguments.name,
+    gpu_jobs.record_queued_job(
+        job_id, "urgent", project=arguments.project, what=arguments.what, job_class="urgent", name=arguments.name,
         gpu=arguments.gpu, gpus=arguments.gpus, mem=mem, command=arguments.command, log=str(log), script=str(path), after=[],
         preempts=victims, submitted_at=int(time.time()),
     )

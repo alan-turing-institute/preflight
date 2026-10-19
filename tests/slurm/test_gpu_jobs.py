@@ -5,12 +5,15 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import signal
 import subprocess
 from pathlib import Path
 
 import gpu_jobs
 import pytest
 import site_config
+import status
+import wait
 from gpu_jobs import EventAction, QueuedJob
 
 
@@ -30,6 +33,55 @@ def test_event_actor_is_the_file_owner_not_the_content(tmp_path: Path, monkeypat
     gpu_jobs.write_event("8", EventAction.RESUME)
     assert len(gpu_jobs.events()) == 3
     assert [e.job for e in gpu_jobs.events("8")] == ["8"]
+
+
+def test_a_hostile_or_foreign_record_is_ignored_and_never_blocks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(gpu_jobs, "STATE_DIR", tmp_path)
+    jobs = tmp_path / "jobs"
+    jobs.mkdir()
+    os.mkfifo(jobs / "1.json")  # any user may leave one; opening it for reading would block for ever
+    (jobs / "2.json").symlink_to(jobs / "6.json")
+    (jobs / "3.json").mkdir()
+    (jobs / "4.json").write_text('{"x": 1}' + " " * gpu_jobs.MAX_RECORD_BYTES)  # valid JSON, too big to be a record
+    (jobs / "5.json").write_text("[" * 200_000)  # deep enough to overflow the parser's stack
+    (jobs / "6.json").write_text(json.dumps({"gpu": True, "name": "n", "what": "forged"}))
+    signal.signal(signal.SIGALRM, lambda *_: pytest.fail("read_json blocked"))
+    signal.alarm(5)
+    try:
+        assert [gpu_jobs.read_sidecar(str(i)) for i in range(1, 6)] == [None] * 5
+    finally:
+        signal.alarm(0)
+    me = gpu_jobs.current_user()
+    assert gpu_jobs.read_sidecar("6", me) == {"gpu": True, "name": "n", "what": "forged"}
+    assert gpu_jobs.read_sidecar("6", "somebody-else") is None  # the file's owner is its writer's identity
+    job = QueuedJob("6", "normal", "PENDING", "None", "n", user="somebody-else")
+    assert not gpu_jobs.needs_the_card(job)
+    assert gpu_jobs.needs_the_card(QueuedJob("6", "normal", "PENDING", "None", "n", user=me))
+    assert wait.all_sidecars({"6": "somebody-else"})["6"] == {}
+    monkeypatch.setattr(status.gpu_jobs, "node_state", lambda: "idle")
+    monkeypatch.setattr(status.audit, "unregistered", list)
+    monkeypatch.setattr(status.audit, "report", lambda _u: [])
+    assert not any("forged" in line for line in status.lines([job]))
+    # an update never merges into a record that is not this user's, and a write that cannot replace says so
+    monkeypatch.setattr(gpu_jobs, "current_user", lambda: "somebody-else")
+    gpu_jobs.update_sidecar("6", extra=1)
+    assert gpu_jobs.read_sidecar("6") == {"job_id": "6", "extra": 1}
+    with pytest.raises(OSError, match="belongs to"):
+        gpu_jobs.update_sidecar("3", what="x")
+    assert not list(jobs.glob(".*.tmp"))
+
+
+def test_the_peak_for_mem_auto_comes_from_clean_finished_legs_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(gpu_jobs, "STATE_DIR", tmp_path)
+    (tmp_path / "jobs").mkdir()
+    done = {"peak_gpu_mib": 1024, "peak_mem_bytes": 0, "ended_at": 1, "exit": 0, "signals": []}
+    crashed = {**done, "peak_gpu_mib": 40, "ended_at": 3, "exit": 1}
+    preempted = {**done, "peak_gpu_mib": 40, "ended_at": 2, "signals": ["SIGTERM"]}
+    legs = [done, preempted, crashed]
+    (tmp_path / "jobs" / "1.json").write_text(json.dumps({"name": "n", "legs": legs, "last_leg": crashed}))
+    assert gpu_jobs.measured_peak_bytes("n") == 1024 * 1024**2
+    monkeypatch.setattr(gpu_jobs, "current_user", lambda: "somebody-else")  # the file is not theirs
+    assert gpu_jobs.measured_peak_bytes("n") is None
 
 
 def squeue_json(*jobs: dict[str, object]) -> str:

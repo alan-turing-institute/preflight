@@ -29,13 +29,14 @@ import argparse
 import contextlib
 import json
 import os
-import pwd
 import signal
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from enum import IntEnum
 from pathlib import Path
+from typing import IO
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "hostguard"))
@@ -212,12 +213,7 @@ def metrics_text(job_id: str, row: dict[str, object]) -> str:
     """The job's two gauges in Prometheus text format; project is the first `:` field of the job name."""
     name = os.environ.get("SLURM_JOB_NAME", "")
     project = name.split(":", 1)[0] if ":" in name else "(other)"
-    uid = os.getuid()
-    try:
-        user = pwd.getpwuid(uid).pw_name
-    except KeyError:
-        user = str(uid)
-    labels = f'jobid="{_label(job_id)}",user="{_label(user)}",project="{_label(project)}"'
+    labels = f'jobid="{_label(job_id)}",user="{_label(gpu_jobs.current_user())}",project="{_label(project)}"'
     gpu_bytes = int(float(row["gpu_mib"]) * MIB)  # type: ignore[arg-type]
     return (
         "# TYPE gpujobs_job_gpu_memory_bytes gauge\n"
@@ -234,6 +230,32 @@ def write_metrics(job_id: str, row: dict[str, object]) -> None:
     temp = target.with_suffix(".prom.tmp")
     temp.write_text(metrics_text(job_id, row), encoding="utf-8")
     os.replace(temp, target)
+
+
+_WARNED: set[str] = set()
+
+
+def best_effort(what: str, action: Callable[..., object], *args: object) -> object | None:
+    """Bookkeeping never fails a job. The shared state directories are open to every user, so a record file another
+    user planted under this job's id (or a full disk) must cost only the record: one warning line per `what`, and
+    the command's own exit status stays the job's."""
+    try:
+        return action(*args)
+    except OSError as error:
+        if what not in _WARNED:
+            _WARNED.add(what)
+            print(f"[job] warning: {what} not recorded: {error}", file=sys.stderr, flush=True)
+        return None
+
+
+def open_footprint(path: Path) -> IO[str]:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path.open("a", encoding="utf-8")
+
+
+def append_row(out: IO[str], row: dict[str, object]) -> None:
+    out.write(json.dumps(row) + "\n")
+    out.flush()
 
 
 def run_and_measure(
@@ -254,9 +276,9 @@ def run_and_measure(
 
     signal.signal(signal.SIGTERM, forward)
     peak_gpu, peak_mem = 0.0, 0
-    footprint.parent.mkdir(parents=True, exist_ok=True)
+    out = best_effort("footprint", open_footprint, footprint)
     try:
-        with footprint.open("a", encoding="utf-8") as out:
+        with out or contextlib.nullcontext():
             while True:
                 try:
                     status = child.wait(timeout=sample_s)
@@ -264,10 +286,10 @@ def run_and_measure(
                 except subprocess.TimeoutExpired:
                     pass
                 row = sample(cgroup, {child.pid}, job_id)
-                out.write(json.dumps(row) + "\n")
-                out.flush()
+                if out:
+                    best_effort("footprint", append_row, out, row)
                 if metrics:
-                    write_metrics(job_id, row)
+                    best_effort("metrics", write_metrics, job_id, row)
                 peak_gpu = max(peak_gpu, float(row["gpu_mib"]))
                 peak_mem = max(peak_mem, int(row["mem_peak"] or row["mem_current"] or 0))
     finally:
@@ -320,7 +342,8 @@ def main() -> int:
         )
         if not ok:
             print(f"[job] REFUSED after {arguments.wait_limit:.0f} s: {reason}", file=sys.stderr, flush=True)
-            gpu_jobs.update_sidecar(job_id, last_leg={"leg": restart, "refused": reason, "ended_at": int(time.time())})
+            best_effort("sidecar", lambda: gpu_jobs.update_sidecar(
+                job_id, last_leg={"leg": restart, "refused": reason, "ended_at": int(time.time())}))
             return Exit.CARD_NOT_READY
         print("[job] card ready", flush=True)
 
@@ -331,7 +354,8 @@ def main() -> int:
         )
         if done.returncode != 0:
             print("[job] REFUSED: the code changed since submission (manifest re-check)", file=sys.stderr, flush=True)
-            gpu_jobs.update_sidecar(job_id, last_leg={"leg": restart, "refused": "manifest", "ended_at": int(time.time())})
+            best_effort("sidecar", lambda: gpu_jobs.update_sidecar(
+                job_id, last_leg={"leg": restart, "refused": "manifest", "ended_at": int(time.time())}))
             return Exit.CODE_CHANGED
 
     footprint = gpu_jobs.STATE_DIR / "footprints" / f"{job_id}.jsonl"
@@ -349,10 +373,9 @@ def main() -> int:
         mark_preferred_victim()
     outcome = run_and_measure(command, footprint, cgroup, arguments.sample, job_id, metrics_on)
     outcome.update(leg=restart, started_at=started, ended_at=int(time.time()))
-    record = gpu_jobs.read_sidecar(job_id) or {}
-    legs = list(record.get("legs") or [])
-    legs.append(outcome)
-    gpu_jobs.update_sidecar(job_id, legs=legs, last_leg=outcome)
+    record = gpu_jobs.read_sidecar(job_id, gpu_jobs.current_user()) or {}
+    legs = [*(record.get("legs") or []), outcome]
+    best_effort("sidecar", lambda: gpu_jobs.update_sidecar(job_id, legs=legs, last_leg=outcome))
     print(f"[job] exit {outcome['exit']}; signals {outcome['signals']}; peak GPU {outcome['peak_gpu_mib']:.0f} MiB",
           flush=True)
     status = int(outcome["exit"])

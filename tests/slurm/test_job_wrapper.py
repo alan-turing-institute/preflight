@@ -175,3 +175,17 @@ def test_an_unverifiable_manifest_refuses_the_launch(tmp_path: Path) -> None:
         env=env, check=False,
     )
     assert done.returncode == job_wrapper.Exit.CODE_CHANGED
+
+
+def test_bookkeeping_that_cannot_be_written_never_fails_the_job(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    for blocked in ("footprints/79.jsonl", "jobs/79.json", "metrics/job_79.prom.tmp"):
+        (state / blocked).mkdir(parents=True)  # stand in for another user's files in the sticky directories
+    (tmp_path / "site.toml").write_text(SITE % "local")
+    env = dict(os.environ, SLURM_GPU_STATE_DIR=str(state), SLURM_JOB_ID="79", GPUJOBS_SITE=str(tmp_path / "site.toml"))
+    done = subprocess.run(
+        [sys.executable, str(WRAPPER), "--sample", "0.2", "--", sys.executable, "-c", "import time; time.sleep(0.7); raise SystemExit(3)"],
+        env=env, check=False, capture_output=True, text=True,
+    )
+    assert done.returncode == 3  # the command's own status
+    assert all(f"warning: {what} not recorded" in done.stderr for what in ("footprint", "metrics", "sidecar"))
