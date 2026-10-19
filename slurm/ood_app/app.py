@@ -60,6 +60,7 @@ MINUTE_S, HOUR_MIN, DAY_H = 60, 60, 24
 SMALLEST_HOURS = 0.05  # below this a total reads "under 0.1 h", not "0.0 h"
 
 METER_WARN = 0.9
+CANNOT_ACT = "Only the job's owner or an admin can pause or cancel it."
 class Kind(StrEnum):
     """How a job's state is drawn: each is a badge class in static/app.css."""
 
@@ -744,7 +745,7 @@ def job_page(backend: Backend, job_id: str, root: str = "") -> str | None:
         # From the Jobstats README's example of its OOD helper at /pun/sys/jobstats/<jobid>.
         f'<a class="meta" href="{root.rstrip("/").rpartition("/")[0]}/jobstats/{esc(job_id)}">Jobstats report →</a>' if backend.metrics_on() else ""
     )
-    buttons = ""
+    buttons = f'<p class="muted small">{esc(CANNOT_ACT)}</p>' if job is not None else ""
     if job is not None and jobs_view.can_act(job, viewer, backend.is_admin(viewer)):
         # only a started steady job loses its run to a pause (pause.py)
         buttons = _buttons_html(job, job.partition == gpu_jobs.Partition.STEADY and job.state != gpu_jobs.State.PENDING)

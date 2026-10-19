@@ -642,7 +642,7 @@ def stage_portal() -> None:
     link = sh("readlink /var/www/ood/apps/sys/gpujobs; grep passenger_app_root /var/lib/ondemand-nginx/config/apps/sys/gpujobs.conf")
     page_code, page = get("alice", "/")
     check("symlinked OOD sys app: Passenger serves the app through /var/www/ood/apps/sys/gpujobs -> install_dir",
-          page_code == HTTPStatus.OK and "Signed in as alice" in page and "/opt/gpujobs/slurm/ood_app" in link.out, link.text[:200])
+          page_code == HTTPStatus.OK and "Signed in as <strong>alice</strong>" in page and "/opt/gpujobs/slurm/ood_app" in link.out, link.text[:200])
 
     # Passenger runs our bin/python: put a marker in the installed launcher, restart alice's app, look
     sh("cp -p /opt/gpujobs/slurm/ood_app/bin/python /root/bin-python.orig && printf '%s\\n' '#!/bin/sh' "
@@ -667,21 +667,21 @@ def stage_portal() -> None:
     check("the app lists every user's jobs, with the project and description from the record",
           aj in listed and bj in listed and listed.get(bj, {}).get("user") == "bob" and listed.get(bj, {}).get("project") == "e2e"
           and listed.get(bj, {}).get("description") == "e2e portal-b", json.dumps(listed.get(bj, {}))[:250])
-    for path, needle in (("/", "GPU jobs"), ("/history", "History"), ("/projects", "GPU-hours"), (f"/job/{aj}", "Dependency chain"),
+    for path, needle in (("/", "GPU jobs"), ("/history", "History"), ("/projects", "GPU-hours"), (f"/job/{aj}", "Dependencies"),
                          ("/static/app.js", "function")):
         code, body = get("alice", path)
         check(f"the app's page {path} loads (200)", code == HTTPStatus.OK and needle in body, f"HTTP {code}, {len(body)} bytes")
     code, own = get("alice", f"/job/{aj}")
     _, other = get("alice", f"/job/{bj}")
     check("S4: the app shows alice's buttons on her own job and hides them on bob's",
-          'data-action="pause"' in own and 'data-action="pause"' not in other and "You cannot act on this job." in other,
-          f"own has pause button={'data-action=\"pause\"' in own}; bob's job page says cannot act={'You cannot act' in other}")
+          'data-action="pause"' in own and 'data-action="pause"' not in other and "owner or an admin can pause" in other,
+          f"own has pause button={'data-action=\"pause\"' in own}; bob's job page says who can act={'owner or an admin can pause' in other}")
     forced = post("alice", f"/api/job/{bj}/pause", PORTAL)
     check("S4: even if the button is bypassed, a pause of bob's job through the portal is refused by slurm and bob's job runs on",
           forced[0] == HTTPStatus.OK and '"ok": false' in forced[1] and state(bj) == "RUNNING", f"HTTP {forced[0]} {forced[1][:200]}")
     code, admin_view = get("carol", f"/job/{bj}")
     check("the app shows an admin the buttons on anyone's job ('Signed in as carol (admin)')",
-          'data-action="pause"' in admin_view and "carol (admin)" in admin_view, f"HTTP {code}")
+          'data-action="pause"' in admin_view and "<strong>carol</strong>" in admin_view and 'class="role">admin' in admin_view, f"HTTP {code}")
 
     # Origin / Host reach the app unchanged
     evil = post("alice", f"/api/job/{aj}/pause", "https://evil.example")
@@ -760,7 +760,7 @@ def stage_proxy() -> None:
     page = sh(f"{CURL} -L {keyed} -w '\\n%{{http_code}} %{{url_effective}}' {APP}/").out
     body, _, tail = page.rpartition("\n")
     check("with the key, the portal opens straight on the jobs page: no login page, no redirect to Dex",
-          tail.startswith("200") and tail.endswith("/pun/sys/gpujobs/") and "Signed in as alice" in body, tail)
+          tail.startswith("200") and tail.endswith("/pun/sys/gpujobs/") and "Signed in as <strong>alice</strong>" in body, tail)
     code, _, jobs = sh(f"{CURL} {keyed} -w '\\n%{{http_code}}' {app}").out.rpartition("\n")[::-1]
     check("with the key, /api/jobs returns JSON, served as the configured user", code == "200" and isinstance(json.loads(jobs).get("jobs"), list),
           f"HTTP {code} {jobs[:80]}")
