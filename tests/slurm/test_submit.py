@@ -228,3 +228,14 @@ def test_the_keeper_and_gate_are_checked_only_where_the_site_has_them(
     assert (record["gpu"], record["gpus"]) == (True, 2)
     if not gate:
         assert record["manifest"] is None
+
+
+def test_search_roots_reach_the_gate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An entry script importing a helper from another folder needs that root on the parity walk, or the gate refuses."""
+    seen: list[list[str]] = []
+    monkeypatch.setattr(submit.subprocess, "run", lambda cmd, **_k: seen.append(cmd) or SimpleNamespace(returncode=1))
+    with pytest.raises(submit.Refused):
+        submit.run_gate(tmp_path, "a.py", ["x"], tmp_path / "m.json", ["d1", "d2"])
+    cmd = seen[0]
+    assert cmd[cmd.index("--search") : cmd.index("--search") + 4] == ["--search", "d1", "--search", "d2"]
+    assert cmd.index("--search") < cmd.index("--")

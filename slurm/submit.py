@@ -114,11 +114,12 @@ def known_to_slurm(job_id: str) -> bool:
     return done.returncode == 0
 
 
-def run_gate(repo: Path, entry: str, command: list[str], manifest_copy: Path) -> None:
+def run_gate(repo: Path, entry: str, command: list[str], manifest_copy: Path, searches: list[str] = ()) -> None:
     env = dict(os.environ, AUTOCAST_DGX_GATE_CHECK_ONLY="1", AUTOCAST_DGX_HOST="localhost", AUTOCAST_DGX_ROOT=str(repo))
     done = subprocess.run(
         [
             "bash", str(GATE), "--repo", str(repo), "--entry", entry,
+            *(arg for root in searches for arg in ("--search", root)),
             "--gpu-leg-at-launch", "slurm: the job wrapper checks the card when the job starts",
             "--", *command,
         ],
@@ -208,6 +209,8 @@ def parser() -> argparse.ArgumentParser:
     gpu.add_argument("--gpus", type=int, default=None, metavar="N", help="N GPUs, N >= 1")
     p.add_argument("--entry", default=None, help="the Python entry script, relative to --repo (runs the gate)")
     p.add_argument("--repo", type=Path, default=None)
+    p.add_argument("--search", action="append", default=[], metavar="DIR",
+                   help="an import root the gate's code-parity leg also walks, relative to --repo (repeatable)")
     p.add_argument("--after", action="append", default=[], metavar="JOBID")
     p.add_argument("--cpus", type=int, default=None,
                    help=f"default: a GPU job gets the cores the site holds per GPU (cores_per_gpu), else its GPUs' share "
@@ -273,7 +276,7 @@ def submit(argv: list[str]) -> str:
             msg = f"--after {job_id}: slurm no longer knows that job (finished over a day ago, or never existed)"
             raise Refused(msg)
     if gated:
-        run_gate(arguments.repo.resolve(), arguments.entry, arguments.command, manifest)
+        run_gate(arguments.repo.resolve(), arguments.entry, arguments.command, manifest, arguments.search)
     print("\n".join(audit.report(audit.unregistered())))
     path = gpu_jobs.STATE_DIR / "scripts" / f"{arguments.name}-{stamp}.sbatch"
     log.parent.mkdir(parents=True, exist_ok=True)
