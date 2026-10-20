@@ -498,7 +498,7 @@ def _resource_tiles(have: Mapping[str, int], rows: list[dict[str, object]], busy
     ]
     return (
         '<section class="card box" aria-labelledby="h-box"><div class="card-head"><h2 id="h-box">This machine</h2>'
-        '<span class="meta">what slurm has given to jobs</span></div><div class="box-meters">' + "".join(meters) + "</div></section>"
+        '<span class="meta">now, out of what slurm can give</span></div><div class="box-meters">' + "".join(meters) + "</div></section>"
     )
 
 
