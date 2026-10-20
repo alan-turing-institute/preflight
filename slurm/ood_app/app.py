@@ -791,7 +791,7 @@ def job_page(backend: Backend, job_id: str, root: str = "") -> str | None:
     buttons = f'<p class="muted small">{esc(CANNOT_ACT)}</p>' if job is not None else ""
     if job is not None and jobs_view.can_act(job, viewer, backend.is_admin(viewer)):
         # only a started steady job loses its run to a pause (pause.py)
-        buttons = _buttons_html(job, job.partition == gpu_jobs.Partition.STEADY and job.state != gpu_jobs.State.PENDING)
+        buttons = _buttons_html(job, job.restarts and job.state != gpu_jobs.State.PENDING)
     running = kind == Kind.RUNNING
     body = _template("job.html").substitute(
         job_id=esc(job_id),

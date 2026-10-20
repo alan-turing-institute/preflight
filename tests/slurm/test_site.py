@@ -75,6 +75,9 @@ def test_example_loads_and_minimal_file_gets_every_default(tmp_path: Path) -> No
         (MINIMAL + "[portal]\nsession_days = -1\n", "portal.session_days = -1"),
         (MINIMAL + "[portal]\nallow_from = ['ts']\n", "portal.allow_from entry 'ts'"),
         ('name = "x"\n', "missing nodes"),
+        (MINIMAL + "cores_per_gpu = 1\n", "cores_per_gpu must be"),  # no GPUs: nothing to hold cores for
+        (MINIMAL + "cores_per_gpu = 1.5\n" + GPU, "cores_per_gpu must be"),  # would render MaxCPUsPerNode=0.5
+        (MINIMAL + "cores_per_gpu = 2\n" + GPU, "must leave CPU-only jobs a core"),  # 2 of 2: CPU jobs could never run
         ("state_dir = 5\n" + MINIMAL, "has a value of the wrong kind"),
     ],
 )

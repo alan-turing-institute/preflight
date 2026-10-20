@@ -14,9 +14,11 @@ import submit
 DIRECTIVE = "#S" + "BATCH"  # spelled in two halves so a text-matching guard does not read a submission here
 
 
-def fake_site(monkeypatch: pytest.MonkeyPatch, *, lease: object, dgx_gate: bool, nodes: tuple = ()) -> None:
+def fake_site(monkeypatch: pytest.MonkeyPatch, *, lease: object, dgx_gate: bool, nodes: tuple = (),
+              cpu_job_cap: int | None = None) -> None:
     """`load` returns just the fields submit.py reads."""
-    monkeypatch.setattr(site_config, "load", lambda *_p: SimpleNamespace(lease=lease, dgx_gate=dgx_gate, nodes=nodes))
+    site = SimpleNamespace(lease=lease, dgx_gate=dgx_gate, nodes=nodes, cpu_job_cap=cpu_job_cap)
+    monkeypatch.setattr(site_config, "load", lambda *_p: site)
 
 
 @pytest.fixture(autouse=True)
@@ -41,7 +43,7 @@ def test_resume_job_runs_in_normal_with_requeue_append_and_the_gpu_token() -> No
 
 def test_restart_job_runs_in_steady_still_requeueable() -> None:
     script = dry("--project", "p", "--what", "w", "--class", "restart", "--mem", "4G", "--", "score")
-    assert f"{DIRECTIVE} --partition=steady" in script
+    assert f"{DIRECTIVE} --partition=cpu" in script  # no GPUs: the capped cpu partition, either class
     assert f"{DIRECTIVE} --requeue" in script
     assert "--gres" not in script
     assert "--needs-lease" not in script
@@ -54,6 +56,7 @@ def test_restart_job_runs_in_steady_still_requeueable() -> None:
         (["--class", "restart", "--entry", "a.py", "--", "x"], "--entry needs --repo"),
         (["--class", "restart", "--wait-limit", "soon", "--", "x"], "not a duration"),
         (["--class", "restart"], "no command"),
+        (["--project", "x:resume", "--class", "restart", "--", "x"], "no ':' in a project name"),  # would fake the class
     ],
 )
 def test_refusals(argv: list[str], why: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -97,23 +100,39 @@ def test_a_first_gpu_run_with_no_mem_takes_the_whole_box(mem: list[str], tmp_pat
 
 
 @pytest.mark.parametrize(
-    ("site_cpus", "argv", "cpus"),
+    ("site_cpus", "held", "argv", "cpus"),
     [
-        (None, ["--gpu"], 4),  # the site lists no GPU node: the small default
-        (20, ["--gpu"], 20),  # one-GPU box: all of it
-        (20, [], 4),  # a CPU job keeps the small default
-        (20, ["--gpu", "--cpus", "8"], 8),  # asked for wins
-        (24, ["--gpus", "2"], 12),  # four GPUs: two of them get half the cores
+        (None, None, ["--gpu"], 4),  # the site lists no GPU node: the small default
+        (20, None, ["--gpu"], 20),  # one-GPU box, nothing held: all of it
+        (20, 6, ["--gpu"], 6),  # the cores the site holds for the GPU
+        (20, None, [], 4),  # a CPU job keeps the small default
+        (20, None, ["--gpu", "--cpus", "8"], 8),  # asked for wins
+        (24, None, ["--gpus", "2"], 12),  # four GPUs: two of them get half the cores
+        (24, 5, ["--gpus", "2"], 10),  # two GPUs' held cores
     ],
 )
-def test_a_gpu_job_gets_its_gpus_share_of_the_cores(site_cpus: int | None, argv: list[str], cpus: int, tmp_path: Path,
-                                                    monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_gpu_job_gets_its_gpus_share_of_the_cores(site_cpus: int | None, held: int | None, argv: list[str], cpus: int,
+                                                    tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(gpu_jobs, "STATE_DIR", tmp_path)
     if site_cpus is not None:
         gpus = (object(),) * (4 if "--gpus" in argv else 1)
-        fake_site(monkeypatch, lease=None, dgx_gate=False, nodes=(SimpleNamespace(cpus=site_cpus, gpus=gpus),))
+        node = SimpleNamespace(cpus=site_cpus, gpus=gpus, cores_per_gpu=held)
+        fake_site(monkeypatch, lease=None, dgx_gate=False, nodes=(node,))
     script = dry("--project", "p", "--what", "w", "--class", "restart", "--mem", "4G", *argv, "--", "x")
     assert f"{DIRECTIVE} --cpus-per-task={cpus}" in script
+    # a job without GPUs runs in the CPU-only twin, kept off the cores held for GPU jobs
+    assert f"{DIRECTIVE} --partition={'steady' if '--gpu' in argv or '--gpus' in argv else 'cpu'}" in script
+
+
+def test_a_cpu_job_over_the_cpu_cap_is_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(gpu_jobs, "STATE_DIR", tmp_path)
+    fake_site(monkeypatch, lease=None, dgx_gate=False, cpu_job_cap=14)
+    with pytest.raises(submit.Refused, match="at most 14 cores"):  # it would wait forever on MaxCPUsPerNode
+        dry("--project", "p", "--what", "w", "--class", "restart", "--mem", "4G", "--cpus", "15", "--", "x")
+    assert "--cpus-per-task=14" in dry("--project", "p", "--what", "w", "--class", "restart", "--mem", "4G",
+                                        "--cpus", "14", "--", "x")
+    fake_site(monkeypatch, lease=None, dgx_gate=False, cpu_job_cap=2)  # a small box: the default 4 is clamped, not refused
+    assert "--cpus-per-task=2" in dry("--project", "p", "--what", "w", "--class", "restart", "--mem", "4G", "--", "x")
 
 
 def test_a_first_cpu_run_with_no_mem_gets_slurms_default(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -253,12 +253,13 @@ class Agent:
         errors: list[str] = []
         self.note = ""
         self._reconcile_boot(now, errors)
+        read_at_ns = time.time_ns()  # wall clock, like a request file's mtime
         queue = self.read_queue()
         if queue is None:
             errors.append("squeue did not answer; keeping the last state")
         else:
             self._keep_priorities(queue, now, errors)
-            self._restore_order(queue, errors)
+            self._restore_order(queue, read_at_ns, errors)
         if now - self._notices_at >= NOTICES_EVERY_S:
             self._notices_at = now
             self._failure_notices(errors)
@@ -394,17 +395,15 @@ class Agent:
     # -- 3. restore order after urgent work -----------------------------------------------------------------
 
     def _restore_order(
-        self, queue: list[gpu_jobs.QueuedJob], errors: list[str]
+        self, queue: list[gpu_jobs.QueuedJob], read_at_ns: int, errors: list[str]
     ) -> None:
         s = self.state
         jobs = {job.job_id: job for job in queue}
         present: set[str] = set()
         for path in sorted(self.requests.glob("restore_order-*.json")):
             try:
-                key, owner = (
-                    f"{path.name}:{path.stat().st_mtime_ns}",
-                    gpu_jobs._owner(path),
-                )
+                written_ns = path.stat().st_mtime_ns
+                key, owner = f"{path.name}:{written_ns}", gpu_jobs._owner(path)
             except OSError:
                 continue
             present.add(key)
@@ -416,6 +415,10 @@ class Agent:
                         file=sys.stderr,
                         flush=True,
                     )
+                continue
+            if written_ns >= read_at_ns:
+                # written after this step read the queue (urgent.py submits, then writes): that queue may lack the
+                # urgent job, so the request would look finished. The next step judges it.
                 continue
             order = gpu_jobs.read_json(path)
             if not order or key in s.released_requests:

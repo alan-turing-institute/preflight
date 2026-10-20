@@ -47,6 +47,10 @@ EXPECTED_DIFF = {
         "+# services' base use minus the host memory guard's reserve).",
         "+NodeName=gpu-node-1 CPUs=20 Boards=1 SocketsPerBoard=1 CoresPerSocket=20 ThreadsPerCore=1 RealMemory=100000 Gres=gpu:gb10:1 State=UNKNOWN",
         "-PartitionName=urgent Nodes=gpu-node-1 PriorityTier=2 PreemptMode=OFF MaxTime=INFINITE State=UP",
+        "+# cpu: every job without GPUs (submit.py routes it here), kept off the cores the site file holds for GPU jobs",
+        "+# (cores_per_gpu), so a free GPU never waits for cores. ONE partition: MaxCPUsPerNode counts only its own jobs.",
+        "+# Never pre-empted by slurm; urgent.py requeues a resume-class job in its way itself.",
+        "+PartitionName=cpu Nodes=gpu-node-1 PriorityTier=1 PreemptMode=OFF MaxTime=INFINITE State=UP MaxCPUsPerNode=8",
         "+PartitionName=urgent Nodes=gpu-node-1 PriorityTier=2 PreemptMode=OFF MaxTime=INFINITE State=UP AllowGroups=gpujobs-admin",
     ],
     "gres.conf": [
@@ -105,6 +109,7 @@ def test_eight_gpu_site_and_extra_slot():
                 "name": "n1",
                 "cpus": 64,
                 "real_memory_mb": 500000,
+                "cores_per_gpu": 4,
                 "gpus": [
                     {"index": i, "uuid": f"GPU-{i}", "device": f"/dev/nvidia{i}", "type": "h100"} for i in range(8)
                 ],
@@ -120,4 +125,5 @@ def test_eight_gpu_site_and_extra_slot():
     conf = files["/etc/slurm/slurm.conf"].content
     assert "Gres=gpu:h100:8" in conf
     assert "AllowGroups=ops" in conf
+    assert conf.count(" MaxCPUsPerNode=32\n") == 1  # 64 cores less 4 held for each of 8 GPUs, on the one cpu partition
     assert conf.endswith("State=UP AllowGroups=ops\nProlog=/x\n")

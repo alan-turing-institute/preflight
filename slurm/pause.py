@@ -40,7 +40,7 @@ def main() -> int:
         print(f"[pause] job {arguments.job_id} is not in the queue", file=sys.stderr)
         return 1
     pending = job.state == gpu_jobs.State.PENDING
-    steady = job.partition == gpu_jobs.Partition.STEADY and not pending
+    steady = job.restarts and not pending
     if pending:
         loss = "[pause] it is not running, so a pause loses nothing; it waits held until released (slurm/resume.py)"
     elif steady:

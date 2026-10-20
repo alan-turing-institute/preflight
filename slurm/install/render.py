@@ -70,6 +70,8 @@ def _slurm(site: Site, extra: dict[str, str]) -> dict[str, FileSpec]:
         "head_node": names[0],
         "cluster_name": site.cluster_name,
         "partition_nodes": ",".join(names),
+        # slurm.conf(5) MaxCPUsPerNode: a partition limited to a subset of the cores keeps the rest for GPU jobs
+        "cpu_job_limit": f" MaxCPUsPerNode={site.cpu_job_cap}" if site.cpu_job_cap else "",
         "node_lines": "".join(_node_line(n) for n in site.nodes),
         "gres_lines": gres_lines,
         "admin_group": site.admin_group,

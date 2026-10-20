@@ -37,6 +37,7 @@ USERS = ("alice", "bob", "carol")
 PASSWORDS: dict[str, str] = {u: f"pw-{u}-e2e" for u in (*USERS, "dave")}
 RESULTS: list[tuple[str, bool, str]] = []
 CHAIN_LENGTH = 3  # jobs in the chain S1 submits
+CPU_CAP = 2  # cores S3 lets the CPU-only partition use on the 4-core harness node
 AGENT_LOOP_S = 5  # the agent's loop interval
 REQUEUE_DELAY_S = 60  # slurm.conf AuthInfo=cred_expire: how long before a requeued job may start again
 REQUEUE_WITHIN_S = 70  # the agent waits 30 s for slurmctld, then acts within one 5-s loop; slack for the restarts themselves
@@ -402,6 +403,25 @@ def stage_jobs() -> None:
     why = jobinfo(dj).get("Reason", "")
     check("S6: alice cannot sidestep the tool: a job she sends straight to the urgent partition never runs (slurm: AllowGroups)",
           bool(dj) and state(dj) == "PENDING" and "not_in_group_permitted_to_use_this_partition" in why, f"job {dj} {state(dj)}: {why}")
+    clear_queue()
+
+    # S3: CPU-only jobs never take the cores held for GPU jobs. The harness node (4 cores, 4 GPUs) cannot hold a core per
+    # GPU and leave CPU jobs one, so the cap a site's cores_per_gpu renders is set on the live partition instead. The CPU
+    # jobs mix both classes: slurm counts MaxCPUsPerNode per partition, so one partition must cap them together.
+    capped = sh(f"scontrol update PartitionName=cpu MaxCPUsPerNode={CPU_CAP}")
+    try:
+        cpu = [submit("alice", f"cpu{i}", 120, cls=cls) for i, cls in enumerate(("resume", "restart", "resume"))]
+        wait_for(lambda: sum(state(j) == "RUNNING" for j in cpu) == CPU_CAP, 60)
+        g = submit("alice", "gpu-beside-cpu", 30, "--gpu", "--cpus", "2", cls="restart")
+        started = wait_for(lambda: state(g) == "RUNNING", 90)  # a backfill pass can take up to 30 s
+        parts = {jobinfo(j).get("Partition") for j in cpu}
+        check("S3: CPU-only jobs of both classes share one cpu partition capped at 2 cores; the third waits, and a 2-core "
+              "GPU job still starts", capped.rc == 0 and parts == {"cpu"}
+              and [state(j) for j in cpu].count("RUNNING") == CPU_CAP and bool(started),
+              f"cap rc={capped.rc}; partitions {parts}; cpu {[(j, state(j), jobinfo(j).get('Reason')) for j in cpu]}; "
+              f"gpu {g} {state(g)}")
+    finally:
+        sh("scontrol update PartitionName=cpu MaxCPUsPerNode=UNLIMITED")
     clear_queue()
 
     keeps_place(agent_on=True)

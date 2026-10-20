@@ -277,6 +277,21 @@ def test_restore_order_releases_once_when_the_victim_left_and_the_file_cannot_be
     assert world.writes == [["release", "7,8"]]
 
 
+def test_restore_order_waits_for_a_queue_read_after_the_request_was_written(world: World) -> None:
+    # urgent.py submits, then writes its request; a queue read from before the submission lacks the urgent job, and
+    # judged against it the request looks finished (measured in the e2e, 2026-10-20: the held job was released at once).
+    paths: list[Path] = []
+
+    def read_queue() -> list:
+        paths.append(world.request("9", ["1"], ["7"]))  # written while this step is between its read and its look
+        world.admins = {gpu_jobs._owner(paths[0])}
+        return [job("1")]
+
+    world.agent.read_queue = read_queue
+    world.step()
+    assert world.writes == [] and paths[0].exists()  # judged on the next step, against a queue that has job 9
+
+
 def test_failed_jobs_raise_an_event_and_run_the_notify_command_once(
     world: World, tmp_path: Path
 ) -> None:

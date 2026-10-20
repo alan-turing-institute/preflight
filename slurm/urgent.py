@@ -69,6 +69,15 @@ def mem_mb(text: str) -> int:
     return int(float(text[:-1]) * scale[unit]) if unit in scale else int(text)
 
 
+def _asked_mb(job_id: str, user: str) -> int:
+    """The memory a job asked for, from its sidecar (which its owner writes); 0 when unknown, the whole box or unreadable,
+    which counts as freeing nothing, so a CPU job is requeued rather than the urgent job left waiting."""
+    try:
+        return mem_mb(str((gpu_jobs.read_sidecar(job_id, user) or {}).get("mem") or "0"))
+    except (ValueError, KeyError, IndexError):
+        return 0
+
+
 def plan(
     queue: list[gpu_jobs.QueuedJob], *, gpu: bool, whole_box: bool, leases: list[tuple[str, bool]],
     unregistered: list[tuple[int, float, str]], services: dict[str, str], memory_short: bool = False,
@@ -90,7 +99,12 @@ def plan(
             victims.append(job.job_id)
             lines.append(f"[urgent] PAUSABLE  {what}: may be pre-empted (slurm picks as many as the urgent job needs); "
                          "loses at most the time since its last checkpoint")
-        elif job.partition == gpu_jobs.Partition.STEADY:
+        elif job.partition == gpu_jobs.Partition.CPU and not job.restarts:  # slurm never pre-empts `cpu`: urgent.py does
+            victims.append(job.job_id)
+            lines.append(f"[urgent] PAUSABLE  {what}: requeued once the urgent job is accepted"
+                         + ("" if whole_box else ", if pre-empting the normal jobs does not free enough memory")
+                         + "; loses at most the time since its last checkpoint")
+        elif job.restarts:
             steady.append(job.job_id)
             lines.append(f"[urgent] WAIT-ONLY {what}: cannot resume; requeueing it loses all of that run")
         else:
@@ -179,6 +193,15 @@ def run(argv: list[str]) -> int:
         queue, gpu=arguments.gpu, whole_box=whole_box, leases=other_leases(), unregistered=audit.unregistered(),
         memory_short=memory_short, services=services,
     )
+    # slurm pre-empts `normal` victims; a `cpu` one urgent.py requeues itself, and it stays out of the restore-order
+    # request (whose held GPU jobs would otherwise wait until a requeued CPU job got its capped cores back)
+    by_id = {job.job_id: job for job in queue}
+    cpu_victims = [v for v in victims if by_id[v].partition == gpu_jobs.Partition.CPU]
+    victims = [v for v in victims if v not in cpu_victims]
+    if cpu_victims and not whole_box and free is not None:  # memory short: only if the normal ones cannot free enough
+        freed = sum(_asked_mb(v, by_id[v].user) for v in victims)
+        if freed >= mem_mb(arguments.mem) - free:
+            cpu_victims = []
     if arguments.mem and free is not None:
         print(f"[urgent] memory: needs {mem_mb(arguments.mem)} MB, slurm has {free} MB unallocated"
               + ("; jobs will be pre-empted to make room" if memory_short else "; it fits beside what runs"))
@@ -250,6 +273,10 @@ def run(argv: list[str]) -> int:
                     gpu_jobs.write_event(held_id, gpu_jobs.EventAction.URGENT_HOLD, urgent=f"{arguments.name}: {arguments.what}")
                 except OSError as error:  # the history only: the request above is what matters
                     print(f"[urgent] warning: job {held_id}'s history misses this hold ({error})", file=sys.stderr)
+    for victim in cpu_victims:  # a `cpu` job resumes but slurm never pre-empts it (PreemptMode=OFF): requeue it here
+        if gpu_jobs.run_slurm(["scontrol", "requeue", victim]):
+            print(f"[urgent] could not requeue job {victim} (slurm's message is above); job {job_id} waits behind it",
+                  file=sys.stderr)
     if arguments.requeue_steady:  # only now: requeueing loses the run, which a refused submission must not cost
         for steady_id in steady:
             if gpu_jobs.run_slurm(["scontrol", "requeue", steady_id]):

@@ -62,10 +62,11 @@ JOB_ID = re.compile(r"\d+(?:_\d+)?", re.ASCII)
 
 
 class Partition(StrEnum):
-    """The three partitions of the rendered `slurm.conf` (`slurm/install/templates/slurm/slurm.conf`)."""
+    """The partitions of the rendered `slurm.conf` (`slurm/install/templates/slurm/slurm.conf`)."""
 
     NORMAL = "normal"  # resumes from its own checkpoint; pre-emptable
     STEADY = "steady"  # cannot resume; never pre-empted
+    CPU = "cpu"  # a job without GPUs, either class: kept off the cores held for GPU jobs; slurm never pre-empts it
     URGENT = "urgent"  # urgent.py only; pre-empts `normal`
 
 
@@ -76,8 +77,12 @@ class JobClass(StrEnum):
     RESTART = "restart"
 
 
-#: The partition each class runs in.
-PARTITION_OF = {JobClass.RESUME: Partition.NORMAL, JobClass.RESTART: Partition.STEADY}
+def partition_for(job_class: JobClass, gpus: int) -> Partition:
+    """The partition a job runs in: one without GPUs in `cpu` (one partition, so its MaxCPUsPerNode caps all CPU-only
+    jobs together: slurm counts that limit per partition), else by its class."""
+    if not gpus:
+        return Partition.CPU
+    return Partition.NORMAL if job_class is JobClass.RESUME else Partition.STEADY
 
 
 class State(StrEnum):
@@ -138,6 +143,22 @@ class QueuedJob:
     priority: int = 0
     gpus: int = 0
     cpus: int = 0  # cores slurm gave it (asked, while it waits)
+
+    @property
+    def job_class(self) -> JobClass | None:
+        """The class `submit.py` put in the name (`project:class:name`); None for a job it did not submit."""
+        try:
+            _, label, _ = self.name.split(":", 2)
+        except ValueError:
+            return None
+        return JobClass(label) if label in set(JobClass) else None
+
+    @property
+    def restarts(self) -> bool:
+        """A requeue loses its run: a `steady` job, or a `cpu` job not known to resume from a checkpoint."""
+        return self.partition == Partition.STEADY or (
+            self.partition == Partition.CPU and self.job_class is not JobClass.RESUME
+        )
 
     @property
     def depends_on(self) -> tuple[str, ...]:

@@ -31,6 +31,11 @@ notify_command = []
 name = "example-host"        # slurm NodeName (required)
 cpus = 8                     # CPUs slurm may hand out (required)
 real_memory_mb = 64000       # RealMemory in MB slurm may hand out (required)
+# Cores held for GPU jobs, per GPU: a GPU job gets this many per GPU by default, and CPU-only jobs (partitions
+# partition cpu, capped by MaxCPUsPerNode) never use them, so a free GPU never waits for cores. Set it
+# from a measurement: the fewest cores at which your GPU jobs stop getting faster. Unset: nothing is held, and a
+# GPU job's default is its GPUs' share of the node's cores (all of them on a one-GPU node). Optional.
+# cores_per_gpu = 4
 
 # One [[nodes.gpus]] table per GPU on that node, belonging to the [[nodes]] table above it. May be omitted.
 [[nodes.gpus]]

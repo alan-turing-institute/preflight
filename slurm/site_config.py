@@ -57,6 +57,12 @@ class Node:
     cpus: int
     real_memory_mb: int
     gpus: tuple[Gpu, ...]
+    cores_per_gpu: int | None = None  # held for GPU jobs; CPU-only jobs never use them (slurm's RestrictedCoresPerGPU)
+
+    @property
+    def gpu_cores(self) -> int:
+        """Cores held for GPU jobs on this node: 0 when `cores_per_gpu` is unset."""
+        return (self.cores_per_gpu or 0) * len(self.gpus)
 
 
 @dataclass(frozen=True)
@@ -106,6 +112,14 @@ class Site:
     portal: Portal
     notify_command: tuple[str, ...]  # argv; empty means no notification
 
+    @property
+    def cpu_job_cap(self) -> int | None:
+        """Cores a CPU-only job may use per node (its partitions' MaxCPUsPerNode): every node's cores less those held
+        for its GPUs, at the tightest node; None when no node holds cores. slurm 23.11 has no per-node form, so a
+        CPU-only node in a mixed site is capped too."""
+        held = [n.cpus - n.gpu_cores for n in self.nodes if n.gpu_cores]
+        return min(held) if held else None
+
 
 _HINT = "run `slurm/install/install.py detect` to write one for this machine"
 
@@ -149,12 +163,18 @@ def _opt_path(value: str) -> Path | None:
 
 def _parse_node(raw: Any, i: int) -> Node:
     where = f"nodes[{i}]"
-    t = _table(raw, where, {"name", "cpus", "real_memory_mb"}, {"gpus": []})
+    t = _table(raw, where, {"name", "cpus", "real_memory_mb"}, {"gpus": [], "cores_per_gpu": None})
     gpus = tuple(
         Gpu(**_table(g, f"{where}.gpus[{j}]", {"index", "uuid", "device", "type"}, {}))
         for j, g in enumerate(t["gpus"])
     )
-    return Node(t["name"], t["cpus"], t["real_memory_mb"], gpus)
+    node = Node(t["name"], t["cpus"], t["real_memory_mb"], gpus, t["cores_per_gpu"])
+    if node.cores_per_gpu is not None and not (
+        type(node.cores_per_gpu) is int and gpus and node.cores_per_gpu >= 1 and node.gpu_cores < node.cpus
+    ):
+        raise SiteError(f"site file: [{where}] cores_per_gpu must be a whole number of at least 1, needs GPUs, and must leave CPU-only jobs a core "
+                        f"({node.cores_per_gpu} x {len(gpus)} GPU(s) of {node.cpus} cores)")
+    return node
 
 
 def _parse_lease(raw: Any) -> Lease:

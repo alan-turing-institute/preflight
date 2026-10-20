@@ -142,6 +142,7 @@ TOML. Tables: the top level, `[[nodes]]` with `[[nodes.gpus]]`, `[lease]` with `
 | `cpus` | required | CPUs slurm may hand out. |
 | `real_memory_mb` | required | Memory in MB slurm may hand out (the machine's memory minus what the host keeps back). |
 | `gpus` | `[]` | `[[nodes.gpus]]` tables, one per GPU on this node. |
+| `cores_per_gpu` | absent | Cores held for GPU jobs, per GPU. A GPU job gets this many per GPU by default, and CPU-only jobs (partition `cpu`) are capped by `MaxCPUsPerNode` at the node's cores less those held, so a free GPU never waits for cores taken by CPU jobs (slurm.conf(5)'s own use of `MaxCPUsPerNode`; slurm 23.11 has no `RestrictedCoresPerGPU`). Set it from a measurement: the fewest cores at which your GPU jobs stop getting faster. With several nodes the cap is the tightest node's and applies to every node, CPU-only ones included. At least 1, and must leave CPU-only jobs a core. Absent: nothing is held, and a GPU job's default is its GPUs' share of the node's cores (all of them on a one-GPU node), so any CPU job running holds a GPU job back. `submit.py` refuses a CPU-only job asking for more than the cap, which would otherwise wait forever. |
 
 ### `[[nodes.gpus]]`
 
@@ -236,9 +237,11 @@ The installer stops and disables `ondemand-dex` in this mode if it is running (a
 **`slurm`** (always on). Packages `slurm-wlm`, `slurmdbd`, `mariadb-server`, `munge`. Files:
 `/etc/slurm/slurm.conf`, `cgroup.conf`, `gres.conf`, `/etc/slurm/slurmdbd.conf` (0600, owned by `slurm`),
 `/etc/mysql/mariadb.conf.d/90-slurm.cnf`, and a `10-restart-protect.conf` drop-in for the `slurmctld`, `slurmd`,
-`munge` and `slurmdbd` services (restart on failure, kept away from the kernel's out-of-memory killer). Three
-partitions: `normal` (default; pre-emptable, resumes from its checkpoint), `steady` (never pre-empted) and
-`urgent` (higher tier, `AllowGroups=` the admin group). Priority is `priority/basic`. Services restarted:
+`munge` and `slurmdbd` services (restart on failure, kept away from the kernel's out-of-memory killer). Four
+partitions: `normal` (default; pre-emptable, resumes from its checkpoint), `steady` (never pre-empted), `cpu`
+(every job without GPUs, either class, which `submit.py` sends there; capped by `cores_per_gpu`, as one partition
+because slurm counts `MaxCPUsPerNode` per partition; never pre-empted by slurm, so `urgent.py` requeues a
+resume-class one in its way itself) and `urgent` (higher tier, `AllowGroups=` the admin group; pre-empts `normal`). Priority is `priority/basic`. Services restarted:
 `mariadb`, `munge`, `slurmdbd`, then `slurmctld`, `slurmd`. Slurm's own ports (6817, 6818, 6819) are slurm's
 defaults, not set by this installer.
 
@@ -307,7 +310,8 @@ Page-changing requests must carry an `Origin` header that matches `Host`.
 
 The commands below are the shims installed in `/usr/local/bin`; from a checkout use `python3 slurm/NAME.py`.
 
-    # submit: the job's command follows --; --class says whether re-running continues (resume) or redoes (restart)
+    # submit: the job's command follows --; --class says whether re-running continues (resume) or redoes (restart);
+    # --cpus N asks for N cores (a job without GPUs: at most the cap, cores_per_gpu); no ':' in --project
     gpujobs-submit --project myproj --what 'train the model' --class resume --resume-ok --gpu --name train1 -- python train.py
 
     # see the queue, who holds the GPU and why jobs wait

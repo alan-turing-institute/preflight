@@ -13,8 +13,8 @@ import resume
 import urgent
 
 
-def job(job_id: str, partition: str, state: str = "RUNNING", gpus: int = 1) -> gpu_jobs.QueuedJob:
-    return gpu_jobs.QueuedJob(job_id, partition, state, "None", f"p:x:{job_id}", gpus=gpus)
+def job(job_id: str, partition: str, state: str = "RUNNING", gpus: int = 1, cls: str = "x") -> gpu_jobs.QueuedJob:
+    return gpu_jobs.QueuedJob(job_id, partition, state, "None", f"p:{cls}:{job_id}", gpus=gpus)
 
 
 @pytest.fixture(autouse=True)
@@ -26,7 +26,7 @@ def sidecars(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_classes_of_what_is_in_the_way() -> None:
-    queue = [job("1", "normal"), job("2", "steady"), job("3", "normal", gpus=0), job("4", "urgent", "PENDING")]
+    queue = [job("1", "normal"), job("2", "steady"), job("3", "cpu", gpus=0, cls="resume"), job("4", "urgent", "PENDING")]
     lines, victims, steady, wait_only = urgent.plan(
         queue, gpu=True, whole_box=False,
         leases=[("service-a", False), ("service-b", False), ("service-c", False), ("slurm", False)],
@@ -43,11 +43,12 @@ def test_classes_of_what_is_in_the_way() -> None:
 
 
 def test_whole_box_puts_every_running_job_in_the_way() -> None:
-    _, victims, _, _ = urgent.plan(
-        [job("1", "normal"), job("3", "normal", gpus=0)], gpu=True, whole_box=True, leases=[], unregistered=[],
-        services={},
+    _, victims, steady, _ = urgent.plan(
+        [job("1", "normal"), job("3", "cpu", gpus=0, cls="resume"), job("5", "cpu", gpus=0, cls="restart")],
+        gpu=True, whole_box=True, leases=[], unregistered=[], services={},
     )
-    assert victims == ["1", "3"]
+    assert victims == ["1", "3"]  # a cpu job that resumes is a victim (urgent.py requeues it; slurm never pre-empts cpu)
+    assert steady == ["5"]  # one that restarts would lose its run, like a steady job
 
 
 def test_stops_without_submitting_behind_a_wait_only_blocker_or_without_a_site_file(
@@ -99,6 +100,7 @@ def site_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 def test_site_admin_check_multi_gpu_plan_and_request_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    write_new = gpu_jobs.write_new
     queue = [
         gpu_jobs.QueuedJob("5", "normal", "RUNNING", "None", "p:x:5", gpus=2),
         gpu_jobs.QueuedJob("6", "normal", "PENDING", "Resources", "p:x:6", gpus=1),
@@ -173,6 +175,7 @@ def test_site_admin_check_multi_gpu_plan_and_request_file(
     assert calls == []
     assert urgent.run([*argv, "--requeue-steady", "--", "true"]) == 1  # sbatch still refuses
     assert ["scontrol", "requeue", "2"] not in calls  # so the steady job keeps its run
+
     calls.clear()
     monkeypatch.setattr(urgent.subprocess, "run", lambda command, **_k: calls.append(command) or done)
     assert urgent.run([*argv, "--requeue-steady", "--", "true"]) == 0
@@ -188,6 +191,28 @@ def test_site_admin_check_multi_gpu_plan_and_request_file(
     monkeypatch.setattr(urgent.gpu_jobs, "write_new", lambda *_a: (_ for _ in ()).throw(FileExistsError(17, "taken")))
     assert urgent.run([*argv, "--requeue-steady", "--", "true"]) == 1
     assert calls == [] and "REFUSED: the batch script taken" in capsys.readouterr().err
+
+    # slurm never pre-empts the cpu partition: urgent.py requeues a resume-class cpu job in its way, once accepted
+    queue[:] = [gpu_jobs.QueuedJob("3", "cpu", "RUNNING", "None", "p:resume:3", gpus=0)]
+    monkeypatch.setattr(urgent.gpu_jobs, "write_new", write_new)
+    monkeypatch.setattr(urgent.subprocess, "run", lambda command, **_k: calls.append(command) or done)
+    calls.clear()
+    assert urgent.run(["--project", "p", "--what", "w", "--time", "0:10:00", "--name", "u", "--whole-box", "--", "true"]) == 0
+    assert ["scontrol", "requeue", "3"] in calls
+    # ... and it stays out of the restore-order request: the held GPU jobs wait only for what slurm pre-empted
+    queue[:] = [gpu_jobs.QueuedJob("5", "normal", "RUNNING", "None", "p:resume:5", gpus=2), queue[0],
+                gpu_jobs.QueuedJob("6", "normal", "PENDING", "Resources", "p:resume:6", gpus=1)]
+    calls.clear()
+    assert urgent.run(["--project", "p", "--what", "w", "--time", "0:10:00", "--name", "u", "--whole-box", "--", "true"]) == 0
+    request = max((tmp_path / "requests").glob("restore_order-*.json"), key=lambda p: p.stat().st_mtime_ns)
+    assert json.loads(request.read_text())["victims"] == ["5"] and ["scontrol", "requeue", "3"] in calls
+    # memory short (not the whole box): the cpu job is requeued only if pre-empting the normal one cannot free enough
+    monkeypatch.setattr(urgent, "free_memory_mb", lambda: 1000)
+    for asked, requeued in (("4G", False), ("512M", True), ("lots", True)):  # needs 1048 MB more; its owner wrote "lots"
+        gpu_jobs.update_sidecar("5", mem=asked)
+        calls.clear()
+        assert urgent.run([*argv[:-4], "--mem", "2G", "--", "true"]) == 0
+        assert (["scontrol", "requeue", "3"] in calls) is requeued, asked
 
 
 class FakeSlurm:

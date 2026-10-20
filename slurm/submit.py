@@ -145,7 +145,7 @@ def sbatch_script(
 ) -> str:
     """The job script: directives, then one line running the wrapper. `urgent.py` passes its own partition."""
     label = arguments.job_class
-    partition = partition or gpu_jobs.PARTITION_OF[gpu_jobs.JobClass(label)]
+    partition = partition or gpu_jobs.partition_for(gpu_jobs.JobClass(label), arguments.gpus)
     lines = [
         "#!/bin/bash",
         f"#SBATCH --partition={partition}",
@@ -180,7 +180,8 @@ def sbatch_script(
 
 
 def resolve_cpus(asked: int | None, gpus: int, site: site_config.Site) -> int:
-    """`--cpus`, else for a GPU job its GPUs' share of the GPU node's cores, else DEFAULT_CPUS.
+    """`--cpus`, else for a GPU job the cores the site holds for its GPUs (`cores_per_gpu`) or, unset, its GPUs'
+    share of the GPU node's cores, else DEFAULT_CPUS.
 
     A GPU job given the old flat 4 cores was CPU-bound: the same inference timing ran 2-14x slower than with all 20
     (slurm jobs 254 and 258, 2026-10-19), while the other cores sat idle behind the one GPU.
@@ -189,7 +190,9 @@ def resolve_cpus(asked: int | None, gpus: int, site: site_config.Site) -> int:
         return asked
     node = next((n for n in site.nodes if n.gpus), None)
     if not gpus or node is None:
-        return DEFAULT_CPUS
+        return min(DEFAULT_CPUS, site.cpu_job_cap or DEFAULT_CPUS)  # a CPU-only job's default fits under the cap
+    if node.cores_per_gpu:
+        return node.cores_per_gpu * min(gpus, len(node.gpus))
     return max(1, node.cpus * min(gpus, len(node.gpus)) // len(node.gpus))
 
 
@@ -207,8 +210,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--repo", type=Path, default=None)
     p.add_argument("--after", action="append", default=[], metavar="JOBID")
     p.add_argument("--cpus", type=int, default=None,
-                   help=f"default: a GPU job gets its GPUs' share of the GPU node's cores (all of them on a one-GPU box), "
-                        f"other jobs {DEFAULT_CPUS}")
+                   help=f"default: a GPU job gets the cores the site holds per GPU (cores_per_gpu), else its GPUs' share "
+                        f"of the GPU node's cores; other jobs {DEFAULT_CPUS}")
     p.add_argument("--name", default=None)
     p.add_argument("--log", type=Path, default=None)
     p.add_argument("--workdir", type=Path, default=Path.cwd())
@@ -231,6 +234,11 @@ def submit(argv: list[str]) -> str:
     if not arguments.command:
         msg = "no command after --"
         raise Refused(msg)
+    if ":" in arguments.project:
+        # the job name is project:class:name, and tools read the class back from it (QueuedJob.job_class): a ':' here
+        # could make a restart job read as one that resumes, and urgent.py would then requeue it and lose its run
+        msg = f"--project {arguments.project!r}: no ':' in a project name"
+        raise Refused(msg)
     if arguments.gpus is not None and arguments.gpus < 1:
         msg = f"--gpus {arguments.gpus}: ask for at least one GPU, or leave it out for a CPU job"
         raise Refused(msg)
@@ -248,6 +256,10 @@ def submit(argv: list[str]) -> str:
     seconds(arguments.wait_limit)
     mem = resolve_mem(arguments.mem, named, arguments.gpu)
     arguments.cpus = resolve_cpus(arguments.cpus, arguments.gpus, site)
+    if not arguments.gpus and site.cpu_job_cap and arguments.cpus > site.cpu_job_cap:
+        msg = (f"--cpus {arguments.cpus}: a job without GPUs may use at most {site.cpu_job_cap} cores here; the rest "
+               "are held for GPU jobs (cores_per_gpu in the site file)")
+        raise Refused(msg)
     stamp = time.strftime("%Y%m%d-%H%M%S")
     log = arguments.log or gpu_jobs.STATE_DIR / "logs" / f"{arguments.name}-{stamp}.log"
     gated = bool(arguments.entry) and site.dgx_gate
@@ -293,8 +305,14 @@ def submit(argv: list[str]) -> str:
         max_jobs=arguments.max_jobs,
         submitted_at=int(time.time()),
     )
-    partition = gpu_jobs.PARTITION_OF[gpu_jobs.JobClass(arguments.job_class)]
-    pauses = "pre-empted and resumed from its checkpoint" if partition == gpu_jobs.Partition.NORMAL else "never pre-empted"
+    partition = gpu_jobs.partition_for(gpu_jobs.JobClass(arguments.job_class), arguments.gpus)
+    pauses = {
+        gpu_jobs.Partition.NORMAL: "pre-empted and resumed from its checkpoint",
+        gpu_jobs.Partition.STEADY: "never pre-empted",
+    }.get(partition) or (
+        "requeued for urgent work and resumed from its checkpoint" if arguments.job_class == gpu_jobs.JobClass.RESUME
+        else "never pre-empted"
+    )
     print(f"[submit] job {job_id} ({partition}: {pauses}); log {log}")
     return job_id
 
