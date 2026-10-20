@@ -137,6 +137,7 @@ class QueuedJob:
     user: str = ""
     priority: int = 0
     gpus: int = 0
+    cpus: int = 0  # cores slurm gave it (asked, while it waits)
 
     @property
     def depends_on(self) -> tuple[str, ...]:
@@ -192,6 +193,7 @@ def parse_squeue(text: str) -> list[QueuedJob]:
                 str(raw["job_id"]), raw.get("partition", ""), state, raw.get("state_reason", ""), raw.get("name", ""),
                 raw.get("dependency", ""), raw.get("user_name", ""),
                 int(priority.get("number", 0)) if priority.get("set") else 0, parse_gpus(raw.get("tres_per_node") or ""),
+                int((raw.get("cpus") or {}).get("number") or 0),
             )
         )
     return jobs
@@ -616,6 +618,26 @@ def job_pids(cgroup: Path | None, fallback_pids: set[int], job_id: str, gpu_pids
         if container_label(audit.cgroup_of(pid), JOB_LABEL) == job_id:
             pids.add(pid)
     return pids
+
+
+def capacity(runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run) -> dict[str, int]:
+    """Over every node: the cores, memory (MB) and GPUs slurm has to give, and how much of each it has given to jobs
+    (`scontrol show nodes -o`). {} when slurm does not answer."""
+    try:
+        done = runner(["scontrol", "show", "nodes", "-o"], capture_output=True, text=True, timeout=30, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    if done.returncode != 0:
+        return {}
+    total = dict.fromkeys(("cpus", "cpus_used", "mem_mb", "mem_used_mb", "gpus", "gpus_used"), 0)
+    for line in done.stdout.splitlines():
+        fields = dict(part.split("=", 1) for part in line.split() if "=" in part)
+        gpus = [re.search(r"gres/gpu=(\d+)", fields.get(key, "")) for key in ("CfgTRES", "AllocTRES")]
+        for key, value in (("cpus", fields.get("CPUTot")), ("cpus_used", fields.get("CPUAlloc")),
+                           ("mem_mb", fields.get("RealMemory")), ("mem_used_mb", fields.get("AllocMem")),
+                           ("gpus", gpus[0] and gpus[0][1]), ("gpus_used", gpus[1] and gpus[1][1])):
+            total[key] += int(value) if value and str(value).isdigit() else 0
+    return total
 
 
 def nodes(runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run) -> list[str]:

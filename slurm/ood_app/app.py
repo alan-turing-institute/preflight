@@ -211,6 +211,7 @@ class Backend:
     finished: Callable[[str], jobs_view.HistoryRow | None] = jobs_view.finished_job
     now: Callable[[], datetime] = datetime.now
     project_order: Callable[[], list[str]] = lambda: _project_order()
+    capacity: Callable[[], Mapping[str, int]] = gpu_jobs.capacity
     run: Run = run_tool
     python: str = field(default_factory=lambda: sys.executable)
     slurm_dir: Path = SLURM_DIR
@@ -255,6 +256,7 @@ def job_rows(backend: Backend) -> list[dict[str, object]]:
                 "waiting": jobs_view.waiting_reason(job, by_id, records, events),
                 "elapsed": elapsed.get(job.job_id, ""),
                 "gpus": job.gpus,
+                "cpus": job.cpus,
                 "mem": str(record.get("mem") or ""),
             }
         )
@@ -430,7 +432,7 @@ def _ordered(queue: list[QueuedJob]) -> list[QueuedJob]:
 
 
 def _now_card(rows: list[dict[str, object]], keeper: Mapping[str, object], backend: Backend, root: str) -> str:
-    running = [r for r in rows if r["kind"] == Kind.RUNNING]
+    running = sorted((r for r in rows if r["kind"] == Kind.RUNNING), key=lambda r: not r["gpus"])  # a GPU job leads
     waiting = [r for r in rows if r["kind"] == Kind.WAITING]
     blockers = [str(b) for b in keeper.get("blockers") or [] if b] if isinstance(keeper.get("blockers"), list) else []
     icon = '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">{}</svg>'
@@ -441,12 +443,12 @@ def _now_card(rows: list[dict[str, object]], keeper: Mapping[str, object], backe
         figures = [
             ("Running for", _duration(job["elapsed_s"])),  # type: ignore[arg-type]
             ("GPU memory in use", _gib(live.get("gpu"))),
-            ("CPU memory in use", _gib(live.get("cpu"))),
+            ("CPU memory in use", _gib(live.get("cpu")) + (f" of {_asked_memory(job['mem'])} asked" if job["mem"] else "")),
         ]
         return (
             '<section class="card now" aria-label="The GPU now">'
             f'<div class="now-icon busy">{icon.format("<path d=\"M5 3l14 9-14 9V3z\"/>")}</div>'
-            f'<div><div class="now-label">On the GPU now</div>'
+            f'<div><div class="now-label">{"On the GPU now" if job["gpus"] else "Running now, without the GPU"}</div>'
             f'<div class="now-title"><a href="{root}job/{esc(job["id"])}">{esc(job["short"])}</a>{esc(more)}</div>'
             f'<div class="now-desc">{_project(str(job["project"]))} · {esc(job["description"] or job["name"])}</div></div>'
             '<div class="now-figures">'
@@ -465,6 +467,31 @@ def _now_card(rows: list[dict[str, object]], keeper: Mapping[str, object], backe
         f'<div><div class="now-label">The GPU now</div><div class="now-title">{esc(title)}</div><div class="now-desc">{esc(desc)}</div></div>'
         "</section>"
     )
+
+
+def _running_note(running: int, on_gpu: int) -> str:
+    """The Running tile's line: how many of the running jobs hold the GPU (a CPU-only job runs beside it)."""
+    if not running:
+        return "nothing running"
+    return "on the GPU now" if on_gpu == running else f"{on_gpu} on the GPU" if on_gpu else "none on the GPU"
+
+
+def _resource_tiles(have: Mapping[str, int], rows: list[dict[str, object]]) -> str:
+    """What slurm has handed out of the box, and what is free (its own totals: memory is what slurm may give, not all
+    of the machine's)."""
+    if not have:
+        return ""
+    running = [r for r in rows if r["kind"] == Kind.RUNNING]
+    by_gpu = sum(int(r["cpus"]) for r in running if r["gpus"])  # type: ignore[call-overload]
+    by_cpu = sum(int(r["cpus"]) for r in running if not r["gpus"])  # type: ignore[call-overload]
+    gib = 1024  # slurm counts memory in MB
+    return _tiles([
+        ("GPUs in use", f"{have['gpus_used']} of {have['gpus']}", f"{have['gpus'] - have['gpus_used']} free"),
+        ("Cores in use", f"{have['cpus_used']} of {have['cpus']}",
+         f"{by_cpu} by CPU jobs, {by_gpu} by GPU jobs · {have['cpus'] - have['cpus_used']} free"),
+        ("Memory given to jobs", f"{have['mem_used_mb'] / gib:.0f} of {have['mem_mb'] / gib:.0f} GiB",
+         f"{(have['mem_mb'] - have['mem_used_mb']) / gib:.0f} GiB free"),
+    ])
 
 
 def _tiles(items: list[tuple[str, str, str]]) -> str:
@@ -553,11 +580,11 @@ def index_page(backend: Backend, root: str = "") -> str:
     failed = sum(1 for r in recent if _result(r.state)[0] in BAD_RESULTS)
     count = {kind: sum(1 for r in rows if r["kind"] == kind) for kind in (Kind.RUNNING, Kind.WAITING, Kind.PAUSED)}
     tiles = _tiles([
-        ("Running", str(count[Kind.RUNNING]), "on the GPU now" if count[Kind.RUNNING] else "nothing running"),
+        ("Running", str(count[Kind.RUNNING]), _running_note(count[Kind.RUNNING], sum(1 for r in rows if r["kind"] == Kind.RUNNING and r["gpus"]))),
         ("Waiting", str(count[Kind.WAITING]), "in the queue" if count[Kind.WAITING] else "queue is empty"),
         ("Paused", str(count[Kind.PAUSED]), "resume from the job's page" if count[Kind.PAUSED] else ""),
         ("Finished, last 24 h", str(len(recent)), f"{failed} failed" if failed else "none failed"),
-    ])
+    ]) + _resource_tiles(backend.capacity(), rows)
     recent_html = (
         '<div class="card-head"><h2 id="h-recent">Finished in the last 24 hours</h2>'
         f'<a class="meta" href="{root}history">All history →</a></div>'
