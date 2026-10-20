@@ -356,7 +356,7 @@ def _asked_memory(mem: object) -> str:
         return "—"
     if text == jobs_view.WHOLE_NODE_MEM:
         return "whole box"
-    return re.sub(r"^(\d+)([KMGT])$", r"\1 \2B", text)
+    return re.sub(r"^(\d+)([KMGT])$", r"\1 \2iB", text)  # slurm counts in binary units: 32G is 32 GiB
 
 
 def _short(name: str) -> str:
