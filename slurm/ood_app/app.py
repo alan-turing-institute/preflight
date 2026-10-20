@@ -485,13 +485,23 @@ def _resource_tiles(have: Mapping[str, int], rows: list[dict[str, object]]) -> s
     by_gpu = sum(int(r["cpus"]) for r in running if r["gpus"])  # type: ignore[call-overload]
     by_cpu = sum(int(r["cpus"]) for r in running if not r["gpus"])  # type: ignore[call-overload]
     gib = 1024  # slurm counts memory in MB
-    return _tiles([
-        ("GPUs in use", f"{have['gpus_used']} of {have['gpus']}", f"{have['gpus'] - have['gpus_used']} free"),
-        ("Cores in use", f"{have['cpus_used']} of {have['cpus']}",
-         f"{by_cpu} by CPU jobs, {by_gpu} by GPU jobs · {have['cpus'] - have['cpus_used']} free"),
-        ("Memory given to jobs", f"{have['mem_used_mb'] / gib:.0f} of {have['mem_mb'] / gib:.0f} GiB",
-         f"{(have['mem_mb'] - have['mem_used_mb']) / gib:.0f} GiB free"),
-    ])
+    free_cpus, free_mem = have["cpus"] - have["cpus_used"], (have["mem_mb"] - have["mem_used_mb"]) / gib
+    meters = [
+        _meter("GPU", f"{have['gpus_used']} of {have['gpus']} in use", _share(have["gpus_used"], have["gpus"]),
+               f"{have['gpus'] - have['gpus_used']} free"),
+        _meter("Cores", f"{have['cpus_used']} of {have['cpus']} in use", _share(have["cpus_used"], have["cpus"]),
+               f"{by_cpu} by CPU jobs · {by_gpu} by GPU jobs · {free_cpus} free"),
+        _meter("Memory", f"{have['mem_used_mb'] / gib:.0f} of {have['mem_mb'] / gib:.0f} GiB given to jobs",
+               _share(have["mem_used_mb"], have["mem_mb"]), f"{free_mem:.0f} GiB free"),
+    ]
+    return (
+        '<section class="card box" aria-labelledby="h-box"><div class="card-head"><h2 id="h-box">This machine</h2>'
+        '<span class="meta">what slurm has given to jobs</span></div><div class="box-meters">' + "".join(meters) + "</div></section>"
+    )
+
+
+def _share(used: int, total: int) -> float | None:
+    return used / total if total else None
 
 
 def _tiles(items: list[tuple[str, str, str]]) -> str:
