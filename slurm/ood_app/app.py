@@ -440,7 +440,11 @@ def _now_card(rows: list[dict[str, object]], keeper: Mapping[str, object], backe
     if running:
         job = running[0]
         live = backend.live_memory(str(job["id"]))
-        more = f" and {len(running) - 1} more" if len(running) > 1 else ""
+        # "and N more" counts only jobs like the lead one: a CPU-only job beside a GPU job is not on the GPU
+        alike = sum(bool(r["gpus"]) == bool(job["gpus"]) for r in running) - 1
+        off_gpu = sum(not r["gpus"] for r in running) if job["gpus"] else 0
+        more = (f" and {alike} more" if alike else "") + (
+            f" · {off_gpu} CPU-only job{'s' if off_gpu > 1 else ''} beside it" if off_gpu else "")
         figures = [
             ("Running for", _duration(job["elapsed_s"])),  # type: ignore[arg-type]
             ("GPU memory in use", _gib(live.get("gpu"))),
