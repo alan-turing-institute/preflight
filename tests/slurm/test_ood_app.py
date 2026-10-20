@@ -57,6 +57,7 @@ class Fake:
             now=lambda: datetime(2026, 10, 19, 12, 0),  # noqa: DTZ001 - local, like the times sacct prints
             project_order=lambda: ["proj"],
             capacity=lambda: {"cpus": 20, "cpus_used": 8, "mem_mb": 102400, "mem_used_mb": 65536, "gpus": 1, "gpus_used": 1},
+            gpu_busy=lambda: 0.37,
         )
         self.application = app.make_application(self.backend)
 
@@ -103,6 +104,7 @@ def test_every_get_route_answers(path: str) -> None:
     if path == "/":  # both jobs hold a GPU; a CPU-only job running beside them is not said to be on it
         assert "On the GPU now" in body and "on the GPU now" in body
         assert (app._running_note(2, 0), app._running_note(2, 1)) == ("none on the GPU", "1 on the GPU")
+        assert "37% busy" in body and "1 of 1 given to jobs" in body  # how busy, not only whether it is given
         assert "8 of 20" in body and "12 free" in body and "64 of 100 GiB" in body and "36 GiB free" in body
         assert "of 4 GB asked" in body  # the running job's memory against what it asked for
 

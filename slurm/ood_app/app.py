@@ -212,6 +212,7 @@ class Backend:
     now: Callable[[], datetime] = datetime.now
     project_order: Callable[[], list[str]] = lambda: _project_order()
     capacity: Callable[[], Mapping[str, int]] = gpu_jobs.capacity
+    gpu_busy: Callable[[], float | None] = gpu_jobs.gpu_busy
     run: Run = run_tool
     python: str = field(default_factory=lambda: sys.executable)
     slurm_dir: Path = SLURM_DIR
@@ -476,7 +477,7 @@ def _running_note(running: int, on_gpu: int) -> str:
     return "on the GPU now" if on_gpu == running else f"{on_gpu} on the GPU" if on_gpu else "none on the GPU"
 
 
-def _resource_tiles(have: Mapping[str, int], rows: list[dict[str, object]]) -> str:
+def _resource_tiles(have: Mapping[str, int], rows: list[dict[str, object]], busy: float | None = None) -> str:
     """What slurm has handed out of the box, and what is free (its own totals: memory is what slurm may give, not all
     of the machine's)."""
     if not have:
@@ -487,8 +488,9 @@ def _resource_tiles(have: Mapping[str, int], rows: list[dict[str, object]]) -> s
     gib = 1024  # slurm counts memory in MB
     free_cpus, free_mem = have["cpus"] - have["cpus_used"], (have["mem_mb"] - have["mem_used_mb"]) / gib
     meters = [
-        _meter("GPU", f"{have['gpus_used']} of {have['gpus']} in use", _share(have["gpus_used"], have["gpus"]),
-               f"{have['gpus'] - have['gpus_used']} free"),
+        _meter("GPU", f"{busy:.0%} busy" if busy is not None else f"{have['gpus_used']} of {have['gpus']} in use",
+               busy if busy is not None else _share(have["gpus_used"], have["gpus"]),
+               f"{have['gpus_used']} of {have['gpus']} given to jobs · {have['gpus'] - have['gpus_used']} free"),
         _meter("Cores", f"{have['cpus_used']} of {have['cpus']} in use", _share(have["cpus_used"], have["cpus"]),
                f"{by_cpu} by CPU jobs · {by_gpu} by GPU jobs · {free_cpus} free"),
         _meter("Memory", f"{have['mem_used_mb'] / gib:.0f} of {have['mem_mb'] / gib:.0f} GiB given to jobs",
@@ -594,7 +596,7 @@ def index_page(backend: Backend, root: str = "") -> str:
         ("Waiting", str(count[Kind.WAITING]), "in the queue" if count[Kind.WAITING] else "queue is empty"),
         ("Paused", str(count[Kind.PAUSED]), "resume from the job's page" if count[Kind.PAUSED] else ""),
         ("Finished, last 24 h", str(len(recent)), f"{failed} failed" if failed else "none failed"),
-    ]) + _resource_tiles(backend.capacity(), rows)
+    ]) + _resource_tiles(backend.capacity(), rows, backend.gpu_busy())
     recent_html = (
         '<div class="card-head"><h2 id="h-recent">Finished in the last 24 hours</h2>'
         f'<a class="meta" href="{root}history">All history →</a></div>'
