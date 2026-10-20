@@ -605,14 +605,17 @@ def gpu_usage() -> dict[int, float] | None:
 
 
 def gpu_busy() -> float | None:
-    """How busy the GPUs are, 0-1, averaged over them (`nvidia-smi` utilization.gpu); None when it does not answer."""
+    """How busy the GPUs are, 0-1, averaged over them (`nvidia-smi` utilization.gpu); None when it does not answer, or
+    when any GPU gives no number (`[N/A]`): an average over the GPUs that did answer would misstate the box."""
     try:
         done = subprocess.run(["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
                               capture_output=True, text=True, timeout=10, check=False)
     except (OSError, subprocess.TimeoutExpired):
         return None
-    shares = [int(line) / 100 for line in done.stdout.split() if line.isdigit()] if done.returncode == 0 else []
-    return sum(shares) / len(shares) if shares else None
+    lines = [line.strip() for line in done.stdout.splitlines() if line.strip()] if done.returncode == 0 else []
+    if not lines or not all(line.isdigit() for line in lines):
+        return None
+    return sum(int(line) for line in lines) / 100 / len(lines)
 
 
 def gpu_mib_by_pid() -> dict[int, float]:

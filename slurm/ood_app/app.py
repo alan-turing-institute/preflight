@@ -487,10 +487,14 @@ def _resource_tiles(have: Mapping[str, int], rows: list[dict[str, object]], busy
     by_cpu = sum(int(r["cpus"]) for r in running if not r["gpus"])  # type: ignore[call-overload]
     gib = 1024  # slurm counts memory in MB
     free_cpus, free_mem = have["cpus"] - have["cpus_used"], (have["mem_mb"] - have["mem_used_mb"]) / gib
+    given, free_gpus = f"{have['gpus_used']} of {have['gpus']} given to jobs", f"{have['gpus'] - have['gpus_used']} free"
+    # without a busy reading the value already says what is given, so the note does not repeat it
+    gpu_value, gpu_fraction, gpu_note = (
+        (f"{busy:.0%} busy", busy, f"{given} · {free_gpus}") if busy is not None
+        else (given, _share(have["gpus_used"], have["gpus"]), free_gpus)
+    )
     meters = [
-        _meter("GPU", f"{busy:.0%} busy" if busy is not None else f"{have['gpus_used']} of {have['gpus']} in use",
-               busy if busy is not None else _share(have["gpus_used"], have["gpus"]),
-               f"{have['gpus_used']} of {have['gpus']} given to jobs · {have['gpus'] - have['gpus_used']} free"),
+        _meter("GPU", gpu_value, gpu_fraction, gpu_note),
         _meter("Cores", f"{have['cpus_used']} of {have['cpus']} in use", _share(have["cpus_used"], have["cpus"]),
                f"{by_cpu} by CPU jobs · {by_gpu} by GPU jobs · {free_cpus} free"),
         _meter("Memory", f"{have['mem_used_mb'] / gib:.0f} of {have['mem_mb'] / gib:.0f} GB given to jobs",

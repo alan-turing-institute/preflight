@@ -233,3 +233,9 @@ def test_state_dir_resolution_env_over_site_file_and_no_fallback(tmp_path: Path,
     finally:
         monkeypatch.undo()
         importlib.reload(gpu_jobs)
+
+
+@pytest.mark.parametrize(("out", "busy"), [("40\n60\n", 0.5), ("40\n[N/A]\n", None), ("", None)])
+def test_gpu_busy_is_unknown_unless_every_gpu_answers(out: str, busy: float | None, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a, 0, stdout=out))
+    assert gpu_jobs.gpu_busy() == busy  # an average over only the GPUs that answered would misstate the box

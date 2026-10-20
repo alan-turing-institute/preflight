@@ -107,6 +107,8 @@ def test_every_get_route_answers(path: str) -> None:
         assert "37% busy" in body and "1 of 1 given to jobs" in body  # how busy, not only whether it is given
         assert "8 of 20" in body and "12 free" in body and "64 of 100 GB" in body and "36 GB free" in body
         assert "of 4 GB asked" in body  # in the same units as the memory it uses
+        quiet = app._resource_tiles({"cpus": 1, "cpus_used": 0, "mem_mb": 1024, "mem_used_mb": 0, "gpus": 1, "gpus_used": 1}, [])
+        assert quiet.count("1 of 1") == 1 and "busy" not in quiet  # nvidia-smi silent: given once, not in value and note
 
 
 def test_unknown_things_are_not_found_or_bad() -> None:
