@@ -82,8 +82,8 @@ SERVICES = ("gpujobs-node-exporter", "gpujobs-cgroup-exporter", "gpujobs-gpu-exp
 # OOD's `custom.grafana` block minus `host` (the portal component adds it; OOD docs, customizations.rst "Grafana
 # support", lines 1331-1356). The dashboard is Jobstats' (`grafana/Single_Job_Stats.json` at the pinned commit): "uid",
 # slug `name` of its title, and its graph panels "Job CPU Utilization" id 7, "Job CPU Memory Utilization" id 9,
-# "GPU Utilization" id 2, "GPU Memory utilization" id 3 (those two sit in a collapsed row; on a unified-memory GPU the
-# memory one has no data). `labels` map OOD's cluster/host/jobid to the dashboard's variables (it has `JobID` and
+# "GPU Utilization" id 2, "GPU Memory utilization" id 3 (those two sit in a collapsed row; on a unified-memory GPU
+# `_grafana_steps` points the memory one at the agent's series). `labels` map OOD's cluster/host/jobid to the dashboard's variables (it has `JobID` and
 # `node`, no cluster). Grafana's default organisation has id 1.
 GRAFANA_DASHBOARD = {
     "orgId": 1,
@@ -95,6 +95,8 @@ GRAFANA_DASHBOARD = {
     "labels": {"cluster": "cluster", "host": "node", "jobid": "JobID"},
 }
 OWN_DASHBOARD = {"uid": "gpujobs-job-memory", "title": "GPU memory by job"}
+#: The agent's per-job GPU memory series (`slurm/agent.py` `metrics_text`), which our own dashboard plots.
+AGENT_GPU_MEMORY = "gpujobs_job_gpu_memory_bytes"
 
 
 @dataclass(frozen=True)
@@ -466,8 +468,9 @@ def _jobstats_steps(site: Site) -> list[list[str]]:
     return steps
 
 
-def _grafana_steps() -> list[list[str]]:
+def _grafana_steps(site: Site) -> list[list[str]]:
     dashboard = _cached(_BY_NAME["Single_Job_Stats.json"])
+    installed = GRAFANA_DASHBOARDS / JOBSTATS_DASHBOARD_FILE
     # The exported dashboard names its data source `${DS_DEFAULT_LOCAL PROMETHEUS}`; provisioning needs the real name.
     rewrite = (
         'sed "s/\\${DS_DEFAULT_LOCAL PROMETHEUS}/$2/g" "$1" '
@@ -478,10 +481,12 @@ def _grafana_steps() -> list[list[str]]:
         'umask 077; test -s "$1" || printf "GF_SECURITY_ADMIN_PASSWORD=%s\\n" '
         '"$(head -c 24 /dev/urandom | base64 | tr -d "/+=\\n")" > "$1"'
     )
-    return [
-        ["sh", "-ec", rewrite, "rewrite", str(dashboard), DATASOURCE_NAME, str(GRAFANA_DASHBOARDS / JOBSTATS_DASHBOARD_FILE)],
-        ["sh", "-ec", password, "password", str(GRAFANA_ENV_FILE)],
-    ]
+    steps = [["sh", "-ec", rewrite, "rewrite", str(dashboard), DATASOURCE_NAME, str(installed)]]
+    if site.unified_memory:
+        # nvidia-smi reports no memory for a GPU that shares the host's, so the GPU exporter's series is empty there:
+        # the panel reads the agent's per-job series instead (same `jobid` and `instance` labels).
+        steps.append(["sed", "-i", f"s/nvidia_gpu_memory_used_bytes/{AGENT_GPU_MEMORY}/g", str(installed)])
+    return [*steps, ["sh", "-ec", password, "password", str(GRAFANA_ENV_FILE)]]
 
 
 def _ood_helper_steps() -> list[list[str]]:
@@ -512,7 +517,7 @@ def post_install(site: Site) -> list[list[str]]:
         *_jobstats_steps(site),
     ]
     if _is_local(site):
-        steps += _grafana_steps()
+        steps += _grafana_steps(site)
         units += ["prometheus", "grafana-server"]
     if _portal_on(site):
         steps += _ood_helper_steps()

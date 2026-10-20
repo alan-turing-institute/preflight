@@ -14,18 +14,15 @@ import submit
 DIRECTIVE = "#S" + "BATCH"  # spelled in two halves so a text-matching guard does not read a submission here
 
 
+def fake_site(monkeypatch: pytest.MonkeyPatch, *, lease: object, dgx_gate: bool, nodes: tuple = ()) -> None:
+    """`load` returns just the fields submit.py reads."""
+    monkeypatch.setattr(site_config, "load", lambda *_p: SimpleNamespace(lease=lease, dgx_gate=dgx_gate, nodes=nodes))
+
+
 @pytest.fixture(autouse=True)
-def no_site_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Default: no site file, so the box behaves as before the cutover."""
-    monkeypatch.setattr(site_config, "SITE_FILE", tmp_path / "absent-site.toml")
-
-
-def fake_site(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, lease: object, dgx_gate: bool) -> None:
-    """A site file that exists; `load` returns just the fields submit.py reads."""
-    present = tmp_path / "site.toml"
-    present.write_text("")
-    monkeypatch.setattr(site_config, "SITE_FILE", present)
-    monkeypatch.setattr(site_config, "load", lambda *_path: SimpleNamespace(lease=lease, dgx_gate=dgx_gate, nodes=()))
+def default_site(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Default: a site with a lease and the DGX gate, so a submission checks both."""
+    fake_site(monkeypatch, lease=object(), dgx_gate=True)
 
 
 def dry(*argv: str) -> str:
@@ -102,7 +99,7 @@ def test_a_first_gpu_run_with_no_mem_takes_the_whole_box(mem: list[str], tmp_pat
 @pytest.mark.parametrize(
     ("site_cpus", "argv", "cpus"),
     [
-        (None, ["--gpu"], 4),  # no site file: the old default
+        (None, ["--gpu"], 4),  # the site lists no GPU node: the small default
         (20, ["--gpu"], 20),  # one-GPU box: all of it
         (20, [], 4),  # a CPU job keeps the small default
         (20, ["--gpu", "--cpus", "8"], 8),  # asked for wins
@@ -113,10 +110,8 @@ def test_a_gpu_job_gets_its_gpus_share_of_the_cores(site_cpus: int | None, argv:
                                                     monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(gpu_jobs, "STATE_DIR", tmp_path)
     if site_cpus is not None:
-        fake_site(monkeypatch, tmp_path, lease=None, dgx_gate=False)
         gpus = (object(),) * (4 if "--gpus" in argv else 1)
-        node = SimpleNamespace(cpus=site_cpus, gpus=gpus)
-        monkeypatch.setattr(site_config, "load", lambda *_p: SimpleNamespace(lease=None, dgx_gate=False, nodes=(node,)))
+        fake_site(monkeypatch, lease=None, dgx_gate=False, nodes=(SimpleNamespace(cpus=site_cpus, gpus=gpus),))
     script = dry("--project", "p", "--what", "w", "--class", "restart", "--mem", "4G", *argv, "--", "x")
     assert f"{DIRECTIVE} --cpus-per-task={cpus}" in script
 
@@ -202,14 +197,13 @@ def test_a_record_that_cannot_be_written_after_sbatch_is_a_warning_naming_the_jo
 
 @pytest.mark.parametrize(
     ("site", "keeper", "gate"),
-    [(None, True, True), ({"lease": None, "dgx_gate": False}, False, False), ({"lease": object(), "dgx_gate": True}, True, True)],
-    ids=["no site file", "no lease or gate", "lease and gate"],
+    [({"lease": None, "dgx_gate": False}, False, False), ({"lease": object(), "dgx_gate": True}, True, True)],
+    ids=["no lease or gate", "lease and gate"],
 )
 def test_the_keeper_and_gate_are_checked_only_where_the_site_has_them(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, site: dict[str, object] | None, keeper: bool, gate: bool
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, site: dict[str, object], keeper: bool, gate: bool
 ) -> None:
-    if site is not None:
-        fake_site(monkeypatch, tmp_path, **site)
+    fake_site(monkeypatch, **site)
     record = submit_for_real(monkeypatch, tmp_path)
     assert (record["keeper"], record["gate"]) == (keeper, gate)
     assert (record["gpu"], record["gpus"]) == (True, 2)

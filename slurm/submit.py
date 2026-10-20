@@ -13,10 +13,10 @@ run plus 10%; with no measured run (or no `--name`) a GPU job asks for the whole
 REFUSES: a class outside
 the closed set; a `resume` job without `--resume-ok` (the caller's statement that running the command
 again continues from its latest checkpoint); `--after` on a job slurm no longer knows; `--gpu` together with `--gpus`; any submission
-while the lease keeper is not running (checked only when the site file declares a lease, or there is no site file).
+while the lease keeper is not running (checked only when the site file declares a lease).
 
 AT SUBMISSION, before anything is queued (a fault must surface before the queue wait, not after it):
-with `--entry` (and a site with `dgx_gate`, or no site file), the DGX gate in check-only mode against this box (code parity, the entry script's
+with `--entry` (and a site with `dgx_gate`), the DGX gate in check-only mode against this box (code parity, the entry script's
 import, the host memory guard), its GPU leg deferred to launch, where the job wrapper runs it; the
 manifest it writes is copied per job, so two queued jobs with one entry script cannot overwrite each
 other's. Then `audit.py`, and the job's sidecar record.
@@ -56,7 +56,7 @@ COMMENT_MAX = 200
 AUTO_MARGIN = 0.10
 #: --mem with no measured run, for a GPU job: slurm's "all of the memory on each node".
 WHOLE_BOX = "0"
-DEFAULT_CPUS = 4  # a CPU-only job, or any job when no site file says what the box has
+DEFAULT_CPUS = 4  # a CPU-only job, or any job on a site whose nodes have no GPUs
 _DURATION = re.compile(r"^(\d+(?:\.\d+)?)([smh]?)$")
 _UNIT_S = {"": 1, "s": 1, "m": 60, "h": 3600}
 
@@ -102,9 +102,9 @@ def keeper_running(now: float | None = None) -> bool:
     return (time.time() if now is None else now) - updated < KEEPER_STALE_S
 
 
-def require_keeper(site: site_config.Site | None) -> None:
-    """Refuse when the site has a lease (or there is no site file) and the keeper's heartbeat is stale."""
-    if (site is None or site.lease) and not keeper_running():
+def require_keeper(site: site_config.Site) -> None:
+    """Refuse when the site has a lease and the keeper's heartbeat is stale."""
+    if site.lease and not keeper_running():
         msg = f"the lease keeper ({KEEPER_UNIT}) is not running; start it before submitting"
         raise Refused(msg)
 
@@ -179,7 +179,7 @@ def sbatch_script(
     return "\n".join(lines) + "\n"
 
 
-def resolve_cpus(asked: int | None, gpus: int, site: site_config.Site | None) -> int:
+def resolve_cpus(asked: int | None, gpus: int, site: site_config.Site) -> int:
     """`--cpus`, else for a GPU job its GPUs' share of the GPU node's cores, else DEFAULT_CPUS.
 
     A GPU job given the old flat 4 cores was CPU-bound: the same inference timing ran 2-14x slower than with all 20
@@ -187,7 +187,7 @@ def resolve_cpus(asked: int | None, gpus: int, site: site_config.Site | None) ->
     """
     if asked is not None:
         return asked
-    node = next((n for n in site.nodes if n.gpus), None) if site is not None else None
+    node = next((n for n in site.nodes if n.gpus), None)
     if not gpus or node is None:
         return DEFAULT_CPUS
     return max(1, node.cpus * min(gpus, len(node.gpus)) // len(node.gpus))
@@ -236,7 +236,7 @@ def submit(argv: list[str]) -> str:
         raise Refused(msg)
     arguments.gpus = 1 if arguments.gpu else arguments.gpus or 0
     arguments.gpu = arguments.gpus > 0
-    site = site_config.load_optional()
+    site = gpu_jobs.load_site()
     named = arguments.name
     arguments.name = arguments.name or Path(arguments.command[0]).name
     if arguments.job_class == gpu_jobs.JobClass.RESUME and not arguments.resume_ok:
@@ -250,7 +250,7 @@ def submit(argv: list[str]) -> str:
     arguments.cpus = resolve_cpus(arguments.cpus, arguments.gpus, site)
     stamp = time.strftime("%Y%m%d-%H%M%S")
     log = arguments.log or gpu_jobs.STATE_DIR / "logs" / f"{arguments.name}-{stamp}.log"
-    gated = bool(arguments.entry) and (site is None or site.dgx_gate)
+    gated = bool(arguments.entry) and site.dgx_gate
     manifest = gpu_jobs.STATE_DIR / "manifests" / f"{arguments.name}-{stamp}.json" if gated else None
     script = sbatch_script(arguments, mem=mem, log=log, manifest=manifest)
     if arguments.dry_run:

@@ -37,10 +37,12 @@ def chain(job_id: str, sidecars: dict[str, dict[str, object]]) -> list[str]:
 
 def all_sidecars(users: dict[str, str] | None = None) -> dict[str, dict[str, object]]:
     """Every record. `users` maps job id to its slurm user for the jobs the caller has queued: a record of one of those
-    that another user wrote is ignored. The rest (finished jobs) are read as they are."""
+    that another user wrote is ignored. The rest (finished jobs) are read as they are. A file not named by a job id
+    is no record: anyone can create one, and its name would reach the terminal."""
     users = users or {}
     return {
-        p.stem: gpu_jobs.read_json(p, users.get(p.stem)) or {} for p in (gpu_jobs.STATE_DIR / "jobs").glob("*.json")
+        p.stem: gpu_jobs.read_json(p, users.get(p.stem)) or {}
+        for p in (gpu_jobs.STATE_DIR / "jobs").glob("*.json") if gpu_jobs.JOB_ID.fullmatch(p.stem)
     }
 
 

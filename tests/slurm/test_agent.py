@@ -300,7 +300,7 @@ def test_failed_jobs_raise_an_event_and_run_the_notify_command_once(
         "9": {
             "JobId": "9",
             "JobState": "OUT_OF_MEMORY",
-            "Name": "p:resume:train",
+            "Name": "p:resume:train\x1b[2J",
             "UserId": "user1(1000)",
         },
         "10": {
@@ -322,9 +322,9 @@ def test_failed_jobs_raise_an_event_and_run_the_notify_command_once(
     world.step()
     world.step()
     assert [(e.job, e.action, e.fields) for e in gpu_jobs.events()] == [
-        ("9", "failed", {"state": "OUT_OF_MEMORY", "name": "p:resume:train"})
+        ("9", "failed", {"state": "OUT_OF_MEMORY", "name": "p:resume:train\x1b[2J"})
     ]
-    assert sink.read_text() == "9 OUT_OF_MEMORY user1 p:resume:train\n"
+    assert sink.read_text() == "9 OUT_OF_MEMORY user1 p:resume:train?[2J\n"  # the notify command gets it shown, not live
     assert json.loads((world.dir / "agent" / "state.json").read_text())[
         "ended_seen"
     ] == ["3", "9", "10"]

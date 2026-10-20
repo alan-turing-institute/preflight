@@ -20,7 +20,7 @@ from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
 
 import gpu_jobs
-from gpu_jobs import Event, EventAction, QueuedJob
+from gpu_jobs import Event, EventAction, QueuedJob, Reason
 
 #: Runs a command line and returns what it printed; "" when slurm does not answer.
 Runner = Callable[[list[str]], str]
@@ -44,21 +44,6 @@ class Bucket(StrEnum):
 
     DAY = "day"
     WEEK = "week"
-
-
-class Reason(StrEnum):
-    """The squeue pending reasons that get their own sentence (`man squeue`, JOB REASON CODES)."""
-
-    NONE = "None"
-    DEPENDENCY = "Dependency"
-    HELD_USER = "JobHeldUser"
-    HELD_REQUEUE = "job requeued in held state"
-    HELD_ADMIN = "JobHeldAdmin"
-    RESOURCES = "Resources"
-    PRIORITY = "Priority"
-    BEGIN_TIME = "BeginTime"
-    PARTITION_CONFIG = "PartitionConfig"
-    ACCOUNT_NOT_ALLOWED = "AccountNotAllowed"
 
 
 _PAUSE_ACTIONS = {EventAction.PAUSE, EventAction.URGENT_HOLD}

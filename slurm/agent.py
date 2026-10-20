@@ -60,7 +60,6 @@ MIB = 1024 * 1024
 #: How many ended jobs and recorded restorations are remembered.
 ENDED_KEPT = 5000
 RESTORED_KEPT = 20
-_JOB_ID = re.compile(r"\d+(?:_\d+)?")
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
 
@@ -413,7 +412,7 @@ class Agent:
                 if path.name not in self._ignored:
                     self._ignored.add(path.name)
                     print(
-                        f"[agent] ignoring {path}: owned by {owner}, not an admin",
+                        gpu_jobs.printable(f"[agent] ignoring {path}: owned by {owner}, not an admin"),
                         file=sys.stderr,
                         flush=True,
                     )
@@ -422,12 +421,12 @@ class Agent:
             if not order or key in s.released_requests:
                 continue
             urgent = str(order.get("urgent", ""))
-            if not _JOB_ID.fullmatch(urgent):
+            if not gpu_jobs.JOB_ID.fullmatch(urgent):
                 if path.name not in self._ignored:
                     self._ignored.add(path.name)
                     print(f"[agent] ignoring {path}: it names no urgent job", file=sys.stderr, flush=True)
                 continue
-            victims = [v for v in _strings(order.get("victims")) if _JOB_ID.fullmatch(v)]
+            victims = [v for v in _strings(order.get("victims")) if gpu_jobs.JOB_ID.fullmatch(v)]
             # A pre-empted victim is requeued and can run again only once the urgent job's resources are free; a
             # victim slurm did not pre-empt never stopped. So: the urgent job gone, then each victim running, gone,
             # or held (a held one does not start by itself, and must not keep the waiting jobs held forever).
@@ -438,7 +437,7 @@ class Agent:
             held = [
                 job_id
                 for job_id in _strings(order.get("held"))
-                if _JOB_ID.fullmatch(job_id)
+                if gpu_jobs.JOB_ID.fullmatch(job_id)
             ]
             if (
                 held
@@ -497,7 +496,7 @@ class Agent:
             "GPUJOBS_JOB": job_id,
             "GPUJOBS_STATE": state,
             "GPUJOBS_USER": user,
-            "GPUJOBS_NAME": name,
+            "GPUJOBS_NAME": gpu_jobs.printable(name),  # what the submitter typed
         }
         try:
             self.notify(list(self.site.notify_command), env)

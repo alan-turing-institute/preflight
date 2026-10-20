@@ -170,6 +170,9 @@ def main() -> int:
     )
     arguments = parser.parse_args()
 
+    if gpu_jobs.LEASE_DIR is None:
+        print("[keeper] REFUSED: the site file has no [lease] table, so there is no lease to keep", file=sys.stderr)
+        return 1
     gpu_jobs.LEASE_DIR.mkdir(parents=True, exist_ok=True)
     removed = remove_leases_from_before_boot(gpu_jobs.LEASE_DIR, gpu_jobs.boot_time())
     print(f"[keeper] start; removed leases from before this boot: {removed or 'none'}", flush=True)

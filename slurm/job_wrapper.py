@@ -5,7 +5,7 @@ Design 3.4-3.5 (`design notes`). `submit.py` writes an
 sbatch script whose only line runs this wrapper. In order:
 
 1. WAIT (GPU and urgent jobs) until the keeper holds slurm's GPU lease (`gpu_lease_keeper.py`; only when
-   the site has a lease, or there is no site file) and the job's own GPUs show no compute process outside
+   the site has a lease) and the job's own GPUs show no compute process outside
    its cgroup (`nvidia-smi` inside the job sees only the GPUs slurm gave it; run before this job's own
    command starts, so any other process belongs to something else). Polls
    every `--poll` s up to `--wait-limit` s, then exits non-zero saying what it waited for: the job ends
@@ -43,7 +43,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "hostguard"))
 
 import gpu_jobs  # noqa: E402 - path set just above
-import site_config
 from gpu_jobs import (  # audit.py imports gpu_mib_by_pid from here
     CGROUP_ROOT,
     cgroup_pids,
@@ -255,11 +254,11 @@ def main() -> int:
     if arguments.max_jobs > 1:
         print(f"[job] DECLARED SHARING: up to {arguments.max_jobs} GPU jobs on the card", flush=True)
 
-    site = site_config.load_optional()
+    site = gpu_jobs.load_site()
     cgroup = job_cgroup(job_id)
     if arguments.needs_lease or arguments.needs_card:
         ok, reason = wait_for_card(
-            needs_lease=arguments.needs_lease and (site is None or site.lease is not None),
+            needs_lease=arguments.needs_lease and site.lease is not None,
             limit_s=arguments.wait_limit,
             poll_s=arguments.poll,
             card_free=(
@@ -288,7 +287,7 @@ def main() -> int:
 
     footprint = gpu_jobs.STATE_DIR / "footprints" / f"{job_id}.jsonl"
     started = int(time.time())
-    if site is None or site.hostguard:
+    if site.hostguard:
         # The job is what a memory shortage should end, not a session: 2026-10-18 13:57 earlyoom ended three
         # Claude sessions while a training job holding 68.5 GB of the unified pool sat at oom_score_adj 0 (GPU
         # memory is not in RSS, so its score saw 2.8 GB). Raised here, inherited by the command, so every slurm

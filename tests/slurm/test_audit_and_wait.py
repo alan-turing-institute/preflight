@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 
 import audit
+import pytest
 import wait
 
 
@@ -27,7 +28,7 @@ def test_attribution_by_job_cgroup_service_cgroup_and_ancestry(tmp_path: Path) -
     fake_proc(proc, 101, "/system.slice/gpu-node-1_slurmstepd.scope/job_5/step_batch", 1)
     fake_proc(proc, 102, "/user.slice/service-a-models.service", 1)  # same unit as the lease owner
     fake_proc(proc, 103, "/user.slice/other.scope", owner)  # a child of the lease owner
-    fake_proc(proc, 104, "/user.slice/autocast-swe32-patch4.service", 1, "python train patch4")
+    fake_proc(proc, 104, "/user.slice/autocast-swe32-patch4.service", 1, "python train patch4\x1b[2J")
     # containers: one labelled for the leased project, one for a project with no lease, one unlabelled
     labelled, other, bare = ("a" * 64), ("b" * 64), ("c" * 64)
     fake_proc(proc, 105, f"/system.slice/docker-{labelled}.scope", 2)
@@ -37,10 +38,15 @@ def test_attribution_by_job_cgroup_service_cgroup_and_ancestry(tmp_path: Path) -
     usage = {101: 100.0, 102: 200.0, 103: 300.0, 104: 400.0, 105: 1.0, 106: 2.0, 107: 3.0}
     found = audit.unregistered(usage, leases, proc, lambda cgroup, _label: next((v for k, v in labels.items() if k in cgroup), ""))
     assert [(pid, mib) for pid, mib, _ in found] == [(104, 400.0), (106, 2.0), (107, 3.0)]
-    assert "patch4" in found[0][2]
+    assert "patch4" in found[0][2] and found[0][2].isprintable()  # any user's command line reaches admins' terminals
 
 
-def test_chain_follows_dependents_transitively() -> None:
+def test_chain_follows_dependents_transitively(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     sidecars = {"1": {}, "2": {"after": ["1"]}, "3": {"after": ["2"]}, "4": {"after": ["9"]}}
     assert wait.chain("1", sidecars) == ["1", "2", "3"]
+    monkeypatch.setattr(wait.gpu_jobs, "STATE_DIR", tmp_path)
+    (tmp_path / "jobs").mkdir()
+    for name in ("5", "\x1b]0;forged\x07"):  # anyone may create a file in the sticky jobs directory
+        (tmp_path / "jobs" / f"{name}.json").write_text(json.dumps({"after": ["1"]}))
+    assert wait.chain("1", wait.all_sidecars()) == ["1", "5"]  # so a name that is no job id never reaches the terminal
     assert wait.chain("1", {"1": {}, "2": {"after": "1"}, "3": {"after": 1}}) == ["1"]  # only a list names dependencies

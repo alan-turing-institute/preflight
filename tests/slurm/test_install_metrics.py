@@ -5,6 +5,7 @@ No network: downloads are checked as data (pinned URL, version, sha256) and the 
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import importlib.util
 import json
@@ -256,12 +257,16 @@ def test_cgroup_exporter_wrapper_finds_slurms_scope(tmp_path):
 
 
 def test_grafana_steps_rewrite_the_datasource_and_create_the_admin_password_once(tmp_path):
-    rewrite, password = metrics._grafana_steps()
+    rewrite, password = metrics._grafana_steps(make_site())
     source = tmp_path / "dash.json"
-    source.write_text('{"datasource": "${DS_DEFAULT_LOCAL PROMETHEUS}", "x": 1}')
+    source.write_text('{"datasource": "${DS_DEFAULT_LOCAL PROMETHEUS}", "expr": "nvidia_gpu_memory_used_bytes{jobid=1}"}')
     target = tmp_path / "out" / "dash.json"
     subprocess.run([*rewrite[:4], str(source), "my-prom", str(target)], check=True)
-    assert json.loads(target.read_text()) == {"datasource": "my-prom", "x": 1}
+    assert json.loads(target.read_text()) == {"datasource": "my-prom", "expr": "nvidia_gpu_memory_used_bytes{jobid=1}"}
+    # a GPU sharing the host's memory reports none to the exporter: the memory panel reads the agent's series instead
+    _, repoint, _ = metrics._grafana_steps(dataclasses.replace(make_site(), unified_memory=True))
+    subprocess.run([*repoint[:-1], str(target)], check=True)
+    assert json.loads(target.read_text())["expr"] == "gpujobs_job_gpu_memory_bytes{jobid=1}"
     env_file = tmp_path / "gpujobs.env"
     subprocess.run([*password[:4], str(env_file)], check=True)
     first = env_file.read_text()

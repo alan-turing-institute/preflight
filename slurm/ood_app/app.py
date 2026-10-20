@@ -391,9 +391,9 @@ def _queue_state(job: QueuedJob) -> tuple[str, str]:
     """(css kind, words) for a queued job."""
     if job.state in {gpu_jobs.State.RUNNING, gpu_jobs.State.CONFIGURING, gpu_jobs.State.COMPLETING}:
         return Kind.RUNNING, "Running"
-    if job.state == gpu_jobs.State.SUSPENDED or job.reason in {jobs_view.Reason.HELD_USER, jobs_view.Reason.HELD_REQUEUE}:
+    if job.state == gpu_jobs.State.SUSPENDED or job.reason in {gpu_jobs.Reason.HELD_USER, gpu_jobs.Reason.HELD_REQUEUE}:
         return Kind.PAUSED, "Paused"
-    if job.reason == jobs_view.Reason.HELD_ADMIN:
+    if job.reason == gpu_jobs.Reason.HELD_ADMIN:
         return Kind.PAUSED, "Held by admin"
     return Kind.WAITING, "Waiting"
 
@@ -440,8 +440,8 @@ def _now_card(rows: list[dict[str, object]], keeper: Mapping[str, object], backe
         more = f" and {len(running) - 1} more" if len(running) > 1 else ""
         figures = [
             ("Running for", _duration(job["elapsed_s"])),  # type: ignore[arg-type]
-            ("GPU memory now", _gib(live.get("gpu"))),
-            ("CPU memory now", _gib(live.get("cpu"))),
+            ("GPU memory in use", _gib(live.get("gpu"))),
+            ("CPU memory in use", _gib(live.get("cpu"))),
         ]
         return (
             '<section class="card now" aria-label="The GPU now">'
@@ -623,8 +623,8 @@ def _resources_html(eff: jobs_view.Efficiency, live: Mapping[str, int], kind: st
     if kind == Kind.RUNNING:
         # slurm fills in peaks and CPU time when a job ends; while it runs, the agent's samples are what there is
         return "".join([
-            _meter("GPU memory now", _gib(live.get("gpu")), None, "sampled every few seconds"),
-            _meter("CPU memory now", _gib(live.get("cpu")), None),
+            _meter("GPU memory in use", _gib(live.get("gpu")), None, "sampled every few seconds"),
+            _meter("CPU memory in use", _gib(live.get("cpu")), None),
             _meter("Peak GPU memory, earlier runs", _gib(gpu_peak), None) if gpu_peak is not None else "",
         ])
     parts = [_meter("Peak GPU memory", _gib(gpu_peak), None, "" if gpu_peak is not None else "not recorded for this job")]

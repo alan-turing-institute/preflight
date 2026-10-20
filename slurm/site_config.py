@@ -248,13 +248,12 @@ def load(path: Path | None = None) -> Site:
         raise SiteError(f"no site file at {path}; {_HINT}") from None
     except tomllib.TOMLDecodeError as exc:
         raise SiteError(f"site file {path} is not valid TOML: {exc}") from None
-    return parse(raw)
-
-
-def load_optional(path: Path | None = None) -> Site | None:
-    """The site, or None when there is no site file: the tools then keep their single-machine defaults."""
-    path = path or SITE_FILE
-    return load(path) if path.exists() else None
+    except (OSError, UnicodeDecodeError) as exc:
+        raise SiteError(f"cannot read site file {path}: {exc}") from None
+    try:
+        return parse(raw)
+    except (TypeError, ValueError) as exc:  # a value of the wrong kind, say a number where a path belongs
+        raise SiteError(f"site file {path} has a value of the wrong kind: {exc}") from None
 
 
 def is_admin(site: Site, user: str) -> bool:

@@ -51,7 +51,7 @@ def main() -> int:
         print(loss)
         return 0
     record = gpu_jobs.read_sidecar(job.job_id, job.user) or {}
-    print(f"[pause] {job.job_id} {job.name} ({record.get('what', 'no sidecar')}), {job.state}, run {elapsed(job.job_id)}")
+    print(gpu_jobs.printable(f"[pause] {job.job_id} {job.name} ({record.get('what', 'no sidecar')}), {job.state}, run {elapsed(job.job_id)}"))
     print(loss)
     if steady and not arguments.lose_progress:
         print("[pause] STOPPED: pass --lose-progress to pause it anyway", file=sys.stderr)

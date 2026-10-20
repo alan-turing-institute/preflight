@@ -59,9 +59,10 @@ def lease_pids(lease_dir: Path) -> dict[int, str]:
 
 def command_of(pid: int, proc: Path = Path("/proc")) -> str:
     try:
-        return (proc / str(pid) / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace").strip()
+        text = (proc / str(pid) / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace").strip()
     except OSError:
         return "?"
+    return gpu_jobs.printable(text)  # any user's process: shown in admins' terminals
 
 
 def unregistered(
@@ -71,7 +72,8 @@ def unregistered(
     label_of: Callable[[str, str], str] = gpu_jobs.container_label,
 ) -> list[tuple[int, float, str]]:
     usage = gpu_mib_by_pid() if usage is None else usage
-    leases = lease_pids(lease_dir or gpu_jobs.LEASE_DIR)
+    lease_dir = lease_dir or gpu_jobs.LEASE_DIR
+    leases = lease_pids(lease_dir) if lease_dir else {}
     lease_cgroups = {cgroup_of(pid, proc) for pid in leases} - {""}
     found = []
     for pid, mib in sorted(usage.items()):

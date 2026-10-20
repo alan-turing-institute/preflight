@@ -11,13 +11,14 @@ Design 3.6 (`design notes`).
    pausable with a delay (service-b, at its next job boundary), wait-only (a `steady` job, another urgent
    job, any other lease holder such as service-c's queue, unregistered GPU work).
 2. With a wait-only blocker it stops and submits nothing, unless `--wait` (accept the wait) or, for a
-   `steady` job, `--requeue-steady` (requeue it, losing its progress so far, which the plan states).
+   `steady` job, `--requeue-steady` (requeue it, losing its progress so far, which the plan states). The
+   requeue happens only once slurm has accepted the urgent job: a refused submission must not cost a run.
 3. Otherwise it submits to `urgent` with the required `--time`. Default size `--whole-box`: the GPU, all
    memory and all cores. Slurm pre-empts and requeues the `normal` jobs in the way; their dependents wait;
    the services step aside because an urgent job is keeper demand, with or without `--gpu`.
 4. ORDER AFTERWARDS: a requeued job cannot start for the requeue wait, so an urgent job shorter than that
    would hand the card to another queued job first. Other pending tier-1 GPU jobs are held and recorded in
-   `requests/restore_order-<ns>.json`; the keeper releases them once every pre-empted job is running again or has left.
+   `requests/restore_order-<ns>.json`; the agent releases them once every pre-empted job is running again or has left.
 """
 
 from __future__ import annotations
@@ -37,12 +38,6 @@ import gpu_jobs  # noqa: E402
 import site_config  # noqa: E402
 import submit  # noqa: E402
 
-#: Background services in the lease protocol that yield to a waiting lease, and how fast (design section 2). Used
-#: only without a site file; a site lists its own in `[lease] services`.
-YIELDING_SERVICES = {
-    "service-a": "yields within about 1 min (30-s poll, then its stop)",
-    "service-b": "yields at its next job boundary, up to ~15 min (an inference runs up to 900 s)",
-}
 #: slurm's own delay from an urgent submission to its start, measured in the trial (build notes).
 SLURM_START_S = (31, 46)
 ADMIN_REMEDY = "sudo slurm/install/install.py admin add USER"
@@ -76,17 +71,14 @@ def mem_mb(text: str) -> int:
 
 def plan(
     queue: list[gpu_jobs.QueuedJob], *, gpu: bool, whole_box: bool, leases: list[tuple[str, bool]],
-    unregistered: list[tuple[int, float, str]], memory_short: bool = False,
-    services: dict[str, str] | None = None,
+    unregistered: list[tuple[int, float, str]], services: dict[str, str], memory_short: bool = False,
 ) -> tuple[list[str], list[str], list[str], list[str]]:
     """(lines to print, normal victims, steady blockers, other wait-only blockers).
 
     `memory_short`: the urgent job's memory does not fit in what slurm has left, so every running job is in
-    its way (slurm picks which `normal` ones to pre-empt). `services`: service name -> yield text (default
-    `YIELDING_SERVICES`; a site passes its own, possibly empty). A GPU urgent job puts every running `normal`
-    job holding GPUs in the way, on any node.
+    its way (slurm picks which `normal` ones to pre-empt). `services`: service name -> yield text, the site's
+    `[lease] services`. A GPU urgent job puts every running `normal` job holding GPUs in the way, on any node.
     """
-    services = YIELDING_SERVICES if services is None else services
     lines, victims, steady, wait_only = [], [], [], []
     for job in queue:
         record = gpu_jobs.read_sidecar(job.job_id, job.user) or {}
@@ -123,7 +115,7 @@ def plan(
 
 def other_leases() -> list[tuple[str, bool]]:
     found = []
-    for path in gpu_jobs.LEASE_DIR.glob("*.json"):
+    for path in gpu_jobs.LEASE_DIR.glob("*.json") if gpu_jobs.LEASE_DIR else []:
         record = gpu_jobs.read_json(path) or {}
         if gpu_jobs.pid_alive(record.get("pid")):
             found.append((str(record.get("project") or path.stem), record.get("requested_at") is not None))
@@ -166,12 +158,12 @@ def run(argv: list[str]) -> int:
     if arguments.gpus is not None and arguments.gpus < 1:
         print("[urgent] REFUSED: --gpus must be an integer >= 1", file=sys.stderr)
         return 1
-    site = site_config.load_optional()
-    if site and not site_config.is_admin(site, pwd.getpwuid(os.getuid()).pw_name):
+    site = gpu_jobs.load_site()
+    if not site_config.is_admin(site, pwd.getpwuid(os.getuid()).pw_name):
         print(f"[urgent] REFUSED: only members of {site.admin_group} may submit urgent work; "
               f"an admin adds you with: {ADMIN_REMEDY}", file=sys.stderr)
         return 1
-    services = YIELDING_SERVICES if site is None else site.lease.services if site.lease else {}
+    services = site.lease.services if site.lease else {}
     whole_box = arguments.whole_box or arguments.mem is None
     arguments.gpu = arguments.gpu or arguments.gpus is not None or whole_box
     arguments.gpus = arguments.gpus or int(arguments.gpu)
@@ -190,7 +182,7 @@ def run(argv: list[str]) -> int:
     if arguments.mem and free is not None:
         print(f"[urgent] memory: needs {mem_mb(arguments.mem)} MB, slurm has {free} MB unallocated"
               + ("; jobs will be pre-empted to make room" if memory_short else "; it fits beside what runs"))
-    print("\n".join(lines))
+    print("\n".join(map(gpu_jobs.printable, lines)))  # descriptions and lease names are what other users wrote
     print(f"[urgent] expected start: slurm's own {SLURM_START_S[0]}-{SLURM_START_S[1]} s after the pre-empted jobs "
           "end (trial), plus the slowest yield above")
     blocked = wait_only + ([] if arguments.requeue_steady else steady)
@@ -215,7 +207,7 @@ def run(argv: list[str]) -> int:
     except submit.Refused as refused:
         print(f"[urgent] REFUSED: {refused}", file=sys.stderr)
         return 1
-    # Written before anything is requeued or held, so a refusal here leaves every other job as it was.
+    # Written before anything is held or requeued, so a refusal here leaves every other job as it was.
     path = gpu_jobs.STATE_DIR / "scripts" / f"{arguments.name}-{stamp}.sbatch"
     log.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -223,20 +215,16 @@ def run(argv: list[str]) -> int:
     except FileExistsError as error:
         print(f"[urgent] REFUSED: the batch script {error.strerror}", file=sys.stderr)
         return 1
-    if arguments.requeue_steady:
-        for job_id in steady:
-            subprocess.run(["scontrol", "requeue", job_id], check=True)
-            print(f"[urgent] requeued steady job {job_id} (its run so far is lost)")
     held = [
         job.job_id for job in queue
         if job.waiting and job.partition != gpu_jobs.Partition.URGENT and job.job_id not in victims
         and job.gpus > 0
     ]
-    if victims and held:
-        subprocess.run(["scontrol", "hold", ",".join(held)], check=True)
-        for job_id in held:
-            gpu_jobs.write_event(job_id, gpu_jobs.EventAction.URGENT_HOLD, urgent=f"{arguments.name}: {arguments.what}")
-        print(f"[urgent] held {held} until the pre-empted jobs {victims} run again")
+    if victims and held and gpu_jobs.run_slurm(["scontrol", "hold", ",".join(held)]):
+        # slurm holds the ids it can and refuses the rest (one that started meanwhile): release them all
+        subprocess.run(["scontrol", "release", ",".join(held)], capture_output=True, check=False)
+        print(f"[urgent] REFUSED, nothing submitted: slurm would not hold {held} (its message is above)", file=sys.stderr)
+        return 1
     done = subprocess.run(["sbatch", "--parsable", str(path)], capture_output=True, text=True, check=False)
     if done.returncode != 0:
         print(f"[urgent] REFUSED by slurm: {done.stderr.strip()}", file=sys.stderr)
@@ -244,12 +232,31 @@ def run(argv: list[str]) -> int:
             subprocess.run(["scontrol", "release", ",".join(held)], check=False)
         return 1
     job_id = done.stdout.strip().split(";")[0]
-    if victims and held:  # written only now: a refused submission leaves no request to release jobs later
+    if victims and held:  # written only now: a refused submission leaves no request and no hold in the jobs' history
         requests = gpu_jobs.STATE_DIR / "requests"
-        requests.mkdir(parents=True, exist_ok=True)
-        gpu_jobs.write_json(
-            requests / f"restore_order-{time.time_ns()}.json", {"urgent": job_id, "victims": victims, "held": held}
-        )
+        try:  # first: the request is what releases the held jobs later
+            requests.mkdir(parents=True, exist_ok=True)
+            gpu_jobs.write_json(
+                requests / f"restore_order-{time.time_ns()}.json", {"urgent": job_id, "victims": victims, "held": held}
+            )
+        except OSError as error:
+            subprocess.run(["scontrol", "release", ",".join(held)], capture_output=True, check=False)
+            print(f"[urgent] could not record when to release {held} ({error}): released them now, so they may "
+                  f"start before the pre-empted jobs {victims}", file=sys.stderr)
+        else:
+            print(f"[urgent] held {held} until the pre-empted jobs {victims} run again")
+            for held_id in held:
+                try:
+                    gpu_jobs.write_event(held_id, gpu_jobs.EventAction.URGENT_HOLD, urgent=f"{arguments.name}: {arguments.what}")
+                except OSError as error:  # the history only: the request above is what matters
+                    print(f"[urgent] warning: job {held_id}'s history misses this hold ({error})", file=sys.stderr)
+    if arguments.requeue_steady:  # only now: requeueing loses the run, which a refused submission must not cost
+        for steady_id in steady:
+            if gpu_jobs.run_slurm(["scontrol", "requeue", steady_id]):
+                print(f"[urgent] could not requeue steady job {steady_id} (slurm's message is above); "
+                      f"job {job_id} waits behind it", file=sys.stderr)
+            else:
+                print(f"[urgent] requeued steady job {steady_id} (its run so far is lost)")
     gpu_jobs.record_queued_job(
         job_id, "urgent", project=arguments.project, what=arguments.what, job_class="urgent", name=arguments.name,
         gpu=arguments.gpu, gpus=arguments.gpus, mem=mem, command=arguments.command, log=str(log), script=str(path), after=[],

@@ -31,6 +31,7 @@ def test_classes_of_what_is_in_the_way() -> None:
         queue, gpu=True, whole_box=False,
         leases=[("service-a", False), ("service-b", False), ("service-c", False), ("slurm", False)],
         unregistered=[(99, 500.0, "python patch4")],
+        services={"service-a": "yields within a minute", "service-b": "yields at its next job"},
     )
     assert victims == ["1"]  # job 3 holds no GPU, so a GPU-only urgent job leaves it alone
     assert steady == ["2"]
@@ -43,26 +44,38 @@ def test_classes_of_what_is_in_the_way() -> None:
 
 def test_whole_box_puts_every_running_job_in_the_way() -> None:
     _, victims, _, _ = urgent.plan(
-        [job("1", "normal"), job("3", "normal", gpus=0)], gpu=True, whole_box=True, leases=[], unregistered=[]
+        [job("1", "normal"), job("3", "normal", gpus=0)], gpu=True, whole_box=True, leases=[], unregistered=[],
+        services={},
     )
     assert victims == ["1", "3"]
 
 
-def test_stops_without_submitting_behind_a_wait_only_blocker(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_stops_without_submitting_behind_a_wait_only_blocker_or_without_a_site_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
     monkeypatch.setattr(gpu_jobs, "read_queue", lambda: [job("2", "steady")])
     monkeypatch.setattr(urgent, "other_leases", list)
     monkeypatch.setattr(urgent.audit, "unregistered", list)
     monkeypatch.setattr(urgent, "free_memory_mb", lambda: None)
-    monkeypatch.setattr(urgent.site_config, "SITE_FILE", Path("/nonexistent/site.toml"))
+    monkeypatch.setattr(urgent.site_config, "is_admin", lambda _site, _user: True)
     submitted = []
     monkeypatch.setattr(urgent.subprocess, "run", lambda *a, **k: submitted.append(a))
-    assert urgent.run(["--project", "p", "--what", "w", "--time", "0:10:00", "--", "true"]) == 1
+    argv = ["--project", "p", "--what", "w", "--time", "0:10:00", "--", "true"]
+    monkeypatch.setattr(urgent.site_config, "SITE_FILE", tmp_path / "absent-site.toml")
+    with pytest.raises(SystemExit, match=r"^\[gpujobs\] REFUSED: no site file at"):  # so no admin check is skipped
+        urgent.run(argv)
+    site_file(tmp_path, monkeypatch)
+    gpu_jobs.update_sidecar("2", what="\x1b]0;forged\x07")  # whatever its submitter typed
+    assert urgent.run(argv) == 1
+    printed = capsys.readouterr()
+    assert "STOPPED, nothing submitted" in printed.err
+    assert "forged" in printed.out and printed.out.rstrip("\n").replace("\n", "").isprintable()
     assert submitted == []
 
 
 def test_a_memory_only_urgent_job_that_does_not_fit_puts_running_jobs_in_the_way() -> None:
     _, victims, _, _ = urgent.plan(
-        [job("3", "normal")], gpu=False, whole_box=False, leases=[], unregistered=[], memory_short=True
+        [job("3", "normal")], gpu=False, whole_box=False, leases=[], unregistered=[], services={}, memory_short=True
     )
     assert victims == ["3"]
 
@@ -135,14 +148,40 @@ def test_site_admin_check_multi_gpu_plan_and_request_file(
         return type("Done", (), {"returncode": int(command[0] == "sbatch"), "stdout": "", "stderr": "no"})()
 
     monkeypatch.setattr(urgent.subprocess, "run", refusing_sbatch)
+    holds = len(gpu_jobs.events("6"))
     assert urgent.run([*argv, "--", "true"]) == 1
     assert ["scontrol", "hold", "6"] in calls and calls[-1] == ["scontrol", "release", "6"]
+    assert len(gpu_jobs.events("6")) == holds  # a refused submission leaves no hold in the job's history
+
+    # a hold slurm refuses stops it before anything is submitted, with slurm's words (no traceback)
+    def refusing_hold(command: list[str], **_kwargs: object) -> object:
+        calls.append(command)
+        return type("Done", (), {"returncode": int(command[:2] == ["scontrol", "hold"]), "stdout": "", "stderr": "denied"})()
+
+    calls.clear()
+    capsys.readouterr()
+    monkeypatch.setattr(urgent.subprocess, "run", refusing_hold)
+    assert urgent.run([*argv, "--", "true"]) == 1
+    err = capsys.readouterr().err
+    assert calls == [["scontrol", "hold", "6"], ["scontrol", "release", "6"]]  # a partial hold is undone
+    assert "denied" in err and "would not hold ['6']" in err
+
     queue[:] = [gpu_jobs.QueuedJob("2", "steady", "RUNNING", "None", "p:x:2", gpus=2)]
+    monkeypatch.setattr(urgent.subprocess, "run", refusing_sbatch)
     calls.clear()
     assert urgent.run([*argv, "--", "true"]) == 1
     assert calls == []
     assert urgent.run([*argv, "--requeue-steady", "--", "true"]) == 1  # sbatch still refuses
-    assert ["scontrol", "requeue", "2"] in calls
+    assert ["scontrol", "requeue", "2"] not in calls  # so the steady job keeps its run
+    calls.clear()
+    monkeypatch.setattr(urgent.subprocess, "run", lambda command, **_k: calls.append(command) or done)
+    assert urgent.run([*argv, "--requeue-steady", "--", "true"]) == 0
+    assert calls[-2][0] == "sbatch" and calls[-1] == ["scontrol", "requeue", "2"]  # requeued only once accepted
+    refused = type("Done", (), {"returncode": 1, "stdout": "", "stderr": "denied"})()
+    monkeypatch.setattr(urgent.subprocess, "run", lambda c, **_k: done if c[0] == "sbatch" else refused)
+    capsys.readouterr()
+    assert urgent.run([*argv, "--requeue-steady", "--", "true"]) == 0  # submitted; the steady job keeps the card
+    assert "could not requeue steady job 2" in capsys.readouterr().err
     # no batch script (every name taken): refused before any requeue or hold, so nothing is left held
     calls.clear()
     capsys.readouterr()
@@ -189,7 +228,11 @@ def test_pause_dry_run_acts_on_nothing_and_a_pause_is_recorded(
     slurm.calls.clear()
 
     monkeypatch.setattr("sys.argv", ["pause.py", "1", "--reason", "need the card"])
+    gpu_jobs.update_sidecar("1", what="\x1b[2Jforged")
+    capsys.readouterr()
     assert pause.main() == 0
+    out = capsys.readouterr().out
+    assert "forged" in out and out.replace("\n", "").isprintable()  # a description is shown, never acted on
     assert slurm.calls == [["scontrol", "requeuehold", "1"]]
     assert [(e.action, e.fields) for e in gpu_jobs.events("1")] == [("pause", {"reason": "need the card"})]
 

@@ -40,11 +40,11 @@ def lines(queue: list[gpu_jobs.QueuedJob] | None) -> list[str]:
     for job in queue:
         record = records.get(job.job_id, {})
         why = jobs_view.waiting_reason(job, by_id, records, events)
-        out.append(
+        out.append(gpu_jobs.printable(  # names and descriptions are what their submitters typed
             f"[status] {job.job_id} {job.state:<10} {job.user or '?':<10} {job.gpus} GPU {job.name}"
             f" | {record.get('mem') or 'default mem'}, {PAUSES.get(job.partition, job.partition)}"
             f" | {record.get('what', '(no sidecar)')}{f' | {why}' if why else ''}"
-        )
+        ))
     out += audit.report(audit.unregistered())
     return out
 

@@ -29,29 +29,36 @@ from pathlib import Path
 
 import site_config
 
-_LEGACY_STATE_DIR = Path("~/.local/state/slurm-gpu")
-_LEGACY_LEASE_DIR = Path("~/.local/state/gpu-lease")
+
+def load_site() -> site_config.Site:
+    """The site file. Without a usable one the tool stops here with the reason, not a traceback: there is no
+    fallback, every machine gets its site file from the installer."""
+    try:
+        return site_config.load()
+    except site_config.SiteError as error:
+        sys.exit(f"[gpujobs] REFUSED: {error}")
 
 
 def _site_dirs() -> tuple[Path, Path | None]:
-    """(state dir, lease dir) from env, then the site file, then the pre-site-file locations.
-
-    Never fails for a missing site file: until the installer writes one, the box keeps its legacy paths.
-    """
+    """(state dir, lease dir), each from its environment variable, else from the site file, which is read on import
+    either way: no tool runs without one."""
+    site = load_site()
     state, lease = os.environ.get("SLURM_GPU_STATE_DIR"), os.environ.get("GPU_LEASE_DIR")
-    site = site_config.load_optional() if not (state and lease) else None
-    state_dir = Path(state) if state else site.state_dir if site else _LEGACY_STATE_DIR
-    lease_dir = Path(lease) if lease else site.lease.lease_dir if site and site.lease else _LEGACY_LEASE_DIR
-    return state_dir.expanduser(), lease_dir.expanduser()
+    lease_dir = Path(lease) if lease else site.lease.lease_dir if site.lease else None
+    return Path(state or site.state_dir).expanduser(), lease_dir.expanduser() if lease_dir else None
 
 
 _STATE, _LEASE = _site_dirs()
 #: Where the tools keep their records (sidecars, events, footprints, the keeper's state). Overridable for tests.
 STATE_DIR = _STATE
-#: The cross-project GPU lease directory (service-c's protocol document); same override as localmodels.
+#: The cross-project GPU lease directory (service-c's protocol document); same override as localmodels. None for a
+#: site without a `[lease]` table.
 LEASE_DIR = _LEASE
 #: The project name slurm's keeper holds the lease under.
 LEASE_PROJECT = "slurm"
+#: A slurm job id (an array task as `<job>_<task>`). Files in the shared sticky directories are named by whoever made
+#: them, so a tool acts on or prints only names that match this.
+JOB_ID = re.compile(r"\d+(?:_\d+)?", re.ASCII)
 
 
 class Partition(StrEnum):
@@ -83,16 +90,35 @@ class State(StrEnum):
     SUSPENDED = "SUSPENDED"
 
 
+class Reason(StrEnum):
+    """The squeue pending reasons these tools and the jobs pages act on (`man squeue`, JOB REASON CODES)."""
+
+    NONE = "None"
+    DEPENDENCY = "Dependency"
+    DEPENDENCY_NEVER = "DependencyNeverSatisfied"
+    HELD_USER = "JobHeldUser"
+    HELD_REQUEUE = "job requeued in held state"  # squeue's %r after `scontrol requeuehold` (stage C test 9)
+    HELD_ADMIN = "JobHeldAdmin"
+    RESOURCES = "Resources"
+    PRIORITY = "Priority"
+    BEGIN_TIME = "BeginTime"
+    PARTITION_CONFIG = "PartitionConfig"
+    ACCOUNT_NOT_ALLOWED = "AccountNotAllowed"
+
+
 #: States in which a job holds (or is about to hold) its resources.
 ACTIVE_STATES = frozenset({State.RUNNING, State.CONFIGURING, State.COMPLETING, State.SUSPENDED})
 #: Pending reasons meaning a person or the requeue limit holds the job: it will not start by itself.
-#: "job requeued in held state" is what squeue's %r shows after `scontrol requeuehold` (stage C test 9).
-HELD_REASONS = frozenset(
-    {"JobHeldUser", "JobHeldAdmin", "DependencyNeverSatisfied", "job requeued in held state"}
-)
+HELD_REASONS = frozenset({Reason.HELD_USER, Reason.HELD_ADMIN, Reason.DEPENDENCY_NEVER, Reason.HELD_REQUEUE})
 
-#: The pending reason of a job waiting for the jobs it depends on (`man squeue`, JOB REASON CODES).
-DEPENDENCY_REASON = "Dependency"
+
+def printable(text: str) -> str:
+    """`text` with every character a terminal acts on (escape sequences, newlines, direction overrides) as `?`.
+
+    Job names and descriptions are whatever their submitter typed, and they reach admins' terminals and the site's
+    notify command.
+    """
+    return "".join(c if c.isprintable() else "?" for c in text)
 
 #: Explicit, because with MinJobAge a day slurm keeps finished jobs listable; these tools want unfinished ones only.
 _UNFINISHED = ",".join(state.lower() for state in State)
@@ -176,7 +202,7 @@ def held_back(job: QueuedJob, jobs: dict[str, QueuedJob], _seen: frozenset[str] 
 
     A dependency no longer in the queue has just finished, so the job may be about to start: not held back.
     """
-    if job.reason != DEPENDENCY_REASON or not job.depends_on or job.job_id in _seen:
+    if job.reason != Reason.DEPENDENCY or not job.depends_on or job.job_id in _seen:
         return False
     before = [jobs.get(job_id) for job_id in job.depends_on]
     return all(
@@ -339,7 +365,8 @@ def pid_alive(pid: object) -> bool:
 
 def slurm_lease_admitted(lease_dir: Path | None = None) -> bool:
     """Whether the keeper holds the GPU lease for slurm: a live pid and no outstanding request."""
-    record = read_json((lease_dir or LEASE_DIR) / f"{LEASE_PROJECT}.json")
+    lease_dir = lease_dir or LEASE_DIR
+    record = read_json(lease_dir / f"{LEASE_PROJECT}.json") if lease_dir else None
     return bool(record) and record.get("requested_at") is None and pid_alive(record.get("pid"))
 
 

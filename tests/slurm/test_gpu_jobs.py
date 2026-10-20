@@ -13,6 +13,7 @@ import gpu_jobs
 import pytest
 import site_config
 import status
+import urgent
 import wait
 from gpu_jobs import EventAction, QueuedJob
 
@@ -88,6 +89,8 @@ def test_a_hostile_or_foreign_record_is_ignored_and_never_blocks(tmp_path: Path,
     monkeypatch.setattr(status.audit, "unregistered", list)
     monkeypatch.setattr(status.audit, "report", lambda _u: [])
     assert not any("forged" in line for line in status.lines([job]))
+    named = QueuedJob("8", "normal", "PENDING", "None", "p:resume:\x1b]0;forged\x07")
+    assert all(line.isprintable() for line in status.lines([named]))  # a terminal shows a name, never acts on it
     # an update never merges into a record that is not this user's, and a write that cannot replace says so
     monkeypatch.setattr(gpu_jobs, "current_user", lambda: "somebody-else")
     gpu_jobs.update_sidecar("6", extra=1)
@@ -201,7 +204,7 @@ def test_nodes_from_scontrol_one_line_records() -> None:
     assert gpu_jobs.nodes(missing) == []
 
 
-def test_state_dir_resolution_env_over_site_file_over_legacy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_state_dir_resolution_env_over_site_file_and_no_fallback(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     site = tmp_path / "site.toml"
     site.write_text(
         f'name = "t"\nstate_dir = "{tmp_path / "site-state"}"\n'
@@ -211,9 +214,20 @@ def test_state_dir_resolution_env_over_site_file_over_legacy(tmp_path: Path, mon
         monkeypatch.delenv(var, raising=False)
     try:
         monkeypatch.setattr(site_config, "SITE_FILE", tmp_path / "absent.toml")
-        assert importlib.reload(gpu_jobs).STATE_DIR == Path("~/.local/state/slurm-gpu").expanduser()
+        with pytest.raises(SystemExit, match=r"^\[gpujobs\] REFUSED: no site file at"):  # a message, not a traceback
+            importlib.reload(gpu_jobs)
+        monkeypatch.setenv("SLURM_GPU_STATE_DIR", str(tmp_path / "s"))
+        monkeypatch.setenv("GPU_LEASE_DIR", str(tmp_path / "l"))
+        with pytest.raises(SystemExit):  # both directories given still needs the site file
+            importlib.reload(gpu_jobs)
+        for var in ("SLURM_GPU_STATE_DIR", "GPU_LEASE_DIR"):
+            monkeypatch.delenv(var)
         monkeypatch.setattr(site_config, "SITE_FILE", site)
-        assert importlib.reload(gpu_jobs).STATE_DIR == tmp_path / "site-state"
+        reloaded = importlib.reload(gpu_jobs)
+        assert (reloaded.STATE_DIR, reloaded.LEASE_DIR) == (tmp_path / "site-state", None)  # no [lease]: no lease dir
+        assert not reloaded.slurm_lease_admitted() and urgent.other_leases() == []  # and nothing reads one
+        monkeypatch.setenv("GPU_LEASE_DIR", str(tmp_path / "env-lease"))
+        assert importlib.reload(gpu_jobs).LEASE_DIR == tmp_path / "env-lease"
         monkeypatch.setenv("SLURM_GPU_STATE_DIR", str(tmp_path / "env-state"))
         assert importlib.reload(gpu_jobs).STATE_DIR == tmp_path / "env-state"
     finally:

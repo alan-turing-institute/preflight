@@ -125,10 +125,10 @@ TOML. Tables: the top level, `[[nodes]]` with `[[nodes.gpus]]`, `[lease]` with `
 | `state_dir` | `/var/lib/gpujobs` | Where the job layer keeps its records and events (section 8). |
 | `install_dir` | `/opt/gpujobs` | Where the tools are installed (`install_dir/slurm/`). |
 | `admin_group` | `gpujobs-admin` | Unix group of administrators. Also the group allowed to submit to the `urgent` partition. |
-| `unified_memory` | `false` | True when the GPU shares system memory with the host (`nvidia-smi` reports total memory as `[N/A]`). `detect` sets it. Read and checked, but no tool acts on it yet. |
+| `unified_memory` | `false` | True when the GPU shares system memory with the host (`nvidia-smi` reports total memory as `[N/A]`). `detect` sets it. On such a site the Jobstats dashboard's GPU memory panel plots the agent's per-job series, because the GPU exporter has none to report. |
 | `hostguard` | `false` | The job wrapper marks every job as the preferred out-of-memory victim (`oom_score_adj` 800, through the host memory guard in `hostguard/hostguard.py`), so a memory shortage ends a job rather than a login session. The `tools` component installs the guard when this is on. |
 | `dgx_gate` | `false` | Require the DGX submission gate for jobs submitted with `--entry` (other jobs are not gated). The `tools` component installs the gate (`dgx/`) and the host memory guard it checks when this is on. |
-| `notify_command` | `[]` | Command (list of arguments, no shell, 30 s limit) the agent runs when a job ends FAILED, OUT_OF_MEMORY, TIMEOUT or NODE_FAIL, with the job in the environment: `GPUJOBS_JOB` (id), `GPUJOBS_STATE`, `GPUJOBS_USER`, `GPUJOBS_NAME`. Empty means no notification. |
+| `notify_command` | `[]` | Command (list of arguments, no shell, 30 s limit) the agent runs when a job ends FAILED, OUT_OF_MEMORY, TIMEOUT or NODE_FAIL, with the job in the environment: `GPUJOBS_JOB` (id), `GPUJOBS_STATE`, `GPUJOBS_USER`, `GPUJOBS_NAME`. The name is whatever its submitter typed, with control characters shown as `?`: quote it wherever it goes into a shell command or a mail header. Empty means no notification. |
 | `nodes` | required | One `[[nodes]]` table per compute node; at least one. |
 | `lease` | absent | Optional table; leave it out when no other service shares the GPU through the lease. Without it the `lease` component is not installed. |
 | `metrics` | all defaults below | Table. |
@@ -289,7 +289,7 @@ written. In both modes our page is linked at `/var/www/ood/apps/sys/gpujobs`.
 
 - **Owners** pause, resume and kill their own jobs.
 - **Admins** act on anyone's jobs, and **only admins may submit urgent work** (`urgent.py` refuses everyone
-  else and prints how to be added; with no site file it checks nothing, see section 8). An admin is a member of `admin_group` (as a listed member or as that
+  else and prints how to be added). An admin is a member of `admin_group` (as a listed member or as that
   primary group) and has slurm's administrator level Operator; `install.py admin add USER` sets both.
 - The rules are slurm's: the tools run `scontrol` and `scancel` as the user and print slurm's own refusal. The
   `urgent` partition also limits who may submit to it by group.
@@ -389,15 +389,9 @@ prints a job's last measured peak memory. `gpujobs-status` and `gpujobs-audit` t
   The sticky bit (the leading 1) lets everyone write but lets only a file's owner delete it.
 - **Changing the site file** means running `apply` again; the services read the copy in `/etc/gpujobs/`.
 
-- **Without a site file** the tools still run (`site_config.load_optional()` returns nothing) and keep the settings
-  of the single machine they were first written for. This is a fallback, and a wrong `$GPUJOBS_SITE` lands there
-  silently. Then:
-  - State and lease directories come from `$SLURM_GPU_STATE_DIR` and `$GPU_LEASE_DIR` if set, else the per-user
-    `~/.local/state/slurm-gpu` and `~/.local/state/gpu-lease` (`gpu_jobs._site_dirs`).
-  - `urgent` does not check the admin group, and takes the built-in service list (`service-a`, `service-b`) for
-    what yields the card.
-  - `submit` requires the lease keeper's heartbeat, and gates every `--entry` job with the DGX gate.
-  - The job wrapper turns the host memory guard on.
+- **Without a site file** (none at `/etc/gpujobs/site.toml`, or `$GPUJOBS_SITE` naming a missing or broken one) the
+  tools refuse, naming the file and what is wrong with it; there is no built-in fallback. `$SLURM_GPU_STATE_DIR`
+  and `$GPU_LEASE_DIR` override the site file's two directories (the unit tests use them).
 
 ## 9. Uninstall
 

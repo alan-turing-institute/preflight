@@ -75,6 +75,7 @@ def test_example_loads_and_minimal_file_gets_every_default(tmp_path: Path) -> No
         (MINIMAL + "[portal]\nsession_days = -1\n", "portal.session_days = -1"),
         (MINIMAL + "[portal]\nallow_from = ['ts']\n", "portal.allow_from entry 'ts'"),
         ('name = "x"\n', "missing nodes"),
+        ("state_dir = 5\n" + MINIMAL, "has a value of the wrong kind"),
     ],
 )
 def test_bad_site_files_are_refused(tmp_path: Path, text: str, fragment: str) -> None:
@@ -85,6 +86,10 @@ def test_bad_site_files_are_refused(tmp_path: Path, text: str, fragment: str) ->
 def test_missing_file_names_the_detect_command(tmp_path: Path) -> None:
     with pytest.raises(gpujobs_site.SiteError, match="slurm/install/install.py detect"):
         gpujobs_site.load(tmp_path / "absent.toml")
+    (tmp_path / "latin1.toml").write_bytes(b'name = "caf\xe9"\n')
+    for unreadable in (tmp_path, tmp_path / "latin1.toml"):  # a SiteError, which every tool turns into one line
+        with pytest.raises(gpujobs_site.SiteError, match="cannot read site file"):
+            gpujobs_site.load(unreadable)
 
 
 def test_is_admin(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
