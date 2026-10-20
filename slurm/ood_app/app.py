@@ -321,7 +321,7 @@ def _today() -> date:
 def _gib(value: float | None) -> str:
     if value is None:
         return "—"
-    return f"{value / 1024**3:.1f} GiB" if value >= 1024**3 else f"{value / 1024**2:.0f} MiB"
+    return f"{value / 1024**3:.1f} GB" if value >= 1024**3 else f"{value / 1024**2:.0f} MB"
 
 
 def _hours(value: float) -> str:
@@ -356,7 +356,7 @@ def _asked_memory(mem: object) -> str:
         return "—"
     if text == jobs_view.WHOLE_NODE_MEM:
         return "whole box"
-    return re.sub(r"^(\d+)([KMGT])$", r"\1 \2iB", text)  # slurm counts in binary units: 32G is 32 GiB
+    return re.sub(r"^(\d+)([KMGT])$", r"\1 \2B", text)
 
 
 def _short(name: str) -> str:
@@ -493,8 +493,8 @@ def _resource_tiles(have: Mapping[str, int], rows: list[dict[str, object]], busy
                f"{have['gpus_used']} of {have['gpus']} given to jobs · {have['gpus'] - have['gpus_used']} free"),
         _meter("Cores", f"{have['cpus_used']} of {have['cpus']} in use", _share(have["cpus_used"], have["cpus"]),
                f"{by_cpu} by CPU jobs · {by_gpu} by GPU jobs · {free_cpus} free"),
-        _meter("Memory", f"{have['mem_used_mb'] / gib:.0f} of {have['mem_mb'] / gib:.0f} GiB given to jobs",
-               _share(have["mem_used_mb"], have["mem_mb"]), f"{free_mem:.0f} GiB free"),
+        _meter("Memory", f"{have['mem_used_mb'] / gib:.0f} of {have['mem_mb'] / gib:.0f} GB given to jobs",
+               _share(have["mem_used_mb"], have["mem_mb"]), f"{free_mem:.0f} GB free"),
     ]
     return (
         '<section class="card box" aria-labelledby="h-box"><div class="card-head"><h2 id="h-box">This machine</h2>'
