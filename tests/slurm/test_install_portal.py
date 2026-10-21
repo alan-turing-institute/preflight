@@ -299,6 +299,15 @@ def test_install_links_our_app_after_the_restart_and_ships_the_repo_keys(tmp_pat
     )
     # running per-user servers keep the old server name until stopped, after Apache has the new one
     assert steps.index(["systemctl", "restart", "apache2"]) < steps.index([portal.NGINX_STAGE, "nginx_clean", "--force"])
+    # an apply of the tools alone replaces the page's code: the per-user servers are stopped too, once there are any
+    tools, live = importlib.import_module("components.tools"), importlib.import_module("components.portal")
+    stage = tmp_path / "nginx_stage"
+    monkeypatch.setattr(live, "NGINX_STAGE", str(stage))
+    (later,) = tools.post_install(site)
+    assert later() == []  # a fresh box: the portal is installed after the tools
+    stage.touch()
+    assert later() == [[str(stage), "nginx_clean", "--force"]]
+    assert tools.post_install(make_site(tmp_path, mode="existing")) == []  # not our portal to restart
     sources = portal.apt_sources(site)
     assert sources[portal.OOD_LIST].content == (
         f"deb [signed-by={portal.OOD_KEYRING}] https://apt.osc.edu/ondemand/4.2/web/apt noble main\n"

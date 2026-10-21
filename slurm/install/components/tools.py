@@ -60,5 +60,12 @@ def refusals(site) -> list[str]:
     return []
 
 
-def post_install(site) -> list[list[str]]:
-    return []
+def post_install(site) -> list:
+    """With the portal installed here, stop the per-user web servers once the page's code is replaced: Open OnDemand
+    keeps a page's old code loaded until its server restarts (2026-10-21: the queue page lacked a new column after an
+    apply of the tools). Only when the portal is there to stop: a fresh box installs it after the tools."""
+    from . import portal
+
+    if not (portal.enabled(site) and portal._installing(site)):
+        return []
+    return [lambda: [[portal.NGINX_STAGE, "nginx_clean", "--force"]] if Path(portal.NGINX_STAGE).exists() else []]
