@@ -19,6 +19,8 @@ TEMPLATES = Path(__file__).resolve().parent / "templates"
 UNITS = ("slurmctld", "slurmd", "munge", "slurmdbd")
 DROPIN = "10-restart-protect.conf"
 FILE_MODE = 0o644
+#: In the first line of every slurm.conf this installer writes: a slurm.conf without it was set up by someone else.
+RENDERED_MARK = "Rendered from the site file by slurm/install/render.py"
 EXEC_MODE = 0o755
 SECRET_MODE = 0o600
 #: slurm's SlurmUser; `templates/slurm/slurm.conf` sets the same name.

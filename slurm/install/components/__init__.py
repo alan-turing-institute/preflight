@@ -27,6 +27,10 @@ Runner = Callable[[list[str]], "subprocess.CompletedProcess[str]"]
 
 #: the site file as given on the command line; the agent component installs a copy of it
 SITE_PATH: Path | None = None
+#: the root `apply` writes under (`--root`), where the refusals read what is already installed
+ROOT = Path("/")
+#: `apply --replace-existing-slurm`: take over a slurm someone else set up (its settings files are replaced)
+REPLACE_EXISTING_SLURM = False
 #: slurmdbd is `Type=simple` on Ubuntu 24.04 (`systemctl show slurmdbd -p Type`): its restart returns before it answers
 ACCOUNTING_WAIT_S = 60
 

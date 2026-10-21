@@ -14,6 +14,7 @@ spec = importlib.util.spec_from_file_location("gpujobs_install", ROOT / "slurm" 
 cli = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(cli)
 components = cli.components
+RENDERED_MARK = cli.render.RENDERED_MARK
 
 USER = getpass.getuser()
 SITE = f"""
@@ -135,6 +136,13 @@ def test_apply_refuses_with_a_busy_queue_or_without_the_lease_client(env, monkey
     assert run(site, tmp / "root", "apply") == 1
     assert not (tmp / "root").exists()
     old.unlink()
+    taken = tmp / "taken"  # a machine whose slurm someone else set up: never replaced unasked
+    (taken / "etc/slurm").mkdir(parents=True)
+    (taken / "etc/slurm/slurm.conf").write_text("ClusterName=theirs\n")
+    assert run(site, taken, "apply") == 1 and (taken / "etc/slurm/slurm.conf").read_text() == "ClusterName=theirs\n"
+    assert run(site, taken, "apply", "--replace-existing-slurm") == 0
+    assert RENDERED_MARK in (taken / "etc/slurm/slurm.conf").read_text().splitlines()[0]
+    assert run(site, taken, "apply") == 0  # once ours, an apply goes ahead without the flag
     proc = tmp / "proc"
     proc.mkdir()
     for name, value in [("protected_regular", "2"), ("protected_symlinks", "0")]:  # protected_hardlinks absent
