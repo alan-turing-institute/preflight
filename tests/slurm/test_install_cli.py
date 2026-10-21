@@ -37,13 +37,16 @@ class Fake:
 
     def __init__(self, queue="", client_ok=True):
         self.calls, self.queue, self.client_ok, self.known = [], queue, client_ok, set()
+        self.squeue_rc, self.ctld_rc = 0, 0  # squeue's exit status; `systemctl is-active slurmctld`'s (0: running)
         self.policy = "slurm-wlm:\n  Installed: (none)\n  Candidate: 23.11.4-1.2ubuntu5\n"
 
     def __call__(self, argv):
         self.calls.append(argv)
         rc = 0
         if argv[:1] == ["squeue"]:
-            return subprocess.CompletedProcess(argv, 0, self.queue, "")
+            return subprocess.CompletedProcess(argv, self.squeue_rc, self.queue, "")
+        if argv[:2] == ["systemctl", "is-active"]:
+            return subprocess.CompletedProcess(argv, self.ctld_rc, "", "")
         if argv[:2] == ["apt-cache", "policy"]:
             return subprocess.CompletedProcess(argv, 0, self.policy, "")
         if argv[:4] == ["sacctmgr", "-n", "-P", "show"]:
@@ -132,7 +135,18 @@ def test_apply_refuses_with_a_busy_queue_or_without_the_lease_client(env, monkey
     assert run(site, tmp / "root", "apply") == 1
     assert not (tmp / "root").exists()
     assert not any(a[0] in ("apt-get", "systemctl") for a in fake.calls)
-    fake.queue, fake.client_ok = "", False
+    # squeue failing: refused while slurmctld runs or has saved jobs; a first apply that stopped before starting
+    # slurmctld (Turing box, 2026-10-21) runs again
+    fake.queue, fake.squeue_rc = "", 1
+    assert run(site, tmp / "root", "apply") == 1 and not (tmp / "root").exists()
+    fake.ctld_rc = 3
+    saved = tmp / "saved"
+    (saved / "var/spool/slurmctld").mkdir(parents=True)
+    (saved / "var/spool/slurmctld/job_state").write_text("")
+    assert run(site, saved, "apply") == 1 and not (saved / "etc").exists()
+    assert run(site, tmp / "fresh", "apply") == 0
+    fake.squeue_rc = fake.ctld_rc = 0
+    fake.client_ok = False
     assert run(site, tmp / "root", "apply") == 1
     assert not (tmp / "root").exists()
     fake.client_ok = True

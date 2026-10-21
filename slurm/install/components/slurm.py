@@ -43,9 +43,19 @@ def refusals(site) -> list[str]:
         done = components.run(["squeue", "-h"])
     except FileNotFoundError:
         return out
+    if done.returncode != 0 and _never_ran():
+        return out  # a first apply that stopped before starting the controller can be run again
     if done.returncode != 0 or done.stdout.strip():
         out.append("slurm has jobs (or squeue failed); restarting its daemons now would requeue or kill them")
     return out
+
+
+def _never_ran() -> bool:
+    """slurmctld is down and has never saved job state (StateSaveLocation in templates/slurm/slurm.conf), so no job
+    exists that a restart could requeue or kill."""
+    if (components.ROOT / "var/spool/slurmctld/job_state").exists():
+        return False
+    return components.run(["systemctl", "is-active", "--quiet", "slurmctld"]).returncode != 0
 
 
 def post_install(site) -> list:
