@@ -93,6 +93,9 @@ def test_a_hostile_or_foreign_record_is_ignored_and_never_blocks(tmp_path: Path,
     named = QueuedJob("8", "normal", "PENDING", "None", "p:resume:\x1b]0;forged\x07")
     assert all(line.isprintable() for line in status.lines([named]))  # a terminal shows a name, never acts on it
     assert "[status] 8 PENDING    ?          normal 0 GPU" in "\n".join(status.lines([named]))  # the level after the user
+    keeper = any(line.startswith("[status] keeper:") for line in status.lines([named]))
+    monkeypatch.setattr(status.gpu_jobs, "LEASE_DIR", None)  # a site without a lease (Turing box) has no keeper line
+    assert keeper and not any(line.startswith("[status] keeper:") for line in status.lines([named]))
     # an update never merges into a record that is not this user's, and a write that cannot replace says so
     monkeypatch.setattr(gpu_jobs, "current_user", lambda: "somebody-else")
     gpu_jobs.update_sidecar("6", extra=1)
