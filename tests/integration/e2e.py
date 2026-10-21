@@ -252,6 +252,14 @@ def stage_install() -> None:
 
     before = sh("sacctmgr -n -P show assoc where account=gpujobs format=account").out.strip()
     check("before apply: slurm accounting has no record of the site's account 'gpujobs'", before == "", before)
+    # A fresh machine's MariaDB has no login for slurmdbd (2026-10-21, the Turing box: "Access denied for user
+    # 'slurm'@'localhost'"). The first-boot unit made one; take it away so only apply can bring slurmdbd back.
+    dropped = sh("mariadb -e \"DROP USER 'slurm'@'localhost'\"")
+    check("before apply: slurmdbd's MariaDB login removed, as on a fresh machine", dropped.rc == 0, dropped.text[:200])
+    # Nor has it slurmctld's state folder, which slurmctld cannot make itself; with slurmctld stopped, squeue fails, so
+    # this is also the first apply that stopped before starting slurmctld, which must be allowed to run again.
+    fresh = sh("systemctl stop slurmctld && rm -rf /var/spool/slurmctld")
+    check("before apply: slurmctld stopped and its state folder removed, as on a fresh machine", fresh.rc == 0, fresh.text[:200])
 
     detected = sh(f"{INSTALL} detect")
     check("install.py detect prints a draft site file for the container", detected.rc == 0 and "testnode" in detected.out
@@ -267,7 +275,8 @@ def stage_install() -> None:
     check("check before apply: exit 1 and a DIFFERS line", pre.rc == 1 and "DIFFERS" in pre.out, pre.text[:200])
 
     started = time.monotonic()
-    applied = sh(f"{INSTALL} --site {SITE} apply", timeout=1500)
+    # The first-boot units set slurm up, not this installer, so taking it over needs the flag (e301be5).
+    applied = sh(f"{INSTALL} --site {SITE} apply --replace-existing-slurm", timeout=1500)
     check(f"apply installs slurm, tools, agent, metrics and portal ({time.monotonic() - started:.0f} s)",
           applied.rc == 0 and "installed" in applied.out, applied.text[-300:])
     sh("systemctl reset-failed")

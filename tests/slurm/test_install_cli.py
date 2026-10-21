@@ -14,6 +14,7 @@ spec = importlib.util.spec_from_file_location("gpujobs_install", ROOT / "slurm" 
 cli = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(cli)
 components = cli.components
+slurm_component = importlib.import_module("components.slurm")
 RENDERED_MARK = cli.render.RENDERED_MARK
 
 USER = getpass.getuser()
@@ -36,13 +37,16 @@ class Fake:
 
     def __init__(self, queue="", client_ok=True):
         self.calls, self.queue, self.client_ok, self.known = [], queue, client_ok, set()
+        self.squeue_rc, self.ctld_rc = 0, 0  # squeue's exit status; `systemctl is-active slurmctld`'s (0: running)
         self.policy = "slurm-wlm:\n  Installed: (none)\n  Candidate: 23.11.4-1.2ubuntu5\n"
 
     def __call__(self, argv):
         self.calls.append(argv)
         rc = 0
         if argv[:1] == ["squeue"]:
-            return subprocess.CompletedProcess(argv, 0, self.queue, "")
+            return subprocess.CompletedProcess(argv, self.squeue_rc, self.queue, "")
+        if argv[:2] == ["systemctl", "is-active"]:
+            return subprocess.CompletedProcess(argv, self.ctld_rc, "", "")
         if argv[:2] == ["apt-cache", "policy"]:
             return subprocess.CompletedProcess(argv, 0, self.policy, "")
         if argv[:4] == ["sacctmgr", "-n", "-P", "show"]:
@@ -103,7 +107,12 @@ def test_apply_then_check_against_a_temp_root(env):
     assert ["apt-get", "install", "-y", "slurm-wlm", "slurmdbd", "mariadb-server", "munge"] in fake.calls
     assert ["systemctl", "restart", "slurmctld", "slurmd"] in fake.calls
     # slurm's accounting gets the cluster and the account after slurmdbd is back and before slurmctld starts
-    db, ctld = (fake.calls.index(["systemctl", "restart", *g]) for g in (["mariadb", "munge", "slurmdbd"], ["slurmctld", "slurmd"]))
+    db, dbd, ctld = (fake.calls.index(["systemctl", "restart", *g]) for g in (["mariadb", "munge"], ["slurmdbd"], ["slurmctld", "slurmd"]))
+    # a fresh MariaDB has no login for slurmdbd (Turing box, 2026-10-21): it is made between the two restarts
+    assert db < fake.calls.index(["mariadb", "-e", slurm_component.DB_LOGIN]) < dbd
+    # nor does it have slurmctld's state folder, which slurmctld cannot make itself (Turing box, 2026-10-21)
+    state = ["install", "-d", "-m", "0755", "-o", "slurm", "-g", "slurm", slurm_component.STATE_SAVE]
+    assert fake.calls.index(state) < ctld
     adds = [a for a in fake.calls[db:ctld] if a[2:3] == ["add"]]
     assert adds == [["sacctmgr", "-i", "add", "cluster", "t"],
                     ["sacctmgr", "-i", "add", "account", "gpujobs", "Cluster=t", "Description=gpujobs", "Organization=gpujobs"],
@@ -129,7 +138,18 @@ def test_apply_refuses_with_a_busy_queue_or_without_the_lease_client(env, monkey
     assert run(site, tmp / "root", "apply") == 1
     assert not (tmp / "root").exists()
     assert not any(a[0] in ("apt-get", "systemctl") for a in fake.calls)
-    fake.queue, fake.client_ok = "", False
+    # squeue failing: refused while slurmctld runs or has saved jobs; a first apply that stopped before starting
+    # slurmctld (Turing box, 2026-10-21) runs again
+    fake.queue, fake.squeue_rc = "", 1
+    assert run(site, tmp / "root", "apply") == 1 and not (tmp / "root").exists()
+    fake.ctld_rc = 3
+    saved = tmp / "saved"
+    (saved / "var/spool/slurmctld").mkdir(parents=True)
+    (saved / "var/spool/slurmctld/job_state").write_text("")
+    assert run(site, saved, "apply") == 1 and not (saved / "etc").exists()
+    assert run(site, tmp / "fresh", "apply") == 0
+    fake.squeue_rc = fake.ctld_rc = 0
+    fake.client_ok = False
     assert run(site, tmp / "root", "apply") == 1
     assert not (tmp / "root").exists()
     fake.client_ok = True

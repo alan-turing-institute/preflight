@@ -8,7 +8,14 @@ import components
 
 NAME = "slurm"
 PACKAGES = ["slurm-wlm", "slurmdbd", "mariadb-server", "munge"]
-RESTARTS = [["mariadb", "munge", "slurmdbd"], ["slurmctld", "slurmd"]]
+RESTARTS = [["mariadb", "munge"], ["slurmdbd"], ["slurmctld", "slurmd"]]
+# slurmctld's StateSaveLocation (templates/slurm/slurm.conf). The packages do not make it, and slurmctld, running as
+# SlurmUser, cannot make it in /var/spool itself (Turing box, 2026-10-21: "mkdir(/var/spool/slurmctld): Permission denied").
+STATE_SAVE = "/var/spool/slurmctld"
+# slurmdbd logs in to MariaDB as the OS user `slurm` by unix_socket (templates/slurm/slurmdbd.conf), so no password
+# exists anywhere. A fresh MariaDB has no such login: it is made here, before slurmdbd first starts.
+DB_LOGIN = ("CREATE USER IF NOT EXISTS 'slurm'@'localhost' IDENTIFIED VIA unix_socket; "
+            "GRANT ALL ON slurm_acct_db.* TO 'slurm'@'localhost';")
 
 
 def enabled(site) -> bool:
@@ -39,22 +46,35 @@ def refusals(site) -> list[str]:
         done = components.run(["squeue", "-h"])
     except FileNotFoundError:
         return out
+    if done.returncode != 0 and _never_ran():
+        return out  # a first apply that stopped before starting the controller can be run again
     if done.returncode != 0 or done.stdout.strip():
         out.append("slurm has jobs (or squeue failed); restarting its daemons now would requeue or kill them")
     return out
 
 
+def _never_ran() -> bool:
+    """slurmctld is down and has never saved job state, so no job exists that a restart could requeue or kill."""
+    if (components.ROOT / STATE_SAVE.lstrip("/") / "job_state").exists():
+        return False
+    return components.run(["systemctl", "is-active", "--quiet", "slurmctld"]).returncode != 0
+
+
 def post_install(site) -> list:
-    """Restart the database side, give accounting the cluster and its account, then start the controller.
+    """Restart the database side, give slurmdbd its database login, give accounting the cluster and its account, then
+    start the controller.
 
     The records go in before slurmctld starts, the order the test cluster boots in, so slurmctld registers with a
     cluster accounting already knows.
     """
-    database, controller = RESTARTS
+    database, accounting, controller = RESTARTS
     return [
         ["systemctl", "daemon-reload"],
         ["systemctl", "restart", *database],
+        ["mariadb", "-e", DB_LOGIN],
+        ["systemctl", "restart", *accounting],
         lambda: _records(site),
+        ["install", "-d", "-m", "0755", "-o", "slurm", "-g", "slurm", STATE_SAVE],
         ["systemctl", "restart", *controller],
     ]
 
