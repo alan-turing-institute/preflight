@@ -271,7 +271,8 @@ def stage_install() -> None:
     check("check before apply: exit 1 and a DIFFERS line", pre.rc == 1 and "DIFFERS" in pre.out, pre.text[:200])
 
     started = time.monotonic()
-    applied = sh(f"{INSTALL} --site {SITE} apply", timeout=1500)
+    # The first-boot units set slurm up, not this installer, so taking it over needs the flag (e301be5).
+    applied = sh(f"{INSTALL} --site {SITE} apply --replace-existing-slurm", timeout=1500)
     check(f"apply installs slurm, tools, agent, metrics and portal ({time.monotonic() - started:.0f} s)",
           applied.rc == 0 and "installed" in applied.out, applied.text[-300:])
     sh("systemctl reset-failed")
