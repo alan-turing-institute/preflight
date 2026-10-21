@@ -17,7 +17,9 @@ from __future__ import annotations
 import argparse
 import grp
 import os
+import platform
 import pwd
+import re
 import shutil
 import stat
 import sys
@@ -45,6 +47,12 @@ Chown = Callable[[Path, str], None]
 #: them 0, a file or link another user leaves under a predictable name (a job's log, a record) is written through.
 KERNEL_PROTECTIONS = Path("/proc/sys/fs")
 PROTECTIONS = ("protected_regular", "protected_symlinks", "protected_hardlinks")
+#: The oldest slurm this build is written for (README, Requirements); Ubuntu 22.04's apt offers 21.08.
+MIN_SLURM = (23, 11)
+#: Where the build has been tested (README, Requirements): elsewhere an apply warns, and goes ahead.
+TESTED_OS = ("ubuntu", "24.04")
+TESTED_ARCH = "aarch64"
+OS_RELEASE = Path("/etc/os-release")
 
 
 class Action(StrEnum):
@@ -156,9 +164,45 @@ def kernel_refusals() -> list[str]:
     return problems
 
 
+def platform_refusals(site, modules) -> list[str]:
+    """What would make an apply fail on this machine, found before anything is touched: no apt to install the
+    packages with, or an apt whose slurm is older than this build supports."""
+    if not apt_install_commands(modules, site):
+        return []
+    if shutil.which("apt-get") is None:
+        return ["this installer installs its packages with apt (Debian or Ubuntu); this machine has no apt-get"]
+    if not any(m.NAME == "slurm" for m in modules):
+        return []
+    policy = components.run(["apt-cache", "policy", "slurm-wlm"]).stdout or ""
+    version = re.search(r"Candidate:\s*(?:\d+:)?(\d+)\.(\d+)", policy)
+    if not version:
+        return ["apt offers no slurm-wlm package here (`apt-cache policy slurm-wlm` names no candidate)"]
+    if (int(version[1]), int(version[2])) < MIN_SLURM:
+        return [f"apt's slurm-wlm is {version[1]}.{version[2]}; this build needs slurm "
+                f"{MIN_SLURM[0]}.{MIN_SLURM[1]} or newer (README, Requirements)"]
+    return []
+
+
+def platform_warnings(site, os_release: Path = OS_RELEASE) -> list[str]:
+    """Where this machine differs from what the build was tested on: worth knowing, not a reason to stop."""
+    text = os_release.read_text(encoding="utf-8", errors="replace") if os_release.exists() else ""
+    fields = dict(re.findall(r'^(\w+)="?([^"\n]*)"?$', text, re.MULTILINE))
+    out = []
+    if (fields.get("ID"), fields.get("VERSION_ID")) != TESTED_OS:
+        out.append(f"untested operating system {fields.get('PRETTY_NAME') or 'unknown'}: the build is tested on "
+                   "Ubuntu 24.04 only")
+    if platform.machine() != TESTED_ARCH:
+        out.append(f"untested architecture {platform.machine()}: the build is tested on {TESTED_ARCH} only")
+    if len(site.nodes) > 1:
+        out.append(f"the site file lists {len(site.nodes)} nodes: only one-machine sites have been tested")
+    return out
+
+
 def cmd_check(site, args, modules) -> int:
     _warn_portal_secrets(site, modules)
-    for problem in kernel_refusals():
+    for warning in platform_warnings(site):
+        print(f"WARNING  {warning}")
+    for problem in [*kernel_refusals(), *platform_refusals(site, modules)]:
         print(f"REFUSED  {problem}")
     files = _all(modules, site, "files")
     with tempfile.TemporaryDirectory() as tmp:
@@ -189,7 +233,9 @@ def apt_install_commands(modules, site) -> list[list[str]]:
 
 
 def cmd_apply(site, args, modules, chown: Chown | None = _chown) -> int:
-    refusals = [*kernel_refusals(), *(r for m in modules for r in m.refusals(site))]
+    for warning in platform_warnings(site):
+        print(f"WARNING: {warning}", file=sys.stderr)
+    refusals = [*kernel_refusals(), *platform_refusals(site, modules), *(r for m in modules for r in m.refusals(site))]
     if refusals:
         for r in refusals:
             print(f"REFUSED: {r}", file=sys.stderr)

@@ -29,6 +29,10 @@ The pieces are installed by one program, `slurm/install/install.py`, in six comp
   and for the container test cluster in `tests/integration/`. Anything else (other Ubuntu or Debian releases,
   x86_64 machines, real multi-node clusters) is untested. The metrics component has download entries for both
   x86_64 and aarch64, but only aarch64 was exercised.
+- **What `apply` and `check` say about the machine.** They refuse, before anything is touched, when the build cannot
+  work: no `apt-get`, or apt offering no `slurm-wlm` or one older than 23.11 (Ubuntu 22.04 offers 21.08). They warn
+  and go ahead where it is only untested: an operating system other than Ubuntu 24.04, an architecture other than
+  aarch64, a site file listing more than one node.
 - **Slurm 23.11 or newer, from the distribution packages.** Ubuntu 24.04 ships 23.11.4. The installer installs
   `slurm-wlm`, `slurmdbd`, `mariadb-server` and `munge`. That Ubuntu build has no NVML plugin (NVML is NVIDIA's
   management library), so GPUs are declared by device file in `gres.conf`, and slurm itself records no per-GPU

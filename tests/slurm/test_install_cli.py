@@ -31,17 +31,20 @@ python = "{sys.executable}"
 
 
 class Fake:
-    """Records every argv; `queue` is squeue's output, `client_ok` the lease-client import's success, and `known` the
-    `sacctmgr show` queries (after `show`) that find a record."""
+    """Records every argv; `queue` is squeue's output, `client_ok` the lease-client import's success, `known` the
+    `sacctmgr show` queries (after `show`) that find a record, and `policy` what `apt-cache policy` says."""
 
     def __init__(self, queue="", client_ok=True):
         self.calls, self.queue, self.client_ok, self.known = [], queue, client_ok, set()
+        self.policy = "slurm-wlm:\n  Installed: (none)\n  Candidate: 23.11.4-1.2ubuntu5\n"
 
     def __call__(self, argv):
         self.calls.append(argv)
         rc = 0
         if argv[:1] == ["squeue"]:
             return subprocess.CompletedProcess(argv, 0, self.queue, "")
+        if argv[:2] == ["apt-cache", "policy"]:
+            return subprocess.CompletedProcess(argv, 0, self.policy, "")
         if argv[:4] == ["sacctmgr", "-n", "-P", "show"]:
             return subprocess.CompletedProcess(argv, 0, "row\n" if " ".join(argv[4:]) in self.known else "", "")
         if argv[0] == sys.executable:
@@ -136,6 +139,19 @@ def test_apply_refuses_with_a_busy_queue_or_without_the_lease_client(env, monkey
     assert run(site, tmp / "root", "apply") == 1
     assert not (tmp / "root").exists()
     old.unlink()
+    for policy in ("  Candidate: 21.08.5-2ubuntu1\n", "  Candidate: (none)\n"):  # Ubuntu 22.04's slurm; none at all
+        fake.policy = policy
+        assert run(site, tmp / "root", "apply") == 1 and not (tmp / "root").exists()
+    fake.policy = Fake().policy
+    # untested platforms warn and go ahead; the tested one says nothing
+    release = tmp / "os-release"
+    release.write_text('PRETTY_NAME="Debian GNU/Linux 12"\nID=debian\nVERSION_ID="12"\n')
+    monkeypatch.setattr(cli.platform, "machine", lambda: "x86_64")
+    warnings = cli.platform_warnings(SimpleNamespace(nodes=[1, 2]), release)
+    assert [w.split()[:2] for w in warnings] == [["untested", "operating"], ["untested", "architecture"], ["the", "site"]]
+    release.write_text('PRETTY_NAME="Ubuntu 24.04.3 LTS"\nID=ubuntu\nVERSION_ID="24.04"\n')
+    monkeypatch.setattr(cli.platform, "machine", lambda: "aarch64")
+    assert cli.platform_warnings(SimpleNamespace(nodes=[1]), release) == []
     taken = tmp / "taken"  # a machine whose slurm someone else set up: never replaced unasked
     (taken / "etc/slurm").mkdir(parents=True)
     (taken / "etc/slurm/slurm.conf").write_text("ClusterName=theirs\n")
