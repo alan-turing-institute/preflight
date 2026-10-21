@@ -8,10 +8,13 @@ Plan 3.5 (`plan notes`). One system service, run as SlurmUser
 1. BOOT RE-REGISTRATION, once per boot (`agent/boot_id` against the kernel's boot id): once slurmctld has run
    30 s, `scontrol update nodename=N state=undrain` for every node not drained on purpose. That makes slurmd
    register again, which is what makes slurm purge the jobs the node lost (otherwise it waits ~32 minutes).
-2. A RELEASED JOB KEEPS ITS PLACE: the priority of each pending or running job is recorded. A job the agent saw
-   held that is later pending and not held at a lower priority gets its recorded priority back, once. A job the
-   agent never saw held is never touched, so an admin's deliberate change stays; but an admin who releases a held
-   job and lowers its priority within one look (5 s) sees the first lowering undone, and must lower it again.
+2. LEVEL, THEN SUBMISSION ORDER (D18): every pending job that is not held gets the priority its level and job id
+   give it (`levels.priority_for`, from a base id kept in the state), so a job keeps its place after a requeue, a
+   pause or a slurmctld restart: slurm keeps a priority set this way across a requeue and a restart, and the agent
+   sets it again after a release. Every placed priority is above any slurm gives by itself, so a job not placed
+   yet (just submitted, or released) waits behind them all. The level is the job's QOS, slurm's own field; every
+   level is open to everyone, so reading it grants nothing. An admin's hand-set priority is overwritten at the
+   next look: move a job by changing its level (`scontrol update jobid=J qos=high`).
 3. RESTORE ORDER after urgent work: `requests/restore_order-*.json` written by an admin names the urgent job
    (`urgent`), the jobs it may pre-empt (`victims`) and the jobs held meanwhile (`held`). The held jobs are released
    once the urgent job has left the queue and every victim is running, gone or held (a pre-empted victim can run
@@ -50,6 +53,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import gpu_jobs  # the path is set just above
+import levels
 import site_config
 
 BOOT_ID_FILE = Path("/proc/sys/kernel/random/boot_id")
@@ -57,9 +61,8 @@ BOOT_ID_FILE = Path("/proc/sys/kernel/random/boot_id")
 CTLD_SETTLE_S = 30.0
 NOTIFY_TIMEOUT_S = 30
 MIB = 1024 * 1024
-#: How many ended jobs and recorded restorations are remembered.
+#: How many ended jobs are remembered.
 ENDED_KEPT = 5000
-RESTORED_KEPT = 20
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
 
@@ -142,8 +145,7 @@ def notify_run(argv: list[str], env: dict[str, str]) -> None:
 class State:
     """What the agent has seen, kept in `agent/state.json` so a restart does not forget it."""
 
-    priorities: dict[str, int] = field(default_factory=dict)
-    seen_held: list[str] = field(default_factory=list)
+    base: int | None = None  # the job id placed priorities count from (levels.rebase)
     ended_seen: list[str] | None = (
         None  # None until the first look: the log's history is not news
     )
@@ -160,7 +162,7 @@ def _by_id(job_id: str) -> tuple[int, str]:
 #: Ended jobs are asked of slurm's accounting (sacct, through slurmdbd) at most this often, not every loop.
 NOTICES_EVERY_S = 30.0
 #: Failure notices sent per look; the rest wait for the next, so a burst and a slow notify command (30 s each) can
-#: never stall the loop (priority restore, restore order) for long.
+#: never stall the loop (placing jobs, restore order) for long.
 NOTICES_PER_LOOK = 3
 
 
@@ -221,20 +223,15 @@ class Agent:
             notify,
         )
         saved = gpu_jobs.read_json(self.dir / "state.json") or {}
-        raw_priorities = saved.get("priorities")
         ended = saved.get("ended_seen")
+        base = saved.get("base")
         self.state = State(
-            priorities={str(k): int(v) for k, v in raw_priorities.items()}
-            if isinstance(raw_priorities, dict)
-            else {},
-            seen_held=_strings(saved.get("seen_held")),
+            base=base if isinstance(base, int) else None,
             ended_seen=_strings(ended) if isinstance(ended, list) else None,
             released_requests=_strings(saved.get("released_requests")),
         )
         beat = gpu_jobs.read_json(self.dir / "agent.json") or {}
         self.boot_reconciled_at = beat.get("boot_reconciled_at")
-        restored = beat.get("restored")
-        self.restored: list[object] = restored if isinstance(restored, list) else []
         self.last_error, self.last_error_at = (
             str(beat.get("last_error") or ""),
             beat.get("last_error_at"),
@@ -258,7 +255,7 @@ class Agent:
         if queue is None:
             errors.append("squeue did not answer; keeping the last state")
         else:
-            self._keep_priorities(queue, now, errors)
+            self._place_jobs(queue, errors)
             self._restore_order(queue, read_at_ns, errors)
         if now - self._notices_at >= NOTICES_EVERY_S:
             self._notices_at = now
@@ -274,8 +271,7 @@ class Agent:
         gpu_jobs.write_json(
             self.dir / "state.json",
             {
-                "priorities": s.priorities,
-                "seen_held": s.seen_held,
+                "base": s.base,
                 "ended_seen": s.ended_seen,
                 "released_requests": s.released_requests,
             },
@@ -283,7 +279,6 @@ class Agent:
         beat: dict[str, object] = {
             "updated": int(now),
             "boot_reconciled_at": self.boot_reconciled_at,
-            "restored": self.restored,
             "last_error": self.last_error,
             "last_error_at": self.last_error_at,
             "note": self.note,
@@ -343,54 +338,22 @@ class Agent:
             self.boot_reconciled_at = int(now)
             self._undrained.clear()
 
-    # -- 2. a released job keeps its place ------------------------------------------------------------------
+    # -- 2. level, then submission order ------------------------------------------------------------------
 
-    def _keep_priorities(
-        self, queue: list[gpu_jobs.QueuedJob], now: float, errors: list[str]
-    ) -> None:
-        s = self.state
-        live = {job.job_id for job in queue}
-        seen_held = set(s.seen_held) & live
+    def _place_jobs(self, queue: list[gpu_jobs.QueuedJob], errors: list[str]) -> None:
+        self.state.base = levels.rebase(self.state.base, [job.job_id for job in queue])
         for job in queue:
-            pending = job.state == gpu_jobs.State.PENDING
-            if pending and (job.held or job.priority == 0):
-                seen_held.add(job.job_id)
-                continue
-            recorded = s.priorities.get(job.job_id)
-            if job.job_id in seen_held and pending and job.priority > 0:
-                if recorded is not None and job.priority < recorded:
-                    done = call(
-                        self.scontrol,
-                        [
-                            "scontrol",
-                            "update",
-                            f"jobid={job.job_id}",
-                            f"priority={recorded}",
-                        ],
-                    )
-                    if done.returncode:
-                        errors.append(
-                            f"restoring the priority of job {job.job_id} failed; will retry"
-                        )
-                        continue
-                    self.restored = [
-                        *self.restored,
-                        {
-                            "job": job.job_id,
-                            "from": job.priority,
-                            "to": recorded,
-                            "at": int(now),
-                        },
-                    ][-RESTORED_KEPT:]
-                    seen_held.discard(job.job_id)
-                    continue
-                seen_held.discard(job.job_id)  # released and nothing lost
-            if job.priority > 0 and (pending or job.active):
-                s.priorities[job.job_id] = job.priority
-        s.seen_held = sorted(seen_held, key=_by_id)
-        s.priorities = {
-            job_id: prio for job_id, prio in s.priorities.items() if job_id in live
-        }
+            if job.state == gpu_jobs.State.PENDING and job.priority:  # 0 is slurm's hold, which refuses a priority
+                self._place(job, errors)
+
+    def _place(self, job: gpu_jobs.QueuedJob, errors: list[str]) -> None:
+        target = levels.priority_for(job.level, job.job_id, self.state.base or 0)
+        if job.priority == target:
+            return
+        if call(self.scontrol, ["scontrol", "update", f"jobid={job.job_id}", f"priority={target}"]).returncode:
+            errors.append(f"placing job {job.job_id} failed; will retry")
+            return
+        print(f"[agent] job {job.job_id} placed at {job.level} (priority {job.priority} -> {target})", flush=True)
 
     # -- 3. restore order after urgent work -----------------------------------------------------------------
 
@@ -442,18 +405,29 @@ class Agent:
                 for job_id in _strings(order.get("held"))
                 if gpu_jobs.JOB_ID.fullmatch(job_id)
             ]
-            if (
-                held
-                and call(
-                    self.scontrol, ["scontrol", "release", ",".join(held)]
-                ).returncode
-            ):
+            if not self._release_in_order(held, jobs, errors):
                 errors.append(f"releasing {held} for {path.name} failed; will retry")
                 continue
             print(f"[agent] released {held}: the pre-empted jobs run again", flush=True)
             s.released_requests.append(key)
             gpu_jobs.remove_quietly(path)
         s.released_requests = [key for key in s.released_requests if key in present]
+
+    def _release_in_order(self, held: list[str], jobs: dict[str, gpu_jobs.QueuedJob], errors: list[str]) -> bool:
+        """Release one job at a time, best place first, each placed at once: a release starts a scheduling pass, and
+        with the card free the first job released takes it."""
+        def place_of(job_id: str) -> int:
+            job = jobs.get(job_id)
+            return levels.priority_for(job.level, job_id, self.state.base or 0) if job else 0
+
+        ok = True
+        for job_id in sorted(held, key=place_of, reverse=True):
+            if call(self.scontrol, ["scontrol", "release", job_id]).returncode:
+                ok = False  # slurm refuses a job it no longer knows, or one not held: the rest still go
+                continue
+            if job_id in jobs:
+                self._place(jobs[job_id], errors)  # held in this queue read: priority 0, never its target
+        return ok
 
     # -- 4. failure notices ---------------------------------------------------------------------------------
 

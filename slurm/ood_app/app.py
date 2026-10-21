@@ -53,6 +53,11 @@ CLASS_HELP = {
     "restart": "Never pre-empted; if stopped it starts again from the beginning.",
     "urgent": "Submitted with urgent.py: it jumps the queue.",
 }
+LEVEL_HELP = {
+    "high": "Waits ahead of normal and low jobs. It never stops a running job.",
+    "normal": "The default place in line.",
+    "low": "Waits behind normal and high jobs.",
+}
 #: project -> palette slot for the request being served (set in `handle`)
 _SLOTS: ContextVar[Mapping[str, int] | None] = ContextVar("slots", default=None)
 CLOCK_FIELDS = 3  # H:MM:SS
@@ -249,6 +254,7 @@ def job_rows(backend: Backend) -> list[dict[str, object]]:
                 "state_label": label,
                 "elapsed_s": _seconds(elapsed.get(job.job_id, "")),
                 "user": job.user,
+                "level": str(job.level),
                 "project": jobs_view.project_of(job.name),
                 "class": str(record.get("job_class") or job.partition),
                 "name": job.name,
@@ -347,6 +353,13 @@ def _class_pill(job_class: object) -> str:
     title = f' title="{esc(help_text)}"' if help_text else ""
     return f'<span class="pill"{title}>{esc(text)}</span>'
 
+
+
+def _level_pill(level: object) -> str:
+    text = str(level or "")
+    if text not in LEVEL_HELP:
+        return "—"
+    return f'<span class="pill level-{esc(text)}" title="{esc(LEVEL_HELP[text])}">{esc(text)}</span>'
 
 
 def _asked_memory(mem: object) -> str:
@@ -536,24 +549,25 @@ def _queue_table(rows: list[dict[str, object]], root: str) -> str:
             f'{f"<div class=\"desc\">{esc(r["description"])}</div>" if r["description"] else ""}</td>'
             f"<td class=\"inline\">{_project(str(r['project']))}</td>"
             f'<td class="inline">{_badge(str(r["kind"]), str(r["state_label"]))}{why}</td>'
+            f'<td class="inline" data-k="level">{_level_pill(r["level"])}</td>'
             + (f'<td class="num inline" data-k="for">{esc(time_text)}</td>' if r["kind"] == Kind.RUNNING else '<td class="num hide-sm">—</td>')
             + f'<td class="hide-sm">{_class_pill(r["class"])}</td>'
             f'<td class="num hide-sm">{esc(r["gpus"])}</td>'
             f'<td class="num hide-sm">{esc(_asked_memory(r["mem"]))}</td>'
-            f'<td class="hide-sm">{esc(r["user"])}</td>'
+            f'<td class="inline" data-k="user">{esc(r["user"])}</td>'
             "</tr>"
         )
     counts = f"{len(rows)} job(s)"
     return (
         head.format(counts)
         + '<div class="table-wrap"><table class="stack"><thead><tr><th scope="col" class="num">#</th><th scope="col">Job</th><th scope="col">Project</th>'
-        '<th scope="col">State</th><th scope="col">Running for</th><th scope="col" class="hide-sm">Class</th>'
-        '<th scope="col" class="hide-sm">GPUs</th><th scope="col" class="hide-sm">Memory asked</th><th scope="col" class="hide-sm">User</th></tr></thead>'
+        '<th scope="col">State</th><th scope="col">Level</th><th scope="col">Running for</th><th scope="col" class="hide-sm">Class</th>'
+        '<th scope="col" class="hide-sm">GPUs</th><th scope="col" class="hide-sm">Memory asked</th><th scope="col">User</th></tr></thead>'
         f"<tbody>{''.join(body)}</tbody></table></div>"
     )
 
 
-def _finished_rows(rows: list[jobs_view.HistoryRow], root: str, now: datetime, *, user_column: bool = False) -> str:
+def _finished_rows(rows: list[jobs_view.HistoryRow], root: str, now: datetime) -> str:
     out = []
     for r in rows:
         kind, label = _result(r.state)
@@ -568,19 +582,18 @@ def _finished_rows(rows: list[jobs_view.HistoryRow], root: str, now: datetime, *
             f'<td class="num inline" data-k="took">{esc(_duration(r.elapsed_s) if r.start else "—")}</td>'
             f'<td class="num hide-sm">{esc(r.gpus)}</td>'
             f'<td class="num hide-sm">{esc(_gib(r.max_rss_bytes))}</td>'
-            + (f'<td class="hide-sm">{esc(r.user)}</td>' if user_column else "")
-            + "</tr>"
+            + f'<td class="inline" data-k="user">{esc(r.user)}</td>'
+            "</tr>"
         )
     return "".join(out)
 
 
-def _finished_table(rows: list[jobs_view.HistoryRow], root: str, now: datetime, *, user_column: bool = False) -> str:
+def _finished_table(rows: list[jobs_view.HistoryRow], root: str, now: datetime) -> str:
     return (
         '<div class="table-wrap"><table class="stack"><thead><tr><th scope="col">Job</th><th scope="col">Project</th><th scope="col">Result</th>'
         '<th scope="col">Started</th><th scope="col">Took</th><th scope="col" class="hide-sm">GPUs</th>'
-        '<th scope="col" class="hide-sm">Peak CPU memory</th>'
-        + ('<th scope="col" class="hide-sm">User</th>' if user_column else "")
-        + f"</tr></thead><tbody>{_finished_rows(rows, root, now, user_column=user_column)}</tbody></table></div>"
+        '<th scope="col" class="hide-sm">Peak CPU memory</th><th scope="col">User</th>'
+        f"</tr></thead><tbody>{_finished_rows(rows, root, now)}</tbody></table></div>"
     )
 
 
@@ -780,6 +793,7 @@ def job_page(backend: Backend, job_id: str, root: str = "") -> str | None:
         ("Description", esc(record.get("what") or "—")),
         ("Class", _class_pill(record.get("job_class") or (job.partition if job else row.partition if row else ""))),
         ("User", esc(user or "—")),
+        ("Level", _level_pill(job.level if job else "")),
         ("Partition", esc((job.partition if job else row.partition if row else "") or "—")),
         ("GPUs", esc(record.get("gpus") or (job.gpus if job else row.gpus if row else "") or "—")),
         ("Memory asked", esc(_asked_memory(record.get("mem")) if record.get("mem") else _gib(row.req_mem_bytes) if row else "—")),
@@ -864,7 +878,7 @@ def history_page(backend: Backend, query: Mapping[str, list[str]], root: str = "
     shown = rows[(page - 1) * HISTORY_PAGE : page * HISTORY_PAGE]
     keep = {"since": since, "until": until or "", **filters}
     table = (
-        _finished_table(shown, root, now, user_column=True) if shown
+        _finished_table(shown, root, now) if shown
         else '<div class="empty"><strong>No jobs match</strong>Try a longer period or clear a filter.</div>'
     )
 

@@ -17,6 +17,8 @@ from pathlib import Path
 from types import ModuleType
 from typing import TYPE_CHECKING
 
+from levels import Level
+
 if TYPE_CHECKING:
     from site_config import Site
 
@@ -64,7 +66,8 @@ def _lacks(*query: str) -> bool:
 
 
 def accounting_adds(site: Site, user: str | None = None) -> list[list[str]]:
-    """The `sacctmgr add`s for what slurm's accounting lacks of the site's cluster, its account and (given) the user.
+    """The `sacctmgr add`s for what slurm's accounting lacks of the site's cluster, its account, the levels (QOS, D18)
+    and (given) the user.
 
     `AccountingStorageEnforce=associations` admits only users with an association to an account, and `add` of a
     record that exists exits 1 (measured, 23.11.4), so each is looked up first. A user accounting already knows keeps
@@ -78,6 +81,10 @@ def accounting_adds(site: Site, user: str | None = None) -> list[list[str]]:
     if _lacks("assoc", "where", f"cluster={cluster}", f"account={account}", "format=account"):
         adds.append(["sacctmgr", "-i", "add", "account", account, f"Cluster={cluster}",
                      f"Description={account}", f"Organization={account}"])
+    # Every level is open to everyone: AccountingStorageEnforce=associations checks no QOS access lists.
+    adds += [
+        ["sacctmgr", "-i", "add", "qos", str(level)] for level in Level if _lacks("qos", "where", f"name={level}", "format=name")
+    ]
     if user and _lacks("assoc", "where", f"cluster={cluster}", f"account={account}", f"user={user}", "format=user"):
         default = [f"DefaultAccount={account}"] if _lacks("user", "where", f"name={user}", "format=user") else []
         adds.append(["sacctmgr", "-i", "add", "user", user, f"Account={account}", *default, f"Cluster={cluster}"])

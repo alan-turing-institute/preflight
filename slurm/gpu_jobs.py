@@ -28,6 +28,7 @@ from enum import StrEnum
 from pathlib import Path
 
 import site_config
+from levels import Level, level_of  # noqa: F401 - re-exported for the tools
 
 
 def load_site() -> site_config.Site:
@@ -143,6 +144,7 @@ class QueuedJob:
     priority: int = 0
     gpus: int = 0
     cpus: int = 0  # cores slurm gave it (asked, while it waits)
+    level: Level = Level.NORMAL
 
     @property
     def job_class(self) -> JobClass | None:
@@ -214,7 +216,7 @@ def parse_squeue(text: str) -> list[QueuedJob]:
                 str(raw["job_id"]), raw.get("partition", ""), state, raw.get("state_reason", ""), raw.get("name", ""),
                 raw.get("dependency", ""), raw.get("user_name", ""),
                 int(priority.get("number", 0)) if priority.get("set") else 0, parse_gpus(raw.get("tres_per_node") or ""),
-                int((raw.get("cpus") or {}).get("number") or 0),
+                int((raw.get("cpus") or {}).get("number") or 0), level_of(str(raw.get("qos") or "")),
             )
         )
     return jobs

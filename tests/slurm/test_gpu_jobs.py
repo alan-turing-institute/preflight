@@ -10,12 +10,13 @@ import subprocess
 from pathlib import Path
 
 import gpu_jobs
+import levels
 import pytest
 import site_config
 import status
 import urgent
 import wait
-from gpu_jobs import EventAction, QueuedJob
+from gpu_jobs import EventAction, Level, QueuedJob
 
 
 def test_event_actor_is_the_file_owner_not_the_content(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -91,6 +92,7 @@ def test_a_hostile_or_foreign_record_is_ignored_and_never_blocks(tmp_path: Path,
     assert not any("forged" in line for line in status.lines([job]))
     named = QueuedJob("8", "normal", "PENDING", "None", "p:resume:\x1b]0;forged\x07")
     assert all(line.isprintable() for line in status.lines([named]))  # a terminal shows a name, never acts on it
+    assert "[status] 8 PENDING    ?          normal 0 GPU" in "\n".join(status.lines([named]))  # the level after the user
     # an update never merges into a record that is not this user's, and a write that cannot replace says so
     monkeypatch.setattr(gpu_jobs, "current_user", lambda: "somebody-else")
     gpu_jobs.update_sidecar("6", extra=1)
@@ -147,9 +149,9 @@ def test_parse_squeue_reads_json_so_a_name_cannot_forge_a_row() -> None:
     forged = "x\n999|normal|PENDING|None||bob|9999|N/A|y"
     text = squeue_json(
         {"job_id": 12, "job_state": ["RUNNING"], "priority": {"set": True, "number": 4001}, "tres_per_node": "gres/gpu:2",
-         "name": forged},
+         "name": forged, "qos": "high"},
         {"job_id": 13, "job_state": ["COMPLETED"]},  # squeue --json ignored -t: finished jobs are dropped here
-        {"job_id": 14, "priority": {"set": False, "number": 7}, "state_reason": "JobHeldUser"},
+        {"job_id": 14, "priority": {"set": False, "number": 7}, "state_reason": "JobHeldUser", "qos": "staff"},
         # Still saving after a pause (requeued) or a kill: COMPLETING is a flag after the base state in JSON.
         {"job_id": 15, "job_state": ["PENDING", "COMPLETING"]},
         {"job_id": 16, "job_state": ["CANCELLED", "COMPLETING"]},
@@ -157,11 +159,28 @@ def test_parse_squeue_reads_json_so_a_name_cannot_forge_a_row() -> None:
     running, held, paused, killed = gpu_jobs.parse_squeue(text)
     assert (running.job_id, running.user, running.priority, running.gpus, running.name) == ("12", "ann", 4001, 2, forged)
     assert (held.job_id, held.priority, held.held) == ("14", 0, True)
+    assert (running.level, held.level) == (Level.HIGH, Level.NORMAL)  # an admin's own QOS counts as normal
     assert [(j.job_id, j.state, j.active) for j in (paused, killed)] == [("15", "COMPLETING", True), ("16", "COMPLETING", True)]
     old = QueuedJob("1", "normal", "PENDING", "Priority", "n", "afterok:3(unfulfilled)")
     assert (old.user, old.priority, old.gpus, old.depends_on) == ("", 0, 0, ("3",))
     with pytest.raises(ValueError):
         gpu_jobs.parse_squeue("12|normal|RUNNING|None||ann|1|N/A|n")
+
+
+def test_a_level_always_wins_then_the_earlier_job_and_every_placed_priority_is_above_slurms_own() -> None:
+    order = [(Level.HIGH, "100"), (Level.NORMAL, "2"), (Level.NORMAL, "3"), (Level.LOW, "2")]
+    priorities = [levels.priority_for(level, job_id, 2) for level, job_id in order]
+    assert priorities == sorted(priorities, reverse=True) and len(set(priorities)) == len(priorities)
+    # Above TOP_PRIORITY, the most priority/basic gives by itself (a fresh or released job: behind every placed one),
+    # and below NO_VAL, which scontrol refuses; a job past the span shares its level's lowest priority.
+    lowest, highest = levels.priority_for(Level.LOW, str(2 + 10 * levels.SPAN), 2), levels.priority_for(Level.HIGH, "2", 2)
+    assert 0xFFFF0000 < lowest < highest < 0xFFFFFFFE
+    far = str(2 + 10 * levels.SPAN)
+    assert lowest == levels.priority_for(Level.LOW, str(1 + levels.SPAN), 2)  # past the span: the level's lowest
+    assert levels.priority_for(Level.NORMAL, far, 2) > levels.priority_for(Level.LOW, "2", 2)  # still above the next level
+    # the base moves only when it must: a lower live id, or one a whole span past it
+    assert levels.rebase(None, ["7", "9"]) == 7 and levels.rebase(5, ["7", "9"]) == 5 and levels.rebase(5, []) == 5
+    assert levels.rebase(5, ["4"]) == 4 and levels.rebase(5, ["9", str(5 + levels.SPAN)]) == 9
 
 
 @pytest.mark.parametrize(
