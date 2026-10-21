@@ -190,7 +190,7 @@ TOML. Tables: the top level, `[[nodes]]` with `[[nodes.gpus]]`, `[lease]` with `
 | Field | Default | Meaning |
 |---|---|---|
 | `mode` | `off` | `install` sets up Open OnDemand here; `existing` writes only the cluster file and links our page into a portal that is already there; `off` installs nothing. |
-| `auth` | `dex-local` | Login method: `oidc`, `dex-ldap`, `dex-local`, or `proxy` (no sign-in page; below). |
+| `auth` | `dex-local` | Login method: `oidc`, `dex-ldap`, `dex-local`, `proxy` or `ssh` (no sign-in page; below). |
 | `server_name` | `""` | Host name or IP address the portal answers to. Required when `mode = "install"`. |
 | `tls_cert` | `""` | Path to the certificate. Empty (with `tls_key` empty) makes the installer generate a self-signed pair. Set both or neither. |
 | `tls_key` | `""` | Path to its key. |
@@ -243,6 +243,29 @@ For **`proxy`** (no sign-in: a reverse proxy you trust vouches for every request
 | `key_file` | yes | | Root-only file with the key (16 or more characters, no spaces), the value of the `X-Frontdoor-Key` header the proxy adds to every request. Create it with `openssl rand -hex 32 \| sudo install -m 0600 /dev/stdin /etc/gpujobs/portal/proxy_key`. A request without the right key is refused with 403 and the header is removed before the apps see it. Only the key's SHA-1 digest is written to Apache's configuration. |
 
 The installer stops and disables `ondemand-dex` in this mode if it is running (a machine switched from a Dex login).
+
+For **`ssh`** (no sign-in page: each person reaches the portal through their own ssh forward, and the account that opens
+the connection is who they are). For a machine people already reach with ssh and nothing else, such as one behind a
+firewall that admits only ssh. Needs `allow_from = ["127.0.0.0/8"]` and no `tls_cert`/`tls_key`: Apache answers only the
+relay on the machine itself, over plain http, and each ssh connection is the encryption.
+
+| Key | Required | Default | Meaning |
+|---|---|---|---|
+| `key_file` | yes | | Root-only file with the key (16 or more characters, no spaces) the relay adds to every request. Create it with `openssl rand -hex 32 \| sudo install -m 0600 /dev/stdin /etc/gpujobs/portal/relay_key`. Only its SHA-1 digest is written to Apache's configuration. |
+
+How it works: the `portal` component installs `gpujobs-portal-relay.socket`, a Unix socket at `/run/gpujobs-portal.sock`
+that anyone on the machine may open, and the relay behind it (`slurm/portal_relay.py`, its own unprivileged user, the key
+handed over by systemd). sshd opens the socket as the person whose session forwards to it, so the kernel names their
+account for each connection. The relay takes that name, never one the request carries, refuses root, passes exactly one
+request per connection to Apache with the name and the key, and Apache serves the request as that user only when the key
+matches. Each person adds to their own `~/.ssh/config`, in the block for this machine:
+
+    LocalForward 18080 /run/gpujobs-portal.sock
+    LocalForward 13000 localhost:3000
+
+and, while `ssh <machine>` is open, uses http://localhost:18080 (the jobs page) and http://localhost:13000 (Grafana). Set `server_name = "localhost"`
+and `metrics.grafana_url` to the forwarded Grafana address (`"http://localhost:13000"`), so the page's links work.
+Pick local ports nothing else on people's own machines uses; any port works for the portal itself.
 
 ## 5. What each component installs
 

@@ -16,6 +16,7 @@ import hashlib
 import importlib
 import ipaddress
 import json
+import os
 import re
 import stat
 import uuid
@@ -52,6 +53,11 @@ SECRET_FILE_MODE_MASK = stat.S_IRWXG | stat.S_IRWXO
 # carries the Linux user to OOD (`user_env`, ood_portal_example.yml; read by mod_ood_proxy/lib/pun_proxy.lua:20).
 PROXY_KEY_HEADER = "X-Frontdoor-Key"
 PROXY_USER_ENV = "GPUJOBS_PORTAL_USER"
+# Sign-in mode `ssh` (D19): the relay (slurm/portal_relay.py) names the account that opened each connection in this
+# header, next to the key; Apache takes the name only from a request that carries the key.
+SSH_USER_HEADER = "X-Gpujobs-User"
+RELAY_SOCKET = "/run/gpujobs-portal.sock"
+RELAY_UNITS = ("gpujobs-portal-relay.socket", "gpujobs-portal-relay.service")
 
 # Package repository: docs "1. Install Software", Ubuntu 24.04 tab. Its release .deb
 # (https://apt.osc.edu/ondemand/4.2/ondemand-release-web_4.2.0-noble_all.deb) carries exactly these two source lines
@@ -82,6 +88,7 @@ _AUTH_KEYS: dict[AuthMode, tuple[set[str], set[str]]] = {
     ),
     AuthMode.DEX_LOCAL: ({"users_file"}, _COMMON_OPTIONAL),
     AuthMode.PROXY: ({"user", "key_file"}, set()),
+    AuthMode.SSH: ({"key_file"}, set()),
 }
 
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -112,8 +119,14 @@ def _dex(site: Site) -> bool:
     return site.portal.auth in (AuthMode.DEX_LDAP, AuthMode.DEX_LOCAL)
 
 
+def _tls_on(site: Site) -> bool:
+    """Every mode serves https except `ssh`, where Apache answers only the relay on the loopback and each person's ssh
+    connection is the encryption."""
+    return site.portal.auth is not AuthMode.SSH
+
+
 def _self_signed(site: Site) -> bool:
-    return site.portal.tls_cert is None and site.portal.tls_key is None
+    return _tls_on(site) and site.portal.tls_cert is None and site.portal.tls_key is None
 
 
 def _read(path: Path) -> str | None:
@@ -151,13 +164,15 @@ def _yaml(value: Any, indent: int) -> list[str]:
 
 
 def _check_mode(path: Path, what: str, problems: list[str]) -> bool:
+    """Only the installer's own user (root, under sudo) may own and read a secret file: a 0600 file a normal user owns
+    is that user's secret, not root's."""
     try:
-        mode = path.stat().st_mode
+        info = path.stat()
     except OSError:
         problems.append(f"{what} {path} does not exist or cannot be read")
         return False
-    if mode & SECRET_FILE_MODE_MASK:
-        problems.append(f"{what} {path} must be root-only: run `sudo chmod 0600 {path}`")
+    if info.st_mode & SECRET_FILE_MODE_MASK or info.st_uid != os.geteuid():
+        problems.append(f"{what} {path} must be root-only: run `sudo chown root: {path} && sudo chmod 0600 {path}`")
         return False
     return True
 
@@ -349,9 +364,7 @@ def _proxy_block(site: Site, problems: list[str]) -> list[str]:
       serves everyone as that user without a login module.
     - `dex: false` keeps the generator from enabling Dex when the `ondemand-dex` package is installed (application.rb
       `Dex.installed? && dex.enabled?`).
-    - Apache cannot compare in constant time, so the comparison is on the SHA-1 of the header: an attacker controls the
-      header, not its hash, so how long the comparison takes says nothing about the key. The key itself is never
-      written to the portal config; only its digest is.
+    - The key check is `_key_expr`'s.
     """
     s = site.portal.auth_settings
     user = s.get("user", "")
@@ -362,12 +375,8 @@ def _proxy_block(site: Site, problems: list[str]) -> list[str]:
             "auth proxy serves everyone who reaches the portal as one user: set portal.allow_from to the proxy's "
             "address, e.g. allow_from = [\"192.0.2.8/32\"]"
         )
-    key_file = s.get("key_file", "")
-    key = _secret(key_file, "proxy key file", _TOKEN_RE, problems)
-    if key is None:
-        problems.append(f"create it with: openssl rand -hex 32 | sudo install -m 0600 /dev/stdin {key_file or '<path>'}")
-    digest = hashlib.sha1((key or "").encode()).hexdigest()  # Apache expressions offer sha1/md5 only
-    gate = [f"Require expr \"sha1(req('{PROXY_KEY_HEADER}')) == '{digest}'\"", f"RequestHeader unset {PROXY_KEY_HEADER}"]
+    has_key = _key_expr(s.get("key_file", ""), problems)
+    gate = [f'Require expr "{has_key}"', f"RequestHeader unset {PROXY_KEY_HEADER}"]
     return _yaml(
         {
             "user_env": PROXY_USER_ENV,
@@ -379,10 +388,64 @@ def _proxy_block(site: Site, problems: list[str]) -> list[str]:
     )
 
 
+def _key_expr(key_file: str, problems: list[str]) -> str:
+    """The Apache expression that is true only for a request carrying the key in `key_file`.
+
+    Apache cannot compare in constant time, so it compares the SHA-1 of the header: an attacker controls the header, not
+    its hash, so how long the comparison takes says nothing about the key. Only the digest is ever written to the config.
+    """
+    key = _secret(key_file, "key file", _TOKEN_RE, problems)
+    if key is None:
+        problems.append(f"create it with: openssl rand -hex 32 | sudo install -m 0600 /dev/stdin {key_file or '<path>'}")
+    digest = hashlib.sha1((key or "").encode()).hexdigest()  # Apache expressions offer sha1/md5 only
+    return f"sha1(req('{PROXY_KEY_HEADER}')) == '{digest}'"
+
+
+def _ssh_block(site: Site, problems: list[str]) -> list[str]:
+    """Open OnDemand with no sign-in page, reached only through each person's own ssh forward to the relay (D19).
+
+    The relay (slurm/portal_relay.py) adds the key and the name of the account that opened the connection, which the
+    kernel reports and the person cannot choose. Apache serves a request only with the key (the `proxy` mode's gate)
+    and takes the user from the relay's header only when that key is there, through the same `user_env` variable
+    `proxy` sets to a constant. Both headers are removed before the apps see the request.
+    """
+    s = site.portal.auth_settings
+    if not site.portal.allow_from:
+        problems.append(
+            "auth ssh: Apache must answer only the relay: set portal.allow_from = [\"127.0.0.0/8\"]"
+        )
+    if site.portal.tls_cert is not None or site.portal.tls_key is not None:
+        problems.append("auth ssh serves plain http to the relay (each ssh connection is the encryption): "
+                        "leave portal.tls_cert and portal.tls_key unset")
+    if site.portal.server_name != "localhost":
+        problems.append("auth ssh: set portal.server_name = \"localhost\", the host every forwarded browser asks for "
+                        "(the relay refuses any other)")
+    has_key = _key_expr(s.get("key_file", ""), problems)
+    # mod_setenvif: $1 is the parenthesised match, SetEnvIfExpr included; the pattern is portal_relay.py's USER_RE
+    name = (f"SetEnvIfExpr \"{has_key} && req('{SSH_USER_HEADER}') =~ /^([a-z_][a-z0-9_-]{{0,31}})$/\" "
+            f"{PROXY_USER_ENV}=$1")
+    gate = [f'Require expr "{has_key}"', f"RequestHeader unset {PROXY_KEY_HEADER}", f"RequestHeader unset {SSH_USER_HEADER}"]
+    return _yaml(
+        {
+            # The browser's host is localhost:<the port each person forwards>, which OOD's rewrite would send to
+            # http://localhost:80 (ood-portal.conf.erb:86-92, measured 301 in the harness). use_rewrites also governs
+            # the https redirect and the maintenance page (:48, :94), neither used here.
+            "use_rewrites": False,
+            "user_env": PROXY_USER_ENV,
+            "dex": False,
+            "auth": gate,
+            "custom_vhost_directives": [name, '<Location "/">', *gate, "</Location>"],
+        },
+        0,
+    )
+
+
 def _login_lines(site: Site, problems: list[str]) -> str:
     """The YAML that makes the portal ask for a sign-in (or, for `proxy`, not to): cookie passphrase, session, `auth`."""
     if site.portal.auth is AuthMode.PROXY:
         return "\n".join(_proxy_block(site, problems))
+    if site.portal.auth is AuthMode.SSH:
+        return "\n".join(_ssh_block(site, problems))
     passphrase = _passphrase(site.portal.auth_settings, problems)
     return (
         f"oidc_crypto_passphrase: {_quote(passphrase or '')}\n{_session_lines(site)}"
@@ -392,7 +455,7 @@ def _login_lines(site: Site, problems: list[str]) -> str:
 
 def _tls(site: Site, problems: list[str]) -> tuple[Path, Path]:
     cert, key = site.portal.tls_cert, site.portal.tls_key
-    if _self_signed(site):
+    if not _tls_on(site) or _self_signed(site):
         return SELF_SIGNED_CERT, SELF_SIGNED_KEY
     if cert is None or key is None:
         problems.append(
@@ -437,8 +500,9 @@ def _build_portal_yml(site: Site) -> tuple[str, list[str]]:
     text = Template((TEMPLATE_DIR / "ood_portal.yml").read_text()).substitute(
         servername=_quote(servername),
         root_uri=_quote(f"/pun/sys/{APP_NAME}/"),
-        ssl_lines="\n".join(_yaml([f'SSLCertificateFile "{cert}"', f'SSLCertificateKeyFile "{key}"'], 2)),
-        hsts="false" if _self_signed(site) else "true",
+        ssl_block="ssl:\n" + "\n".join(_yaml([f'SSLCertificateFile "{cert}"', f'SSLCertificateKeyFile "{key}"'], 2))
+        if _tls_on(site) else "# no ssl: plain http to the relay on the loopback (auth ssh)",
+        hsts="false" if not _tls_on(site) or _self_signed(site) else "true",
         login_lines=login_lines,
         auth_block="\n".join(auth_lines),
     )
@@ -504,6 +568,13 @@ def files(site: Site) -> dict[str, FileSpec]:
             dropin = f"# Rendered from the site file by slurm/install/components/portal.py: [portal] allow_from.\n[Service]\n{filtered}"
             for unit in ["apache2", *([DEX_UNIT] if _dex(site) else [])]:
                 out[f"/etc/systemd/system/{unit}.service.d/10-gpujobs.conf"] = FileSpec(dropin, FILE_MODE, "root")
+        if site.portal.auth is AuthMode.SSH:
+            for unit in RELAY_UNITS:
+                text = Template((TEMPLATE_DIR / unit).read_text()).substitute(
+                    socket=RELAY_SOCKET, install_dir=site.install_dir,
+                    key_file=site.portal.auth_settings.get("key_file", ""),
+                )
+                out[f"/etc/systemd/system/{unit}"] = FileSpec(text, FILE_MODE, "root")
     return out
 
 
@@ -576,8 +647,9 @@ def post_install(site: Site) -> list[list[str]]:
         steps.append(["update-ca-certificates"])
     # packaging/deb/postinst:17-23 enables rewrite, lua, headers, proxy, proxy_http, proxy_wstunnel but not ssl; the
     # auth_openidc.load file ships with libapache2-mod-auth-openidc (packages.ubuntu.com, noble filelist).
-    steps.append(["a2enmod", "ssl"])
-    if site.portal.auth is not AuthMode.PROXY:
+    if _tls_on(site):
+        steps.append(["a2enmod", "ssl"])
+    if site.portal.auth not in (AuthMode.PROXY, AuthMode.SSH):
         steps.append(["a2enmod", "auth_openidc"])
     # --force: replace ood-portal.conf even if its checksum differs (the old file is backed up first,
     # application.rb:213-218). --insecure is what makes Dex use the users in ood_portal.yml at all
@@ -588,12 +660,17 @@ def post_install(site: Site) -> list[list[str]]:
     steps.append(["systemctl", "daemon-reload"])  # the allow_from drop-ins
     if _dex(site):
         steps += [["systemctl", "enable", DEX_UNIT], ["systemctl", "restart", DEX_UNIT]]
-    elif site.portal.auth is AuthMode.PROXY:
+    elif site.portal.auth in (AuthMode.PROXY, AuthMode.SSH):
         # A machine switched from a Dex login still has Dex running, with a login nobody uses any more.
         # Dex exits non-zero when stopped, which leaves the unit "failed" (harness, 2026-10-19); reset-failed clears it.
         stop = f"systemctl disable --now {DEX_UNIT}; systemctl reset-failed {DEX_UNIT} 2>/dev/null || true"
         steps.append(["sh", "-c", f"if systemctl cat {DEX_UNIT} >/dev/null 2>&1; then {stop}; fi"])
     steps += [["systemctl", "enable", "apache2"], ["systemctl", "restart", "apache2"]]
+    if site.portal.auth is AuthMode.SSH:
+        socket_unit, service_unit = RELAY_UNITS
+        # try-restart: a relay already running swaps to the new code; otherwise the socket starts it on first use
+        steps += [["systemctl", "enable", socket_unit], ["systemctl", "restart", socket_unit],
+                  ["systemctl", "try-restart", service_unit]]
     # Each user's running web server keeps the environment Apache gave it at start, including OOD_ALLOWED_HOSTS
     # (the server name): after a rename the dashboard refused every page with "Blocked hosts" (measured 2026-10-19).
     # Stopping them all makes the next request start one with the current settings; jobs are not touched.

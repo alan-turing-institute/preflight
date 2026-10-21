@@ -1,0 +1,11 @@
+# Rendered from the site file by slurm/install/components/portal.py for portal.auth = "ssh" (D19); do not edit by hand.
+# Each person's ssh forward ends here. Anyone on the machine may connect: the kernel tells the relay who they are.
+[Unit]
+Description=lifecycle=service gpujobs portal relay socket ($socket)
+
+[Socket]
+ListenStream=$socket
+SocketMode=0666
+
+[Install]
+WantedBy=sockets.target

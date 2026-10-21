@@ -6,7 +6,7 @@
 
 Runs on the host and drives the container through `run.sh shell`. Every check prints PASS or FAIL with its
 evidence as it happens; the exit status is 1 when any check failed. Stages: install, jobs, urgent, failure,
-recovery, portal, proxy, lease, host (in this order; `--only` takes a subset, later stages need `install` to have run once).
+recovery, portal, proxy, ssh, lease, host (in this order; `--only` takes a subset, later stages need `install` to have run once).
 """
 
 from __future__ import annotations
@@ -867,6 +867,71 @@ def stage_proxy() -> None:
     sh(f"rm -rf {PROBE_APP}; /opt/ood/nginx_stage/sbin/nginx_stage nginx_clean --force")
 
 
+# -- stage: ssh ---------------------------------------------------------------------------------------------------
+
+RELAY_KEY_FILE = "/etc/gpujobs/portal/relay_key"
+SSH_SITE = "/root/ssh.site.toml"
+RELAY = "/run/gpujobs-portal.sock"
+LOCAL = "http://localhost:8080"  # what a person's browser asks for, through `LocalForward 8080 <RELAY>`
+
+
+def through_relay(user: str, path: str, *extra: str) -> tuple[str, str]:
+    """(HTTP status, body) of a request `user` sends to the relay socket, as their ssh forward would (the container
+    has no sshd: on the Turing box sshd was measured opening the socket as the person, 2026-10-21)."""
+    out = sh(f"{CURL} --unix-socket {RELAY} -L -w '\\n%{{http_code}}' {' '.join(extra)} {shlex.quote(LOCAL + path)}", user=user).out
+    body, _, code = out.rpartition("\n")
+    return code, body
+
+
+def stage_ssh() -> None:
+    section("ssh: the portal behind the relay, where the account that opens the connection is the sign-in (D19)")
+    sh(f"openssl rand -hex 32 | install -m 0600 /dev/stdin {RELAY_KEY_FILE}")
+    key = sh(f"cat {RELAY_KEY_FILE}").out.strip()
+    site = Path(HERE / "harness.site.toml").read_text()
+    site = site.replace('auth = "dex-local"', 'auth = "ssh"\nallow_from = ["127.0.0.0/8"]  # only the relay, on the box')
+    site = site.replace('server_name = "testnode"', 'server_name = "localhost"')
+    site = site.replace('users_file = "/etc/gpujobs/portal/users.json"', f'key_file = "{RELAY_KEY_FILE}"')
+    put(SSH_SITE, site)
+    put("/etc/systemd/system/gpujobs-portal-relay.service.d/99-harness-container.conf", DROPIN_DYNAMIC)
+    applied = sh(f"{INSTALL} --site {SSH_SITE} apply --component tools --component portal", timeout=900)
+    check("apply of the portal with auth = ssh succeeds", applied.rc == 0 and "installed" in applied.out, applied.text[-300:])
+    units = sh("systemctl is-active apache2 gpujobs-portal-relay.socket").out.split()
+    conf = sh("cat /etc/apache2/sites-available/ood-portal.conf").out
+    check("Apache and the relay socket are up; the portal config has no TLS, holds the key's digest only, and takes the "
+          "user only with the key", units == ["active", "active"] and "SSLEngine" not in conf and key not in conf
+          and "SetEnvIfExpr" in conf and "X-Gpujobs-User" in conf, f"{units} | {conf.count('SetEnvIfExpr')}")
+
+    direct = f"{CURL} -o /dev/null -w '%{{http_code}}' -H 'Host: localhost:8080' http://127.0.0.1/pun/sys/gpujobs/"
+    plain, forged = sh(direct, user="bob").out, sh(f"{direct} -H 'X-Gpujobs-User: alice'", user="bob").out
+    check("Apache straight, without the relay, is refused with 403 (not redirected), also with a claimed user", [plain, forged] == ["403"] * 2,
+          f"plain={plain} forged={forged}")
+
+    for user in ("alice", "bob"):
+        through_relay(user, "/nginx/init?redir=%2fpun%2fsys%2fgpujobs%2f")  # first visit starts the per-user server
+    pages = {user: through_relay(user, "/pun/sys/gpujobs/", "-H 'X-Gpujobs-User: carol'") for user in ("alice", "bob")}
+    check("through the relay each person is signed in as themselves, with no login page, whatever user they claim",
+          all(code == "200" and f"Signed in as <strong>{user}</strong>" in body and "carol" not in body
+              for user, (code, body) in pages.items()), str({u: (c, b[:80]) for u, (c, b) in pages.items()}))
+    code, jobs = through_relay("alice", "/pun/sys/gpujobs/api/jobs")
+    check("through the relay /api/jobs returns JSON", code == "200" and isinstance(json.loads(jobs or "{}").get("jobs"), list),
+          f"HTTP {code} {jobs[:80]}")
+    root_code, _ = through_relay("root", "/pun/sys/gpujobs/")
+    check("root is refused at the relay", root_code == "403", root_code)
+    # a page that re-points its own domain at 127.0.0.1 still names that domain (DNS rebinding; review, 2026-10-21)
+    rebound, _ = through_relay("alice", "/pun/sys/gpujobs/api/jobs", "-H 'Host: evil.example:8080'")
+    check("a request naming any host but localhost is refused at the relay", rebound == "421", rebound)
+
+    put(f"{PROBE_APP}/manifest.yml", PROBE_MANIFEST)
+    put(f"{PROBE_APP}/passenger_wsgi.py", PROBE_WSGI)
+    put(f"{PROBE_APP}/bin/python", "#!/bin/sh\nexec /usr/bin/python3 \"$@\"\n", "0755")
+    through_relay("alice", "/nginx/init?redir=%2fpun%2fsys%2fhdrprobe%2f")
+    _, echoed = through_relay("alice", "/pun/sys/hdrprobe/", "-H 'X-Probe: kept'")
+    seen = json.loads(echoed).get("headers", []) if echoed.startswith("{") else []
+    check("neither the key nor the user header reaches the app (a control header sent with them does)",
+          "HTTP_X_PROBE" in seen and not {"HTTP_X_FRONTDOOR_KEY", "HTTP_X_GPUJOBS_USER"} & set(seen), echoed[:200])
+    sh(f"rm -rf {PROBE_APP}; /opt/ood/nginx_stage/sbin/nginx_stage nginx_clean --force")
+
+
 # -- stage: lease -------------------------------------------------------------------------------------------------
 
 LEASE_SITE = '\n[lease]\nlease_dir = "/var/lib/gpujobs/gpu-lease"\nkeeper_user = "dave"\npython = "%s"\n'
@@ -955,6 +1020,7 @@ STAGES: dict[str, Callable[[], None]] = {
     "recovery": stage_recovery,
     "portal": stage_portal,
     "proxy": stage_proxy,
+    "ssh": stage_ssh,
     "lease": stage_lease,
     "host": stage_host,
 }
