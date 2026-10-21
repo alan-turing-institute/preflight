@@ -8,7 +8,11 @@ import components
 
 NAME = "slurm"
 PACKAGES = ["slurm-wlm", "slurmdbd", "mariadb-server", "munge"]
-RESTARTS = [["mariadb", "munge", "slurmdbd"], ["slurmctld", "slurmd"]]
+RESTARTS = [["mariadb", "munge"], ["slurmdbd"], ["slurmctld", "slurmd"]]
+# slurmdbd logs in to MariaDB as the OS user `slurm` by unix_socket (templates/slurm/slurmdbd.conf), so no password
+# exists anywhere. A fresh MariaDB has no such login: it is made here, before slurmdbd first starts.
+DB_LOGIN = ("CREATE USER IF NOT EXISTS 'slurm'@'localhost' IDENTIFIED VIA unix_socket; "
+            "GRANT ALL ON slurm_acct_db.* TO 'slurm'@'localhost';")
 
 
 def enabled(site) -> bool:
@@ -45,15 +49,18 @@ def refusals(site) -> list[str]:
 
 
 def post_install(site) -> list:
-    """Restart the database side, give accounting the cluster and its account, then start the controller.
+    """Restart the database side, give slurmdbd its database login, give accounting the cluster and its account, then
+    start the controller.
 
     The records go in before slurmctld starts, the order the test cluster boots in, so slurmctld registers with a
     cluster accounting already knows.
     """
-    database, controller = RESTARTS
+    database, accounting, controller = RESTARTS
     return [
         ["systemctl", "daemon-reload"],
         ["systemctl", "restart", *database],
+        ["mariadb", "-e", DB_LOGIN],
+        ["systemctl", "restart", *accounting],
         lambda: _records(site),
         ["systemctl", "restart", *controller],
     ]

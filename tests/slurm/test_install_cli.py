@@ -14,6 +14,7 @@ spec = importlib.util.spec_from_file_location("gpujobs_install", ROOT / "slurm" 
 cli = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(cli)
 components = cli.components
+slurm_component = importlib.import_module("components.slurm")
 RENDERED_MARK = cli.render.RENDERED_MARK
 
 USER = getpass.getuser()
@@ -103,7 +104,9 @@ def test_apply_then_check_against_a_temp_root(env):
     assert ["apt-get", "install", "-y", "slurm-wlm", "slurmdbd", "mariadb-server", "munge"] in fake.calls
     assert ["systemctl", "restart", "slurmctld", "slurmd"] in fake.calls
     # slurm's accounting gets the cluster and the account after slurmdbd is back and before slurmctld starts
-    db, ctld = (fake.calls.index(["systemctl", "restart", *g]) for g in (["mariadb", "munge", "slurmdbd"], ["slurmctld", "slurmd"]))
+    db, dbd, ctld = (fake.calls.index(["systemctl", "restart", *g]) for g in (["mariadb", "munge"], ["slurmdbd"], ["slurmctld", "slurmd"]))
+    # a fresh MariaDB has no login for slurmdbd (Turing box, 2026-10-21): it is made between the two restarts
+    assert db < fake.calls.index(["mariadb", "-e", slurm_component.DB_LOGIN]) < dbd
     adds = [a for a in fake.calls[db:ctld] if a[2:3] == ["add"]]
     assert adds == [["sacctmgr", "-i", "add", "cluster", "t"],
                     ["sacctmgr", "-i", "add", "account", "gpujobs", "Cluster=t", "Description=gpujobs", "Organization=gpujobs"],
