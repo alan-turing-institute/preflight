@@ -33,6 +33,11 @@ The pieces are installed by one program, `slurm/install/install.py`, in six comp
   `slurm-wlm`, `slurmdbd`, `mariadb-server` and `munge`. That Ubuntu build has no NVML plugin (NVML is NVIDIA's
   management library), so GPUs are declared by device file in `gres.conf`, and slurm itself records no per-GPU
   use; the metrics component fills that gap.
+- **A machine whose slurm this installer sets up.** The `slurm` component always installs and configures slurm
+  itself. On a machine that already runs a slurm someone else set up (its `/etc/slurm/slurm.conf` lacks this
+  installer's "Rendered from the site file" line), `apply` refuses rather than replace their settings; taking it
+  over needs `apply --replace-existing-slurm`, after backing up `/etc/slurm`. Installing only this layer on top of
+  someone else's slurm is not supported.
 - **An NVIDIA driver** that provides `nvidia-smi` (hardware detection uses it).
 - **Internet access during the install.** Packages come from apt. The metrics and portal components also add
   Grafana's and Open OnDemand's apt repositories and download exporters and Jobstats files from GitHub. Every

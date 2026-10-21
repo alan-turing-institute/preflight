@@ -24,14 +24,24 @@ def packages(site) -> list[str]:
 
 
 def refusals(site) -> list[str]:
-    """A restart requeues or kills running jobs, so the queue must be empty (an absent `squeue` means no slurm yet)."""
+    """A slurm someone else set up is never replaced unasked (its slurm.conf lacks `render.RENDERED_MARK`), and a
+    restart requeues or kills running jobs, so the queue must be empty (an absent `squeue` means no slurm yet)."""
+    out = []
+    conf = components.ROOT / "etc/slurm/slurm.conf"
+    try:
+        first = conf.read_text(encoding="utf-8", errors="replace").partition("\n")[0]
+    except FileNotFoundError:
+        first = render.RENDERED_MARK  # no slurm set up here yet
+    if render.RENDERED_MARK not in first and not components.REPLACE_EXISTING_SLURM:
+        out.append(f"{conf} was not written by this installer: this machine runs a slurm someone else set up, and "
+                   "apply would replace its settings. Leave it, or back it up and pass --replace-existing-slurm")
     try:
         done = components.run(["squeue", "-h"])
     except FileNotFoundError:
-        return []
+        return out
     if done.returncode != 0 or done.stdout.strip():
-        return ["slurm has jobs (or squeue failed); restarting its daemons now would requeue or kill them"]
-    return []
+        out.append("slurm has jobs (or squeue failed); restarting its daemons now would requeue or kill them")
+    return out
 
 
 def post_install(site) -> list:

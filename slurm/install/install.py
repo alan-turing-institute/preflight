@@ -288,9 +288,10 @@ def parser() -> argparse.ArgumentParser:
     sub.add_parser("detect", parents=[shared])
     sub.add_parser("check", parents=[shared])
     sub.add_parser("render", parents=[shared]).add_argument("--out", type=Path, required=True)
-    sub.add_parser("apply", parents=[shared]).add_argument(
-        "--component", action="append", choices=components.ORDER, dest="components"
-    )
+    apply = sub.add_parser("apply", parents=[shared])
+    apply.add_argument("--component", action="append", choices=components.ORDER, dest="components")
+    apply.add_argument("--replace-existing-slurm", action="store_true",
+                       help="take over a slurm this installer did not set up (its settings files are replaced)")
     for name in ("user", "admin"):
         who = sub.add_parser(name, parents=[shared])
         who.add_argument("action", type=Action, choices=list(Action))
@@ -318,6 +319,8 @@ def main(argv: list[str] | None = None, chown: Chown | None = _chown) -> int:
         print(error, file=sys.stderr)
         return 2
     components.SITE_PATH = args.site
+    components.ROOT = getattr(args, "root", Path("/"))
+    components.REPLACE_EXISTING_SLURM = getattr(args, "replace_existing_slurm", False)
     modules = components.load(site, getattr(args, "components", None))
     if args.command == "apply":
         return cmd_apply(site, args, modules, chown)
