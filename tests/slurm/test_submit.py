@@ -35,15 +35,16 @@ def test_resume_job_runs_in_normal_with_requeue_append_and_the_gpu_token() -> No
     script = dry("--project", "p", "--what", "w", "--class", "resume", "--resume-ok", "--gpu", "--mem", "24G",
                  "--after", "5", "--after", "6", "--name", "n", "--", "python", "train.py")
     for option in ["--partition=normal", "--requeue", "--open-mode=append", "--gres=gpu:1",
-                   "--dependency=afterok:5:6", "--job-name=p:resume:n", "--mem=24G"]:
+                   "--dependency=afterok:5:6", "--job-name=p:resume:n", "--mem=24G", "--qos=normal"]:
         assert f"{DIRECTIVE} {option}" in script
     assert "--needs-lease --needs-card" in script
     assert script.rstrip().endswith("-- python train.py")
 
 
 def test_restart_job_runs_in_steady_still_requeueable() -> None:
-    script = dry("--project", "p", "--what", "w", "--class", "restart", "--mem", "4G", "--", "score")
+    script = dry("--project", "p", "--what", "w", "--class", "restart", "--mem", "4G", "--level", "low", "--", "score")
     assert f"{DIRECTIVE} --partition=cpu" in script  # no GPUs: the capped cpu partition, either class
+    assert f"{DIRECTIVE} --qos=low" in script
     assert f"{DIRECTIVE} --requeue" in script
     assert "--gres" not in script
     assert "--needs-lease" not in script

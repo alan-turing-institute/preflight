@@ -102,7 +102,8 @@ def test_apply_then_check_against_a_temp_root(env):
     db, ctld = (fake.calls.index(["systemctl", "restart", *g]) for g in (["mariadb", "munge", "slurmdbd"], ["slurmctld", "slurmd"]))
     adds = [a for a in fake.calls[db:ctld] if a[2:3] == ["add"]]
     assert adds == [["sacctmgr", "-i", "add", "cluster", "t"],
-                    ["sacctmgr", "-i", "add", "account", "gpujobs", "Cluster=t", "Description=gpujobs", "Organization=gpujobs"]]
+                    ["sacctmgr", "-i", "add", "account", "gpujobs", "Cluster=t", "Description=gpujobs", "Organization=gpujobs"],
+                    *(["sacctmgr", "-i", "add", "qos", level] for level in ("low", "normal", "high"))]  # D18's levels
     assert ["systemctl", "enable", "--now", "gpujobs-agent.service"] in fake.calls
     assert ["systemctl", "--user", f"--machine={USER}@.host", "restart", "slurm-gpu-lease-keeper.service"] in fake.calls
     # plan 3.3, every state directory's (mode, owner): the shared ones sticky and open, requests/ the agent's own
@@ -146,15 +147,18 @@ def test_apply_refuses_with_a_busy_queue_or_without_the_lease_client(env, monkey
 def test_user_and_admin_argv(env):
     tmp, site, fake = env
     fake.known = {"cluster where cluster=t format=cluster", "assoc where cluster=t account=gpujobs format=account",
-                  "assoc where cluster=t account=gpujobs user=bob format=user", "user where name=erin format=user"}
+                  "assoc where cluster=t account=gpujobs user=bob format=user", "user where name=erin format=user",
+                  "qos where name=normal format=name", "qos where name=high format=name"}  # every database has normal
     assert run(site, tmp, "user", "add", "bob") == 0  # already there: nothing added
     assert run(site, tmp, "user", "add", "erin") == 0  # known to accounting elsewhere: keeps her default account
     assert run(site, tmp, "admin", "add", "alice") == 0  # not a user yet: made one first
     assert run(site, tmp, "admin", "remove", "alice") == 0
     assert run(site, tmp, "user", "remove", "alice") == 0
+    low = ["sacctmgr", "-i", "add", "qos", "low"]  # the missing level, each time (this fake never learns it)
     assert [a for a in fake.calls if "show" not in a] == [
-        ["sacctmgr", "-i", "add", "user", "erin", "Account=gpujobs", "Cluster=t"],
-        ["sacctmgr", "-i", "add", "user", "alice", "Account=gpujobs", "DefaultAccount=gpujobs", "Cluster=t"],
+        low,
+        low, ["sacctmgr", "-i", "add", "user", "erin", "Account=gpujobs", "Cluster=t"],
+        low, ["sacctmgr", "-i", "add", "user", "alice", "Account=gpujobs", "DefaultAccount=gpujobs", "Cluster=t"],
         ["usermod", "-aG", "gpujobs-admin", "alice"],
         ["sacctmgr", "-i", "modify", "user", "name=alice", "set", "adminlevel=Operator"],
         ["gpasswd", "-d", "alice", "gpujobs-admin"],

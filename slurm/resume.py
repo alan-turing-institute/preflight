@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Release a paused or held slurm job, or return the node to service after a reboot (design 3.7-3.8).
 
-    slurm/resume.py JOBID...     # scontrol release (a job paused by pause.py, or held by the requeue limit)
+    slurm/resume.py JOBID...     # scontrol release (a job paused by pause.py, or held by the requeue limit); the
+                                 # job waits at the back until the agent gives it its place again (D18)
     slurm/resume.py --node [NAME]  # after a reboot: ReturnToService=1 leaves a node DOWN until this (sudo);
                                    # without NAME, every node slurm knows
 """

@@ -5,10 +5,15 @@ Design 3.3 (`design notes`).
 
     slurm/submit.py --project P --what 'one line' --class resume|restart [--mem 24G|auto] [--gpu|--gpus N] \
         [--entry script.py --repo DIR] [--after JOBID]... [--cpus N] [--name NAME] [--log FILE] \
-        [--workdir DIR] [--wait-limit 1h] [--resume-ok] -- <command...>
+        [--workdir DIR] [--wait-limit 1h] [--resume-ok] [--level low|normal|high] -- <command...>
 
 MEMORY: `--mem` is optional. Without it (or with `auto`) a job given `--name` asks for that name's newest measured
 run plus 10%; with no measured run (or no `--name`) a GPU job asks for the whole box, a CPU job for slurm's default.
+
+LEVEL (D18): where the job waits among the others, `normal` by default; `high` goes ahead of normal and low, `low`
+behind them. Open to everyone. It orders the waiting line only: a running job is never stopped for a higher level.
+The job is submitted with that level as its QOS; it waits behind every placed job until the agent gives it its
+place, at most 5 s later.
 
 REFUSES: a class outside
 the closed set; a `resume` job without `--resume-ok` (the caller's statement that running the command
@@ -144,14 +149,17 @@ def sbatch_script(
     extra: tuple[str, ...] = (),
     needs_lease: bool | None = None,
 ) -> str:
-    """The job script: directives, then one line running the wrapper. `urgent.py` passes its own partition."""
+    """The job script: directives, then one line running the wrapper. `urgent.py` passes its own partition and no
+    level (its partition goes first whatever the level)."""
     label = arguments.job_class
+    level = getattr(arguments, "level", None) or gpu_jobs.Level.NORMAL
     partition = partition or gpu_jobs.partition_for(gpu_jobs.JobClass(label), arguments.gpus)
     lines = [
         "#!/bin/bash",
         f"#SBATCH --partition={partition}",
         f"#SBATCH --job-name={arguments.project}:{label}:{arguments.name}",
         f"#SBATCH --cpus-per-task={arguments.cpus}",
+        f"#SBATCH --qos={level}",
         "#SBATCH --requeue",
         "#SBATCH --open-mode=append",
         f"#SBATCH --output={log}",
@@ -220,6 +228,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--workdir", type=Path, default=Path.cwd())
     p.add_argument("--wait-limit", default="1h", help="how long the job waits in-job for the card")
     p.add_argument("--resume-ok", action="store_true", help="running the command again resumes it")
+    p.add_argument("--level", choices=[level.value for level in gpu_jobs.Level], default=gpu_jobs.Level.NORMAL.value,
+                   help="where it waits among the others (default normal); never stops a running job")
     p.add_argument(
         "--max-jobs",
         type=int,

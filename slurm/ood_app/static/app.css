@@ -161,6 +161,8 @@ td .why { color: var(--ink-2); font-size: 12.5px; margin-top: 4px; }
 .badge.paused::before { border-radius: 1px; width: 6px; background: none; border-left: 2px solid currentColor; border-right: 2px solid currentColor; height: 8px; }
 .badge.failed::before, .badge.timeout::before, .badge.oom::before, .badge.node-fail::before { border-radius: 1px; transform: rotate(45deg); }
 .pill { display: inline-block; padding: 1px 8px; border-radius: 6px; font-size: 12px; font-weight: 550; color: var(--ink-2); background: var(--surface-2); border: 1px solid var(--border); white-space: nowrap; }
+.pill.level-high { color: var(--accent-ink); border-color: var(--accent); }
+.pill.level-low { color: var(--idle); background: var(--idle-bg); }
 .project { display: inline-flex; align-items: center; gap: 7px; white-space: nowrap; color: var(--ink); }
 .dot { width: 9px; height: 9px; border-radius: 3px; flex: none; background: var(--c, var(--muted)); }
 .c1 { --c: var(--c1); } .c2 { --c: var(--c2); } .c3 { --c: var(--c3); } .c4 { --c: var(--c4); }

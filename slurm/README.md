@@ -8,6 +8,9 @@ adds:
 
 - **Pause and resume.** A job that can continue from its latest checkpoint is paused by putting it back in the
   queue held, and resumed by releasing it. A job that cannot continue (a "steady" job) says so before it is paused.
+- **Levels for waiting jobs.** Each job waits at a level, `low`, `normal` (the default) or `high`, open to everyone;
+  within a level, the earlier job goes first, and keeps its place after a pause, a pre-emption or a slurm restart.
+  A level orders the waiting line only: it never stops a running job (section 7).
 - **Urgent work.** An administrator can run an urgent job now. Jobs in its way are paused, and background services
   that share the GPU through the lease (see section 5) step aside.
 - **A web page** (Open OnDemand, our own page inside it) listing every GPU job with its waiting reason, log,
@@ -241,7 +244,9 @@ The installer stops and disables `ondemand-dex` in this mode if it is running (a
 partitions: `normal` (default; pre-emptable, resumes from its checkpoint), `steady` (never pre-empted), `cpu`
 (every job without GPUs, either class, which `submit.py` sends there; capped by `cores_per_gpu`, as one partition
 because slurm counts `MaxCPUsPerNode` per partition; never pre-empted by slurm, so `urgent.py` requeues a
-resume-class one in its way itself) and `urgent` (higher tier, `AllowGroups=` the admin group; pre-empts `normal`). Priority is `priority/basic`. Services restarted:
+resume-class one in its way itself) and `urgent` (higher tier, `AllowGroups=` the admin group; pre-empts `normal`). Priority is `priority/basic`; the agent sets each waiting job's priority from its level. The
+levels `low`, `normal` and `high` are created as slurm QOS (no access lists: every level is open to everyone).
+Services restarted:
 `mariadb`, `munge`, `slurmdbd`, then `slurmctld`, `slurmd`. Slurm's own ports (6817, 6818, 6819) are slurm's
 defaults, not set by this installer.
 
@@ -253,7 +258,7 @@ on, and `dgx/` to `install_dir/dgx/` when `dgx_gate` is on), and installs one sm
 
 **`agent`** (always on). A system service `gpujobs-agent.service` run as slurm's `SlurmUser` (`slurm`), plus the
 site file copy `/etc/gpujobs/site.toml`, the group `admin_group`, and the state directories (section 8). Every
-5 seconds it does: boot re-registration, restoring the priority of released jobs, releasing held jobs after
+5 seconds it does: boot re-registration, giving each waiting job its place (level, then job id), releasing held jobs after
 urgent work, failure notices (slurm's accounting is asked at most every 30 s), and a heartbeat (`agent/agent.json`). Enabled and started by `apply`.
 
 **`lease`** (only when `[lease]` is present). `slurm-gpu-lease-keeper.service`, a systemd **user** unit of
@@ -300,7 +305,7 @@ written. In both modes our page is linked at `/var/www/ood/apps/sys/gpujobs`.
 **The web page.** Open OnDemand logs the person in and runs our page as that person, so the page shows every
 unfinished GPU job to everybody, and shows the pause, resume and kill buttons only on jobs the viewer owns, or
 on any job for an admin ("Signed in as NAME (admin)"). The buttons call the same tools as the command line, so
-slurm still decides. The page has four views: Jobs (job, user, project, class, name, description, state, plain-language
+slurm still decides. The page has four views: Jobs (job, user, project, class, name, description, state, level, plain-language
 waiting reason, elapsed, GPUs, memory), History (filter by date, user, project and state), Use per project
 (GPU-hours per project and period), and a job page (record, link to Jobstats when metrics are on, actions,
 command and batch script, dependency chain, efficiency, events, and a log viewer with a text filter and an errors-only filter).
@@ -313,6 +318,11 @@ The commands below are the shims installed in `/usr/local/bin`; from a checkout 
     # submit: the job's command follows --; --class says whether re-running continues (resume) or redoes (restart);
     # --cpus N asks for N cores (a job without GPUs: at most the cap, cores_per_gpu); no ':' in --project
     gpujobs-submit --project myproj --what 'train the model' --class resume --resume-ok --gpu --name train1 -- python train.py
+
+    # the level: where it waits among the others (low, normal by default, high; open to everyone); it never stops a
+    # running job, only urgent work does. Change a waiting job's level later with slurm itself:
+    gpujobs-submit --project myproj --what 'quick check' --class restart --gpu --level high -- python check.py
+    scontrol update jobid=123 qos=low
 
     # see the queue, who holds the GPU and why jobs wait
     gpujobs-status

@@ -10,15 +10,20 @@ from pathlib import Path
 
 import agent as agent_module
 import gpu_jobs
+import levels
 import pytest
 import site_config
 
 
 def job(
-    job_id: str, state: str = "RUNNING", reason: str = "None", priority: int = 100
+    job_id: str, state: str = "RUNNING", reason: str = "None", priority: int | None = None,
+    level: gpu_jobs.Level = gpu_jobs.Level.NORMAL,
 ) -> gpu_jobs.QueuedJob:
+    """A job; by default already at the place its level gives it (the World's agent counts from base 1)."""
+    placed = levels.priority_for(level, job_id, 1) if job_id.isdigit() else 1
     return gpu_jobs.QueuedJob(
-        job_id, "normal", state, reason, f"p:resume:{job_id}", priority=priority
+        job_id, "normal", state, reason, f"p:resume:{job_id}", priority=placed if priority is None else priority,
+        level=level,
     )
 
 
@@ -51,6 +56,7 @@ class World:
         (tmp_path / "agent" / "boot_id").write_text(
             "boot-1\n"
         )  # this boot is already reconciled
+        gpu_jobs.write_json(tmp_path / "agent" / "state.json", {"base": 1})  # placed priorities count from job 1
         self.agent = self.new_agent()
 
     def scontrol(
@@ -188,30 +194,31 @@ def test_nodes_are_undrained_once_per_boot_after_slurmctld_settles_and_drained_o
     )  # once more for the new boot
 
 
-def test_priority_returns_only_to_jobs_the_agent_saw_held_and_survives_a_restart(
-    world: World,
-) -> None:
-    world.queue = [job("5", "PENDING", "Resources"), job("6", "PENDING", "Resources")]
-    world.step()
+def test_waiting_jobs_get_the_place_their_level_and_id_give_them_and_nothing_else_is_touched(world: World) -> None:
+    high = levels.priority_for(gpu_jobs.Level.HIGH, "5", 1)
     world.queue = [
-        job("5", "PENDING", "JobHeldUser", 0),
-        job("6", "PENDING", "Resources", 50),
-    ]  # 6: an admin's change
-    world.step()
-    world.agent = world.new_agent()
-    world.queue = [
-        job("5", "PENDING", "Resources", 1),
-        job("6", "PENDING", "Resources", 50),
-    ]  # 5 released, re-ranked
+        job("5", "PENDING", "Priority", 4294901630, gpu_jobs.Level.HIGH),  # just submitted: slurm's own number
+        job("6", "PENDING", "Priority", 50),  # an admin's hand-set priority: overwritten (D18)
+        job("7", "PENDING", "JobHeldUser", 0),  # held: slurm refuses a priority, and it waits for its owner anyway
+        job("8", "RUNNING", priority=3),  # running: its priority no longer matters
+        job("9", "PENDING", "Priority"),  # already in place
+    ]
     world.fail = {"update"}
-    assert world.step()["restored"] == []  # the restore fails: 5 stays on the list of jobs seen held
+    assert "placing job 5 failed; will retry" in str(world.step()["last_error"])
     world.fail = set()
     world.writes.clear()
-    beat = world.step()
-    assert world.writes == [["update", "jobid=5", "priority=100"]]
-    assert beat["restored"] == [{"job": "5", "from": 1, "to": 100, "at": int(world.t)}]
+    world.agent = world.new_agent()  # nothing to remember: the place comes from the level and id alone
     world.step()
-    assert len(world.writes) == 1  # once
+    assert world.writes == [["update", "jobid=5", f"priority={high}"],
+                            ["update", "jobid=6", f"priority={levels.priority_for(gpu_jobs.Level.NORMAL, '6', 1)}"]]
+    # a fresh agent, with no base saved, counts from the lowest live job: jobs far past the span keep their order
+    (world.dir / "agent" / "state.json").unlink()
+    world.agent = world.new_agent()
+    world.queue = [job("40000", "PENDING", "Priority", 5), job("40001", "PENDING", "Priority", 5)]
+    world.writes.clear()
+    world.step()
+    first, second = (int(w[2].split("=")[1]) for w in world.writes)
+    assert first > second and agent_module.gpu_jobs.read_json(world.dir / "agent" / "state.json")["base"] == 40000
 
 
 def test_a_silent_squeue_keeps_the_state_and_acts_on_nothing(world: World) -> None:
@@ -253,11 +260,15 @@ def test_restore_order_ignores_a_non_admin_then_releases_for_an_admin_once_the_u
     world.writes.clear()
     world.step()  # victim 2 never stopped, and still does not keep job 7 held
     assert world.writes == [["release", "7"]] and not path.exists()
-    path = world.request("10", ["3"], ["8"])
-    world.queue = [job("3", "PENDING", "JobHeldAdmin", 0)]
-    world.step()  # a held victim will not start by itself: it must not keep job 8 held forever
-    assert world.writes[-1] == ["release", "8"]
-    gpu_jobs.write_json(path, {"victims": ["3"], "held": ["8"]})
+    path = world.request("10", ["3"], ["8", "11"])
+    world.queue = [job("3", "PENDING", "JobHeldAdmin", 0), job("8", "PENDING", "JobHeldUser", 0, gpu_jobs.Level.LOW),
+                   job("11", "PENDING", "JobHeldUser", 0, gpu_jobs.Level.HIGH)]
+    world.writes.clear()
+    world.step()  # a held victim will not start by itself: it must not keep jobs 8 and 11 held forever
+    # one at a time, best place first (with the card free, the first released takes it), each placed at once
+    assert world.writes == [["release", "11"], ["update", "jobid=11", f"priority={levels.priority_for(gpu_jobs.Level.HIGH, '11', 1)}"],
+                            ["release", "8"], ["update", "jobid=8", f"priority={levels.priority_for(gpu_jobs.Level.LOW, '8', 1)}"]]
+    gpu_jobs.write_json(path, {"victims": ["3"], "held": ["8", "11"]})
     world.writes.clear()
     world.step()  # a request naming no urgent job is ignored
     assert world.writes == []
@@ -274,7 +285,7 @@ def test_restore_order_releases_once_when_the_victim_left_and_the_file_cannot_be
     world.queue = []
     world.step()
     world.step()
-    assert world.writes == [["release", "7,8"]]
+    assert world.writes == [["release", "7"], ["release", "8"]]
 
 
 def test_restore_order_waits_for_a_queue_read_after_the_request_was_written(world: World) -> None:

@@ -25,6 +25,10 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
+sys.path.insert(0, str(REPO / "slurm"))
+from levels import Level, priority_for  # noqa: E402 - stdlib only; the priority the agent gives each waiting job
+
+TOP_PRIORITY = 0xFFFF0000  # slurm's job_mgr.c: the most priority/basic gives a job by itself
 RUN = HERE / "run.sh"
 SITE = "/src/tests/integration/harness.site.toml"
 INSTALL = "python3 /src/slurm/install/install.py"
@@ -166,6 +170,11 @@ def agent_json(name: str) -> dict:
         return json.loads(done.out)
     except ValueError:
         return {}
+
+
+def placed(level: Level, job: str) -> int:
+    """The priority the agent gives a waiting job, from the base id it keeps in its state."""
+    return priority_for(level, job, agent_json("state.json").get("base") or 0)
 
 
 def can_submit(user: str) -> tuple[bool, str]:
@@ -426,6 +435,7 @@ def stage_jobs() -> None:
 
     keeps_place(agent_on=True)
     keeps_place(agent_on=False)
+    levels_order()
 
 
 def keeps_place(*, agent_on: bool) -> None:
@@ -438,9 +448,6 @@ def keeps_place(*, agent_on: bool) -> None:
         ja = submit("alice", "place-a", 300, "--gpus", "4")
         wait_state(ja, "RUNNING", 60)
         jb = submit("bob", "place-b", 300, "--gpus", "4")
-        if agent_on:
-            wait_for(lambda: agent_json("state.json").get("priorities", {}).get(ja), 40)
-        recorded = agent_json("state.json").get("priorities", {}).get(ja) or priority(ja)
         paused = cl("gpujobs-pause", ja, "--reason", "e2e", user="alice")
         paused_at = time.monotonic()
         held = wait_for(lambda: state(ja) == "PENDING" and priority(ja) == 0, 60)
@@ -448,14 +455,13 @@ def keeps_place(*, agent_on: bool) -> None:
         check(f"S3 ({tag}): alice pauses her own job; it is held and the next job runs",
               paused.rc == 0 and bool(held) and bob_runs, f"pause rc={paused.rc}; job {ja} held={bool(held)}; job {jb} running={bob_runs}")
         jc = submit("carol", "place-c", 300, "--gpus", "1")
-        if agent_on:
-            wait_for(lambda: ja in agent_json("state.json").get("seen_held", []), 30)
         resumed = cl("gpujobs-resume", ja, user="alice")
+        place = placed(Level.NORMAL, ja)  # its place: level, then job id (D18)
         if agent_on:
-            back = wait_for(lambda: priority(ja) == recorded, 40)
-            check(f"S3 ({tag}): after resume the agent puts the recorded priority back",
+            back = wait_for(lambda: priority(ja) == place, 40)
+            check(f"S3 ({tag}): after resume the agent gives the job its place again (level, then job id)",
                   resumed.rc == 0 and bool(back) and priority(ja) > priority(jc),
-                  f"job {ja}: recorded {recorded}, now {priority(ja)}; later job {jc}: {priority(jc)}; restored={agent_json('agent.json').get('restored')}")
+                  f"job {ja}: place {place}, now {priority(ja)}; later job {jc}: {priority(jc)}")
             # A requeued job may not start until slurm's requeue delay (AuthInfo=cred_expire=60 in slurm.conf) has passed, and
             # squeue says "Resources", not "BeginTime", while the card is also busy. Free the card only after that delay, or
             # the lower-priority job simply takes the card first.
@@ -466,12 +472,62 @@ def keeps_place(*, agent_on: bool) -> None:
                   bool(first) and state(jc) == "PENDING", f"job {ja} {state(ja)}, job {jc} {state(jc)}")
         else:
             time.sleep(12)
-            check(f"S3 ({tag}): without the agent the released job lost its place (lower priority than the later job)",
-                  resumed.rc == 0 and priority(ja) < priority(jc) and priority(ja) < recorded,
-                  f"job {ja}: was {recorded}, now {priority(ja)}; later job {jc}: {priority(jc)}")
+            check(f"S3 ({tag}): without the agent the released job lost its place (behind the later job)",
+                  resumed.rc == 0 and priority(ja) < priority(jc),
+                  f"job {ja}: place {place}, now {priority(ja)}; later job {jc}: {priority(jc)}")
     finally:
         sh("systemctl start gpujobs-agent")
         clear_queue()
+
+
+def levels_order() -> None:
+    """D18: waiting jobs go by level, then job id; an owner may move their own waiting job; a slurmctld restart keeps
+    every place; a QOS made while slurmctld runs is usable at once."""
+    clear_queue()
+    try:
+        blocker = submit("alice", "lv-blocker", 300, "--gpus", "4")
+        wait_state(blocker, "RUNNING", 60)
+        low = submit("bob", "lv-low", 60, "--gpu", "--level", "low")
+        normal = submit("carol", "lv-normal", 60, "--gpu")
+        high = submit("alice", "lv-high", 60, "--gpu", "--level", "high")
+        later = submit("bob", "lv-normal-2", 60, "--gpu")
+        want = {low: Level.LOW, normal: Level.NORMAL, high: Level.HIGH, later: Level.NORMAL}
+        ready = wait_for(lambda: all(priority(j) == placed(level, j) for j, level in want.items()), 30)
+        seen = {j: priority(j) for j in want}
+        check("L1: the agent places waiting jobs by level, then job id (high, normal, the later normal, low), all above "
+              "any priority slurm gives by itself", bool(ready) and seen[high] > seen[normal] > seen[later] > seen[low] > TOP_PRIORITY,
+              str(seen))
+        moved = cl("scontrol", "update", f"jobid={low}", "qos=high", user="bob")
+        up = wait_for(lambda: priority(low) == placed(Level.HIGH, low), 30)
+        check("L2: bob moves his own waiting job to high; the agent places it among the high jobs, ahead of the later one",
+              moved.rc == 0 and bool(up) and priority(low) > priority(high) > priority(normal),
+              f"rc={moved.rc} {moved.text[:120]}; {low}: {priority(low)}, {high}: {priority(high)}")
+        # the cold review's case: an owner's own hold and release must not put a job above the placed ones
+        cl("scontrol", "hold", later, user="bob")
+        cl("scontrol", "release", later, user="bob")
+        released = priority(later)
+        check("L5: bob holds and releases his own waiting job: slurm ranks it afresh, behind every placed job, until the "
+              "agent places it again", 0 < released <= TOP_PRIORITY < min(priority(j) for j in (low, normal, high))
+              and bool(wait_for(lambda: priority(later) == placed(Level.NORMAL, later), 30)), f"released at {released}")
+        before = {j: priority(j) for j in want}
+        sh("systemctl stop gpujobs-agent")  # so only slurm itself can keep the order across its restart
+        sh("systemctl restart slurmctld")
+        wait_for(lambda: sh("scontrol ping").rc == 0 and state(blocker) == "RUNNING", 90)
+        after = {j: priority(j) for j in want}
+        check("L3: a slurmctld restart keeps every placed priority (slurm saves them; the agent is stopped)",
+              after == before, f"before {before} after {after}")
+        made = sh("sacctmgr -i add qos e2elevel")
+        queued = cl("sbatch", "--qos=e2elevel", "--hold", "--wrap", "true", user="alice")
+        qj = (re.search(r"Submitted batch job (\d+)", queued.out) or [None, ""])[1]
+        # slurm accepts an unknown QOS name without QOS enforcement (and leaves the job with none): the check is the
+        # QOS the job actually has
+        qos = sh(f"squeue -h -j {qj} -o %q").out.strip() if qj else ""
+        check("L4: a QOS made while slurmctld runs is the next job's QOS at once (no restart)",
+              made.rc == 0 and qos == "e2elevel", f"add rc={made.rc}; job {qj} qos {qos!r}; sbatch: {queued.text[:120]}")
+    finally:
+        sh("systemctl start gpujobs-agent")
+        clear_queue()
+        sh("sacctmgr -i delete qos e2elevel; true")
 
 
 # -- stage: urgent ---------------------------------------------------------------------------------------------
@@ -483,7 +539,7 @@ def stage_urgent() -> None:
     n1 = submit("alice", "victim", 600, "--gpus", "4")
     wait_state(n1, "RUNNING", 60)
     n2 = submit("bob", "bystander", 600, "--gpus", "1")
-    time.sleep(6)  # the agent records priorities
+    wait_for(lambda: priority(n2) == placed(Level.NORMAL, n2), 30)  # the agent places the waiting job
     out = cl("gpujobs-urgent", "--project", "e2e", "--what", "e2e urgent", "--time", "5:00", "--name", "urgent1", "--",
              *sleep_cmd(25), user="carol", timeout=120)
     uj = (re.search(r"job (\d+) submitted", out.out) or [None, ""])[1]
@@ -507,7 +563,8 @@ def stage_urgent() -> None:
           bool(ran_first) and n2_state == "PENDING" and "Unknown" in never_ran, f"victim {n1} {state(n1)}; bystander {n2} {n2_state}, sacct {never_ran}")
     released = wait_for(lambda: priority(n2) > 0 and sh("ls " + STATE + "/requests/ | wc -l").out.strip() == "0", 90, 3)
     log = sh("journalctl -u gpujobs-agent --no-pager | grep 'released'").out
-    check("S7: the agent (not the tool) releases the held job and deletes the request", bool(released) and n2 in log,
+    check("S7: the agent (not the tool) releases the held job, gives it its place back and deletes the request",
+          bool(released) and n2 in log and priority(n2) == placed(Level.NORMAL, n2),
           f"{n2} priority {priority(n2)}; agent log: {log.strip().splitlines()[-1:] }")
     clear_queue()
 
