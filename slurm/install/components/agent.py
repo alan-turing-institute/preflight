@@ -57,5 +57,8 @@ def post_install(site) -> list[list[str]]:
         ["groupadd", "-f", site.admin_group],
         *dirs,
         ["systemctl", "daemon-reload"],
-        ["systemctl", "enable", "--now", UNIT],
+        ["systemctl", "enable", UNIT],
+        # restart, not `enable --now`: an upgrade must swap the running agent for the new code (2026-10-21: the
+        # old agent kept running after an apply until it was restarted by hand); a stopped one is started
+        ["systemctl", "restart", UNIT],
     ]

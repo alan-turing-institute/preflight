@@ -104,7 +104,8 @@ def test_apply_then_check_against_a_temp_root(env):
     assert adds == [["sacctmgr", "-i", "add", "cluster", "t"],
                     ["sacctmgr", "-i", "add", "account", "gpujobs", "Cluster=t", "Description=gpujobs", "Organization=gpujobs"],
                     *(["sacctmgr", "-i", "add", "qos", level] for level in ("low", "normal", "high"))]  # D18's levels
-    assert ["systemctl", "enable", "--now", "gpujobs-agent.service"] in fake.calls
+    # an upgrade swaps the running agent for the new code, not only enables it
+    assert fake.calls.index(["systemctl", "restart", "gpujobs-agent.service"]) > fake.calls.index(["systemctl", "enable", "gpujobs-agent.service"])
     assert ["systemctl", "--user", f"--machine={USER}@.host", "restart", "slurm-gpu-lease-keeper.service"] in fake.calls
     # plan 3.3, every state directory's (mode, owner): the shared ones sticky and open, requests/ the agent's own
     dirs = {a[-1]: (a[3], a[a.index("-o") + 1] if "-o" in a else None) for a in fake.calls if a[:2] == ["install", "-d"]}
