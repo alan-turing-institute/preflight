@@ -52,6 +52,9 @@ def make_site(tmp_path: Path, mode: str = "install", auth: str = "dex-local", tl
     elif auth == "proxy":
         defaults = {"user": "alice", "key_file": secret_file(tmp_path, "key", KEY)}
         portal_extra = {"allow_from": ["192.0.2.8/32"], **(portal_extra or {})}
+    elif auth == "ssh":
+        defaults = {"key_file": secret_file(tmp_path, "key", KEY)}
+        portal_extra = {"allow_from": ["127.0.0.0/8"], **(portal_extra or {})}
     elif auth == "oidc":
         defaults |= {
             "issuer": "https://idp.example.org",
@@ -60,7 +63,8 @@ def make_site(tmp_path: Path, mode: str = "install", auth: str = "dex-local", tl
         }
     else:
         defaults |= {"host": "ldap.example.org:636", "user_base_dn": "ou=People,dc=example,dc=org"}
-    portal_table = {"mode": mode, "auth": auth, "server_name": "ood.example.org", "auth_settings": defaults | settings}
+    server = "localhost" if auth == "ssh" else "ood.example.org"
+    portal_table = {"mode": mode, "auth": auth, "server_name": server, "auth_settings": defaults | settings}
     portal_table |= portal_extra or {}
     if tls:
         portal_table |= {
@@ -175,6 +179,38 @@ def test_proxy_serves_everyone_as_one_user_behind_the_key_and_runs_no_login(tmp_
         refused = make_site(tmp_path, auth="proxy", **setup)
         assert any(expect in r for r in portal.refusals(refused)), setup
         assert portal.PORTAL_YML not in portal.files(refused)
+
+
+def test_ssh_takes_the_user_from_the_relay_only_with_the_key_and_serves_no_tls(tmp_path, monkeypatch):
+    site = make_site(tmp_path, auth="ssh", tls=False)
+    files = portal.files(site)
+    text = files[portal.PORTAL_YML].content
+    has_key = f"sha1(req('X-Frontdoor-Key')) == '{hashlib.sha1(KEY.encode()).hexdigest()}'"
+    assert portal.refusals(site) == []
+    # the name is taken only together with the key, in the shape the relay sends; both headers stop at Apache
+    name = f"SetEnvIfExpr \\\"{has_key} && req('X-Gpujobs-User') =~ /^([a-z_][a-z0-9_-]{{0,31}})$/\\\" GPUJOBS_PORTAL_USER=$1"
+    assert f'"{name}"' in text and text.count(f'Require expr \\"{has_key}\\"') == 2
+    assert text.count("RequestHeader unset X-Gpujobs-User") == 2 and "SetEnv GPUJOBS_PORTAL_USER" not in text
+    assert "\nssl:" not in text and "SSLCertificate" not in text and KEY not in text
+    assert "use_rewrites: false" in text  # else OOD redirects the forwarded localhost:<port> to localhost:80
+    steps, packages = portal.post_install(site), portal.packages(site)
+    assert ["a2enmod", "ssl"] not in steps and "openssl" not in packages and not any("update-ca" in c[0] for c in steps)
+    socket_unit, service_unit = (files[f"/etc/systemd/system/{u}"].content for u in portal.RELAY_UNITS)
+    assert f"ListenStream={portal.RELAY_SOCKET}" in socket_unit and "SocketMode=0666" in socket_unit
+    assert f"LoadCredential=key:{tmp_path / 'key'}" in service_unit and "DynamicUser=yes" in service_unit
+    assert steps.index(["systemctl", "restart", "apache2"]) < steps.index(["systemctl", "restart", portal.RELAY_UNITS[0]])
+    for setup, expect in (
+        ({"portal_extra": {"allow_from": []}}, "allow_from"),
+        ({"tls": True}, "tls_cert"),
+        ({"key_file": secret_file(tmp_path, "loose", KEY, 0o644)}, "must be root-only"),
+        ({"user": "alice"}, "unknown key"),  # the relay names the user; the site file cannot
+        ({"portal_extra": {"server_name": "site-b.example.org"}}, "server_name"),  # the relay admits localhost only
+    ):
+        refused = make_site(tmp_path, auth="ssh", **{"tls": False, **setup})
+        assert any(expect in r for r in portal.refusals(refused)), setup
+        assert portal.PORTAL_YML not in portal.files(refused)
+    monkeypatch.setattr(portal.os, "geteuid", lambda: 0)  # a 0600 key file the installer's user does not own
+    assert any("must be root-only" in r for r in portal.refusals(site))
 
 
 @pytest.mark.parametrize("field", ["email", "userID", "hash"])

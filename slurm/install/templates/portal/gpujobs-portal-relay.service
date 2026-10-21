@@ -1,0 +1,19 @@
+# Rendered from the site file by slurm/install/components/portal.py for portal.auth = "ssh" (D19); do not edit by hand.
+# Started by gpujobs-portal-relay.socket. It runs as a user of its own and talks only to Apache on the loopback.
+[Unit]
+Description=lifecycle=service gpujobs portal relay ($install_dir/slurm/portal_relay.py)
+Requires=gpujobs-portal-relay.socket
+After=gpujobs-portal-relay.socket
+
+[Service]
+ExecStart=/usr/bin/python3 $install_dir/slurm/portal_relay.py
+DynamicUser=yes
+LoadCredential=key:$key_file
+NoNewPrivileges=yes
+# portal_relay.py serves at most 256 connections at once, two descriptors and two threads each
+LimitNOFILE=2048
+TasksMax=1024
+MemoryMax=512M
+IPAddressDeny=any
+IPAddressAllow=localhost
+Restart=on-failure

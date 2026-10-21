@@ -37,6 +37,7 @@ class AuthMode(StrEnum):
     DEX_LDAP = "dex-ldap"
     DEX_LOCAL = "dex-local"
     PROXY = "proxy"  # no sign-in: a trusted reverse proxy vouches for every request (see portal.py)
+    SSH = "ssh"  # no sign-in page: each person's own ssh forward to the relay names them (D19, see portal.py)
 
 
 class SiteError(Exception):
