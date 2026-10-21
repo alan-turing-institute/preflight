@@ -256,6 +256,10 @@ def stage_install() -> None:
     # 'slurm'@'localhost'"). The first-boot unit made one; take it away so only apply can bring slurmdbd back.
     dropped = sh("mariadb -e \"DROP USER 'slurm'@'localhost'\"")
     check("before apply: slurmdbd's MariaDB login removed, as on a fresh machine", dropped.rc == 0, dropped.text[:200])
+    # Nor has it slurmctld's state folder, which slurmctld cannot make itself; with slurmctld stopped, squeue fails, so
+    # this is also the first apply that stopped before starting slurmctld, which must be allowed to run again.
+    fresh = sh("systemctl stop slurmctld && rm -rf /var/spool/slurmctld")
+    check("before apply: slurmctld stopped and its state folder removed, as on a fresh machine", fresh.rc == 0, fresh.text[:200])
 
     detected = sh(f"{INSTALL} detect")
     check("install.py detect prints a draft site file for the container", detected.rc == 0 and "testnode" in detected.out

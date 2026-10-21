@@ -9,6 +9,9 @@ import components
 NAME = "slurm"
 PACKAGES = ["slurm-wlm", "slurmdbd", "mariadb-server", "munge"]
 RESTARTS = [["mariadb", "munge"], ["slurmdbd"], ["slurmctld", "slurmd"]]
+# slurmctld's StateSaveLocation (templates/slurm/slurm.conf). The packages do not make it, and slurmctld, running as
+# SlurmUser, cannot make it in /var/spool itself (Turing box, 2026-10-21: "mkdir(/var/spool/slurmctld): Permission denied").
+STATE_SAVE = "/var/spool/slurmctld"
 # slurmdbd logs in to MariaDB as the OS user `slurm` by unix_socket (templates/slurm/slurmdbd.conf), so no password
 # exists anywhere. A fresh MariaDB has no such login: it is made here, before slurmdbd first starts.
 DB_LOGIN = ("CREATE USER IF NOT EXISTS 'slurm'@'localhost' IDENTIFIED VIA unix_socket; "
@@ -51,9 +54,8 @@ def refusals(site) -> list[str]:
 
 
 def _never_ran() -> bool:
-    """slurmctld is down and has never saved job state (StateSaveLocation in templates/slurm/slurm.conf), so no job
-    exists that a restart could requeue or kill."""
-    if (components.ROOT / "var/spool/slurmctld/job_state").exists():
+    """slurmctld is down and has never saved job state, so no job exists that a restart could requeue or kill."""
+    if (components.ROOT / STATE_SAVE.lstrip("/") / "job_state").exists():
         return False
     return components.run(["systemctl", "is-active", "--quiet", "slurmctld"]).returncode != 0
 
@@ -72,6 +74,7 @@ def post_install(site) -> list:
         ["mariadb", "-e", DB_LOGIN],
         ["systemctl", "restart", *accounting],
         lambda: _records(site),
+        ["install", "-d", "-m", "0755", "-o", "slurm", "-g", "slurm", STATE_SAVE],
         ["systemctl", "restart", *controller],
     ]
 

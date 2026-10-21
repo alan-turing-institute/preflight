@@ -110,6 +110,9 @@ def test_apply_then_check_against_a_temp_root(env):
     db, dbd, ctld = (fake.calls.index(["systemctl", "restart", *g]) for g in (["mariadb", "munge"], ["slurmdbd"], ["slurmctld", "slurmd"]))
     # a fresh MariaDB has no login for slurmdbd (Turing box, 2026-10-21): it is made between the two restarts
     assert db < fake.calls.index(["mariadb", "-e", slurm_component.DB_LOGIN]) < dbd
+    # nor does it have slurmctld's state folder, which slurmctld cannot make itself (Turing box, 2026-10-21)
+    state = ["install", "-d", "-m", "0755", "-o", "slurm", "-g", "slurm", slurm_component.STATE_SAVE]
+    assert fake.calls.index(state) < ctld
     adds = [a for a in fake.calls[db:ctld] if a[2:3] == ["add"]]
     assert adds == [["sacctmgr", "-i", "add", "cluster", "t"],
                     ["sacctmgr", "-i", "add", "account", "gpujobs", "Cluster=t", "Description=gpujobs", "Organization=gpujobs"],
