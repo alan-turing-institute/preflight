@@ -35,7 +35,7 @@ def test_this_box_site_file_loads() -> None:
     assert (site.name, site.cluster_name, site.account) == ("gpu-node-1", "spark", "local") and site.unified_memory and site.hostguard and site.dgx_gate
     gpu = site.nodes[0].gpus[0]
     assert (site.nodes[0].real_memory_mb, gpu.device, gpu.type) == (100000, "/dev/nvidia0", "gb10")
-    assert set(site.lease.services) == {"service-a", "service-b"}
+    assert set(site.lease.services) == {"service-a", "service-b", "service-c-app"}
     assert site.lease.lease_dir == Path("/home/user1/.local/state/gpu-lease")
     assert (site.metrics.mode, site.metrics.grafana_port) == (gpujobs_site.MetricsMode.LOCAL, 3001)
     assert site.metrics.allow_from == ("100.64.0.0/10", "fd7a:115c:a1e0::/48", "192.0.2.8/32")  # Tailscale + NAS Caddy

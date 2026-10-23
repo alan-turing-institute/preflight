@@ -57,7 +57,7 @@ def test_stops_without_submitting_behind_a_wait_only_blocker_or_without_a_site_f
     monkeypatch.setattr(gpu_jobs, "read_queue", lambda: [job("2", "steady")])
     monkeypatch.setattr(urgent, "other_leases", list)
     monkeypatch.setattr(urgent.audit, "unregistered", list)
-    monkeypatch.setattr(urgent, "free_memory_mb", lambda: None)
+    monkeypatch.setattr(urgent, "free_on_nodes", lambda: None)
     monkeypatch.setattr(urgent.site_config, "is_admin", lambda _site, _user: True)
     submitted = []
     monkeypatch.setattr(urgent.subprocess, "run", lambda *a, **k: submitted.append(a))
@@ -74,11 +74,15 @@ def test_stops_without_submitting_behind_a_wait_only_blocker_or_without_a_site_f
     assert submitted == []
 
 
-def test_a_memory_only_urgent_job_that_does_not_fit_puts_running_jobs_in_the_way() -> None:
-    _, victims, _, _ = urgent.plan(
-        [job("3", "normal")], gpu=False, whole_box=False, leases=[], unregistered=[], services={}, memory_short=True
-    )
-    assert victims == ["3"]
+def test_a_job_without_gpus_whose_memory_or_cores_do_not_fit_puts_running_jobs_in_the_way() -> None:
+    for short in ({"memory_short": True}, {"cores_short": True}):
+        _, victims, _, _ = urgent.plan(
+            [job("3", "normal")], gpu=False, whole_box=False, leases=[], unregistered=[], services={}, **short
+        )
+        assert victims == ["3"], short
+    _, victims, _, _ = urgent.plan([job("3", "normal")], gpu=False, whole_box=False, leases=[], unregistered=[],
+                                   services={})
+    assert victims == []  # it fits: a GPU job is not in a CPU job's way
 
 
 def test_memory_notation() -> None:
@@ -108,7 +112,7 @@ def test_site_admin_check_multi_gpu_plan_and_request_file(
     monkeypatch.setattr(gpu_jobs, "read_queue", lambda: queue)
     monkeypatch.setattr(urgent, "other_leases", lambda: [("svc", False)])
     monkeypatch.setattr(urgent.audit, "unregistered", list)
-    monkeypatch.setattr(urgent, "free_memory_mb", lambda: None)
+    monkeypatch.setattr(urgent, "free_on_nodes", lambda: None)
     monkeypatch.setattr(urgent.submit, "keeper_running", lambda: True)
     done = type("Done", (), {"returncode": 0, "stdout": "9", "stderr": ""})()
     monkeypatch.setattr(urgent.subprocess, "run", lambda *_a, **_k: done)
@@ -207,12 +211,19 @@ def test_site_admin_check_multi_gpu_plan_and_request_file(
     request = max((tmp_path / "requests").glob("restore_order-*.json"), key=lambda p: p.stat().st_mtime_ns)
     assert json.loads(request.read_text())["victims"] == ["5"] and ["scontrol", "requeue", "3"] in calls
     # memory short (not the whole box): the cpu job is requeued only if pre-empting the normal one cannot free enough
-    monkeypatch.setattr(urgent, "free_memory_mb", lambda: 1000)
+    monkeypatch.setattr(urgent, "free_on_nodes", lambda: (1000, 99))
     for asked, requeued in (("4G", False), ("512M", True), ("lots", True)):  # needs 1048 MB more; its owner wrote "lots"
         gpu_jobs.update_sidecar("5", mem=asked)
         calls.clear()
         assert urgent.run([*argv[:-4], "--mem", "2G", "--", "true"]) == 0
         assert (["scontrol", "requeue", "3"] in calls) is requeued, asked
+    # cores short (the memory fits): the same rule with the cores the normal job holds; needs 4, slurm has 1 left
+    monkeypatch.setattr(urgent, "free_on_nodes", lambda: (10**6, 1))
+    for held_cores, requeued in ((12, False), (2, True)):
+        queue[0] = gpu_jobs.QueuedJob("5", "normal", "RUNNING", "None", "p:resume:5", gpus=2, cpus=held_cores)
+        calls.clear()
+        assert urgent.run([*argv[:-4], "--mem", "2G", "--cpus", "4", "--", "true"]) == 0
+        assert (["scontrol", "requeue", "3"] in calls) is requeued, held_cores
 
 
 class FakeSlurm:

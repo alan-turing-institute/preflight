@@ -50,18 +50,12 @@ def elapsed(job_id: str) -> str:
     return done.stdout.strip() or "?"
 
 
-def free_memory_mb() -> int | None:
-    """Memory slurm has not allocated across every node (`RealMemory - AllocMem`, summed), or None if unknown."""
-    total = 0
-    names = gpu_jobs.nodes()
-    for name in names:
-        done = subprocess.run(["scontrol", "show", "node", name], capture_output=True, text=True, check=False)
-        fields = dict(part.split("=", 1) for part in done.stdout.split() if "=" in part)
-        try:
-            total += int(fields["RealMemory"]) - int(fields["AllocMem"])
-        except (KeyError, ValueError):
-            return None
-    return total if names else None
+def free_on_nodes() -> tuple[int, int] | None:
+    """(memory MB, cores) slurm has not allocated across every node, or None if slurm does not answer."""
+    total = gpu_jobs.capacity()
+    if not total.get("nodes"):
+        return None
+    return total["mem_mb"] - total["mem_used_mb"], total["cpus"] - total["cpus_used"]
 
 
 def _asked_mb(job: gpu_jobs.QueuedJob) -> int:
@@ -73,17 +67,19 @@ def _asked_mb(job: gpu_jobs.QueuedJob) -> int:
 def plan(
     queue: list[gpu_jobs.QueuedJob], *, gpu: bool, whole_box: bool, leases: list[tuple[str, bool]],
     unregistered: list[tuple[int, float, str]], services: dict[str, str], memory_short: bool = False,
+    cores_short: bool = False,
 ) -> tuple[list[str], list[str], list[str], list[str]]:
     """(lines to print, normal victims, steady blockers, other wait-only blockers).
 
-    `memory_short`: the urgent job's memory does not fit in what slurm has left, so every running job is in
-    its way (slurm picks which `normal` ones to pre-empt). `services`: service name -> yield text, the site's
+    `memory_short` / `cores_short`: the urgent job's memory / cores do not fit in what slurm has left, so every
+    running job is in its way (slurm picks which `normal` ones to pre-empt; a job without GPUs needs cores from a
+    GPU job whenever the GPU jobs and the `cpu` partition hold them all). `services`: service name -> yield text, the site's
     `[lease] services`. A GPU urgent job puts every running `normal` job holding GPUs in the way, on any node.
     """
     lines, victims, steady, wait_only = [], [], [], []
     for job in queue:
         record = gpu_jobs.read_sidecar(job.job_id, job.user) or {}
-        in_way = whole_box or memory_short or (gpu and job.gpus > 0)
+        in_way = whole_box or memory_short or cores_short or (gpu and job.gpus > 0)
         if not in_way or not (job.active or job.partition == gpu_jobs.Partition.URGENT):
             continue
         what = f"{job.job_id} {job.name} ({record.get('what', 'no sidecar')}), running {elapsed(job.job_id)}"
@@ -94,7 +90,7 @@ def plan(
         elif job.partition == gpu_jobs.Partition.CPU and not job.restarts:  # slurm never pre-empts `cpu`: urgent.py does
             victims.append(job.job_id)
             lines.append(f"[urgent] PAUSABLE  {what}: requeued once the urgent job is accepted"
-                         + ("" if whole_box else ", if pre-empting the normal jobs does not free enough memory")
+                         + ("" if whole_box else ", if pre-empting the normal jobs does not free enough room")
                          + "; loses at most the time since its last checkpoint")
         elif job.restarts:
             steady.append(job.job_id)
@@ -179,24 +175,28 @@ def run(argv: list[str]) -> int:
     if queue is None:
         print("[urgent] REFUSED: slurm does not answer (controller down); see slurm/status.py", file=sys.stderr)
         return 1
-    free = free_memory_mb() if arguments.mem else None
-    memory_short = bool(arguments.mem) and free is not None and mem_mb(arguments.mem) > free
+    free = None if whole_box else free_on_nodes()
+    memory_short = free is not None and mem_mb(arguments.mem) > free[0]
+    cores_short = free is not None and arguments.cpus > free[1]
     lines, victims, steady, wait_only = plan(
         queue, gpu=arguments.gpu, whole_box=whole_box, leases=other_leases(), unregistered=audit.unregistered(),
-        memory_short=memory_short, services=services,
+        memory_short=memory_short, cores_short=cores_short, services=services,
     )
     # slurm pre-empts `normal` victims; a `cpu` one urgent.py requeues itself, and it stays out of the restore-order
     # request (whose held GPU jobs would otherwise wait until a requeued CPU job got its capped cores back)
     by_id = {job.job_id: job for job in queue}
     cpu_victims = [v for v in victims if by_id[v].partition == gpu_jobs.Partition.CPU]
     victims = [v for v in victims if v not in cpu_victims]
-    if cpu_victims and not whole_box and free is not None:  # memory short: only if the normal ones cannot free enough
-        freed = sum(_asked_mb(by_id[v]) for v in victims)
-        if freed >= mem_mb(arguments.mem) - free:
+    if cpu_victims and free is not None:  # short: only if the normal ones cannot free enough
+        enough_memory = not memory_short or sum(_asked_mb(by_id[v]) for v in victims) >= mem_mb(arguments.mem) - free[0]
+        enough_cores = not cores_short or sum(by_id[v].cpus for v in victims) >= arguments.cpus - free[1]
+        if enough_memory and enough_cores:
             cpu_victims = []
-    if arguments.mem and free is not None:
-        print(f"[urgent] memory: needs {mem_mb(arguments.mem)} MB, slurm has {free} MB unallocated"
+    if free is not None:
+        print(f"[urgent] memory: needs {mem_mb(arguments.mem)} MB, slurm has {free[0]} MB unallocated"
               + ("; jobs will be pre-empted to make room" if memory_short else "; it fits beside what runs"))
+        print(f"[urgent] cores: needs {arguments.cpus}, slurm has {free[1]} unallocated"
+              + ("; jobs will be pre-empted to make room" if cores_short else "; they fit beside what runs"))
     print("\n".join(map(gpu_jobs.printable, lines)))  # descriptions and lease names are what other users wrote
     print(f"[urgent] expected start: slurm's own {SLURM_START_S[0]}-{SLURM_START_S[1]} s after the pre-empted jobs "
           "end (trial), plus the slowest yield above")
