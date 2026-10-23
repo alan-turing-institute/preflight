@@ -286,14 +286,15 @@ def test_restore_order_ignores_a_non_admin_then_releases_for_an_admin_once_the_u
     world.queue = [job("1", "PENDING", "BeginTime"), job("2")]
     world.step()  # the urgent job ended, the victim has not started again yet
     assert world.writes == []
-    world.queue = [job("1"), job("2")]
+    world.queue = [job("1"), job("2"), job("7", "PENDING", "JobHeldAdmin", 0)]
     world.fail = {"release"}
     world.step()  # the release fails: the request stays, to be tried again
     assert path.exists()
     world.fail = set()
     world.writes.clear()
     world.step()  # victim 2 never stopped, and still does not keep job 7 held
-    assert world.writes == [["release", "7"]] and not path.exists()
+    placed = ["update", "jobid=7", f"priority={levels.priority_for(gpu_jobs.Level.NORMAL, '7', 1)}"]
+    assert world.writes == [["release", "7"], placed] and not path.exists()
     path = world.request("10", ["3"], ["8", "11"])
     world.queue = [job("3", "PENDING", "JobHeldAdmin", 0), job("8", "PENDING", "JobHeldUser", 0, gpu_jobs.Level.LOW),
                    job("11", "PENDING", "JobHeldUser", 0, gpu_jobs.Level.HIGH)]
@@ -316,10 +317,10 @@ def test_restore_order_releases_once_when_the_victim_left_and_the_file_cannot_be
     monkeypatch.setattr(
         gpu_jobs, "remove_quietly", lambda _path: None
     )  # SlurmUser owns none of the request files
-    world.queue = []
+    world.queue = [job("7", "PENDING", "JobHeldAdmin", priority=0)]  # 8 has left the queue: slurm would refuse it
     world.step()
     world.step()
-    assert world.writes == [["release", "7"], ["release", "8"]]
+    assert [w for w in world.writes if w[0] == "release"] == [["release", "7"]]  # once, and done (no retry for ever)
 
 
 def test_restore_order_waits_for_a_queue_read_after_the_request_was_written(world: World) -> None:

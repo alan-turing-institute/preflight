@@ -614,10 +614,10 @@ class Agent:
                 v in jobs and not (jobs[v].active or jobs[v].held) for v in victims
             ):
                 continue
-            held = [
+            held = [  # one that has left the queue or was released meanwhile needs nothing (slurm refuses it)
                 job_id
                 for job_id in _strings(order.get("held"))
-                if gpu_jobs.JOB_ID.fullmatch(job_id)
+                if gpu_jobs.JOB_ID.fullmatch(job_id) and job_id in jobs and jobs[job_id].held
             ]
             if not self._release_in_order(held, jobs, errors):
                 errors.append(f"releasing {held} for {path.name} failed; will retry")
