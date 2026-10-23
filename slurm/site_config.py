@@ -75,6 +75,14 @@ class Lease:
 
 
 @dataclass(frozen=True)
+class Service:
+    """The `service` partition (D20): background services' CPU stand-ins start at once by suspending `cpu` jobs."""
+
+    cores: int  # per node, the partition's MaxCPUsPerNode
+    group: str  # Unix group allowed to submit (slurm AllowGroups, with the admin group)
+
+
+@dataclass(frozen=True)
 class Metrics:
     mode: MetricsMode
     prometheus_url: str
@@ -107,6 +115,7 @@ class Site:
     nodes: tuple[Node, ...]
     unified_memory: bool
     lease: Lease | None
+    service: Service | None
     hostguard: bool
     dgx_gate: bool
     metrics: Metrics
@@ -115,11 +124,15 @@ class Site:
 
     @property
     def cpu_job_cap(self) -> int | None:
-        """Cores a CPU-only job may use per node (its partitions' MaxCPUsPerNode): every node's cores less those held
-        for its GPUs, at the tightest node; None when no node holds cores. slurm 23.11 has no per-node form, so a
-        CPU-only node in a mixed site is capped too."""
-        held = [n.cpus - n.gpu_cores for n in self.nodes if n.gpu_cores]
-        return min(held) if held else None
+        return _cpu_job_cap(self.nodes)
+
+
+def _cpu_job_cap(nodes: tuple[Node, ...]) -> int | None:
+    """Cores a CPU-only job may use per node (its partitions' MaxCPUsPerNode): every node's cores less those held
+    for its GPUs, at the tightest node; None when no node holds cores. slurm 23.11 has no per-node form, so a
+    CPU-only node in a mixed site is capped too."""
+    held = [n.cpus - n.gpu_cores for n in nodes if n.gpu_cores]
+    return min(held) if held else None
 
 
 _HINT = "run `slurm/install/install.py detect` to write one for this machine"
@@ -183,6 +196,17 @@ def _parse_lease(raw: Any) -> Lease:
     return Lease(Path(t["lease_dir"]), t["keeper_user"], Path(t["python"]), dict(t["services"]))
 
 
+def _parse_service(raw: Any, nodes: tuple[Node, ...]) -> Service:
+    t = _table(raw, "service", {"cores"}, {"group": "gpujobs-service"})
+    if len(nodes) != 1:  # the agent frees cores by suspending cpu jobs, and it counts one machine's cores
+        raise SiteError("site file: [service] is built for a site of one node; leave the table out with several")
+    cores, limit = t["cores"], _cpu_job_cap(nodes) or min(n.cpus for n in nodes)
+    if type(cores) is not int or not 1 <= cores <= limit:
+        raise SiteError(f"site file: service.cores = {cores!r}; expected a whole number from 1 to {limit}, the cores "
+                        "CPU-only jobs may use, so suspending them can always make room")
+    return Service(cores, t["group"])
+
+
 def parse(raw: dict[str, Any]) -> Site:
     top = _table(
         raw,
@@ -196,6 +220,7 @@ def parse(raw: dict[str, Any]) -> Site:
             "admin_group": "gpujobs-admin",
             "unified_memory": False,
             "lease": None,
+            "service": None,
             "hostguard": False,
             "dgx_gate": False,
             "metrics": {},
@@ -227,6 +252,7 @@ def parse(raw: dict[str, Any]) -> Site:
     )
     if not isinstance(p["session_days"], int) or isinstance(p["session_days"], bool) or p["session_days"] < 0:
         raise SiteError(f"site file: portal.session_days = {p['session_days']!r}; expected a whole number of days, 0 or more")
+    nodes = tuple(_parse_node(n, i) for i, n in enumerate(top["nodes"]))
     return Site(
         name=top["name"],
         cluster_name=top["cluster_name"] or top["name"],
@@ -234,9 +260,10 @@ def parse(raw: dict[str, Any]) -> Site:
         state_dir=Path(top["state_dir"]),
         install_dir=Path(top["install_dir"]),
         admin_group=top["admin_group"],
-        nodes=tuple(_parse_node(n, i) for i, n in enumerate(top["nodes"])),
+        nodes=nodes,
         unified_memory=top["unified_memory"],
         lease=_parse_lease(top["lease"]) if top["lease"] is not None else None,
+        service=_parse_service(top["service"], nodes) if top["service"] is not None else None,
         hostguard=top["hostguard"],
         dgx_gate=top["dgx_gate"],
         metrics=Metrics(
@@ -279,8 +306,17 @@ def load(path: Path | None = None) -> Site:
 
 def is_admin(site: Site, user: str) -> bool:
     """True when `user` is in the admin group, by listed membership or as the primary group."""
+    return in_group(site.admin_group, user)
+
+
+def may_submit_service(site: Site, user: str) -> bool:
+    """True when `user` may use the service partition (D20): its group or the admin group, as its AllowGroups."""
+    return site.service is not None and (in_group(site.service.group, user) or is_admin(site, user))
+
+
+def in_group(name: str, user: str) -> bool:
     try:
-        group = grp.getgrnam(site.admin_group)
+        group = grp.getgrnam(name)
         primary = pwd.getpwnam(user).pw_gid
     except KeyError:
         return False

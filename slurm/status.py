@@ -19,6 +19,7 @@ PAUSES = {
     gpu_jobs.Partition.NORMAL: "pre-empted, resumes from its checkpoint",
     gpu_jobs.Partition.STEADY: "never pre-empted (a requeue redoes it)",
     gpu_jobs.Partition.URGENT: "urgent",
+    gpu_jobs.Partition.SERVICE: "a service's CPU stand-in; requeued for GPU or urgent work",
 }
 
 

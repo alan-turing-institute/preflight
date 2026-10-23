@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,9 +16,9 @@ DIRECTIVE = "#S" + "BATCH"  # spelled in two halves so a text-matching guard doe
 
 
 def fake_site(monkeypatch: pytest.MonkeyPatch, *, lease: object, dgx_gate: bool, nodes: tuple = (),
-              cpu_job_cap: int | None = None) -> None:
+              cpu_job_cap: int | None = None, service: object = None) -> None:
     """`load` returns just the fields submit.py reads."""
-    site = SimpleNamespace(lease=lease, dgx_gate=dgx_gate, nodes=nodes, cpu_job_cap=cpu_job_cap)
+    site = SimpleNamespace(lease=lease, dgx_gate=dgx_gate, nodes=nodes, cpu_job_cap=cpu_job_cap, service=service)
     monkeypatch.setattr(site_config, "load", lambda *_p: site)
 
 
@@ -134,6 +135,63 @@ def test_a_cpu_job_over_the_cpu_cap_is_refused(tmp_path: Path, monkeypatch: pyte
                                         "--cpus", "14", "--", "x")
     fake_site(monkeypatch, lease=None, dgx_gate=False, cpu_job_cap=2)  # a small box: the default 4 is clamped, not refused
     assert "--cpus-per-task=2" in dry("--project", "p", "--what", "w", "--class", "restart", "--mem", "4G", "--", "x")
+    # a service stand-in (D20): its own partition and cap, never with a GPU, never waiting for the card
+    service = ("--project", "p", "--what", "w", "--class", "restart", "--mem", "12G", "--service")
+    with pytest.raises(submit.Refused, match="no service partition"):
+        dry(*service, "--", "x")
+    node = SimpleNamespace(cpus=8, real_memory_mb=20000, gpus=())
+    fake_site(monkeypatch, lease=None, dgx_gate=False, nodes=(node,), cpu_job_cap=2,
+              service=SimpleNamespace(cores=3, group="svc"))
+    monkeypatch.setattr(gpu_jobs, "read_queue", list)  # an empty machine
+    monkeypatch.setattr(site_config, "may_submit_service", lambda _site, _user: False)
+    with pytest.raises(submit.Refused, match="only members of svc"):  # slurm would hold it forever (AllowGroups)
+        dry(*service, "--", "x")
+    monkeypatch.setattr(site_config, "may_submit_service", lambda _site, _user: True)
+    script = dry(*service, "--", "x")  # the default 4 clamped to the service cap, not the cpu partition's 2
+    assert f"{DIRECTIVE} --partition=service" in script and "--cpus-per-task=3" in script
+    assert "--needs-lease" not in script and "--gres" not in script
+    with pytest.raises(submit.Refused, match="at most 3 cores"):
+        dry(*service, "--cpus", "4", "--", "x")
+    with pytest.raises(submit.Refused, match="no --gpu"):
+        dry(*service, "--gpu", "--", "x")
+    with pytest.raises(submit.Refused, match="needs --mem"):  # whether it fits is judged by it
+        dry("--project", "p", "--what", "w", "--class", "restart", "--service", "--", "x")
+    with pytest.raises(submit.Refused, match="with --service only"):
+        dry("--project", "p", "--what", "w", "--class", "restart", "--mem", "1G", "--no-suspend", "--", "x")
+    with pytest.raises(submit.Refused, match="job ids"):
+        dry(*service, "--suspend", "5,x", "--", "x")
+
+
+def room(capsys: pytest.CaptureFixture[str], *flags: str) -> dict:
+    """The dry run's `service room` line, as a dict."""
+    capsys.readouterr()
+    dry("--project", "p", "--what", "w", "--class", "restart", "--mem", "12G", "--cpus", "2", "--service", *flags, "--", "x")
+    line = capsys.readouterr().out.splitlines()[0]
+    assert line.startswith("[submit] service room: ")
+    return json.loads(line.removeprefix("[submit] service room: "))
+
+
+def test_the_service_dry_run_names_the_jobs_it_would_suspend_with_their_owners_consent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(gpu_jobs, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(site_config, "may_submit_service", lambda _site, _user: True)
+    node = SimpleNamespace(cpus=8, real_memory_mb=40000, gpus=())  # 32,000 MB free beside the two jobs
+    fake_site(monkeypatch, lease=None, dgx_gate=False, nodes=(node,), service=SimpleNamespace(cores=4, group="s"))
+    me = gpu_jobs.current_user()  # a record counts only when the job's own user wrote it
+    queue = [gpu_jobs.QueuedJob("1", "normal", "RUNNING", "None", "r:resume:gpu", user=me, gpus=1, cpus=6, mem_mb=4000),
+             gpu_jobs.QueuedJob("2", "cpu", "RUNNING", "None", "r:restart:edge", user=me, cpus=2, mem_mb=4000)]
+    monkeypatch.setattr(gpu_jobs, "read_queue", lambda: queue)
+    gpu_jobs.update_sidecar("2", what="edge sweep")
+    assert room(capsys) == {"starts": "after_suspending", "why": room(capsys)["why"],
+                            "suspends": [{"job": "2", "user": me, "name": "r:restart:edge", "what": "edge sweep"}]}
+    assert room(capsys, "--suspend", "2")["suspends"][0]["job"] == "2"
+    refused = room(capsys, "--no-suspend")
+    assert refused["starts"] == "waits" and refused["why"].startswith("cores: 0 free")
+    queue.pop()  # job 2 has ended: two cores free
+    assert room(capsys, "--no-suspend") == {"starts": "now", "suspends": [], "why": "it fits beside what runs"}
+    queue[0] = dataclasses.replace(queue[0], mem_mb=0)  # the GPU job holds the whole machine's memory
+    assert room(capsys)["starts"] == "waits"
 
 
 def test_a_first_cpu_run_with_no_mem_gets_slurms_default(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -199,6 +199,7 @@ def test_user_and_admin_argv(env):
     assert run(site, tmp, "admin", "add", "alice") == 0  # not a user yet: made one first
     assert run(site, tmp, "admin", "remove", "alice") == 0
     assert run(site, tmp, "user", "remove", "alice") == 0
+    assert run(site, tmp, "service", "add", "alice") == 1  # no [service] table: refused, nothing run
     low = ["sacctmgr", "-i", "add", "qos", "low"]  # the missing level, each time (this fake never learns it)
     assert [a for a in fake.calls if "show" not in a] == [
         low,
@@ -206,8 +207,10 @@ def test_user_and_admin_argv(env):
         low, ["sacctmgr", "-i", "add", "user", "alice", "Account=gpujobs", "DefaultAccount=gpujobs", "Cluster=t"],
         ["usermod", "-aG", "gpujobs-admin", "alice"],
         ["sacctmgr", "-i", "modify", "user", "name=alice", "set", "adminlevel=Operator"],
+        ["scontrol", "reconfigure"],  # slurmctld's cached AllowGroups list, else up to 600 s before urgent admits her
         ["gpasswd", "-d", "alice", "gpujobs-admin"],
         ["sacctmgr", "-i", "modify", "user", "name=alice", "set", "adminlevel=None"],
+        ["scontrol", "reconfigure"],
         ["sacctmgr", "-i", "delete", "user", "name=alice", "account=gpujobs", "cluster=t"],
     ]
 

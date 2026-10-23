@@ -83,6 +83,10 @@ def test_a_job_without_gpus_whose_memory_or_cores_do_not_fit_puts_running_jobs_i
     _, victims, _, _ = urgent.plan([job("3", "normal")], gpu=False, whole_box=False, leases=[], unregistered=[],
                                    services={})
     assert victims == []  # it fits: a GPU job is not in a CPU job's way
+    # a service stand-in (D20) in the way is requeued by slurm (its partition's PreemptMode=REQUEUE), never wait-only
+    lines, victims, _, wait_only = urgent.plan([job("3", "service", gpus=0)], gpu=False, whole_box=False, leases=[],
+                                               unregistered=[], services={}, cores_short=True)
+    assert (victims, wait_only) == (["3"], []) and "a service's CPU stand-in" in "\n".join(lines)
 
 
 def test_memory_notation() -> None:

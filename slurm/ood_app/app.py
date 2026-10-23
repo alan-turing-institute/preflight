@@ -96,7 +96,7 @@ RESULTS = {
     "REQUEUED": (Kind.REQUEUED, "Requeued"),
     "RUNNING": (Kind.RUNNING, "Running"),
     "PENDING": (Kind.WAITING, "Waiting"),
-    "SUSPENDED": (Kind.PAUSED, "Paused"),
+    "SUSPENDED": (Kind.PAUSED, "Suspended"),
 }
 BAD_RESULTS = {Kind.FAILED, Kind.TIMEOUT, Kind.OOM, Kind.NODE_FAIL}
 SECURITY_HEADERS = [
@@ -414,11 +414,22 @@ def _queue_state(job: QueuedJob) -> tuple[str, str]:
     """(css kind, words) for a queued job."""
     if job.state in {gpu_jobs.State.RUNNING, gpu_jobs.State.CONFIGURING, gpu_jobs.State.COMPLETING}:
         return Kind.RUNNING, "Running"
-    if job.state == gpu_jobs.State.SUSPENDED or job.reason in {gpu_jobs.Reason.HELD_USER, gpu_jobs.Reason.HELD_REQUEUE}:
+    if job.state == gpu_jobs.State.SUSPENDED:  # slurm stopped it for higher work (D20): it keeps its memory
+        return Kind.PAUSED, "Suspended (resumes by itself)"
+    if job.reason in {gpu_jobs.Reason.HELD_USER, gpu_jobs.Reason.HELD_REQUEUE}:
         return Kind.PAUSED, "Paused"
     if job.reason == gpu_jobs.Reason.HELD_ADMIN:
         return Kind.PAUSED, "Held by admin"
     return Kind.WAITING, "Waiting"
+
+
+def _paused_note(rows: list[dict]) -> str:
+    """A held job is resumed from its page; one slurm suspended resumes by itself (no Resume button)."""
+    paused = [r for r in rows if r["kind"] == Kind.PAUSED]
+    suspended = sum(1 for r in paused if r["state"] == gpu_jobs.State.SUSPENDED)
+    return "; ".join(note for count, note in (
+        (len(paused) - suspended, "resume from the job's page"), (suspended, f"{suspended} suspended, " + ("resumes by itself" if suspended == 1 else "resume by themselves"))
+    ) if count)
 
 
 def _result(state: str) -> tuple[str, str]:
@@ -642,7 +653,7 @@ def index_page(backend: Backend, root: str = "") -> str:
     tiles = _tiles([
         ("Running", str(count[Kind.RUNNING]), _running_note(count[Kind.RUNNING], sum(1 for r in rows if r["kind"] == Kind.RUNNING and r["gpus"]))),
         ("Waiting", str(count[Kind.WAITING]), "in the queue" if count[Kind.WAITING] else "queue is empty"),
-        ("Paused", str(count[Kind.PAUSED]), "resume from the job's page" if count[Kind.PAUSED] else ""),
+        ("Paused", str(count[Kind.PAUSED]), _paused_note(rows)),
         ("Finished, last 24 h", str(len(recent)), f"{failed} failed" if failed else "none failed"),
     ]) + _resource_tiles(backend.capacity(), rows, backend.gpu_busy(), backend.machine())
     recent_html = (

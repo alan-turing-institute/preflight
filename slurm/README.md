@@ -123,7 +123,7 @@ and pass `--site` each time.
 
 ## 4. The site file
 
-TOML. Tables: the top level, `[[nodes]]` with `[[nodes.gpus]]`, `[lease]` with `[lease.services]`, `[metrics]`,
+TOML. Tables: the top level, `[[nodes]]` with `[[nodes.gpus]]`, `[lease]` with `[lease.services]`, `[service]`, `[metrics]`,
 `[portal]` with `[portal.auth_settings]`. "required" means there is no default. The source of truth is
 `slurm/site_config.py`.
 
@@ -173,6 +173,28 @@ TOML. Tables: the top level, `[[nodes]]` with `[[nodes.gpus]]`, `[lease]` with `
 | `keeper_user` | required | User the lease keeper runs as. |
 | `python` | required | Interpreter that can import `localmodels.lease` (`GpuLeaseClient`). `apply` refuses when it cannot. |
 | `services` | `{}` | `[lease.services]`: `name = "how and how fast it yields"`. Shown in the plan `urgent.py` prints. |
+
+### `[service]` (optional)
+
+A `service` partition for the small CPU stand-ins of background services: work a person is waiting on that must start
+now while slurm holds the GPU (`submit.py --service --mem M`). When one waits for cores (and fits in memory), the agent
+suspends `cpu` jobs for it (`scontrol suspend`: slurm takes back their cores, keeps their memory, and starts the service
+job at once; the jobs lose no work), newest first and only those its owner agreed to (`--suspend J,J`, or none with
+`--no-suspend`), after holding every waiting `cpu` job so none takes the freed cores; GPU and urgent jobs are never held or suspended.
+It resumes a job only when that job's own cores are free (slurm puts it back on them unchecked), so one whose cores a
+GPU job took meanwhile waits for that job; then it releases its holds. A service job that has not started 60 s after
+room was made gives it back, and is helped again 5 minutes later.
+`submit.py --service --dry-run` prints which jobs it would suspend (`[submit] service room: {json}`), so a service can ask
+its user first. It is not lease demand, so the services keep the card. When memory is short it waits: suspending frees
+no memory. Only the partition line is added to slurm.conf (`scontrol reconfigure` applies it with jobs running).
+Slurm's own suspending pre-emption is not used: it needs gang scheduling, whose second pre-emption pass killed a job
+slurm had just requeued for urgent work (harness, 2026-10-23; slurm 23.11.4). One node only: `apply` refuses the table
+on a site of several.
+
+| Field | Default | Meaning |
+|---|---|---|
+| `cores` | required | Cores the partition may use per node (`MaxCPUsPerNode`), 1 up to the cores CPU-only jobs may use. |
+| `group` | `gpujobs-service` | Unix group allowed to submit (`AllowGroups=`, with the admin group). `install.py service add USER` adds one. |
 
 ### `[metrics]`
 
@@ -276,7 +298,8 @@ Pick local ports nothing else on people's own machines uses; any port works for 
 partitions: `normal` (default; pre-emptable, resumes from its checkpoint), `steady` (never pre-empted), `cpu`
 (every job without GPUs, either class, which `submit.py` sends there; capped by `cores_per_gpu`, as one partition
 because slurm counts `MaxCPUsPerNode` per partition; never pre-empted by slurm, so `urgent.py` requeues a
-resume-class one in its way itself) and `urgent` (higher tier, `AllowGroups=` the admin group; pre-empts `normal`). Priority is `priority/basic`; the agent sets each waiting job's priority from its level. The
+resume-class one in its way itself) and `urgent` (higher tier, `AllowGroups=` the admin group; pre-empts `normal`),
+plus `service` when the site file has `[service]` (the agent suspends `cpu` jobs to make room for it). Priority is `priority/basic`; the agent sets each waiting job's priority from its level. The
 levels `low`, `normal` and `high` are created as slurm QOS (no access lists: every level is open to everyone).
 Services restarted:
 `mariadb`, `munge`, `slurmdbd`, then `slurmctld`, `slurmd`. Slurm's own ports (6817, 6818, 6819) are slurm's

@@ -87,6 +87,9 @@ def plan(
             victims.append(job.job_id)
             lines.append(f"[urgent] PAUSABLE  {what}: may be pre-empted (slurm picks as many as the urgent job needs); "
                          "loses at most the time since its last checkpoint")
+        elif job.partition == gpu_jobs.Partition.SERVICE:
+            victims.append(job.job_id)
+            lines.append(f"[urgent] PAUSABLE  {what}: a service's CPU stand-in; may be requeued by slurm")
         elif job.partition == gpu_jobs.Partition.CPU and not job.restarts:  # slurm never pre-empts `cpu`: urgent.py does
             victims.append(job.job_id)
             lines.append(f"[urgent] PAUSABLE  {what}: requeued once the urgent job is accepted"

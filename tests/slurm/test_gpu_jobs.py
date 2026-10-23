@@ -70,6 +70,7 @@ def test_a_hostile_or_foreign_record_is_ignored_and_never_blocks(tmp_path: Path,
     assert not gpu_jobs.needs_the_card(job)  # the record says gpu, slurm granted none
     assert gpu_jobs.needs_the_card(QueuedJob("7", "normal", "PENDING", "None", "n", gpus=1))  # no record needed
     assert gpu_jobs.needs_the_card(QueuedJob("7", "urgent", "PENDING", "None", "n"))
+    assert not gpu_jobs.needs_the_card(QueuedJob("7", "service", "RUNNING", "None", "n"))  # a stand-in: no demand (D20)
     events = tmp_path / "events"
     events.mkdir()
     (events / "7-100-kill.json").write_text("[" * 200_000)

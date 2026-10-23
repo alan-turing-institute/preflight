@@ -60,6 +60,18 @@ def _node_line(node: Node) -> str:
     )
 
 
+def _service_partition(site: Site, names: list[str]) -> str:
+    """The service partition (D20), when the site has one: background services' CPU stand-ins. Slurm itself never
+    pre-empts for it; the agent suspends CPU-only jobs to make room (agent.py, step 3b). Urgent work requeues it."""
+    if site.service is None:
+        return ""
+    return (
+        "# service: background services' CPU stand-ins (submit.py --service); the agent suspends cpu jobs to make room.\n"
+        f"PartitionName=service Nodes={','.join(names)} PriorityTier=1 PreemptMode=REQUEUE MaxTime=INFINITE State=UP "
+        f"MaxCPUsPerNode={site.service.cores} AllowGroups={site.service.group},{site.admin_group}\n"
+    )
+
+
 def _slurm(site: Site, extra: dict[str, str]) -> dict[str, FileSpec]:
     names = [n.name for n in site.nodes]
     # One line per GPU with its Type (gres.conf(5) example: "Name=gpu Type=tesla File=/dev/nvidia1 COREs=2,3").
@@ -77,6 +89,7 @@ def _slurm(site: Site, extra: dict[str, str]) -> dict[str, FileSpec]:
         "node_lines": "".join(_node_line(n) for n in site.nodes),
         "gres_lines": gres_lines,
         "admin_group": site.admin_group,
+        "service_partition": _service_partition(site, names),
         "def_mem_mb": min(DEF_MEM_MB, *(n.real_memory_mb for n in site.nodes)),
         "extra_slurm_conf": extra_conf if not extra_conf or extra_conf.endswith("\n") else extra_conf + "\n",
     }

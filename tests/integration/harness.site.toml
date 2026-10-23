@@ -45,6 +45,10 @@ type = "fake"
 
 # No [lease]: nothing else shares the container's fake GPUs.
 
+# A service partition (D20), as this box has: the agent suspends cpu jobs to make room for its jobs.
+[service]
+cores = 2
+
 [metrics]
 mode = "local"
 grafana_port = 3001

@@ -207,6 +207,12 @@ def test_buttons_follow_can_act(viewer: str, admin: bool, shown: bool) -> None:
     held = gpu_jobs.QueuedJob("9", "steady", "PENDING", "JobHeldUser", "n")
     assert 'data-action="pause"' not in app._buttons_html(held, steady=False)  # paused already
     assert 'data-action="resume"' in app._buttons_html(held, steady=False)
+    # one slurm suspended for a service job (D20) resumes by itself: no Resume button, and the page says so
+    suspended = gpu_jobs.QueuedJob("10", "cpu", "SUSPENDED", "None", "n")
+    assert 'data-action="resume"' not in app._buttons_html(suspended, steady=False)
+    assert app._queue_state(suspended)[1] == "Suspended (resumes by itself)"
+    rows = [{"kind": app.Kind.PAUSED, "state": "PENDING"}, {"kind": app.Kind.PAUSED, "state": "SUSPENDED"}]
+    assert app._paused_note(rows) == "resume from the job's page; 1 suspended, resumes by itself"
     assert 'data-action="resume"' not in page  # job 7 runs: nothing to resume
     assert "/pun/sys/jobstats/7" in page
     # links are absolute from the mount: opened without its trailing slash, the page still finds its stylesheet

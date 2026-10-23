@@ -388,3 +388,104 @@ def test_failed_jobs_raise_an_event_and_run_the_notify_command_once(
     assert json.loads((world.dir / "agent" / "state.json").read_text())[
         "ended_seen"
     ] == ["3", "9", "10"]
+
+
+def q(job_id: str, partition: str, state: str = "RUNNING", cpus: int = 2, mem: int | None = 100, gpus: int = 0,
+      reason: str = "None", cores: str = "") -> gpu_jobs.QueuedJob:
+    """A job; `cores` like "0-1" names the cores slurm gave it (by default, two of its own past every other job's)."""
+    if not cores and state in {"RUNNING", "SUSPENDED"}:
+        cores = f"{10 * int(job_id)}-{10 * int(job_id) + cpus - 1}"
+    first, _, last = cores.partition("-")
+    given = frozenset(f"n:0:{c}" for c in range(int(first), int(last or first) + 1)) if cores else frozenset()
+    return gpu_jobs.QueuedJob(job_id, partition, state, reason, f"p:resume:{job_id}", user=gpu_jobs.current_user(),
+                              priority=1, gpus=gpus, cpus=cpus, mem_mb=mem, cores=given)
+
+
+def plan(queue: list, suspended: set, cpus: int = 8, cap: int = 8, consent: dict | None = None,
+         given_up: frozenset = frozenset()) -> tuple:
+    room = gpu_jobs.plan_room(queue, suspended, cpus, 1000, cap, consent, given_up)
+    return list(room.suspend), list(room.resume)
+
+
+def test_room_for_a_service_job_comes_from_the_newest_cpu_jobs_and_is_given_back_only_on_free_cores() -> None:
+    full = [q("1", "normal", cpus=4, gpus=1), q("2", "cpu"), q("3", "cpu")]  # 8 cores, all taken
+    waiting = q("9", "service", "PENDING", reason="Resources")
+    assert plan([*full, waiting], set()) == (["3"], [])  # the newest cpu job, enough for its 2 cores
+    assert plan([*full, q("9", "service", "PENDING", cpus=6, reason="Resources")], set()) == ([], [])  # cannot cover 6
+    assert plan([*full, q("9", "service", "PENDING", mem=950, reason="Resources")], set()) == ([], [])  # no memory
+    for reason in ("Dependency", "ReqNodeNotAvail", "PartitionConfig", "QOSMaxCpuPerUserLimit"):  # not cores
+        assert plan([*full, q("9", "service", "PENDING", reason=reason)], set()) == ([], []), reason
+    assert plan([*full, waiting], set(), given_up=frozenset({"9"})) == ([], [])
+    assert plan([*full, q("4", "cpu", mem=None), waiting], set(), cpus=10) == ([], [])  # free memory unknown
+    # the owner's consent (D9): only the jobs named, or none at all; and only within the service partition's cores
+    assert plan([*full, waiting], set(), consent={"9": frozenset({"2"})}) == (["2"], [])
+    assert plan([*full, waiting], set(), consent={"9": frozenset()}) == ([], [])
+    assert plan([*full, q("8", "service"), waiting], set(), cpus=10, cap=3) == ([], [])  # 8 holds 2 of its 3
+    # resumed only on its own cores (slurm puts it back there unchecked): case A of the review, the service job on them
+    frozen = [full[0], full[1], q("3", "cpu", "SUSPENDED", cores="30-31")]
+    assert plan([full[1], frozen[2], q("9", "service", cores="30-31")], {"3"}) == ([], [])  # the GPU job ended: still
+    assert plan([*frozen, q("9", "service", cores="40-41")], {"3"}) == ([], ["3"])  # its own cores are free
+    assert plan(frozen, {"3"}) == ([], ["3"])  # the service job has gone
+    assert plan([*frozen, waiting], {"3"}) == ([], [])  # a service job it could help waits: its cores are free for it
+    assert plan([*frozen, q("8", "service", "PENDING", cpus=6, reason="Resources")], {"3"}) == ([], ["3"])  # cannot
+    unknown = dataclasses.replace(full[1], cores=frozenset())  # a running job whose cores squeue did not give
+    assert plan([full[0], unknown, frozen[2]], {"3"}) == ([], [])
+
+
+def test_the_agent_holds_waiting_cpu_jobs_one_at_a_time_before_suspending_and_undoes_it_all_after(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    world.agent.site = dataclasses.replace(world.agent.site, service=site_config.Service(2, "svc"))
+    room = lambda: [w for w in world.writes if w[0] in {"hold", "suspend", "resume", "release", "uhold"}]  # noqa: E731
+    others = [q("6", "normal", "PENDING", gpus=1, reason="Resources"), q("7", "urgent", "PENDING", reason="Resources")]
+    full = [q("1", "normal", gpus=1), q("2", "cpu"), q("4", "cpu", "PENDING", reason="Resources"),
+            q("5", "cpu", "PENDING", reason="Resources"), *others]
+    world.queue = [*full, q("9", "service", "PENDING", reason="Resources")]
+    gpu_jobs.update_sidecar("9", may_suspend=[])  # submit.py --no-suspend: its owner agreed to suspend nothing (D9)
+    world.step()
+    assert room() == []
+    gpu_jobs.update_sidecar("9", may_suspend=["2"])  # --suspend 2
+    world.fail = {"hold"}
+    world.step()
+    assert room() == [["hold", "4"], ["hold", "5"]]  # failed: nothing suspended, as a cpu job not held could take them
+    world.fail, world.writes = set(), []
+    world.step()
+    assert room() == [["hold", "4"], ["hold", "5"], ["suspend", "2"]]  # cpu jobs only: GPU and urgent ones never
+    saved = json.loads((world.dir / "agent" / "state.json").read_text())
+    assert saved["suspended"] == ["2"] and set(saved["held"]) == {"4", "5"}
+    world.writes.clear()
+    held = [q("4", "cpu", "PENDING", reason="JobHeldAdmin"), q("5", "cpu", "PENDING", reason="JobHeldAdmin")]
+    world.queue = [full[0], q("2", "cpu", "SUSPENDED", cores="20-21"), *held, *others, q("9", "service", cores="20-21")]
+    world.step()
+    assert room() == []  # the service job runs on its cores
+    gpu_jobs.write_event("5", gpu_jobs.EventAction.PAUSE)  # its owner paused it meanwhile
+    monkeypatch.setattr(gpu_jobs, "events", lambda job_id=None: [
+        dataclasses.replace(e, actor="mallory") if e.job == "4" else e for e in events(job_id)])
+    gpu_jobs.write_event("4", gpu_jobs.EventAction.PAUSE)  # someone else's PAUSE event names job 4: not its owner's
+    world.queue = [full[0], q("2", "cpu", "SUSPENDED", cores="20-21"), *held, *others]  # the service job has gone
+    world.step()
+    assert room() == [["resume", "2"], ["uhold", "5"], ["release", "4"]]  # one call: the owner's hold, never a gap
+    assert json.loads((world.dir / "agent" / "state.json").read_text())["held"] == {}
+
+
+events = gpu_jobs.events
+
+
+def test_a_service_job_that_does_not_start_once_room_is_made_gets_it_taken_back(world: World) -> None:
+    world.agent.site = dataclasses.replace(world.agent.site, service=site_config.Service(2, "svc"))
+    stuck = q("9", "service", "PENDING", reason="Resources")
+    world.queue = [q("1", "normal", gpus=1), q("2", "cpu"), stuck]
+    world.step()
+    world.queue = [q("1", "normal", gpus=1), q("2", "cpu", "SUSPENDED", cores="20-21"), stuck]  # cores free, it waits
+    world.t += agent_module.ROOM_WAIT_S + 1
+    world.writes.clear()
+    world.step()
+    assert ["resume", "2"] in world.writes
+    assert set(json.loads((world.dir / "agent" / "state.json").read_text())["given_up"]) == {"9"}
+    world.queue = [q("1", "normal", gpus=1), q("2", "cpu"), stuck]  # resumed; 9 still waits
+    world.writes.clear()
+    world.step()
+    assert ["suspend", "2"] not in world.writes  # passed over for a while...
+    world.t += agent_module.ROOM_RETRY_S
+    world.step()
+    assert ["suspend", "2"] in world.writes  # ...then helped again

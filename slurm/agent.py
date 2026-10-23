@@ -20,6 +20,17 @@ Plan 3.5 (`plan notes`). One system service, run as SlurmUser
    once the urgent job has left the queue and every victim is running, gone or held (a pre-empted victim can run
    again only after the urgent job; one slurm did not pre-empt never stopped). A file owned by a non-admin, or
    naming no urgent job, is ignored.
+3b. ROOM FOR SERVICE JOBS (D20, sites with `[service]`; `gpu_jobs.plan_room` decides): a `service` job (a background
+   service's CPU stand-in, placed in the high band) waiting for cores that fits in memory gets them from the `cpu`
+   jobs its owner agreed to, which the agent suspends (`scontrol suspend`: slurm takes back their cores, keeps their
+   memory, and starts the service job at once), newest first, after holding every waiting `cpu` job (one at a time)
+   so none takes the freed cores. GPU and urgent jobs are never held or suspended. A suspended job is resumed only
+   when its own cores are free (slurm resumes a job on the cores it had, unchecked: 23.11 `_job_resume_test`), so if
+   a GPU job took some meanwhile it waits for that job (the heartbeat says so); then the holds are released. A
+   service job not started 60 s after room was made gives it back, and is helped again 5 minutes later. Every change
+   is saved first (write-ahead), so a crash cannot leave a suspended job the agent does not know. Slurm's own suspending pre-emption (PreemptMode=SUSPEND) is not used:
+   it needs gang scheduling, whose second pre-emption pass killed a `normal` job slurm had just requeued (harness,
+   2026-10-23; slurm 23.11.4 `gang.c` `_preempt_job_dequeue` kills a job it cannot requeue, unchanged upstream).
 4. FAILURE NOTICES for jobs that ended FAILED, OUT_OF_MEMORY, TIMEOUT or NODE_FAIL: a `FAILED` event, and the
    site's `notify_command` if any (argv, no shell, 30 s). Slurm's accounting is asked at most every 30 s
    (`NOTICES_EVERY_S`).
@@ -65,6 +76,10 @@ import site_config
 BOOT_ID_FILE = Path("/proc/sys/kernel/random/boot_id")
 #: slurmctld must have been up this long before the nodes are re-registered (it needs time to read its state).
 CTLD_SETTLE_S = 30.0
+#: How long a service job may take to start once room is made for it; then the room is given back (step 3b).
+ROOM_WAIT_S = 60.0
+#: How long a service job that did not start is passed over before room is made for it again.
+ROOM_RETRY_S = 300.0
 NOTIFY_TIMEOUT_S = 30
 MIB = 1024 * 1024
 #: How many ended jobs are remembered.
@@ -167,6 +182,10 @@ class State:
     released_requests: list[str] = field(
         default_factory=list
     )  # "<file>:<mtime_ns>" released but not deletable
+    suspended: list[str] = field(default_factory=list)  # cpu jobs the agent suspended for a service job (3b)
+    held: dict[str, int] = field(default_factory=dict)  # job -> when (ns) the agent held it while one is suspended
+    helping: dict[str, float] = field(default_factory=dict)  # service job -> when the agent first suspended for it
+    given_up: dict[str, float] = field(default_factory=dict)  # service job -> when it did not start once room was made
 
 
 def _by_id(job_id: str) -> tuple[int, str]:
@@ -255,6 +274,15 @@ class OomWatch:
             self.error = f"journal of {OOM_GUARD_UNIT}: {exc}"
 
 
+def may_suspend(job: gpu_jobs.QueuedJob) -> frozenset[str] | None:
+    """The cpu jobs a service job's owner agreed it may suspend (`submit.py --suspend` / `--no-suspend`, D9), from the
+    job's record, trusted only when its owner is the job's user (slurm's); None, any, when the record names none."""
+    consent = (gpu_jobs.read_sidecar(job.job_id, job.user) or {}).get("may_suspend")
+    if isinstance(consent, list) and all(isinstance(j, str) and j.isdigit() for j in consent):
+        return frozenset(consent)
+    return None
+
+
 def _strings(value: object) -> list[str]:
     return [str(item) for item in value] if isinstance(value, list) else []
 
@@ -306,6 +334,13 @@ class Agent:
             base=base if isinstance(base, int) else None,
             ended_seen=_strings(ended) if isinstance(ended, list) else None,
             released_requests=_strings(saved.get("released_requests")),
+            suspended=_strings(saved.get("suspended")),
+            held={k: v for k, v in (saved.get("held") or {}).items() if isinstance(v, int)}
+            if isinstance(saved.get("held"), dict) else {},
+            helping={k: v for k, v in (saved.get("helping") or {}).items() if isinstance(v, (int, float))}
+            if isinstance(saved.get("helping"), dict) else {},
+            given_up={k: v for k, v in (saved.get("given_up") or {}).items() if isinstance(v, (int, float))}
+            if isinstance(saved.get("given_up"), dict) else {},
         )
         beat = gpu_jobs.read_json(self.dir / "agent.json") or {}
         self.boot_reconciled_at = beat.get("boot_reconciled_at")
@@ -334,6 +369,8 @@ class Agent:
         else:
             self._place_jobs(queue, errors)
             self._restore_order(queue, read_at_ns, errors)
+            if self.site.service is not None or self.state.suspended or self.state.held:  # undo even if removed
+                self._make_room(queue, now, errors)
             self._pid_jobs = self._running_pids(queue)
             self._prune_oom_kills(queue)
         if self.watch is not None and self.watch.error:
@@ -347,7 +384,7 @@ class Agent:
             self.last_error, self.last_error_at = "; ".join(errors), int(now)
         return self._persist(now)
 
-    def _persist(self, now: float) -> dict[str, object]:
+    def _save_state(self) -> None:
         s = self.state
         gpu_jobs.write_json(
             self.dir / "state.json",
@@ -355,8 +392,15 @@ class Agent:
                 "base": s.base,
                 "ended_seen": s.ended_seen,
                 "released_requests": s.released_requests,
+                "suspended": s.suspended,
+                "held": s.held,
+                "helping": s.helping,
+                "given_up": s.given_up,
             },
         )
+
+    def _persist(self, now: float) -> dict[str, object]:
+        self._save_state()
         beat: dict[str, object] = {
             "updated": int(now),
             "boot_reconciled_at": self.boot_reconciled_at,
@@ -428,13 +472,102 @@ class Agent:
                 self._place(job, errors)
 
     def _place(self, job: gpu_jobs.QueuedJob, errors: list[str]) -> None:
-        target = levels.priority_for(job.level, job.job_id, self.state.base or 0)
+        level = levels.Level.HIGH if job.partition == gpu_jobs.Partition.SERVICE else job.level  # a person waits on it
+        target = levels.priority_for(level, job.job_id, self.state.base or 0)
         if job.priority == target:
             return
         if call(self.scontrol, ["scontrol", "update", f"jobid={job.job_id}", f"priority={target}"]).returncode:
             errors.append(f"placing job {job.job_id} failed; will retry")
             return
-        print(f"[agent] job {job.job_id} placed at {job.level} (priority {job.priority} -> {target})", flush=True)
+        print(f"[agent] job {job.job_id} placed at {level} (priority {job.priority} -> {target})", flush=True)
+
+    # -- 3b. room for service jobs --------------------------------------------------------------------------
+
+    def _make_room(self, queue: list[gpu_jobs.QueuedJob], now: float, errors: list[str]) -> None:
+        """Step 3b. Every change is saved first: a suspended job the state forgot would never be resumed."""
+        s = self.state
+        jobs = {job.job_id: job for job in queue}
+        s.suspended = [j for j in s.suspended if j in jobs and jobs[j].state == gpu_jobs.State.SUSPENDED]
+        s.given_up = {j: at for j, at in s.given_up.items() if j in jobs and now - at < ROOM_RETRY_S}
+        for job_id, since in list(s.helping.items()):
+            job = jobs.get(job_id)
+            if job is None or job.state in gpu_jobs.ON_CORES:
+                del s.helping[job_id]  # started, or gone
+            elif now - since > ROOM_WAIT_S:
+                del s.helping[job_id]
+                s.given_up[job_id] = now
+                print(f"[agent] service job {job_id} did not start {ROOM_WAIT_S:.0f} s after room was made; "
+                      "giving its room back", flush=True)
+        service = self.site.service
+        node = self.site.nodes[0]  # site_config allows [service] on one node only
+        room = gpu_jobs.plan_room(
+            queue, set(s.suspended), node.cpus, node.real_memory_mb, service.cores if service else 0,
+            {j.job_id: may_suspend(j) for j in queue if j.partition == gpu_jobs.Partition.SERVICE},
+            frozenset(s.given_up),
+        )
+        just_held: set[str] = set()
+        if room.suspend and self._hold_waiting(queue, errors, just_held):  # else a cpu job not held could take them
+            for job_id in room.suspend:
+                s.suspended.append(job_id)  # write-ahead: a failed suspend is pruned at the next step
+                s.helping.setdefault(room.helping, now)
+                self._save_state()
+                if call(self.scontrol, ["scontrol", "suspend", job_id]).returncode:
+                    s.suspended.remove(job_id)
+                    errors.append(f"suspending job {job_id} for service job {room.helping} failed; will retry")
+                    continue
+                print(f"[agent] job {job_id} suspended to make room for service job {room.helping}", flush=True)
+        for job_id in room.resume:
+            if call(self.scontrol, ["scontrol", "resume", job_id]).returncode:
+                errors.append(f"resuming job {job_id} failed; will retry")
+                continue
+            s.suspended.remove(job_id)
+            self._save_state()
+            print(f"[agent] job {job_id} resumed", flush=True)
+        waiting = [j for j in s.suspended if j not in room.resume and not jobs[j].cores]
+        if waiting:
+            errors.append(f"suspended jobs {waiting} have no cores in squeue; resume them by hand once they are free")
+        if s.suspended:
+            self._hold_waiting(queue, errors, just_held)
+            if not any(j.partition == gpu_jobs.Partition.SERVICE and (j.active or j.waiting) for j in queue):
+                self.note = f"suspended jobs {sorted(s.suspended)} wait for their own cores to be free"
+        elif s.held:
+            self._release_held(jobs, errors)
+
+    def _hold_waiting(self, queue: list[gpu_jobs.QueuedJob], errors: list[str], done: set[str]) -> bool:
+        """Hold every waiting `cpu` job, one at a time (a list stops at the first it cannot hold, and the ones before
+        are held unrecorded), so none takes a suspended job's cores; `done` (held this step) is skipped and added to.
+        A job released by someone else waits again and is held again. GPU and urgent jobs are never held. True when
+        all are held."""
+        ok = True
+        for job in queue:
+            if not job.waiting or job.partition != gpu_jobs.Partition.CPU or job.job_id in done:
+                continue
+            if call(self.scontrol, ["scontrol", "hold", job.job_id]).returncode:
+                errors.append(f"holding job {job.job_id} while a cpu job is suspended failed; will retry")
+                ok = False
+                continue
+            self.state.held[job.job_id] = time.time_ns()
+            done.add(job.job_id)
+            self._save_state()
+        return ok
+
+    def _release_held(self, jobs: dict[str, gpu_jobs.QueuedJob], errors: list[str]) -> None:
+        """Release what the agent held. A job its owner paused meanwhile (`pause.py`'s `uhold` changes nothing on the
+        agent's hold, yet records a PAUSE by its owner) gets the owner's hold instead: an operator's `uhold` turns the
+        hold into a user hold in one call (23.11 `job_mgr.c`), which `resume.py` can release."""
+        s = self.state
+        mine = {j: at for j, at in s.held.items() if j in jobs and jobs[j].held}
+        paused = [j for j, at in mine.items() if any(
+            e.action == gpu_jobs.EventAction.PAUSE and e.at > at and e.actor == jobs[j].user for e in gpu_jobs.events(j))]
+        for job_id in paused:
+            if call(self.scontrol, ["scontrol", "uhold", job_id]).returncode:
+                errors.append(f"handing job {job_id} back to its owner's pause failed; will retry")
+                return
+        if self._release_in_order([j for j in mine if j not in paused], jobs, errors) is False:
+            errors.append("releasing the jobs held for a service job failed in part; will retry")
+            return
+        s.held = {}
+        self._save_state()
 
     # -- 3. restore order after urgent work -----------------------------------------------------------------
 

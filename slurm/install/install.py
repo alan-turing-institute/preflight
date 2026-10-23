@@ -41,6 +41,9 @@ from install_earlyoom import differing, install  # noqa: E402
 
 MIGRATED = ("jobs", "footprints", "events")
 OPERATOR = "Operator"
+#: slurmctld caches who is in a partition's AllowGroups for GroupUpdateTime (600 s by default); a reconfigure reloads it
+#: (measured 2026-10-23, harness: a user just added stayed refused until it).
+RELOAD_GROUPS = ["scontrol", "reconfigure"]
 NO_LEVEL = "None"
 Chown = Callable[[Path, str], None]
 #: The kernel settings the shared, world-writable state directories rely on (`man 5 proc_sys_fs`): with any of
@@ -271,7 +274,7 @@ def cmd_admin(site, args, modules) -> int:
     )
     joins = components.accounting_adds(site, args.user) if args.action is Action.ADD else []  # an admin is a user too
     _run_all([*joins, membership,
-              ["sacctmgr", "-i", "modify", "user", f"name={args.user}", "set", f"adminlevel={level}"]])
+              ["sacctmgr", "-i", "modify", "user", f"name={args.user}", "set", f"adminlevel={level}"], RELOAD_GROUPS])
     print(f"{args.user}: {args.action} admin ({site.admin_group}, slurm AdminLevel {level})")
     return 0
 
@@ -300,6 +303,20 @@ def _copy_keeping(src: Path, dest: Path) -> bool:
     except PermissionError:  # not root: the copy is ours, and the owner is the thing that cannot be kept
         print(f"warning: could not give {dest} its owner (uid {info.st_uid}); run with sudo", file=sys.stderr)
     return True
+
+
+def cmd_service(site, args, modules) -> int:
+    """Who may submit to the service partition (D20): membership of its Unix group, which slurm's AllowGroups reads."""
+    if site.service is None:
+        print("REFUSED: the site file has no [service] table, so there is no service partition", file=sys.stderr)
+        return 1
+    if args.action is Action.ADD:
+        _run_all([*components.accounting_adds(site, args.user), ["usermod", "-aG", site.service.group, args.user],
+                  RELOAD_GROUPS])
+    else:
+        _run_all([["gpasswd", "-d", args.user, site.service.group], RELOAD_GROUPS])
+    print(f"{args.user}: {args.action} service ({site.service.group})")
+    return 0
 
 
 def cmd_migrate(site, args, modules) -> int:
@@ -338,7 +355,7 @@ def parser() -> argparse.ArgumentParser:
     apply.add_argument("--component", action="append", choices=components.ORDER, dest="components")
     apply.add_argument("--replace-existing-slurm", action="store_true",
                        help="take over a slurm this installer did not set up (its settings files are replaced)")
-    for name in ("user", "admin"):
+    for name in ("user", "admin", "service"):
         who = sub.add_parser(name, parents=[shared])
         who.add_argument("action", type=Action, choices=list(Action))
         who.add_argument("user")
@@ -351,6 +368,7 @@ COMMANDS = {
     "check": cmd_check,
     "user": cmd_user,
     "admin": cmd_admin,
+    "service": cmd_service,
     "migrate-state": cmd_migrate,
 }
 

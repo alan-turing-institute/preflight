@@ -69,6 +69,7 @@ class Partition(StrEnum):
     STEADY = "steady"  # cannot resume; never pre-empted
     CPU = "cpu"  # a job without GPUs, either class: kept off the cores held for GPU jobs; slurm never pre-empts it
     URGENT = "urgent"  # urgent.py only; pre-empts `normal`
+    SERVICE = "service"  # submit.py --service only (D20): a service's CPU stand-in; suspends `cpu` jobs to start
 
 
 class JobClass(StrEnum):
@@ -87,9 +88,11 @@ def class_of(name: str) -> JobClass | None:
     return JobClass(label) if label in set(JobClass) else None
 
 
-def partition_for(job_class: JobClass, gpus: int) -> Partition:
-    """The partition a job runs in: one without GPUs in `cpu` (one partition, so its MaxCPUsPerNode caps all CPU-only
-    jobs together: slurm counts that limit per partition), else by its class."""
+def partition_for(job_class: JobClass, gpus: int, *, service: bool = False) -> Partition:
+    """The partition a job runs in: a service's stand-in in `service`; one without GPUs in `cpu` (one partition, so its
+    MaxCPUsPerNode caps all CPU-only jobs together: slurm counts that limit per partition), else by its class."""
+    if service:
+        return Partition.SERVICE
     if not gpus:
         return Partition.CPU
     return Partition.NORMAL if job_class is JobClass.RESUME else Partition.STEADY
@@ -155,6 +158,7 @@ class QueuedJob:
     cpus: int = 0  # cores slurm gave it (asked, while it waits)
     level: Level = Level.NORMAL
     mem_mb: int | None = None  # slurm's memory request now (MB per node; 0 is the whole node), None when it gave none
+    cores: frozenset[str] = frozenset()  # "node:socket:core" slurm gave it; a suspended job keeps them for its resume
 
     @property
     def job_class(self) -> JobClass | None:
@@ -242,10 +246,19 @@ def parse_squeue(text: str) -> list[QueuedJob]:
                 str(raw["job_id"]), raw.get("partition", ""), state, raw.get("state_reason", ""), raw.get("name", ""),
                 raw.get("dependency", ""), raw.get("user_name", ""),
                 int(priority.get("number", 0)) if priority.get("set") else 0, parse_gpus(raw.get("tres_per_node") or ""),
-                cpus, level_of(str(raw.get("qos") or "")), _memory_mb(raw, cpus),
+                cpus, level_of(str(raw.get("qos") or "")), _memory_mb(raw, cpus), _cores(raw),
             )
         )
     return jobs
+
+
+def _cores(raw: dict) -> frozenset[str]:
+    """The cores slurm gave a job (`job_resources.allocated_nodes[].sockets.<s>.cores.<c>`, 23.11 --json)."""
+    found = set()
+    for node in (raw.get("job_resources") or {}).get("allocated_nodes") or []:
+        for socket, entry in (node.get("sockets") or {}).items():
+            found.update(f"{node.get('nodename')}:{socket}:{core}" for core in (entry.get("cores") or {}))
+    return frozenset(found)
 
 
 def held_back(job: QueuedJob, jobs: dict[str, QueuedJob], _seen: frozenset[str] = frozenset()) -> bool:
@@ -381,6 +394,83 @@ def job_of_cgroup(cgroup: str) -> str | None:
 
 def sidecar_path(job_id: str) -> Path:
     return STATE_DIR / "jobs" / f"{job_id}.json"
+
+
+#: Job states that hold their cores (a SUSPENDED job keeps only its memory and GPUs, and its cores for its resume).
+ON_CORES = frozenset({State.RUNNING, State.CONFIGURING, State.COMPLETING})
+
+
+def free_room(queue: list[QueuedJob], cpus: int, memory_mb: int) -> tuple[int, int | None]:
+    """(free cores, free memory MB) on a one-node site, from what its jobs hold. Memory is None (unknown) when a job's
+    is unknown or the whole node; a suspended job keeps its memory but not its cores."""
+    active = [job for job in queue if job.active]
+    sizes = [job.mem_mb for job in active]
+    free_mb = None if None in sizes or 0 in sizes else memory_mb - sum(s for s in sizes if s)
+    return cpus - sum(job.cpus for job in active if job.state in ON_CORES), free_mb
+
+
+@dataclass(frozen=True)
+class Room:
+    """What `plan_room` decides: jobs to suspend for `helping`, suspended jobs to resume."""
+
+    suspend: tuple[str, ...] = ()
+    resume: tuple[str, ...] = ()
+    helping: str | None = None
+
+
+def plan_room(
+    queue: list[QueuedJob], suspended: set[str], cpus: int, memory_mb: int, service_cores: int,
+    may_suspend: dict[str, frozenset[str] | None] | None = None, given_up: frozenset[str] = frozenset(),
+) -> Room:
+    """Room for service jobs on a one-node site of `cpus` cores and `memory_mb` (D20; the agent's step 3b, and
+    `submit.py --service --dry-run`).
+
+    Who gets it: the first service job (by priority, then id) waiting for `Resources` only (another reason, such as a
+    drained node or a limit, is not cores), not in `given_up`, that fits in the free memory (suspending frees none)
+    and in the partition's `service_cores`. Room comes from running cpu jobs, newest first, among those
+    `may_suspend[job]` allows (absent or None: any; empty: none, the owner's consent, D9), and only when they cover the
+    whole shortfall. Otherwise a suspended job is resumed, oldest first, once none of ITS cores is held by another job:
+    slurm resumes a job on the cores it had and does not check them (23.11 `_job_resume_test`; `job_resources.c`:
+    "resumed and it's allocated resources are already in use by some other job"); while a running job's cores are
+    unknown nothing is resumed. With memory unknown nobody is given room.
+    """
+    allowed = may_suspend or {}
+    free_cores, free_mb = free_room(queue, cpus, memory_mb)
+    service = Partition.SERVICE
+    service_free = service_cores - sum(j.cpus for j in queue if j.partition == service and j.state in ON_CORES)
+    waiting = sorted(
+        (j for j in queue if j.partition == service and j.waiting and j.reason == Reason.RESOURCES
+         and j.job_id not in given_up and j.cpus <= service_free
+         and free_mb is not None and j.mem_mb and j.mem_mb <= free_mb),
+        key=lambda j: (-j.priority, int(j.job_id)),
+    )
+    if waiting:
+        job = waiting[0]
+        short = job.cpus - free_cores
+        if short <= 0:
+            return Room()  # it fits: slurm starts it
+        consent = allowed.get(job.job_id)
+        running = sorted((j for j in queue if j.partition == Partition.CPU and j.state == State.RUNNING
+                          and (consent is None or j.job_id in consent)), key=lambda j: int(j.job_id), reverse=True)
+        picked, freed = [], 0
+        for victim in running:
+            if freed >= short:
+                break
+            picked.append(victim.job_id)
+            freed += victim.cpus
+        if freed >= short:
+            return Room(suspend=tuple(picked), helping=job.job_id)
+        # cannot be covered: what is suspended goes back (it would only add to the shortfall if kept)
+    on_cores = [j for j in queue if j.state in ON_CORES]
+    if any(not j.cores for j in on_cores):
+        return Room()  # whose cores a running job holds is unknown: resuming could land on them
+    busy = set().union(*(j.cores for j in on_cores))
+    resume = []
+    for job in sorted((j for j in queue if j.job_id in suspended), key=lambda j: int(j.job_id)):
+        if job.cores and not job.cores & busy:
+            resume.append(job.job_id)
+            busy |= job.cores
+    return Room(resume=tuple(resume))
 
 
 def read_sidecar(job_id: str, user: str | None = None) -> dict[str, object] | None:

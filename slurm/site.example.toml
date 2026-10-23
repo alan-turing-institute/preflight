@@ -54,6 +54,12 @@ python = "/opt/gpujobs/venv/bin/python"       # interpreter with localmodels ins
 [lease.services]
 # myservice = "yields within about 1 min"
 
+# Optional. A `service` partition for background services' CPU stand-ins (submit.py --service): started at once by
+# suspending CPU-only jobs, never touching GPU jobs. Leave the table out when no service has one.
+# [service]
+# cores = 4                    # per node, at most the cores CPU-only jobs may use (required)
+# group = "gpujobs-service"    # Unix group allowed to submit; install.py service add USER. Default: gpujobs-service
+
 [metrics]
 mode = "off"            # local (install Prometheus and Grafana here), external (use the URLs below), or off. Default: off
 prometheus_url = ""     # used when mode = "external". Default: empty

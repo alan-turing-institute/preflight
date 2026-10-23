@@ -55,6 +55,7 @@ def post_install(site) -> list[list[str]]:
     dirs += [["install", "-d", "-m", "0755", "-o", user, "-g", user, str(state / name)] for name in AGENT_ONLY]
     return [
         ["groupadd", "-f", site.admin_group],
+        *([["groupadd", "-f", site.service.group]] if site.service else []),
         *dirs,
         ["systemctl", "daemon-reload"],
         ["systemctl", "enable", UNIT],

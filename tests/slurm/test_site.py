@@ -36,6 +36,7 @@ def test_this_box_site_file_loads() -> None:
     gpu = site.nodes[0].gpus[0]
     assert (site.nodes[0].real_memory_mb, gpu.device, gpu.type) == (100000, "/dev/nvidia0", "gb10")
     assert set(site.lease.services) == {"service-a", "service-b", "service-c-app"}
+    assert site.service == gpujobs_site.Service(4, "gpujobs-service")
     assert site.lease.lease_dir == Path("/home/user1/.local/state/gpu-lease")
     assert (site.metrics.mode, site.metrics.grafana_port) == (gpujobs_site.MetricsMode.LOCAL, 3001)
     assert site.metrics.allow_from == ("100.64.0.0/10", "fd7a:115c:a1e0::/48", "192.0.2.8/32")  # Tailscale + NAS Caddy
@@ -61,6 +62,9 @@ def test_example_loads_and_minimal_file_gets_every_default(tmp_path: Path) -> No
     assert site.metrics.allow_from == ()
     assert site.nodes[0].gpus == ()
     assert site.cluster_name == site.name and site.account == "gpujobs"  # defaults
+    assert site.service is None  # no [service] table: no service partition
+    service = gpujobs_site.load(write(tmp_path, MINIMAL + "[service]\ncores = 2\n")).service
+    assert service == gpujobs_site.Service(2, "gpujobs-service")  # no cores held for GPUs: up to the node's cores
 
 
 @pytest.mark.parametrize(
@@ -79,6 +83,10 @@ def test_example_loads_and_minimal_file_gets_every_default(tmp_path: Path) -> No
         (MINIMAL + "cores_per_gpu = 1.5\n" + GPU, "cores_per_gpu must be"),  # would render MaxCPUsPerNode=0.5
         (MINIMAL + "cores_per_gpu = 2\n" + GPU, "must leave CPU-only jobs a core"),  # 2 of 2: CPU jobs could never run
         ("state_dir = 5\n" + MINIMAL, "has a value of the wrong kind"),
+        (MINIMAL + "cores_per_gpu = 1\n" + GPU + "[service]\ncores = 2\n", "service.cores = 2"),  # beyond the CPU pool
+        (MINIMAL + "[service]\ncores = 0\n", "service.cores = 0"),
+        (MINIMAL + "[[nodes]]\nname = 'm'\ncpus = 2\nreal_memory_mb = 1000\n[service]\ncores = 1\n", "a site of one node"),
+        (MINIMAL + "[service]\ncores = 1\ngroups = 'g'\n", "unknown key(s) in [service]: groups"),
     ],
 )
 def test_bad_site_files_are_refused(tmp_path: Path, text: str, fragment: str) -> None:

@@ -69,7 +69,7 @@ subtree) and tmpfs on `/run`, `/run/lock` and `/tmp`. The only host path mounted
 `run.sh e2e` installs every component into the container through the real installer from `harness.site.toml`, runs the
 scenarios below as alice, bob and carol, and exits 1 if any check failed. Each check prints `PASS` or `FAIL` with its evidence
 as it happens; the summary lists the failures and any `NOTE` (something that could not be exercised). `--only` takes
-`install,jobs,urgent,failure,recovery,portal,lease,host`; later stages need `install` to have run once on that cluster.
+`install,jobs,urgent,service,failure,recovery,portal,proxy,ssh,lease,host`; later stages need `install` to have run once on that cluster.
 
 Disk: the image stays 569 MB, but an installed container's writable layer grows to about 4 GB (Open OnDemand, Grafana,
 Prometheus, a Go toolchain, caches) in Docker's data root. `run.sh down` removes it; run it when you are done.

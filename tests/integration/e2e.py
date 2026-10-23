@@ -578,6 +578,63 @@ def stage_urgent() -> None:
     clear_queue()
 
 
+# -- stage: service --------------------------------------------------------------------------------------------------
+
+
+def stage_service() -> None:
+    section("service: a service's CPU stand-in starts at once by suspending a cpu job, never a GPU job (D20)")
+    clear_queue()
+    flags = ("--service", "--cpus", "2")
+    outsider = cl("gpujobs-submit", "--project", "e2e", "--what", "e2e outsider", "--class", "restart", "--mem", "200M",
+                  *flags, "--", *sleep_cmd(5), user="alice")
+    check("S20: alice, outside the service group, is refused by the tool (slurm would hold her job forever)",
+          outsider.rc != 0 and "only members of gpujobs-service" in outsider.text, outsider.text[-200:])
+    added = sh(f"{INSTALL} --site {SITE} service add bob")
+    capped = sh(f"scontrol update PartitionName=cpu MaxCPUsPerNode={CPU_CAP}")
+    counter = ["python3", "-c", "import time\nfor i in range(10**6):\n open('/tmp/e2e-frozen', 'w').write(str(i)); time.sleep(1)"]
+    count = lambda: int(sh("cat /tmp/e2e-frozen 2>/dev/null || echo -1").out.strip() or -1)  # noqa: E731
+    try:
+        c = submit("alice", "frozen", 0, "--cpus", "2", command=counter)
+        g = submit("alice", "gpu-untouched", 600, "--gpu", "--cpus", "2")
+        full = wait_for(lambda: state(c) == "RUNNING" and state(g) == "RUNNING", 90)
+        w = submit("alice", "waits", 600, "--cpus", "2")  # the cpu cap is full: it waits, and must not take the room
+        ask = cl("gpujobs-submit", "--project", "e2e", "--what", "e2e ask", "--class", "restart", "--mem", "200M", *flags,
+                 "--dry-run", "--", "true", user="bob")
+        line = ask.out.splitlines()[0] if ask.out else ""
+        told = json.loads(line.removeprefix("[submit] service room: ")) if line.startswith("[submit] service room: ") else {}
+        check("S20: bob's dry run names the cpu job a service job would suspend (D9: its user is asked first)",
+              told.get("starts") == "after_suspending" and [x.get("job") for x in told.get("suspends", [])] == [c],
+              ask.text[:300])
+        n = submit("bob", "no-consent", 25, *flags, "--no-suspend", cls="restart")
+        time.sleep(12)  # two agent steps
+        check("S20: with --no-suspend the service job waits and nothing is suspended",
+              state(n) == "PENDING" and state(c) == "RUNNING", f"{n} {state(n)}; cpu {c} {state(c)}")
+        sh(f"scancel {n}")
+        s = submit("bob", "standin", 25, *flags, "--suspend", c, cls="restart")  # the node's 4 cores are all taken
+        started = wait_for(lambda: state(s) == "RUNNING", 60)
+        frozen = wait_state(c, "SUSPENDED", 30)
+        time.sleep(3)  # slurm sends SIGTSTP, then SIGSTOP 2 s later (suspend_grace_time): the counter may tick once
+        before = count()
+        time.sleep(5)
+        check("S20: bob, just added (install.py service add, no wait), starts a service job at once on a full node: the "
+              "agent suspends alice's cpu job (its counter stops), holds her waiting one, and her GPU job keeps running",
+              added.rc == 0 and capped.rc == 0 and bool(full) and bool(started) and frozen and before == count() >= 0
+              and state(g) == "RUNNING" and jobinfo(s).get("Partition") == "service" and priority(w) == 0,
+              f"add rc={added.rc} {added.text[-120:]}; standin {s} {state(s)} ({jobinfo(s).get('Reason')}); cpu {c} "
+              f"{state(c)} counter {before}->{count()}; gpu {g} {state(g)}; waiting {w} {state(w)} priority {priority(w)}")
+        ended = wait_state(s, "COMPLETED", 90)
+        resumed = wait_state(c, "RUNNING", 60)
+        time.sleep(4)
+        after = count()
+        released = wait_for(lambda: priority(w) > 0, 30)
+        check("S20: when the stand-in ends the agent resumes the cpu job, which lost nothing (its counter carries on), and "
+              "releases the waiting one", ended and resumed and after > before and bool(released),
+              f"standin {state(s)}; cpu {state(c)} counter {before}->{after}; waiting {w} priority {priority(w)}")
+    finally:
+        sh("scontrol update PartitionName=cpu MaxCPUsPerNode=UNLIMITED")
+        clear_queue()
+
+
 # -- stage: failure ------------------------------------------------------------------------------------------------
 
 
@@ -1046,6 +1103,7 @@ STAGES: dict[str, Callable[[], None]] = {
     "install": stage_install,
     "jobs": stage_jobs,
     "urgent": stage_urgent,
+    "service": stage_service,
     "failure": stage_failure,
     "recovery": stage_recovery,
     "portal": stage_portal,

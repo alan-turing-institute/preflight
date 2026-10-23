@@ -52,6 +52,8 @@ EXPECTED_DIFF = {
         "+# Never pre-empted by slurm; urgent.py requeues a resume-class job in its way itself.",
         "+PartitionName=cpu Nodes=gpu-node-1 PriorityTier=1 PreemptMode=OFF MaxTime=INFINITE State=UP MaxCPUsPerNode=8",
         "+PartitionName=urgent Nodes=gpu-node-1 PriorityTier=2 PreemptMode=OFF MaxTime=INFINITE State=UP AllowGroups=gpujobs-admin",
+        "+# service: background services' CPU stand-ins (submit.py --service); the agent suspends cpu jobs to make room.",
+        "+PartitionName=service Nodes=gpu-node-1 PriorityTier=1 PreemptMode=REQUEUE MaxTime=INFINITE State=UP MaxCPUsPerNode=4 AllowGroups=gpujobs-service,gpujobs-admin",
     ],
     "gres.conf": [
         "-# The GB10's one GPU as a schedulable token. Its memory is system RAM (unified), so no memory is declared here.",
@@ -127,3 +129,10 @@ def test_eight_gpu_site_and_extra_slot():
     assert "AllowGroups=ops" in conf
     assert conf.count(" MaxCPUsPerNode=32\n") == 1  # 64 cores less 4 held for each of 8 GPUs, on the one cpu partition
     assert conf.endswith("State=UP AllowGroups=ops\nProlog=/x\n")
+    assert "PartitionName=service" not in conf  # no [service]: as before
+    # with one (D20): only the service partition is added; slurm's pre-emption and every other partition stay as they are
+    served = render.render(site_config.parse({**raw, "service": {"cores": 4}}), "slurm")["/etc/slurm/slurm.conf"].content
+    added = [line for line in served.splitlines() if line not in conf.splitlines()]
+    assert len(added) == 2 and added[1].startswith("PartitionName=service ")
+    assert added[1].endswith(" PriorityTier=1 PreemptMode=REQUEUE MaxTime=INFINITE State=UP MaxCPUsPerNode=4 "
+                             "AllowGroups=gpujobs-service,ops")

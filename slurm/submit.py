@@ -5,7 +5,15 @@ Design 3.3 (`design notes`).
 
     slurm/submit.py --project P --what 'one line' --class resume|restart [--mem 24G|auto] [--gpu|--gpus N] \
         [--entry script.py --repo DIR] [--after JOBID]... [--cpus N] [--name NAME] [--log FILE] \
-        [--workdir DIR] [--wait-limit 1h] [--resume-ok] [--level low|normal|high] -- <command...>
+        [--workdir DIR] [--wait-limit 1h] [--resume-ok] [--level low|normal|high] [--service] -- <command...>
+
+SERVICE (D20, sites with `[service]`): `--service` runs a background service's CPU stand-in in the `service` partition
+(`--mem` required). When cores are short the agent suspends CPU-only jobs for it within seconds (they keep their memory,
+lose nothing and are resumed when it has gone); it never touches a GPU job, never waits for the card, and waits when
+memory is short. Which jobs it may suspend is its owner's consent (D9): `--suspend J[,J]` only those, `--no-suspend`
+none, neither any. With `--dry-run` the first line is `[submit] service room: {json}`: `starts` (`now`,
+`after_suspending` or `waits`), `suspends` ([{job, user, name, what}]) and `why`. Only the site's service group and
+admins may use it.
 
 MEMORY: `--mem` is optional. Without it (or with `auto`) a job given `--name` asks for that name's newest measured
 run plus 10%; with no measured run (or no `--name`) a GPU job asks for the whole box, a CPU job for slurm's default.
@@ -34,8 +42,10 @@ requeued job keeps its first leg's log). The job name is `P:class:NAME`.
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
+import pwd
 import re
 import shlex
 import shutil
@@ -153,7 +163,9 @@ def sbatch_script(
     level (its partition goes first whatever the level)."""
     label = arguments.job_class
     level = getattr(arguments, "level", None) or gpu_jobs.Level.NORMAL
-    partition = partition or gpu_jobs.partition_for(gpu_jobs.JobClass(label), arguments.gpus)
+    partition = partition or gpu_jobs.partition_for(
+        gpu_jobs.JobClass(label), arguments.gpus, service=getattr(arguments, "service", False)
+    )
     lines = [
         "#!/bin/bash",
         f"#SBATCH --partition={partition}",
@@ -236,6 +248,12 @@ def parser() -> argparse.ArgumentParser:
         default=1,
         help="GPU jobs allowed on the card, this one included; above 1 only against a measured sharing result",
     )
+    p.add_argument("--service", action="store_true",
+                   help="a background service's CPU stand-in: starts at once by suspending CPU-only jobs (D20)")
+    consent = p.add_mutually_exclusive_group()
+    consent.add_argument("--suspend", default=None, metavar="J[,J]",
+                         help="with --service: the only jobs it may suspend (their owner's consent, D9)")
+    consent.add_argument("--no-suspend", action="store_true", help="with --service: suspend nothing; wait instead")
     p.add_argument("--dry-run", action="store_true", help="print the sbatch script and submit nothing")
     p.add_argument("command", nargs=argparse.REMAINDER)
     return p
@@ -268,8 +286,31 @@ def submit(argv: list[str]) -> str:
         raise Refused(msg)
     seconds(arguments.wait_limit)
     mem = resolve_mem(arguments.mem, named, arguments.gpu)
+    named_cpus = arguments.cpus
     arguments.cpus = resolve_cpus(arguments.cpus, arguments.gpus, site)
-    if not arguments.gpus and site.cpu_job_cap and arguments.cpus > site.cpu_job_cap:
+    if arguments.service:
+        if arguments.gpus:
+            msg = "--service runs a CPU stand-in: no --gpu or --gpus"
+            raise Refused(msg)
+        if site.service is None:
+            msg = "--service: this site has no service partition (no [service] table in the site file)"
+            raise Refused(msg)
+        if arguments.mem in (None, "auto"):
+            msg = "--service needs --mem: whether it fits beside what runs is judged by it (suspending frees no memory)"
+            raise Refused(msg)
+        if not site_config.may_submit_service(site, pwd.getpwuid(os.getuid()).pw_name):
+            msg = (f"--service: only members of {site.service.group} may use it (slurm would hold the job forever); "
+                   "an admin adds you with: sudo slurm/install/install.py service add USER")
+            raise Refused(msg)
+        if named_cpus is None:  # the default fits under the cap, as a CPU-only job's does
+            arguments.cpus = min(DEFAULT_CPUS, site.service.cores)
+        if arguments.cpus > site.service.cores:
+            msg = f"--cpus {arguments.cpus}: a service job may use at most {site.service.cores} cores here"
+            raise Refused(msg)
+    elif arguments.suspend is not None or arguments.no_suspend:
+        msg = "--suspend and --no-suspend go with --service only"
+        raise Refused(msg)
+    elif not arguments.gpus and site.cpu_job_cap and arguments.cpus > site.cpu_job_cap:
         msg = (f"--cpus {arguments.cpus}: a job without GPUs may use at most {site.cpu_job_cap} cores here; the rest "
                "are held for GPU jobs (cores_per_gpu in the site file)")
         raise Refused(msg)
@@ -277,8 +318,11 @@ def submit(argv: list[str]) -> str:
     log = arguments.log or gpu_jobs.STATE_DIR / "logs" / f"{arguments.name}-{stamp}.log"
     gated = bool(arguments.entry) and site.dgx_gate
     manifest = gpu_jobs.STATE_DIR / "manifests" / f"{arguments.name}-{stamp}.json" if gated else None
+    consent = may_suspend(arguments) if arguments.service else None
     script = sbatch_script(arguments, mem=mem, log=log, manifest=manifest)
     if arguments.dry_run:
+        if arguments.service:
+            print(f"[submit] service room: {json.dumps(service_room(site, arguments.cpus, gpu_jobs.mem_mb(mem), consent))}")
         return script
     require_keeper(site)
     for job_id in arguments.after:
@@ -317,17 +361,68 @@ def submit(argv: list[str]) -> str:
         after=arguments.after,
         max_jobs=arguments.max_jobs,
         submitted_at=int(time.time()),
+        **({"may_suspend": None if consent is None else sorted(consent)} if arguments.service else {}),
     )
-    partition = gpu_jobs.partition_for(gpu_jobs.JobClass(arguments.job_class), arguments.gpus)
+    partition = gpu_jobs.partition_for(gpu_jobs.JobClass(arguments.job_class), arguments.gpus, service=arguments.service)
     pauses = {
         gpu_jobs.Partition.NORMAL: "pre-empted and resumed from its checkpoint",
         gpu_jobs.Partition.STEADY: "never pre-empted",
+        gpu_jobs.Partition.SERVICE: "the agent suspends CPU-only jobs it may to make room; requeued for urgent work",
     }.get(partition) or (
         "requeued for urgent work and resumed from its checkpoint" if arguments.job_class == gpu_jobs.JobClass.RESUME
         else "never pre-empted"
     )
     print(f"[submit] job {job_id} ({partition}: {pauses}); log {log}")
     return job_id
+
+
+def may_suspend(arguments: argparse.Namespace) -> frozenset[str] | None:
+    """The jobs a service job may suspend: `--suspend`'s, none for `--no-suspend`, any (None) without either."""
+    if arguments.no_suspend:
+        return frozenset()
+    if arguments.suspend is None:
+        return None
+    ids = [j.strip() for j in arguments.suspend.split(",") if j.strip()]
+    if not ids or not all(j.isdigit() for j in ids):
+        msg = f"--suspend {arguments.suspend!r}: job ids, comma-separated"
+        raise Refused(msg)
+    return frozenset(ids)
+
+
+#: The id `service_room` gives the job it is asked about: past any real one, so it is judged last among equals.
+_ASKING = "999999999"
+
+
+def service_room(site: site_config.Site, cpus: int, memory_mb: int, consent: frozenset[str] | None) -> dict[str, object]:
+    """What a `--service` job submitted now would meet (D20; the agent decides with the same `gpu_jobs.plan_room`).
+    The queue moves on: a submission made later may meet another, which `consent` bounds."""
+    queue = gpu_jobs.read_queue()
+    if queue is None:
+        return {"starts": "waits", "suspends": [], "why": "slurm does not answer"}
+    node, service = site.nodes[0], site.service
+    asking = gpu_jobs.QueuedJob(_ASKING, gpu_jobs.Partition.SERVICE, gpu_jobs.State.PENDING, gpu_jobs.Reason.RESOURCES,
+                                "asking", priority=2**32, cpus=cpus, mem_mb=memory_mb)
+    room = gpu_jobs.plan_room([*queue, asking], set(), node.cpus, node.real_memory_mb, service.cores, {_ASKING: consent})
+    by_id = {job.job_id: job for job in queue}
+    if room.helping == _ASKING:
+        return {"starts": "after_suspending", "why": "cores are short; these cpu jobs are suspended until it has gone",
+                "suspends": [{"job": j, "user": by_id[j].user, "name": by_id[j].name,
+                              "what": str((gpu_jobs.read_sidecar(j, by_id[j].user) or {}).get("what") or "")}
+                             for j in room.suspend]}
+    free_cores, free_mb = gpu_jobs.free_room(queue, node.cpus, node.real_memory_mb)
+    service_free = service.cores - sum(j.cpus for j in queue
+                                       if j.partition == gpu_jobs.Partition.SERVICE and j.state in gpu_jobs.ON_CORES)
+    if free_mb is None:
+        why = "a job holds the whole machine's memory (or one of unknown size runs); suspending frees no memory"
+    elif memory_mb > free_mb:
+        why = f"memory: it needs {memory_mb} MB and {free_mb} MB are free; suspending frees no memory"
+    elif cpus > service_free:
+        why = f"other service jobs use {service.cores - service_free} of the service partition's {service.cores} cores"
+    elif cpus > free_cores:
+        why = f"cores: {free_cores} free, and the cpu jobs it may suspend cannot free the other {cpus - free_cores}"
+    else:
+        return {"starts": "now", "suspends": [], "why": "it fits beside what runs"}
+    return {"starts": "waits", "suspends": [], "why": why}
 
 
 def main() -> int:
