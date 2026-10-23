@@ -11,6 +11,12 @@ async function refreshLive() {
     const reply = await fetch(location.href, { headers: { Accept: "text/html" }, cache: "no-store" });
     if (!reply.ok) throw new Error(String(reply.status));
     const fresh = new DOMParser().parseFromString(await reply.text(), "text/html");
+    // new code was installed: only the live parts are swapped below, so the page's own stylesheet would stay the old one
+    const sheet = 'link[rel="stylesheet"]';
+    if (fresh.querySelector(sheet)?.getAttribute("href") !== document.querySelector(sheet)?.getAttribute("href")) {
+      location.reload();
+      return;
+    }
     for (const part of document.querySelectorAll("[data-live]")) {
       const next = fresh.querySelector('[data-live="' + part.dataset.live + '"]');
       if (next) part.replaceChildren(...next.childNodes);

@@ -22,6 +22,11 @@ sbatch script whose only line runs this wrapper. In order:
    (`metrics/job_<id>.prom`) is not written here: the wrapper runs as the job's user, and only the agent may write
    that directory, so the agent measures the same numbers itself.
 5. RECORD the leg's outcome in the job's sidecar (exit status, signal, restart count, peaks).
+6. A KILL BY THE HOST'S OOM GUARD is not a finished run. The guard signals a process of the job directly, not through
+   slurm, and a training loop that catches SIGTERM exits 0 (2026-10-22: job 428 was recorded COMPLETED at 14.6 of
+   23.5 h and its afterok chain started). The agent records each such kill (`agent/oom_kills/`); when the command ended
+   without slurm having signalled the wrapper and such a record names this leg, the job ends KILLED_FOR_MEMORY, and a
+   `resume` job is first requeued (`scontrol requeue`, its owner's right), at most KILLED_LEGS_LIMIT legs in a row.
 """
 
 from __future__ import annotations
@@ -61,6 +66,18 @@ class Exit(IntEnum):
     NO_COMMAND = 2
     CARD_NOT_READY = 3  # the wait limit passed
     CODE_CHANGED = 4  # the manifest re-check failed
+    KILLED_FOR_MEMORY = 5  # the host's OOM guard killed the run, whatever the command's own exit status
+
+
+#: After the command ends, how long to wait for the agent's record of an OOM-guard kill. The agent writes it as the
+#: guard signals, before the process has exited, so it is normally there already.
+KILL_RECORD_WAIT_S = 3.0
+#: A kill of a process other than the command itself (a data-loader worker, say) counts only if the command ended this
+#: soon after it: the guard's own wait for the process (10 s), slurm's KillWait to save a checkpoint (120 s), and room.
+KILL_WINDOW_S = 180.0
+#: A `resume` job killed this many legs in a row fails instead of being requeued again: slurm's MaxBatchRequeue covers
+#: only failed launches, so a memory shortage that persists would otherwise requeue it for ever.
+KILLED_LEGS_LIMIT = 3
 
 
 def foreign_gpu_processes(own_pids: set[int], output: str | None = None) -> list[tuple[int, str]] | None:
@@ -224,10 +241,67 @@ def run_and_measure(
     final = read_int(cgroup / "memory.peak") if cgroup else None
     return {
         "exit": status,
+        "pid": child.pid,
         "signals": [signal.Signals(s).name for s in received],
         "peak_gpu_mib": peak_gpu,
         "peak_mem_bytes": max(peak_mem, final or 0),
     }
+
+
+def guard_kill(
+    job_id: str,
+    started: float,
+    ended: float,
+    child_pid: int,
+    *,
+    read: Callable[[Path], dict[str, object] | None] = gpu_jobs.read_json,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> dict[str, object] | None:
+    """The agent's record of the OOM guard killing this leg's command, waiting up to KILL_RECORD_WAIT_S for it; None
+    when there is none. A record from an earlier leg, or of a worker killed long before the command ended, is not one."""
+
+    def counts(record: dict[str, object] | None) -> bool:
+        if not isinstance(record, dict) or record.get("job") != job_id or not isinstance(record.get("at"), int | float):
+            return False
+        at = float(record["at"])  # type: ignore[arg-type]
+        return started - 1 <= at <= ended + 1 and (record.get("pid") == child_pid or ended - at <= KILL_WINDOW_S)
+
+    deadline = clock() + KILL_RECORD_WAIT_S
+    while True:
+        record = read(gpu_jobs.oom_kill_path(job_id))
+        if counts(record):
+            return record
+        if clock() >= deadline:
+            return None
+        sleep(0.25)
+
+
+def after_kill(job_id: str, kill: dict[str, object], legs: list[object], job_name: str, run=gpu_jobs.run_slurm) -> int:
+    """Say the run was killed; requeue a `resume` job unless its last KILLED_LEGS_LIMIT legs were all killed."""
+    in_a_row = 0
+    for leg in reversed(legs):
+        if not (isinstance(leg, dict) and leg.get("killed_by")):
+            break
+        in_a_row += 1
+    print(f"[job] KILLED: {kill.get('guard')} sent {kill.get('signal')} to pid {kill.get('pid')} to free memory; the run "
+          "did not finish, whatever the command's exit status", file=sys.stderr, flush=True)
+    if gpu_jobs.class_of(job_name) is not gpu_jobs.JobClass.RESUME:
+        print("[job] not a resume job: it fails, and the jobs that wait on it are cancelled", file=sys.stderr, flush=True)
+    elif in_a_row >= KILLED_LEGS_LIMIT:
+        print(f"[job] killed {in_a_row} runs in a row: it fails instead of being requeued again", file=sys.stderr, flush=True)
+    elif _requeued(run, job_id):
+        print("[job] requeued: it starts again from its checkpoint, and the jobs that wait on it keep waiting", flush=True)
+    else:
+        print("[job] slurm refused the requeue: the job fails", file=sys.stderr, flush=True)
+    return Exit.KILLED_FOR_MEMORY
+
+
+def _requeued(run: Callable[[list[str]], int], job_id: str) -> bool:
+    try:
+        return run(["scontrol", "requeue", job_id]) == 0
+    except OSError:  # no scontrol here
+        return False
 
 
 def main() -> int:
@@ -298,13 +372,18 @@ def main() -> int:
 
         mark_preferred_victim()
     outcome = run_and_measure(command, footprint, cgroup, arguments.sample, job_id)
-    outcome.update(leg=restart, started_at=started, ended_at=int(time.time()))
+    ended = int(time.time())
+    # slurm's own SIGTERM (pre-emption, cancel, time limit) ends the job its own way; only an unforwarded one is a kill
+    killed = None if outcome["signals"] else guard_kill(job_id, started, ended, int(outcome["pid"]))  # type: ignore[call-overload]
+    outcome.update(leg=restart, started_at=started, ended_at=ended, **({"killed_by": killed} if killed else {}))
     record = gpu_jobs.read_sidecar(job_id, gpu_jobs.current_user()) or {}
     earlier = record.get("legs")
     legs = [*(earlier if isinstance(earlier, list) else []), outcome]
     best_effort("sidecar", lambda: gpu_jobs.update_sidecar(job_id, legs=legs, last_leg=outcome))
     print(f"[job] exit {outcome['exit']}; signals {outcome['signals']}; peak GPU {outcome['peak_gpu_mib']:.0f} MiB",
           flush=True)
+    if killed:
+        return after_kill(job_id, killed, legs, os.environ.get("SLURM_JOB_NAME", ""))
     status = int(outcome["exit"])
     return status if status >= 0 else 128 - status
 

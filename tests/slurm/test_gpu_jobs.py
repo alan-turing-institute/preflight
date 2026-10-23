@@ -152,9 +152,10 @@ def test_parse_squeue_reads_json_so_a_name_cannot_forge_a_row() -> None:
     forged = "x\n999|normal|PENDING|None||bob|9999|N/A|y"
     text = squeue_json(
         {"job_id": 12, "job_state": ["RUNNING"], "priority": {"set": True, "number": 4001}, "tres_per_node": "gres/gpu:2",
-         "name": forged, "qos": "high"},
+         "name": forged, "qos": "high", "memory_per_node": {"set": True, "number": 61440}},
         {"job_id": 13, "job_state": ["COMPLETED"]},  # squeue --json ignored -t: finished jobs are dropped here
-        {"job_id": 14, "priority": {"set": False, "number": 7}, "state_reason": "JobHeldUser", "qos": "staff"},
+        {"job_id": 14, "priority": {"set": False, "number": 7}, "state_reason": "JobHeldUser", "qos": "staff",
+         "cpus": {"number": 4}, "memory_per_node": {"set": False, "number": 0}, "memory_per_cpu": {"set": True, "number": 2048}},
         # Still saving after a pause (requeued) or a kill: COMPLETING is a flag after the base state in JSON.
         {"job_id": 15, "job_state": ["PENDING", "COMPLETING"]},
         {"job_id": 16, "job_state": ["CANCELLED", "COMPLETING"]},
@@ -163,11 +164,27 @@ def test_parse_squeue_reads_json_so_a_name_cannot_forge_a_row() -> None:
     assert (running.job_id, running.user, running.priority, running.gpus, running.name) == ("12", "ann", 4001, 2, forged)
     assert (held.job_id, held.priority, held.held) == ("14", 0, True)
     assert (running.level, held.level) == (Level.HIGH, Level.NORMAL)  # an admin's own QOS counts as normal
+    # slurm's memory request as it stands (a later `scontrol update` shows), per cpu times cores, None when it gave none
+    assert (running.mem_mb, held.mem_mb, paused.mem_mb) == (61440, 8192, None)
     assert [(j.job_id, j.state, j.active) for j in (paused, killed)] == [("15", "COMPLETING", True), ("16", "COMPLETING", True)]
     old = QueuedJob("1", "normal", "PENDING", "Priority", "n", "afterok:3(unfulfilled)")
     assert (old.user, old.priority, old.gpus, old.depends_on) == ("", 0, 0, ("3",))
     with pytest.raises(ValueError):
         gpu_jobs.parse_squeue("12|normal|RUNNING|None||ann|1|N/A|n")
+
+
+def test_machine_use_reads_this_host_and_capacity_says_whether_this_host_is_the_node() -> None:
+    proc = {"/proc/meminfo": "MemTotal: 1000 kB\nMemFree: 100 kB\nMemAvailable: 400 kB\n",
+            "/proc/stat": iter(["cpu  10 0 10 70 10 0 0 0 0 0\n", "cpu  40 0 10 100 10 0 0 0 0 0\n"])}
+    use = gpu_jobs.machine_use(lambda path: proc[path] if isinstance(proc[path], str) else next(proc[path]), lambda _s: None)
+    cores = os.cpu_count()
+    assert use == {"mem_total": 1000 * 1024, "mem_used": 600 * 1024, "cores": cores, "cores_busy": cores * 30 / 60}
+    assert gpu_jobs.machine_use(lambda _path: "", lambda _s: None) == {}  # unreadable is unknown, never zero
+    here = os.uname().nodename.split(".")[0]
+    nodes = f"NodeName={here} CPUTot=20 CPUAlloc=12 RealMemory=100000 AllocMem=61440 CfgTRES=gres/gpu=1 AllocTRES=gres/gpu=1\n"
+    one = gpu_jobs.capacity(lambda *_a, **_k: subprocess.CompletedProcess([], 0, nodes))
+    two = gpu_jobs.capacity(lambda *_a, **_k: subprocess.CompletedProcess([], 0, nodes.replace(here, "elsewhere") + nodes))
+    assert (one["nodes"], one["here"], one["mem_used_mb"], two["nodes"], two["here"]) == (1, 1, 61440, 2, 1)
 
 
 def test_a_level_always_wins_then_the_earlier_job_and_every_placed_priority_is_above_slurms_own() -> None:

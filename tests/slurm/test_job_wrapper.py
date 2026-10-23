@@ -218,3 +218,42 @@ def test_a_lease_less_site_never_waits_for_a_keeper_that_does_not_exist(
     assert done.returncode == code, done.stderr
     record = json.loads((tmp_path / "state" / "jobs" / "80.json").read_text())
     assert ("refused" in record["last_leg"]) is refused
+
+
+KILLED = """
+import json, os, pathlib, sys, time
+record = pathlib.Path(sys.argv[1])  # the agent's record, as it writes it when earlyoom names this process
+record.parent.mkdir(parents=True)
+record.write_text(json.dumps({"job": "78", "pid": os.getpid(), "signal": "SIGTERM", "at": time.time(), "guard": "earlyoom.service"}))
+sys.exit(0)  # Lightning ends a SIGTERMed fit with exit 0 (job 428, 2026-10-22)
+"""
+
+
+def test_a_run_the_oom_guard_killed_fails_or_is_requeued_never_passes(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    env = dict(os.environ, SLURM_GPU_STATE_DIR=str(state), SLURM_JOB_ID="78", SLURM_JOB_NAME="p:restart:x")
+    record = state / "agent" / "oom_kills" / "job_78.json"
+    done = subprocess.run([sys.executable, str(WRAPPER), "--sample", "0.2", "--", sys.executable, "-c", KILLED, str(record)],
+                          env=env, capture_output=True, text=True, check=False)
+    assert done.returncode == job_wrapper.Exit.KILLED_FOR_MEMORY, done.stderr
+    assert "KILLED" in done.stderr and "not a resume job" in done.stderr
+    assert json.loads((state / "jobs" / "78.json").read_text())["last_leg"]["killed_by"]["pid"] > 0
+
+    # which records count: this leg's, of the command itself or of a worker killed shortly before the command ended
+    kill = {"job": "78", "pid": 5, "at": 1000.0}
+    clock = iter(range(100)).__next__
+
+    def found(record: dict, ended: float = 1010.0) -> bool:
+        return job_wrapper.guard_kill("78", 900.0, ended, 5, read=lambda _p: record, clock=clock, sleep=lambda _s: None) is not None
+
+    assert found(kill) and found({**kill, "pid": 6}) and not found({**kill, "pid": 6}, 1000.0 + job_wrapper.KILL_WINDOW_S + 1)
+    assert not found({**kill, "at": 800.0}) and not found({**kill, "job": "79"})  # an earlier leg's, another job's
+
+    # a resume job is requeued, until it has been killed KILLED_LEGS_LIMIT legs in a row
+    ran: list[list[str]] = []
+    legs = [{"exit": 0}, *[{"killed_by": kill}] * (job_wrapper.KILLED_LEGS_LIMIT - 1)]
+    assert job_wrapper.after_kill("78", kill, legs, "p:resume:x", lambda argv: ran.append(argv) or 0) == 5
+    assert ran == [["scontrol", "requeue", "78"]]
+    job_wrapper.after_kill("78", kill, [*legs, {"killed_by": kill}], "p:resume:x", lambda argv: ran.append(argv) or 0)
+    job_wrapper.after_kill("78", kill, [{"killed_by": kill}], "p:restart:x", lambda argv: ran.append(argv) or 0)
+    assert len(ran) == 1

@@ -24,7 +24,8 @@ MOUNT = "/pun/sys/gpujobs"  # where OOD serves the app (Passenger's SCRIPT_NAME)
 
 
 def queued(job_id: str, user: str, name: str = "proj:normal:train", partition: str = "normal") -> gpu_jobs.QueuedJob:
-    return gpu_jobs.QueuedJob(job_id, partition, "RUNNING", "None", name, user=user, gpus=1)
+    # 60 GiB: slurm's request, after an `scontrol update` the record's "4G" never saw
+    return gpu_jobs.QueuedJob(job_id, partition, "RUNNING", "None", name, user=user, gpus=1, mem_mb=61440)
 
 
 class Fake:
@@ -56,7 +57,9 @@ class Fake:
             finished=lambda _j: None,
             now=lambda: datetime(2026, 10, 19, 12, 0),  # noqa: DTZ001 - local, like the times sacct prints
             project_order=lambda: ["proj"],
-            capacity=lambda: {"cpus": 20, "cpus_used": 8, "mem_mb": 102400, "mem_used_mb": 65536, "gpus": 1, "gpus_used": 1},
+            capacity=lambda: {"cpus": 20, "cpus_used": 8, "mem_mb": 102400, "mem_used_mb": 65536, "gpus": 1, "gpus_used": 1,
+                              "nodes": 1, "here": 1},
+            machine=lambda: {"mem_total": 120 * 1024**3, "mem_used": 110 * 1024**3, "cores": 20, "cores_busy": 3.0},
             gpu_busy=lambda: 0.37,
         )
         self.application = app.make_application(self.backend)
@@ -104,13 +107,20 @@ def test_every_get_route_answers(path: str) -> None:
     if path == "/":  # both jobs hold a GPU; a CPU-only job running beside them is not said to be on it
         assert "On the GPU now" in body and "on the GPU now" in body
         assert (app._running_note(2, 0), app._running_note(2, 1)) == ("none on the GPU", "1 on the GPU")
-        assert "37% busy" in body and "1 of 1 given to jobs" in body  # how busy, not only whether it is given
-        assert "8 of 20" in body and "12 free" in body and "64 of 100 GB" in body and "36 GB free" in body
-        assert "of 4 GB asked" in body  # in the same units as the memory it uses
+        # each resource as reserved by jobs (of what slurm can give) beside really in use (of the whole machine), in GB
+        assert "Reserved by jobs" in body and "1 of 1" in body and "37%" in body
+        assert "8 of 20" in body and "3.0 of 20" in body and "12 left to reserve" in body
+        assert "68.7 of 107.4 GB" in body and "38.7 GB left to reserve" in body
+        assert "118.1 of 128.8 GB" in body and "10.7 GB available" in body
+        assert "GiB" not in body and "MiB" not in body and "memory in use" not in body.split('class="card box"')[0]
+        assert body.count("used warn") == 1 and "fill warn" not in body  # only real memory in use warns; a full reservation or a busy GPU does not
+        assert "64.4 GB</td>" in body  # slurm's request now (60 x 2^30 bytes), not the record's 4G
         # who queued each job, and its level, at every width (not hide-sm)
         assert '<td class="inline" data-k="user">alice</td>' in body and '<td class="inline" data-k="level"><span class="pill level-normal"' in body
-        quiet = app._resource_tiles({"cpus": 1, "cpus_used": 0, "mem_mb": 1024, "mem_used_mb": 0, "gpus": 1, "gpus_used": 1}, [])
-        assert quiet.count("1 of 1") == 1 and "busy" not in quiet  # nvidia-smi silent: given once, not in value and note
+        # nvidia-smi and /proc read the portal's own host: no in-use bar unless that host is slurm's one node
+        elsewhere = app._resource_tiles({"cpus": 1, "cpus_used": 0, "mem_mb": 1024, "mem_used_mb": 0, "gpus": 1, "gpus_used": 1,
+                                         "nodes": 1, "here": 0}, [], 0.5, {"mem_total": 1, "mem_used": 1, "cores": 1, "cores_busy": 1})
+        assert "Reserved by jobs" in elsewhere and "Busy" not in elsewhere and "In use" not in elsewhere
 
 
 def test_unknown_things_are_not_found_or_bad() -> None:
@@ -200,4 +210,5 @@ def test_buttons_follow_can_act(viewer: str, admin: bool, shown: bool) -> None:
     assert 'data-action="resume"' not in page  # job 7 runs: nothing to resume
     assert "/pun/sys/jobstats/7" in page
     # links are absolute from the mount: opened without its trailing slash, the page still finds its stylesheet
-    assert f'href="{MOUNT}/static/app.css"' in page
+    # and asks for it by the installed files' version, so a browser holding an older copy fetches the new one
+    assert f'href="{MOUNT}/static/app.css?v={app._assets_version()}"' in page

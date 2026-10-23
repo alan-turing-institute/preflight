@@ -78,6 +78,15 @@ class JobClass(StrEnum):
     RESTART = "restart"
 
 
+def class_of(name: str) -> JobClass | None:
+    """The class `submit.py` put in a job name (`project:class:name`); None for a job it did not submit."""
+    try:
+        _, label, _ = name.split(":", 2)
+    except ValueError:
+        return None
+    return JobClass(label) if label in set(JobClass) else None
+
+
 def partition_for(job_class: JobClass, gpus: int) -> Partition:
     """The partition a job runs in: one without GPUs in `cpu` (one partition, so its MaxCPUsPerNode caps all CPU-only
     jobs together: slurm counts that limit per partition), else by its class."""
@@ -145,15 +154,11 @@ class QueuedJob:
     gpus: int = 0
     cpus: int = 0  # cores slurm gave it (asked, while it waits)
     level: Level = Level.NORMAL
+    mem_mb: int | None = None  # slurm's memory request now (MB per node; 0 is the whole node), None when it gave none
 
     @property
     def job_class(self) -> JobClass | None:
-        """The class `submit.py` put in the name (`project:class:name`); None for a job it did not submit."""
-        try:
-            _, label, _ = self.name.split(":", 2)
-        except ValueError:
-            return None
-        return JobClass(label) if label in set(JobClass) else None
+        return class_of(self.name)
 
     @property
     def restarts(self) -> bool:
@@ -192,6 +197,26 @@ def parse_gpus(gres: str) -> int:
     return total
 
 
+def mem_mb(text: str) -> int:
+    """slurm memory notation (`24G`, `512M`, plain megabytes) in megabytes."""
+    scale = {"K": 1 / 1024, "M": 1, "G": 1024, "T": 1024 * 1024}
+    unit = text[-1].upper()
+    return int(float(text[:-1]) * scale[unit]) if unit in scale else int(text)
+
+
+def _number(value: object) -> int | None:
+    """A slurm JSON number (`{"set": true, "number": N}`); None when it is not set."""
+    return int(value.get("number") or 0) if isinstance(value, dict) and value.get("set") else None
+
+
+def _memory_mb(raw: dict[str, object], cpus: int) -> int | None:
+    """The job's memory request as slurm holds it now, so a later `scontrol update MinMemoryNode=` shows."""
+    per_node, per_cpu = _number(raw.get("memory_per_node")), _number(raw.get("memory_per_cpu"))
+    if per_node is not None:
+        return per_node
+    return per_cpu * cpus if per_cpu is not None else None
+
+
 def parse_squeue(text: str) -> list[QueuedJob]:
     """The unfinished jobs in `squeue --json` output; raises ValueError when it is not that.
 
@@ -211,12 +236,13 @@ def parse_squeue(text: str) -> list[QueuedJob]:
         if state not in set(State):
             continue
         priority = raw.get("priority") or {}
+        cpus = int((raw.get("cpus") or {}).get("number") or 0)
         jobs.append(
             QueuedJob(
                 str(raw["job_id"]), raw.get("partition", ""), state, raw.get("state_reason", ""), raw.get("name", ""),
                 raw.get("dependency", ""), raw.get("user_name", ""),
                 int(priority.get("number", 0)) if priority.get("set") else 0, parse_gpus(raw.get("tres_per_node") or ""),
-                int((raw.get("cpus") or {}).get("number") or 0), level_of(str(raw.get("qos") or "")),
+                cpus, level_of(str(raw.get("qos") or "")), _memory_mb(raw, cpus),
             )
         )
     return jobs
@@ -339,6 +365,18 @@ def keeper_state_path() -> Path:
     """The lease keeper's state and heartbeat, in a directory of its own: the keeper runs as the site's keeper user, and
     the state directory itself is root's (the lease component makes `keeper/` that user's)."""
     return STATE_DIR / "keeper" / "keeper.json"
+
+
+def oom_kill_path(job_id: str, state_dir: Path | None = None) -> Path:
+    """The agent's record of the host's OOM guard killing a process of this job (agent/ is the agent's alone, D11's
+    reason: a record any user could write could end any job)."""
+    return (state_dir or STATE_DIR) / "agent" / "oom_kills" / f"job_{job_id}.json"
+
+
+def job_of_cgroup(cgroup: str) -> str | None:
+    """The slurm job a cgroup path belongs to (its `job_<id>` component), None for one outside every job."""
+    match = re.search(r"/job_(\d+)(?:/|$)", cgroup)
+    return match[1] if match else None
 
 
 def sidecar_path(job_id: str) -> Path:
@@ -659,22 +697,53 @@ def job_pids(cgroup: Path | None, fallback_pids: set[int], job_id: str, gpu_pids
 
 def capacity(runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run) -> dict[str, int]:
     """Over every node: the cores, memory (MB) and GPUs slurm has to give, and how much of each it has given to jobs
-    (`scontrol show nodes -o`). {} when slurm does not answer."""
+    (`scontrol show nodes -o`), with the number of nodes and how many of them are this host. {} when slurm does not
+    answer."""
     try:
         done = runner(["scontrol", "show", "nodes", "-o"], capture_output=True, text=True, timeout=30, check=False)
     except (OSError, subprocess.TimeoutExpired):
         return {}
     if done.returncode != 0:
         return {}
-    total = dict.fromkeys(("cpus", "cpus_used", "mem_mb", "mem_used_mb", "gpus", "gpus_used"), 0)
+    total = dict.fromkeys(("cpus", "cpus_used", "mem_mb", "mem_used_mb", "gpus", "gpus_used", "nodes", "here"), 0)
+    host = os.uname().nodename.split(".")[0]
     for line in done.stdout.splitlines():
         fields = dict(part.split("=", 1) for part in line.split() if "=" in part)
+        total["nodes"] += 1
+        total["here"] += host in {fields.get("NodeName"), fields.get("NodeHostName")}
         gpus = [re.search(r"gres/gpu=(\d+)", fields.get(key, "")) for key in ("CfgTRES", "AllocTRES")]
         for key, value in (("cpus", fields.get("CPUTot")), ("cpus_used", fields.get("CPUAlloc")),
                            ("mem_mb", fields.get("RealMemory")), ("mem_used_mb", fields.get("AllocMem")),
                            ("gpus", gpus[0] and gpus[0][1]), ("gpus_used", gpus[1] and gpus[1][1])):
             total[key] += int(value) if value and str(value).isdigit() else 0
     return total
+
+
+def _cpu_ticks(stat_text: str) -> tuple[int, int]:
+    """(busy, total) jiffies over all cores, from /proc/stat's first line (idle and iowait are not busy)."""
+    values = [int(v) for v in stat_text.splitlines()[0].split()[1:]]
+    idle = values[3] + (values[4] if len(values) > 4 else 0)
+    return sum(values) - idle, sum(values)
+
+
+def machine_use(
+    read: Callable[[str], str] = lambda path: Path(path).read_text(encoding="ascii"),
+    sleep: Callable[[float], None] = time.sleep,
+    interval_s: float = 0.2,
+) -> dict[str, float]:
+    """What this host is really using, slurm or not: memory in use (MemTotal - MemAvailable, bytes, as `free`'s
+    "available") and how many cores were busy over `interval_s` (/proc/stat). {} when /proc cannot be read."""
+    try:
+        meminfo = {key: value.split() for key, _, value in (line.partition(":") for line in read("/proc/meminfo").splitlines())}
+        total, available = int(meminfo["MemTotal"][0]) * 1024, int(meminfo["MemAvailable"][0]) * 1024  # kB in meminfo
+        before = _cpu_ticks(read("/proc/stat"))
+        sleep(interval_s)
+        after = _cpu_ticks(read("/proc/stat"))
+    except (OSError, ValueError, IndexError, KeyError):
+        return {}
+    cores, ticks = os.cpu_count() or 0, after[1] - before[1]
+    busy = cores * (after[0] - before[0]) / ticks if ticks > 0 else 0.0
+    return {"mem_total": total, "mem_used": total - available, "cores": cores, "cores_busy": busy}
 
 
 def nodes(runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run) -> list[str]:

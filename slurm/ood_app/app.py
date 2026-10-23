@@ -65,6 +65,7 @@ MINUTE_S, HOUR_MIN, DAY_H = 60, 60, 24
 SMALLEST_HOURS = 0.05  # below this a total reads "under 0.1 h", not "0.0 h"
 
 METER_WARN = 0.9
+GB, MB = 10**9, 10**6  # every size shown is in these decimal units
 CANNOT_ACT = "Only the job's owner or an admin can pause or cancel it."
 class Kind(StrEnum):
     """How a job's state is drawn: each is a badge class in static/app.css."""
@@ -217,6 +218,7 @@ class Backend:
     now: Callable[[], datetime] = datetime.now
     project_order: Callable[[], list[str]] = lambda: _project_order()
     capacity: Callable[[], Mapping[str, int]] = gpu_jobs.capacity
+    machine: Callable[[], Mapping[str, float]] = gpu_jobs.machine_use
     gpu_busy: Callable[[], float | None] = gpu_jobs.gpu_busy
     run: Run = run_tool
     python: str = field(default_factory=lambda: sys.executable)
@@ -264,7 +266,7 @@ def job_rows(backend: Backend) -> list[dict[str, object]]:
                 "elapsed": elapsed.get(job.job_id, ""),
                 "gpus": job.gpus,
                 "cpus": job.cpus,
-                "mem": str(record.get("mem") or ""),
+                "mem_mb": jobs_view.requested_mem_mb(job, record),
             }
         )
     return rows
@@ -277,8 +279,15 @@ def _page(backend: Backend, title: str, body: str, *, root: str, tab: Tab | None
     )
     role = '<span class="role">admin</span>' if backend.is_admin(viewer) else ""
     return _template("layout.html").substitute(
-        title=esc(title), root=root, body=body, viewer=esc(viewer), role=role, tabs=tabs, host=esc(backend.host())
+        title=esc(title), root=root, body=body, viewer=esc(viewer), role=role, tabs=tabs, host=esc(backend.host()),
+        assets=_assets_version(),
     )
+
+
+def _assets_version() -> str:
+    """Changes whenever an installed static file does, so a browser that kept an old copy (2026-10-23: a page with the
+    new markup drawn with the old app.css, despite no-store) fetches the new one."""
+    return str(max((APP_DIR / "static" / name).stat().st_mtime_ns for name in STATIC))
 
 
 # --- formatting: every number a person reads goes through one of these -------------------------------------------
@@ -324,10 +333,11 @@ def _today() -> date:
     return date.today()  # noqa: DTZ011 - the box's local day, the same clock slurm prints times in
 
 
-def _gib(value: float | None) -> str:
+def _size(value: float | None) -> str:
+    """Bytes in decimal units, GB or MB (10^9, 10^6), the standard ones a reader expects."""
     if value is None:
         return "—"
-    return f"{value / 1024**3:.1f} GB" if value >= 1024**3 else f"{value / 1024**2:.0f} MB"
+    return f"{value / GB:.1f} GB" if value >= GB else f"{value / MB:.0f} MB"
 
 
 def _hours(value: float) -> str:
@@ -362,14 +372,11 @@ def _level_pill(level: object) -> str:
     return f'<span class="pill level-{esc(text)}" title="{esc(LEVEL_HELP[text])}">{esc(text)}</span>'
 
 
-def _asked_memory(mem: object) -> str:
-    """The `--mem` a job asked for, as submit.py recorded it: '48G', or '0', slurm's word for the whole node."""
-    text = str(mem or "")
-    if not text:
+def _asked_memory(mb: int | None) -> str:
+    """A memory request (`jobs_view.requested_mem_mb`) in words: '51.5 GB' (for 48G), or 'whole box' for slurm's 0."""
+    if mb is None:
         return "—"
-    if text == jobs_view.WHOLE_NODE_MEM:
-        return "whole box"
-    return re.sub(r"^(\d+)([KMGT])$", r"\1 \2B", text)
+    return "whole box" if mb == 0 else _size(mb * 1024**2)
 
 
 def _short(name: str) -> str:
@@ -452,17 +459,14 @@ def _now_card(rows: list[dict[str, object]], keeper: Mapping[str, object], backe
     icon = '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">{}</svg>'
     if running:
         job = running[0]
-        live = backend.live_memory(str(job["id"]))
         # "and N more" counts only jobs like the lead one: a CPU-only job beside a GPU job is not on the GPU
         alike = sum(bool(r["gpus"]) == bool(job["gpus"]) for r in running) - 1
         off_gpu = sum(not r["gpus"] for r in running) if job["gpus"] else 0
         more = (f" and {alike} more" if alike else "") + (
             f" · {off_gpu} CPU-only job{'s' if off_gpu > 1 else ''} beside it" if off_gpu else "")
-        figures = [
-            ("Running for", _duration(job["elapsed_s"])),  # type: ignore[arg-type]
-            ("GPU memory in use", _gib(live.get("gpu"))),
-            ("CPU memory in use", _gib(live.get("cpu")) + (f" of {_asked_memory(job['mem'])} asked" if job["mem"] else "")),
-        ]
+        # memory is shown once, on the machine card below and on the job's page: here its figures disagreed with those
+        # (on a unified-memory box a job's GPU memory is outside slurm's reservation)
+        figures = [("Running for", _duration(job["elapsed_s"]))]  # type: ignore[arg-type]
         return (
             '<section class="card now" aria-label="The GPU now">'
             f'<div class="now-icon busy">{icon.format("<path d=\"M5 3l14 9-14 9V3z\"/>")}</div>'
@@ -494,33 +498,56 @@ def _running_note(running: int, on_gpu: int) -> str:
     return "on the GPU now" if on_gpu == running else f"{on_gpu} on the GPU" if on_gpu else "none on the GPU"
 
 
-def _resource_tiles(have: Mapping[str, int], rows: list[dict[str, object]], busy: float | None = None) -> str:
-    """What slurm has handed out of the box, and what is free (its own totals: memory is what slurm may give, not all
-    of the machine's)."""
+def _resource_tiles(
+    have: Mapping[str, int], rows: list[dict[str, object]], busy: float | None = None, use: Mapping[str, float] | None = None
+) -> str:
+    """Per resource, what slurm jobs have reserved (out of what slurm can give, its own totals) beside what is really in
+    use (out of the whole machine: a process outside slurm uses memory no job reserved, and a job may use less than it
+    reserved). The in-use readings (`nvidia-smi`, /proc) are of the host the page runs on, so they show only when that
+    host is slurm's one node."""
     if not have:
         return ""
+    if not (have.get("nodes") == 1 and have.get("here")):
+        busy, use = None, {}
+    use = use or {}
     running = [r for r in rows if r["kind"] == Kind.RUNNING]
     by_gpu = sum(int(r["cpus"]) for r in running if r["gpus"])  # type: ignore[call-overload]
     by_cpu = sum(int(r["cpus"]) for r in running if not r["gpus"])  # type: ignore[call-overload]
-    gib = 1024  # slurm counts memory in MB
-    free_cpus, free_mem = have["cpus"] - have["cpus_used"], (have["mem_mb"] - have["mem_used_mb"]) / gib
-    given, free_gpus = f"{have['gpus_used']} of {have['gpus']} given to jobs", f"{have['gpus'] - have['gpus_used']} free"
-    # without a busy reading the value already says what is given, so the note does not repeat it
-    gpu_value, gpu_fraction, gpu_note = (
-        (f"{busy:.0%} busy", busy, f"{given} · {free_gpus}") if busy is not None
-        else (given, _share(have["gpus_used"], have["gpus"]), free_gpus)
-    )
+    mib = 1024**2  # slurm's "MB" is 2^20 bytes
+    left_mem = (have["mem_mb"] - have["mem_used_mb"]) * mib
+    cores, cores_busy = int(use.get("cores", 0)), use.get("cores_busy")
+    mem_total, mem_used = use.get("mem_total"), use.get("mem_used")
     meters = [
-        _meter("GPU", gpu_value, gpu_fraction, gpu_note),
-        _meter("Cores", f"{have['cpus_used']} of {have['cpus']} in use", _share(have["cpus_used"], have["cpus"]),
-               f"{by_cpu} by CPU jobs · {by_gpu} by GPU jobs · {free_cpus} free"),
-        _meter("Memory", f"{have['mem_used_mb'] / gib:.0f} of {have['mem_mb'] / gib:.0f} GB given to jobs",
-               _share(have["mem_used_mb"], have["mem_mb"]), f"{free_mem:.0f} GB free"),
+        _split_meter(
+            "GPU", (f"{have['gpus_used']} of {have['gpus']}", _share(have["gpus_used"], have["gpus"])),
+            ("Busy", f"{busy:.0%}", busy) if busy is not None else None,
+            f"{have['gpus'] - have['gpus_used']} left to reserve",
+        ),
+        _split_meter(
+            "Cores", (f"{have['cpus_used']} of {have['cpus']}", _share(have["cpus_used"], have["cpus"])),
+            ("Busy", f"{cores_busy:.1f} of {cores}", cores_busy / cores) if cores_busy is not None and cores else None,
+            f"{by_cpu} by CPU jobs · {by_gpu} by GPU jobs · {have['cpus'] - have['cpus_used']} left to reserve",
+        ),
+        _split_meter(
+            "Memory", (_of(have["mem_used_mb"] * mib, have["mem_mb"] * mib), _share(have["mem_used_mb"], have["mem_mb"])),
+            ("In use, whole machine", _of(mem_used, mem_total), mem_used / mem_total) if mem_total and mem_used is not None else None,
+            f"{_size(left_mem)} left to reserve"
+            + (f" · {_size(mem_total - mem_used)} available" if mem_total and mem_used is not None else ""),
+            short=True,
+        ),
     ]
     return (
         '<section class="card box" aria-labelledby="h-box"><div class="card-head"><h2 id="h-box">This machine</h2>'
-        '<span class="meta">now, out of what slurm can give</span></div><div class="box-meters">' + "".join(meters) + "</div></section>"
+        '<span class="meta">reserved by slurm jobs, and really in use now</span></div><div class="box-meters">'
+        + "".join(meters) + "</div></section>"
     )
+
+
+def _of(part: float, whole: float) -> str:
+    """'34.4 of 104.9 GB': both in the whole's unit, so the two numbers compare at a glance."""
+    if whole >= GB:
+        return f"{part / GB:.1f} of {whole / GB:.1f} GB"
+    return f"{part / MB:.0f} of {whole / MB:.0f} MB"
 
 
 def _share(used: int, total: int) -> float | None:
@@ -553,7 +580,7 @@ def _queue_table(rows: list[dict[str, object]], root: str) -> str:
             + (f'<td class="num inline" data-k="for">{esc(time_text)}</td>' if r["kind"] == Kind.RUNNING else '<td class="num hide-sm">—</td>')
             + f'<td class="hide-sm">{_class_pill(r["class"])}</td>'
             f'<td class="num hide-sm">{esc(r["gpus"])}</td>'
-            f'<td class="num hide-sm">{esc(_asked_memory(r["mem"]))}</td>'
+            f'<td class="num hide-sm">{esc(_asked_memory(r["mem_mb"]))}</td>'  # type: ignore[arg-type]
             f'<td class="inline" data-k="user">{esc(r["user"])}</td>'
             "</tr>"
         )
@@ -581,7 +608,7 @@ def _finished_rows(rows: list[jobs_view.HistoryRow], root: str, now: datetime) -
             f'<td class="num inline" data-k="started">{esc(_clock(r.start, now))}</td>'
             f'<td class="num inline" data-k="took">{esc(_duration(r.elapsed_s) if r.start else "—")}</td>'
             f'<td class="num hide-sm">{esc(r.gpus)}</td>'
-            f'<td class="num hide-sm">{esc(_gib(r.max_rss_bytes))}</td>'
+            f'<td class="num hide-sm">{esc(_size(r.max_rss_bytes))}</td>'
             + f'<td class="inline" data-k="user">{esc(r.user)}</td>'
             "</tr>"
         )
@@ -617,7 +644,7 @@ def index_page(backend: Backend, root: str = "") -> str:
         ("Waiting", str(count[Kind.WAITING]), "in the queue" if count[Kind.WAITING] else "queue is empty"),
         ("Paused", str(count[Kind.PAUSED]), "resume from the job's page" if count[Kind.PAUSED] else ""),
         ("Finished, last 24 h", str(len(recent)), f"{failed} failed" if failed else "none failed"),
-    ]) + _resource_tiles(backend.capacity(), rows, backend.gpu_busy())
+    ]) + _resource_tiles(backend.capacity(), rows, backend.gpu_busy(), backend.machine())
     recent_html = (
         '<div class="card-head"><h2 id="h-recent">Finished in the last 24 hours</h2>'
         f'<a class="meta" href="{root}history">All history →</a></div>'
@@ -661,41 +688,77 @@ def _chain_html(node: jobs_view.ChainNode, root: str, lookup: Callable[[str], jo
     return "".join(parts)
 
 
-def _meter(label: str, value: str, fraction: float | None, note: str = "") -> str:
-    bar = ""
-    if fraction is not None:
-        width = max(0.0, min(1.0, fraction)) * 100
-        warn = " warn" if fraction > METER_WARN else ""
-        bar = (
-            '<svg viewBox="0 0 100 8" preserveAspectRatio="none" aria-hidden="true">'
-            f'<rect class="track" width="100" height="8"/><rect class="fill{warn}" width="{width:.1f}" height="8"/></svg>'
-        )
+def _bar(fraction: float | None, fill: str = "fill", *, warns: bool = True) -> str:
+    if fraction is None:
+        return ""
+    width = max(0.0, min(1.0, fraction)) * 100
+    warn = " warn" if warns and fraction > METER_WARN else ""
     return (
-        f'<div class="meter"><div class="meter-row"><span class="k">{esc(label)}</span><span class="num">{esc(value)}</span></div>'
-        f'{bar}{f"<div class=\"note\">{esc(note)}</div>" if note else ""}</div>'
+        '<svg viewBox="0 0 100 8" preserveAspectRatio="none" aria-hidden="true">'
+        f'<rect class="track" width="100" height="8"/><rect class="{fill}{warn}" width="{width:.1f}" height="8"/></svg>'
     )
 
 
-def _resources_html(eff: jobs_view.Efficiency, live: Mapping[str, int], kind: str) -> str:
+def _note(note: str) -> str:
+    return f'<div class="note">{esc(note)}</div>' if note else ""
+
+
+def _meter(label: str, value: str, fraction: float | None, note: str = "") -> str:
+    return (
+        f'<div class="meter"><div class="meter-row"><span class="k">{esc(label)}</span><span class="num">{esc(value)}</span></div>'
+        f"{_bar(fraction)}{_note(note)}</div>"
+    )
+
+
+def _split_meter(
+    label: str, reserved: tuple[str, float | None], used: tuple[str, str, float | None] | None, note: str, *, short: bool = False
+) -> str:
+    """One resource as two bars: what slurm jobs have reserved, and what is really in use (`used` is (words, value,
+    fraction); None when it cannot be read here). A full reservation is the point of a queue, and a busy GPU or core is
+    work getting done, so only `short` (a resource whose running out ends jobs) turns the in-use bar amber."""
+    lines = [("Reserved by jobs", *reserved, "fill", False), *([(*used, "fill used", short)] if used else [])]
+    return (
+        f'<div class="meter"><div class="meter-row"><span class="k">{esc(label)}</span></div>'
+        + "".join(
+            f'<div class="meter-line"><span>{esc(words)}</span><span class="num">{esc(value)}</span></div>'
+            f"{_bar(fraction, fill, warns=warns)}"
+            for words, value, fraction, fill, warns in lines
+        )
+        + f"{_note(note)}</div>"
+    )
+
+
+def _resources_html(
+    eff: jobs_view.Efficiency, live: Mapping[str, int], kind: str, asked_mb: int | None = None, node_mb: int | None = None
+) -> str:
+    """A running job's live memory, against what it reserved (`node_mb`: the node's whole memory, for a job that asked
+    for all of it); a finished job's peaks against what it asked."""
     if kind in {Kind.WAITING, Kind.PAUSED} and eff.peak_gpu_mib is None and eff.peak_cpu_mem_bytes is None:
         return '<p class="muted">Not started yet: its memory and CPU use appear here once it runs.</p>'
     gpu_peak = None if eff.peak_gpu_mib is None else eff.peak_gpu_mib * 1024**2
     if kind == Kind.RUNNING:
         # slurm fills in peaks and CPU time when a job ends; while it runs, the agent's samples are what there is
         return "".join([
-            _meter("GPU memory in use", _gib(live.get("gpu")), None, "sampled every few seconds"),
-            _meter("CPU memory in use", _gib(live.get("cpu")), None),
-            _meter("Peak GPU memory, earlier runs", _gib(gpu_peak), None) if gpu_peak is not None else "",
+            _meter("GPU memory in use", _size(live.get("gpu")), None, "sampled every few seconds"),
+            _cpu_in_use(live.get("cpu"), node_mb if asked_mb == 0 else asked_mb),
+            _meter("Peak GPU memory, earlier runs", _size(gpu_peak), None) if gpu_peak is not None else "",
         ])
-    parts = [_meter("Peak GPU memory", _gib(gpu_peak), None, "" if gpu_peak is not None else "not recorded for this job")]
+    parts = [_meter("Peak GPU memory", _size(gpu_peak), None, "" if gpu_peak is not None else "not recorded for this job")]
     if eff.peak_cpu_mem_bytes is not None and eff.req_mem_bytes:
         share = eff.peak_cpu_mem_bytes / eff.req_mem_bytes
-        parts.append(_meter("Peak CPU memory of asked", f"{_gib(eff.peak_cpu_mem_bytes)} of {_gib(eff.req_mem_bytes)}", share, f"{share:.0%} of the memory it asked for"))
+        parts.append(_meter("Peak CPU memory of asked", f"{_size(eff.peak_cpu_mem_bytes)} of {_size(eff.req_mem_bytes)}", share, f"{share:.0%} of the memory it asked for"))
     else:
-        parts.append(_meter("Peak CPU memory", _gib(eff.peak_cpu_mem_bytes), None))
+        parts.append(_meter("Peak CPU memory", _size(eff.peak_cpu_mem_bytes), None))
     if eff.cpu_use is not None:
         parts.append(_meter("CPU time used", f"{eff.cpu_use:.0%}", eff.cpu_use, "of the CPU time its cores could have given"))
     return "".join(parts)
+
+
+def _cpu_in_use(used: int | None, reserved_mb: int | None) -> str:
+    if used is None or not reserved_mb:
+        return _meter("CPU memory in use", _size(used), None)
+    share = used / (reserved_mb * 1024**2)
+    return _meter("CPU memory in use", _of(used, reserved_mb * 1024**2), share, f"{share:.0%} of the memory it reserved")
 
 
 EVENT_WORDS = {
@@ -787,6 +850,7 @@ def job_page(backend: Backend, job_id: str, root: str = "") -> str | None:
     else:
         kind, label, why = Kind.OTHER, "Finished", "slurm no longer has a record of it"
     user = job.user if job else (row.user if row else "")
+    asked_mb = jobs_view.requested_mem_mb(job, record)
     facts = [
         ("State", _badge(kind, label) + (f' <span class="muted small">{esc(_why(why))}</span>' if why else "")),
         ("Project", _project(project)),
@@ -796,7 +860,7 @@ def job_page(backend: Backend, job_id: str, root: str = "") -> str | None:
         ("Level", _level_pill(job.level if job else "")),
         ("Partition", esc((job.partition if job else row.partition if row else "") or "—")),
         ("GPUs", esc(record.get("gpus") or (job.gpus if job else row.gpus if row else "") or "—")),
-        ("Memory asked", esc(_asked_memory(record.get("mem")) if record.get("mem") else _gib(row.req_mem_bytes) if row else "—")),
+        ("Memory asked", esc(_asked_memory(asked_mb) if asked_mb is not None else _size(row.req_mem_bytes) if row else "—")),
     ]
     if name and name != _short(name):
         facts.append(("Slurm name", f'<span class="mono">{esc(name)}</span>'))
@@ -817,7 +881,10 @@ def job_page(backend: Backend, job_id: str, root: str = "") -> str | None:
         subtitle=f"Job #{esc(job_id)} · {esc(user or 'unknown user')}",
         facts="".join(f"<dt>{esc(k)}</dt><dd>{v}</dd>" for k, v in facts),
         jobstats=jobstats,
-        resources=_resources_html(backend.efficiency(job_id, record=record), backend.live_memory(job_id) if running else {}, kind),
+        resources=_resources_html(
+            backend.efficiency(job_id, record=record), backend.live_memory(job_id) if running else {}, kind, asked_mb,
+            backend.capacity().get("mem_mb", 0) if running and asked_mb == 0 else None,
+        ),
         timeline=_timeline_html(row, backend.events(job_id), now),
         chain=_chain_html(jobs_view.chain(job_id, by_id, records), root, backend.finished),
         buttons=buttons,

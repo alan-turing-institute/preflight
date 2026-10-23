@@ -29,7 +29,11 @@ Plan 3.5 (`plan notes`). One system service, run as SlurmUser
    writable by SlurmUser alone: a file in a world-writable directory could name any job or user, and a killed
    job wrapper would leave its file for ever. When `nvidia-smi` does not answer the files stay as they are
    (unknown is not zero) and the error is recorded.
-6. HEARTBEAT `agent/agent.json`. When `squeue` does not answer, the queue-dependent parts are skipped and the
+6. OOM GUARD KILLS: a thread follows the host OOM guard's journal (`OomWatch`) and, for each process it signals,
+   writes `agent/oom_kills/job_<id>.json` naming the job the process belonged to. The guard signals a job's process
+   directly, not through slurm, and a training loop that catches SIGTERM can exit 0: without this record the job
+   wrapper would report a killed run as finished (2026-10-22, job 428). Records of jobs no longer queued are removed.
+7. HEARTBEAT `agent/agent.json`. When `squeue` does not answer, the queue-dependent parts are skipped and the
    state is kept: the agent never acts on a queue it cannot see.
 
 The requests directory is sticky and world-writable, and the installer makes SlurmUser its owner, which lets the agent
@@ -40,10 +44,12 @@ paused, request already released) lives in `agent/state.json`, and deleting the 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -65,6 +71,15 @@ MIB = 1024 * 1024
 ENDED_KEPT = 5000
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
+
+#: The host's OOM guard (machine/earlyoom); its journal is read by unit, the field journald sets itself (`_SYSTEMD_UNIT`
+#: cannot be sent by a client), and the agent's unit is in the `systemd-journal` group for it.
+OOM_GUARD_UNIT = "earlyoom.service"
+#: earlyoom's line before each kill (`kill.c`, v1.7): the process is still alive when it is written. The name that
+#: follows is the process's own (/proc/PID/comm, at most 15 bytes), too short to hold a forged second line.
+KILL_LINE = re.compile(r'sending (SIGTERM|SIGKILL) to process (\d+) uid \d+ "')
+#: Seconds before a stopped journal follower is started again.
+WATCH_RETRY_S = 30.0
 
 
 class EndedBadly(StrEnum):
@@ -182,6 +197,64 @@ def metrics_text(job: gpu_jobs.QueuedJob, gpu_mib: float, mem_bytes: int) -> str
     )
 
 
+def kill_from_entry(line: str) -> tuple[int, str, float] | None:
+    """(pid, signal, wall-clock seconds) from one `journalctl -o json` line of the OOM guard; None for any other line."""
+    try:
+        entry = json.loads(line)
+    except ValueError:
+        return None
+    message = entry.get("MESSAGE") if isinstance(entry, dict) else None
+    if isinstance(message, list):  # journald writes text that is not UTF-8 as a list of bytes
+        message = bytes(message).decode("utf-8", errors="replace")
+    match = KILL_LINE.match(message) if isinstance(message, str) else None
+    if match is None:
+        return None
+    try:
+        at = int(entry["__REALTIME_TIMESTAMP"]) / 1e6
+    except (KeyError, ValueError):
+        at = time.time()
+    return int(match[2]), match[1], at
+
+
+def job_of_pid(pid: int) -> str | None:
+    """The slurm job a live process belongs to: its cgroup, else the docker container labelled with the job."""
+    import audit  # noqa: PLC0415 - lazy, as in gpu_jobs.job_pids: audit imports job_wrapper
+
+    cgroup = audit.cgroup_of(pid)
+    return gpu_jobs.job_of_cgroup(cgroup) or gpu_jobs.container_label(cgroup, gpu_jobs.JOB_LABEL) or None
+
+
+class OomWatch:
+    """Follows the OOM guard's journal in a thread of its own, so each kill is attributed while its process still
+    exists (a 5-s step would often look after the process is gone). `error` holds what stopped the follower last."""
+
+    def __init__(self, on_kill: Callable[[int, str, float], None], unit: str = OOM_GUARD_UNIT) -> None:
+        self.on_kill, self.error = on_kill, ""
+        self.argv = ["journalctl", "--follow", "--lines=0", "--output=json", f"_SYSTEMD_UNIT={unit}"]
+
+    def start(self) -> None:
+        threading.Thread(target=self._run, name="oom-watch", daemon=True).start()
+
+    def _run(self) -> None:
+        while True:
+            self.follow()
+            time.sleep(WATCH_RETRY_S)
+
+    def follow(self, popen: Callable[..., subprocess.Popen[str]] = subprocess.Popen) -> None:
+        self.error = ""
+        try:
+            with popen(self.argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True) as follower:
+                for line in follower.stdout or ():
+                    kill = kill_from_entry(line)
+                    if kill is not None:
+                        self.on_kill(*kill)
+                    elif not line.lstrip().startswith("{"):  # journalctl's own complaint, e.g. no permission
+                        self.error = f"journal of {OOM_GUARD_UNIT}: {line.strip()}"
+            self.error = self.error or f"journalctl stopped following {OOM_GUARD_UNIT}"
+        except OSError as exc:
+            self.error = f"journal of {OOM_GUARD_UNIT}: {exc}"
+
+
 def _strings(value: object) -> list[str]:
     return [str(item) for item in value] if isinstance(value, list) else []
 
@@ -205,8 +278,12 @@ class Agent:
         notify: Callable[[list[str], dict[str, str]], None] = notify_run,
         gpu_usage: Callable[[], dict[int, float] | None] = gpu_jobs.gpu_usage,
         cgroup_root: Path = gpu_jobs.CGROUP_ROOT,
+        pid_job: Callable[[int], str | None] = job_of_pid,
     ) -> None:
         self.site = site
+        self.state_dir, self.pid_job = state_dir, pid_job
+        self.watch: OomWatch | None = None  # main() starts one; a test drives record_kill itself
+        self._pid_jobs: dict[int, str] = {}  # each running job's processes at the last step, for a kill seen late
         self.gpu_usage, self.cgroup_root = gpu_usage, cgroup_root
         self.dir = state_dir / "agent"
         self.metrics = state_dir / "metrics"
@@ -257,6 +334,10 @@ class Agent:
         else:
             self._place_jobs(queue, errors)
             self._restore_order(queue, read_at_ns, errors)
+            self._pid_jobs = self._running_pids(queue)
+            self._prune_oom_kills(queue)
+        if self.watch is not None and self.watch.error:
+            errors.append(self.watch.error)
         if now - self._notices_at >= NOTICES_EVERY_S:
             self._notices_at = now
             self._failure_notices(errors)
@@ -480,6 +561,36 @@ class Agent:
         except (OSError, subprocess.SubprocessError) as exc:
             errors.append(f"notify command for job {job_id} failed: {exc}")
 
+    # -- 6. OOM guard kills ----------------------------------------------------------------------------------
+
+    def record_kill(self, pid: int, signal_name: str, at: float) -> None:
+        """Called from the watch thread for each process the OOM guard signals."""
+        job_id = self.pid_job(pid) or self._pid_jobs.get(pid)
+        if job_id is None:
+            print(f"[agent] {OOM_GUARD_UNIT} sent {signal_name} to pid {pid}, outside every slurm job", flush=True)
+            return
+        record = {"job": job_id, "pid": pid, "signal": signal_name, "at": at, "guard": OOM_GUARD_UNIT}
+        try:
+            gpu_jobs.write_json(gpu_jobs.oom_kill_path(job_id, self.state_dir), record)
+        except OSError as exc:
+            print(f"[agent] recording the kill of pid {pid} (job {job_id}) failed: {exc}", file=sys.stderr, flush=True)
+            return
+        print(f"[agent] {OOM_GUARD_UNIT} sent {signal_name} to pid {pid} of job {job_id}", flush=True)
+
+    def _running_pids(self, queue: list[gpu_jobs.QueuedJob]) -> dict[int, str]:
+        found: dict[int, str] = {}
+        for job in queue:
+            cgroup = self._job_cgroup(job.job_id) if job.state == gpu_jobs.State.RUNNING else None
+            found.update(dict.fromkeys(gpu_jobs.cgroup_pids(cgroup), job.job_id) if cgroup else {})
+        return found
+
+    def _prune_oom_kills(self, queue: list[gpu_jobs.QueuedJob]) -> None:
+        """A job's record is read by its wrapper while the job is still queued; once it has left, the record goes."""
+        queued = {job.job_id for job in queue}
+        for path in (self.dir / "oom_kills").glob("job_*.json"):
+            if path.stem.removeprefix("job_") not in queued:
+                gpu_jobs.remove_quietly(path)
+
     # -- 5. job metrics -------------------------------------------------------------------------------------
 
     def _job_cgroup(self, job_id: str) -> Path | None:
@@ -525,6 +636,8 @@ def main() -> int:
     arguments = parser.parse_args()
 
     agent = Agent(site_config.load(), gpu_jobs.STATE_DIR)
+    agent.watch = OomWatch(agent.record_kill)
+    agent.watch.start()
     while True:
         beat = agent.step()
         if arguments.once:

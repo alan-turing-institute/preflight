@@ -597,6 +597,36 @@ def stage_failure() -> None:
     wait_state(fine, "COMPLETED", 90)
     time.sleep(2 * AGENT_LOOP_S + 2)  # two agent loops: long enough to have written an event, were it going to
     check("S8: a job that completes normally writes no FAILED event", state(fine) == "COMPLETED" and not events(fine), str(events(fine)))
+    oom_guard_kills()
+
+
+# The run saves on SIGTERM and exits 0, as Lightning does (job 428, 2026-10-22); a second leg finishes at once.
+SAVES_ON_TERM = ("import os, signal, sys, time; signal.signal(signal.SIGTERM, lambda *_: sys.exit(0)); "
+                 "time.sleep(0 if int(os.environ.get('SLURM_RESTART_COUNT') or 0) else 300)")
+# A stand-in for earlyoom: the unit name and the line it logs before each kill are earlyoom's own (kill.c, v1.7).
+FAKE_GUARD = 'echo "sending SIGTERM to process $1 uid $(stat -c %u /proc/$1) \\"python3\\": badness 900, VmRSS 10 MiB"; kill -TERM "$1"\n'
+
+
+def oom_guard_kills() -> None:
+    section("failure: a run the host OOM guard killed never passes as finished")
+    put("/var/tmp/fake-earlyoom.sh", FAKE_GUARD, "0755")
+    for cls in ("resume", "restart"):
+        j = submit("alice", f"oom-{cls}", 0, cls=cls, command=["python3", "-c", SAVES_ON_TERM])
+        wait_state(j, "RUNNING", 90)
+        time.sleep(2 * AGENT_LOOP_S)  # long enough for the agent to have seen the job's processes
+        pid = sh("pgrep -u alice -f '^python3 -c import os, signal'").out.split()[:1]
+        sh(f"systemd-run --unit=earlyoom --collect --wait /bin/sh /var/tmp/fake-earlyoom.sh {pid[0] if pid else 0}")
+        leg = lambda: json.loads(sh(f"cat {STATE}/jobs/{j}.json").out or "{}").get("legs") or [{}]  # noqa: E731
+        if cls == "resume":
+            requeued = wait_for(lambda: jobinfo(j).get("Restarts") == "1", 60)
+            finished = wait_state(j, "COMPLETED", REQUEUE_DELAY_S + 90)
+            check("OOM: a killed resume job is requeued, the kill is in its record, and its next leg finishes",
+                  bool(pid) and bool(requeued) and finished and leg()[0].get("killed_by", {}).get("pid") == int(pid[0]),
+                  f"pid {pid} {jobinfo(j).get('JobState')} restarts {jobinfo(j).get('Restarts')} legs {leg()}")
+        else:
+            failed = wait_state(j, "FAILED", 60)
+            check("OOM: a killed restart job fails with the wrapper's KILLED_FOR_MEMORY, not exit 0",
+                  failed and jobinfo(j).get("ExitCode") == "5:0", f"{jobinfo(j).get('JobState')} {jobinfo(j).get('ExitCode')}")
 
 
 # -- stage: recovery -----------------------------------------------------------------------------------------------

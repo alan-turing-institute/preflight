@@ -35,8 +35,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import audit  # noqa: E402 - path set just above
 import gpu_jobs  # noqa: E402
+import jobs_view  # noqa: E402
 import site_config  # noqa: E402
 import submit  # noqa: E402
+from gpu_jobs import mem_mb  # noqa: E402
 
 #: slurm's own delay from an urgent submission to its start, measured in the trial (build notes).
 SLURM_START_S = (31, 46)
@@ -62,20 +64,10 @@ def free_memory_mb() -> int | None:
     return total if names else None
 
 
-def mem_mb(text: str) -> int:
-    """slurm memory notation (`24G`, `512M`, plain megabytes) in megabytes."""
-    scale = {"K": 1 / 1024, "M": 1, "G": 1024, "T": 1024 * 1024}
-    unit = text[-1].upper()
-    return int(float(text[:-1]) * scale[unit]) if unit in scale else int(text)
-
-
-def _asked_mb(job_id: str, user: str) -> int:
-    """The memory a job asked for, from its sidecar (which its owner writes); 0 when unknown, the whole box or unreadable,
-    which counts as freeing nothing, so a CPU job is requeued rather than the urgent job left waiting."""
-    try:
-        return mem_mb(str((gpu_jobs.read_sidecar(job_id, user) or {}).get("mem") or "0"))
-    except (ValueError, KeyError, IndexError):
-        return 0
+def _asked_mb(job: gpu_jobs.QueuedJob) -> int:
+    """The memory a job holds (slurm's request, else its sidecar's); 0 when unknown, the whole box or unreadable, which
+    counts as freeing nothing, so a CPU job is requeued rather than the urgent job left waiting."""
+    return jobs_view.requested_mem_mb(job, gpu_jobs.read_sidecar(job.job_id, job.user) or {}) or 0
 
 
 def plan(
@@ -199,7 +191,7 @@ def run(argv: list[str]) -> int:
     cpu_victims = [v for v in victims if by_id[v].partition == gpu_jobs.Partition.CPU]
     victims = [v for v in victims if v not in cpu_victims]
     if cpu_victims and not whole_box and free is not None:  # memory short: only if the normal ones cannot free enough
-        freed = sum(_asked_mb(v, by_id[v].user) for v in victims)
+        freed = sum(_asked_mb(by_id[v]) for v in victims)
         if freed >= mem_mb(arguments.mem) - free:
             cpu_victims = []
     if arguments.mem and free is not None:

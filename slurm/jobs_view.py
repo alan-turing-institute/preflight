@@ -36,7 +36,15 @@ ERROR_LINE = re.compile(r"(?i)\b(error|exception|traceback|warning|killed|out of
 _NEVER = 2**32 - 2  # sacct's start time for a job that never started
 
 
-WHOLE_NODE_MEM = "0"
+def requested_mem_mb(job: QueuedJob | None, record: Mapping[str, object]) -> int | None:
+    """The memory a job holds or waits for, in MB (0: the whole node): slurm's request as it stands, so a later
+    `scontrol update MinMemoryNode=` shows; else the `--mem` submit.py recorded. None when neither says."""
+    if job is not None and job.mem_mb is not None:
+        return job.mem_mb
+    try:
+        return gpu_jobs.mem_mb(str(record["mem"])) if record.get("mem") else None
+    except (ValueError, IndexError):
+        return None
 
 
 class Bucket(StrEnum):
@@ -157,9 +165,9 @@ def waiting_reason(
         return "held by an admin (requeue limit or admin hold)"
     if reason == Reason.RESOURCES:
         needs = [f"{job.gpus} GPU(s)"] if job.gpus else []
-        mem = records.get(job.job_id, {}).get("mem")
-        if mem:  # --mem=0 is slurm's "all of the node's memory"
-            needs.append("all of the box's memory" if str(mem) == WHOLE_NODE_MEM else f"{mem} memory")
+        mb = requested_mem_mb(job, records.get(job.job_id, {}))
+        if mb is not None:  # --mem=0 is slurm's "all of the node's memory"
+            needs.append("all of the box's memory" if mb == 0 else f"{mb * 1024**2 / 10**9:.1f} GB memory")  # slurm MB: 2^20 bytes
         return f"waiting for {' / '.join(needs)} to free" if needs else "waiting for resources to free"
     if reason == Reason.PRIORITY:
         return f"queued behind {_queued_ahead(job, queue)} job(s)"

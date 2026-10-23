@@ -18,6 +18,7 @@
   --bar-ink: #e5e7eb;
   --bar-muted: #9ca3af;
   --track: #e8eaee;
+  --used: #475569;
   --shadow: 0 1px 2px rgba(15, 23, 42, 0.06), 0 1px 1px rgba(15, 23, 42, 0.03);
   --good: #0a7d0a;   --good-bg: #e6f4e6;
   --warn: #8a5a00;   --warn-bg: #fdf3dc;
@@ -44,6 +45,7 @@
     --accent-ink: #86b6ef;
     --bar: #05070a;
     --track: #262b31;
+    --used: #9aa5b4;
     --shadow: none;
     --good: #4cc94c;   --good-bg: rgba(12, 163, 12, 0.16);
     --warn: #f2c14e;   --warn-bg: rgba(250, 178, 25, 0.14);
@@ -209,6 +211,8 @@ dl.facts dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
 .meter .track { fill: var(--track); }
 .meter .fill { fill: var(--accent); }
 .meter .fill.warn { fill: #fab219; }
+.meter .fill.used { fill: var(--used); }
+.meter-line { display: flex; justify-content: space-between; gap: 12px; margin: 8px 0 4px; color: var(--ink-2); font-size: 12.5px; }
 .meter .note { color: var(--muted); font-size: 12px; margin-top: 4px; }
 .timeline { list-style: none; margin: 0; padding: 0; }
 .timeline li { display: grid; grid-template-columns: 150px 1fr; gap: 12px; padding: 8px 0; border-bottom: 1px dashed var(--border); }

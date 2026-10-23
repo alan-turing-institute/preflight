@@ -52,6 +52,7 @@ class World:
         self.metrics_mode = "off"
         self.smi: dict[int, float] | None = {}  # nvidia-smi's GPU MiB per pid; None when it does not answer
         self.cgroups = tmp_path / "cgroup"
+        self.live: dict[int, str] = {}  # pid -> job of the processes that still exist when the OOM guard names them
         (tmp_path / "agent").mkdir()
         (tmp_path / "agent" / "boot_id").write_text(
             "boot-1\n"
@@ -92,6 +93,7 @@ class World:
             completion=lambda: self.records,
             gpu_usage=lambda: self.smi,
             cgroup_root=self.cgroups,
+            pid_job=lambda pid: self.live.get(pid),
         )
 
     def step(self) -> dict[str, object]:
@@ -149,6 +151,38 @@ def test_the_agent_writes_the_metrics_of_running_jobs_with_the_queues_user_and_r
     world.agent = world.new_agent()
     world.step()  # without GPUs nothing waits for nvidia-smi, so the file is written
     assert "} 0\n" in (metrics / "job_5.prom").read_text() and "} 4096\n" in (metrics / "job_5.prom").read_text()
+
+
+def kill(pid: int) -> str:
+    return json.dumps({"MESSAGE": f'sending SIGTERM to process {pid} uid 1000 "python": badness 1508, VmRSS 695 MiB',
+                       "__REALTIME_TIMESTAMP": "1792500000000000"})
+
+
+def test_oom_guard_kills_are_recorded_for_the_job_that_lost_the_process_and_dropped_once_it_leaves(world: World) -> None:
+    # earlyoom's own line, measured in the journal 2026-10-22 13:45:55 (job 428); anything else is no kill
+    assert agent_module.kill_from_entry(kill(42)) == (42, "SIGTERM", 1792500000.0)
+    assert agent_module.kill_from_entry('{"MESSAGE": "process exited after 2.6 seconds"}') is None
+    assert agent_module.kill_from_entry(json.dumps({"MESSAGE": list(b'sending SIGKILL to process 7 uid 0 "\xff"')})) == (
+        7, "SIGKILL", pytest.approx(agent_module.time.time(), abs=60))  # non-UTF-8 text comes as bytes
+    scope = world.cgroups / "system.slice" / "n1_slurmstepd.scope" / "job_5"
+    scope.mkdir(parents=True)
+    (scope / "cgroup.procs").write_text("10\n11\n")
+    world.queue = [job("5"), job("6", "PENDING")]
+    world.step()  # learns job 5's processes
+    world.live = {12: "6"}
+    watch = agent_module.OomWatch(world.agent.record_kill)
+    lines = [kill(12) + "\n", kill(11) + "\n", kill(99) + "\n",
+             "No journal files were opened due to insufficient permissions.\n"]
+    watch.follow(lambda *_a, **_k: subprocess.Popen(["printf", "%s", "".join(lines)], stdout=subprocess.PIPE, text=True))
+    kills = world.dir / "agent" / "oom_kills"
+    # pid 12 named while alive; pid 11 gone already, found in the last step's processes; pid 99 belongs to no job
+    assert sorted(p.name for p in kills.iterdir()) == ["job_5.json", "job_6.json"]
+    assert json.loads((kills / "job_5.json").read_text())["pid"] == 11
+    world.agent.watch = watch
+    assert "insufficient permissions" in str(world.step())  # a follower that cannot read the journal says so
+    world.queue = [job("6", "PENDING")]  # job 5 has left the queue: its wrapper has read its record already
+    world.step()
+    assert sorted(p.name for p in kills.iterdir()) == ["job_6.json"]
 
 
 def test_slurmctld_uptime_probe_reads_the_monotonic_timestamp() -> None:

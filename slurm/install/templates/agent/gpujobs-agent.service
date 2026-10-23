@@ -6,6 +6,8 @@ After=slurmctld.service
 
 [Service]
 User=$slurm_user
+# reads the host OOM guard's journal, to tell a job wrapper its run was killed (agent.py, OomWatch)
+SupplementaryGroups=systemd-journal
 Environment=GPUJOBS_SITE=$site_file
 ExecStart=/usr/bin/python3 $install_dir/slurm/agent.py
 Restart=always

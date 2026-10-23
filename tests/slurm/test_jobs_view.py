@@ -86,6 +86,9 @@ def test_waiting_reason_sentences() -> None:
         "nobody": jobs_view.waiting_reason(queued("JobHeldUser"), {}, records, [other]),
         "admin": jobs_view.waiting_reason(queued("JobHeldAdmin"), {}, records, []),
         "resources": jobs_view.waiting_reason(queued("Resources", gpus=1), {}, records, []),
+        # slurm's request wins over the record submit.py wrote (`scontrol update MinMemoryNode=` changes only slurm's)
+        "updated": jobs_view.waiting_reason(queued("Resources", gpus=1, mem_mb=61440), {}, records, []),
+        "whole": jobs_view.waiting_reason(queued("Resources", mem_mb=0), {}, records, []),
         "priority": jobs_view.waiting_reason(ahead["300"], ahead, records, []),
         "begin": jobs_view.waiting_reason(queued("BeginTime"), {}, records, []),
         "partition": jobs_view.waiting_reason(queued("PartitionConfig"), {}, records, []),
@@ -98,7 +101,9 @@ def test_waiting_reason_sentences() -> None:
         "newest": "paused by root at 2026-10-20 12:40 UTC; resume: resume.py 300",
         "nobody": "paused; resume: resume.py 300",
         "admin": "held by an admin (requeue limit or admin hold)",
-        "resources": "waiting for 1 GPU(s) / 100000M memory to free",
+        "resources": "waiting for 1 GPU(s) / 104.9 GB memory to free",
+        "updated": "waiting for 1 GPU(s) / 64.4 GB memory to free",
+        "whole": "waiting for all of the box's memory to free",
         "priority": "queued behind 2 job(s)",  # job 1 (higher) and job 2 (equal priority, submitted earlier)
         "begin": "requeued; waiting for its eligible time",
         "partition": "not allowed in partition steady",
