@@ -67,7 +67,8 @@ class Partition(StrEnum):
 
     NORMAL = "normal"  # resumes from its own checkpoint; pre-emptable
     STEADY = "steady"  # cannot resume; never pre-empted
-    CPU = "cpu"  # a job without GPUs, either class: kept off the cores held for GPU jobs; slurm never pre-empts it
+    CPU = "cpu"  # a `restart` job without GPUs: kept off the cores held for GPU jobs; slurm never pre-empts it
+    CPU_FILL = "cpu_fill"  # a `resume` job without GPUs: no core cap, so it fills idle cores; GPU jobs pre-empt it (D23)
     URGENT = "urgent"  # urgent.py only; pre-empts `normal`
     SERVICE = "service"  # submit.py --service only (D20): a service's CPU stand-in; suspends `cpu` jobs to start
     PART_TIME = "part_time"  # the part-time machines (someone's own, lent when idle); only `--anywhere` jobs reach it
@@ -90,20 +91,21 @@ def class_of(name: str) -> JobClass | None:
 
 
 #: What `--anywhere` asks slurm for: it starts in whichever of the two has room first. Once running, squeue names the
-#: one it got, so a job is only ever shown in `cpu` or `part_time`.
-ANYWHERE_PARTITIONS = f"{Partition.CPU},{Partition.PART_TIME}"
+#: one it got, so a job is only ever shown in `cpu_fill` or `part_time`.
+ANYWHERE_PARTITIONS = f"{Partition.CPU_FILL},{Partition.PART_TIME}"
 
 
 def partition_for(job_class: JobClass, gpus: int, *, service: bool = False, anywhere: bool = False) -> str:
-    """The partition a job runs in: a service's stand-in in `service`; one without GPUs in `cpu` (one partition, so its
-    MaxCPUsPerNode caps all CPU-only jobs together: slurm counts that limit per partition), else by its class.
+    """The partition a job runs in: a service's stand-in in `service`; one without GPUs by its class: `restart` in `cpu`
+    (capped by MaxCPUsPerNode, kept off the cores held for GPU jobs), `resume` in `cpu_fill` (no cap; GPU jobs requeue it);
+    otherwise `normal` or `steady` by its class.
     `anywhere` (a CPU-only `resume` job) adds the part-time machines: `ANYWHERE_PARTITIONS`."""
     if service:
         return Partition.SERVICE
     if anywhere:
         return ANYWHERE_PARTITIONS
     if not gpus:
-        return Partition.CPU
+        return Partition.CPU_FILL if job_class is JobClass.RESUME else Partition.CPU
     return Partition.NORMAL if job_class is JobClass.RESUME else Partition.STEADY
 
 

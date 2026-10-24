@@ -132,8 +132,8 @@ IDLE_MEMORY_GB = 8
 IDLE_HOLDERS = 3
 #: Waiting for room, as opposed to a dependency, a hold or a begin time.
 IDLE_WAITING_REASONS = frozenset({gpu_jobs.Reason.RESOURCES, gpu_jobs.Reason.PRIORITY})
-#: Partitions whose `resume` jobs slurm requeues for a waiting job; a `cpu` job is never moved until it has a fill partition.
-MOVABLE_PARTITIONS = frozenset({gpu_jobs.Partition.NORMAL, gpu_jobs.Partition.PART_TIME})
+#: Partitions whose `resume` jobs slurm requeues for a waiting job; a `cpu` (restart) job is never moved.
+MOVABLE_PARTITIONS = frozenset({gpu_jobs.Partition.NORMAL, gpu_jobs.Partition.CPU_FILL, gpu_jobs.Partition.PART_TIME})
 
 
 class IdleRule(StrEnum):

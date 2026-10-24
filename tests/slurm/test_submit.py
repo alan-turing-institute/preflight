@@ -73,15 +73,18 @@ def test_refusals(argv: list[str], why: str, tmp_path: Path, monkeypatch: pytest
         dry("--project", "p", "--what", "w", *argv)
 
 
-def test_anywhere_asks_for_the_cpu_and_part_time_partitions(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_anywhere_asks_for_the_cpu_fill_and_part_time_partitions(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_site(monkeypatch, lease=None, dgx_gate=False, part_time_nodes=(object(),))
     script = dry("--project", "p", "--what", "w", "--class", "resume", "--resume-ok", "--anywhere", "--mem", "4G",
                  "--", "x")
-    assert f"{DIRECTIVE} --partition=cpu,part_time" in script and f"{DIRECTIVE} --requeue" in script
+    assert f"{DIRECTIVE} --partition=cpu_fill,part_time" in script and f"{DIRECTIVE} --requeue" in script
     # the machine has no copy of the submitter's venv: the wrapper runs with the site's node_python, and only there
     assert f"exec /usr/bin/python3 {submit.HERE / 'job_wrapper.py'}" in script
-    local = dry("--project", "p", "--what", "w", "--class", "resume", "--resume-ok", "--mem", "4G", "--", "x")
-    assert f"exec {sys.executable} " in local
+    # without --anywhere: a resume job without GPUs fills idle cores (cpu_fill, GPU jobs pre-empt it), a restart job stays in cpu
+    resume = dry("--project", "p", "--what", "w", "--class", "resume", "--resume-ok", "--mem", "4G", "--", "x")
+    restart = dry("--project", "p", "--what", "w", "--class", "restart", "--mem", "4G", "--", "x")
+    assert f"{DIRECTIVE} --partition=cpu_fill\n" in resume and f"{DIRECTIVE} --partition=cpu\n" in restart
+    assert f"exec {sys.executable} " in resume
 
 
 def test_an_unknown_class_is_refused_by_the_parser() -> None:
