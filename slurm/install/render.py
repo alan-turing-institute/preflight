@@ -156,6 +156,7 @@ def _slurm(site: Site, extra: dict[str, str]) -> dict[str, FileSpec]:
         "gres_lines": gres_lines,
         "admin_group": site.admin_group,
         "constrain_devices": "yes" if site.constrain_devices else "no",
+        "requeue_delay_s": site.requeue_delay_s,
         "service_partition": _service_partition(site, names),
         "def_mem_mb": min(DEF_MEM_MB, *(n.real_memory_mb - (n.mem_spec_limit_mb or 0) for n in site.nodes)),
         "health_lines": _health_lines(site),

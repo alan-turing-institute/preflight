@@ -50,7 +50,7 @@ RESULTS: list[tuple[str, bool, str]] = []
 CHAIN_LENGTH = 3  # jobs in the chain S1 submits
 CPU_CAP = 2  # cores S3 lets the CPU-only partition use on the 4-core harness node
 AGENT_LOOP_S = 5  # the agent's loop interval
-REQUEUE_DELAY_S = 60  # slurm.conf AuthInfo=cred_expire: how long before a requeued job may start again
+REQUEUE_DELAY_S = 20  # harness.site.toml requeue_delay_s (slurm.conf AuthInfo=cred_expire): how long before a requeued job may start again
 REQUEUE_WITHIN_S = 70  # the agent waits 30 s for slurmctld, then acts within one 5-s loop; slack for the restarts themselves
 SCRAPED_EXPORTERS = 2  # exporters Prometheus can scrape in the container (node, cgroup; the GPU one needs NVML)
 
@@ -487,7 +487,7 @@ def keeps_place(*, agent_on: bool) -> None:
             check(f"S3 ({tag}): after resume the agent gives the job its place again (level, then job id)",
                   resumed.rc == 0 and bool(back) and priority(ja) > priority(jc),
                   f"job {ja}: place {place}, now {priority(ja)}; later job {jc}: {priority(jc)}")
-            # A requeued job may not start until slurm's requeue delay (AuthInfo=cred_expire=60 in slurm.conf) has passed, and
+            # A requeued job may not start until slurm's requeue delay (harness.site.toml requeue_delay_s) has passed, and
             # squeue says "Resources", not "BeginTime", while the card is also busy. Free the card only after that delay, or
             # the lower-priority job simply takes the card first.
             time.sleep(max(0.0, REQUEUE_DELAY_S + 5 - (time.monotonic() - paused_at)))

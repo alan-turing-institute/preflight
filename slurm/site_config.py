@@ -164,6 +164,7 @@ class Site:
     constrain_devices: bool = True  # cgroup.conf ConstrainDevices: a job sees only the GPUs it holds
     shared_state: bool = False  # the part-time nodes see this state_dir (a shared filesystem): nothing is copied back
     node_python: str = "/usr/bin/python3"  # the interpreter a part-time job's wrapper runs with, there
+    requeue_delay_s: int = 60  # slurm.conf AuthInfo=cred_expire: how long a requeued job waits before it may start again
 
     @property
     def cpu_job_cap(self) -> int | None:
@@ -351,6 +352,7 @@ def parse(raw: dict[str, Any]) -> Site:
             "health_check": None,
             "shared_state": False,
             "node_python": "/usr/bin/python3",
+            "requeue_delay_s": 60,
             "hostguard": False,
             "dgx_gate": False,
             "constrain_devices": True,
@@ -387,6 +389,8 @@ def parse(raw: dict[str, Any]) -> Site:
         raise SiteError("site file: shared_state must be true or false")
     if not isinstance(top["node_python"], str) or not top["node_python"].startswith("/"):
         raise SiteError(f"site file: node_python = {top['node_python']!r}; expected an absolute path")
+    if type(top["requeue_delay_s"]) is not int or top["requeue_delay_s"] < 1:
+        raise SiteError(f"site file: requeue_delay_s = {top['requeue_delay_s']!r}; expected a whole number of seconds, 1 or more")
     nodes = tuple(_parse_node(n, i) for i, n in enumerate(top["nodes"]))
     if nodes and not any(not n.part_time for n in nodes):
         raise SiteError("site file: every node is part_time; slurmctld runs on a full node, so list at least one")
@@ -429,6 +433,7 @@ def parse(raw: dict[str, Any]) -> Site:
         constrain_devices=top["constrain_devices"],
         shared_state=top["shared_state"],
         node_python=top["node_python"],
+        requeue_delay_s=top["requeue_delay_s"],
     )
 
 

@@ -158,7 +158,7 @@ design choice. Whether a browser then renders the panels inside the portal was *
 - **A restore-order request naming jobs that have since left the queue keeps failing** (`releasing [...] failed; will retry` in
   `agent/agent.json`). Seen in passing, after the jobs of a request were cancelled by hand. Whether one gone id stops the others in
   the same `scontrol release` was not tested.
-- **A requeued job cannot start for about a minute** (`AuthInfo=cred_expire=60`), and `squeue` says `Resources`, not
+- **A requeued job cannot start for 20 s** (`requeue_delay_s = 20` in `harness.site.toml`, `AuthInfo=cred_expire`; a real box keeps 60 s), and `squeue` says `Resources`, not
   `BeginTime`, while the card is also busy. In one run the check that freed the card 8 s after the pause saw the later job start
   first (the backfill scheduler gave it the free GPU, the resumed job needed all four); it now frees the card 65 s after the pause.
   So "keeps its place" is about priority, and holds from the moment the job is eligible.
