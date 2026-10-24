@@ -69,7 +69,7 @@ def test_build_downloads_checks_builds_and_reuses_the_cache(tmp_path, text, fam,
     else:
         assert names == ["dnf", "tar", "dnf", "dnf", "rpmbuild"]
         built = fakes.ran[-1][0]
-        assert built[1] == "-ta" and sb.RPM_WITH == built[3:3 + len(sb.RPM_WITH)]  # without cgroupv2 slurmd cannot start on Fedora
+        assert built[1] == "-ta" and sb.RPM_WITH == built[3:3 + len(sb.RPM_WITH)] and "hwloc" not in built  # without cgroupv2 slurmd cannot start on Fedora
         assert fakes.ran[2][0][:3] == ["dnf", "builddep", "-y"] and {"dbus-devel", "json-c-devel"} <= set(fakes.ran[3][0])
     workdir = cache / "26.05.5" / f"{fam}-{platform.machine()}"
     assert (workdir / sb.MARKER).read_text().strip() == SHA  # written once the build finished

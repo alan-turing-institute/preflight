@@ -36,13 +36,14 @@ DOWNLOAD_TIMEOUT_S = 60
 DEB_INSTALL = ["slurm-smd", "slurm-smd-client", "slurm-smd-slurmctld", "slurm-smd-slurmd", "slurm-smd-slurmdbd"]
 RPM_INSTALL = ["slurm", "slurm-perlapi", "slurm-slurmctld", "slurm-slurmd", "slurm-slurmdbd"]
 RPM_TOOLS = ["dnf", "install", "-y", "rpm-build", "dnf-plugins-core", "tar", "bzip2"]
-#: SchedMD's spec builds neither unless asked: without cgroupv2 slurmd cannot start on a cgroup v2 system (Fedora is one:
-#: "cannot create cgroup context for cgroup/v2", found joining the laptop), and hwloc gives the CPU topology the Debian
-#: build gets. `dnf builddep` of the spec as it stands does not list their development packages.
-#: json-c gives `scontrol --json` and `squeue --json` (the health check and our tools read them); the others match what the
-#: Debian build has (yaml, curl, http-parser, lz4).
-RPM_WITH = ["--with", "cgroupv2", "--with", "hwloc", "--with", "yaml", "--with", "libcurl"]
-RPM_EXTRA_DEVEL = ["dnf", "install", "-y", "dbus-devel", "hwloc-devel", "kernel-headers", "libbpf-devel", "json-c-devel",
+#: SchedMD's spec builds cgroupv2 only when asked: without it slurmd cannot start on a cgroup v2 system (Fedora is one:
+#: "cannot create cgroup context for cgroup/v2", found joining the laptop). `dnf builddep` of the spec as it stands does
+#: not list its development packages. json-c gives `scontrol --json` and `squeue --json` (the health check and our tools
+#: read them); yaml, curl, http-parser and lz4 match the Debian build. NOT hwloc: on the laptop's hybrid Intel CPU
+#: (6 performance cores of 2 threads, 10 efficiency cores of 1) slurm with hwloc sees only 12 of its 22 CPUs and the
+#: controller drains the node "Low CPUs"; without it slurm describes all 22.
+RPM_WITH = ["--with", "cgroupv2", "--with", "yaml", "--with", "libcurl"]
+RPM_EXTRA_DEVEL = ["dnf", "install", "-y", "dbus-devel", "kernel-headers", "libbpf-devel", "json-c-devel",
                    "libyaml-devel", "libcurl-devel", "http-parser-devel", "lz4-devel"]
 DEB_TOOLS = ["apt-get", "install", "-y", "build-essential", "fakeroot", "devscripts", "equivs"]
 
