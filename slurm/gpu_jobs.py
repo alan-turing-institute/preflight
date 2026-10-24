@@ -763,8 +763,13 @@ def run_slurm(command: list[str]) -> int:
 
 
 def node_state() -> str:
-    """The node's state and reason (`ReturnToService=1` leaves it DOWN after a reboot)."""
-    done = subprocess.run(["sinfo", "-h", "-N", "-o", "%T|%E"], capture_output=True, text=True, check=False)
+    """The full node's state and reason (`ReturnToService=1` leaves it DOWN after a reboot); a part-time machine is not it."""
+    try:
+        full = ",".join(node.name for node in site_config.load().full_nodes)
+    except site_config.SiteError:
+        full = ""
+    done = subprocess.run(["sinfo", "-h", "-N", *(["-n", full] if full else []), "-o", "%T|%E"],
+                          capture_output=True, text=True, check=False)
     return done.stdout.splitlines()[0] if done.returncode == 0 and done.stdout else "unknown (sinfo failed)"
 
 
