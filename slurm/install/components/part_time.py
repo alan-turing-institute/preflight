@@ -27,6 +27,12 @@ KNOWN_HOSTS = str(Path(render.COPY_KEY).parent / "known_hosts")  # under the sta
 OWNERS_DIR = "owners"  # under the state dir of each part-time machine: node_check.py (root) writes its manifest there
 MUNGE_KEY = "/etc/munge/munge.key"
 SLURMD_DROP_IN = "/etc/systemd/system/slurmd.service.d/10-conf-server.conf"
+#: The controller's slurm.conf (metrics on) names `Prolog=/etc/slurm/prolog.d/*.sh` and the same for Epilog; configless
+#: slurmd does not ship those scripts, and slurm 26.05 fails every job on a node where the glob matches nothing (drains
+#: the node, holds the job). A script that does nothing makes it match.
+NOOP_HOOK = "#!/bin/sh\n# part-time node: nothing to run here, but slurm needs one script in the directory\nexit 0\n"
+HOOK_DIRS = ("/etc/slurm/prolog.d", "/etc/slurm/epilog.d")
+HOOK_NAME = "00-none.sh"
 SLURMD_PORT = 6818
 PASSWD_UID, PASSWD_GID = 2, 3  # fields of a `getent passwd` line
 NOT_FOUND = 2  # `getent` exit status for a missing entry, passed through by ssh
@@ -225,6 +231,15 @@ def _write_drop_in(controller: str) -> list[list[str]]:
     return [["systemctl", "daemon-reload"]]
 
 
+def _write_noop_hooks() -> list[list[str]]:
+    for directory in HOOK_DIRS:
+        path = components.ROOT / directory.lstrip("/") / HOOK_NAME
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(NOOP_HOOK)
+        path.chmod(0o755)
+    return []
+
+
 def _after(action) -> list[list[str]]:
     """Run a step that does its own work, then add no commands."""
     action()
@@ -269,6 +284,7 @@ def steps(site, args, manager: str, tools_apply, site_copy_apply) -> list:
         *agent_component.state_dir_commands(site),
         lambda: _copy_back_node(site),
         lambda: _write_drop_in(args.controller),
+        _write_noop_hooks,
         lambda: _firewall(args.controller),
         ["systemctl", "enable", "--now", "munge", "slurmd"],
     ]
