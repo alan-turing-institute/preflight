@@ -8,10 +8,12 @@ on the controller, and `install.py apply --part-time NODE` runs on the machine i
 from __future__ import annotations
 
 import grp
+import ipaddress
 import os
 import pwd
 import re
 import shlex
+import socket
 import subprocess
 import sys
 from enum import StrEnum
@@ -253,6 +255,28 @@ def _enable_services() -> list[list[str]]:
     return [["systemctl", "enable", "munge", "slurmd"]]
 
 
+def _controller_name_resolves(site, controller: str) -> list[list[str]]:
+    """slurm.conf names the controller (`SlurmctldHost`) and slurmd registers with it by that name, but `--conf-server`
+    was given an address: a laptop reaching the controller over a VPN does not know the name ("Unable to resolve", found
+    joining the laptop). Give it an /etc/hosts line, kept across reboots, unless it already resolves."""
+    name = site.full_nodes[0].name
+    try:
+        ipaddress.ip_address(controller)
+    except ValueError:
+        return []  # a name is resolved the way this machine resolves names
+    try:
+        socket.gethostbyname(name)
+        return []
+    except OSError:
+        pass
+    hosts = components.ROOT / "etc/hosts"
+    text = hosts.read_text() if hosts.exists() else ""
+    hosts.parent.mkdir(parents=True, exist_ok=True)
+    hosts.write_text(text + ("" if not text or text.endswith("\n") else "\n") + f"{controller} {name}  # gpujobs: slurm.conf's SlurmctldHost\n")
+    print(f"{name} did not resolve here: /etc/hosts now maps it to {controller}")
+    return []
+
+
 def _after(action) -> list[list[str]]:
     """Run a step that does its own work, then add no commands."""
     action()
@@ -297,6 +321,7 @@ def steps(site, args, manager: str, tools_apply, site_copy_apply) -> list:
         *agent_component.state_dir_commands(site),
         lambda: _copy_back_node(site),
         lambda: _write_drop_in(args.controller),
+        lambda: _controller_name_resolves(site, args.controller),
         _write_noop_hooks,
         ["install", "-d", "-m", "0755", "/var/log/slurm"],  # the controller's slurm.conf logs slurmd there; Fedora's rpm makes no such directory
         lambda: _firewall(args.controller),

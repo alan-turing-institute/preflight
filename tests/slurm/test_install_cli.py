@@ -643,6 +643,8 @@ def test_part_time_apply_adds_the_flag_to_the_packages_unit_and_opens_the_port_o
     assert drop_in == ("[Unit]\nAfter=network-online.target tailscaled.service\nWants=network-online.target\n\n[Service]\nExecStart=\n"
                        "ExecStart=/usr/sbin/slurmd --conf-server 100.2.2.2 --systemd $SLURMD_OPTIONS\nRestart=on-failure\nRestartSec=30\n")
     assert ["install", "-d", "-m", "0755", "/var/log/slurm"] in calls
+    hosts = (tmp_path / "root/etc/hosts").read_text()  # the controller's name must resolve here (a VPN laptop does not know it)
+    assert hosts.startswith("100.2.2.2 ") and hosts.endswith("  # gpujobs: slurm.conf's SlurmctldHost\n")
     for hook in ("prolog.d", "epilog.d"):  # slurm 26.05 fails a job where the glob matches no script
         script = tmp_path / "root/etc/slurm" / hook / "00-none.sh"
         assert script.read_text().endswith("exit 0\n") and os.access(script, os.X_OK)
