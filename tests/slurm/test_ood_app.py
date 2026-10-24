@@ -216,6 +216,10 @@ def test_part_time_card_is_the_admins_and_its_buttons_leave_requests_the_agent_r
     assert json.loads(call(boss, "/api/part-time/lap/thresholds", "POST", {"close_below_gb": 9, "evil": "x"})[1])["ok"]
     (request,) = tmp_path.glob("part_time-lap-*.json")
     assert json.loads(request.read_text()) == {"action": "thresholds", "close_below_gb": 9}
+    request.unlink()
+    for bad in (float("nan"), float("inf"), -float("inf")):  # sent as JSON's NaN/Infinity, which Python parses
+        assert call(boss, "/api/part-time/lap/resources", "POST", {"jobs_memory_gb": bad})[0][:3] == "400"
+    assert list(tmp_path.glob("part_time-*.json")) == []
 
 
 

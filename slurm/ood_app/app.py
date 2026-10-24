@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import html
 import json
+import math
 import os
 import pwd
 import re
@@ -1296,6 +1297,8 @@ def part_time_request(backend: Backend, node: str, action: str, body: Mapping[st
     except ValueError:
         raise Refused("404 Not Found", "no such action") from None
     payload = {"action": kind.value, **{k: body[k] for k in PART_TIME_FIELDS.get(kind, ()) if k in body}}
+    if any(isinstance(v, float) and not math.isfinite(v) for v in payload.values()):  # JSON's NaN and Infinity
+        raise Refused("400 Bad Request", "numbers must be finite")
     try:
         gpu_jobs.write_json(backend.requests_dir / f"part_time-{node}-{time.time_ns()}.json", payload)
     except OSError as exc:

@@ -379,7 +379,8 @@ def main() -> int:
     # slurm's own SIGTERM (pre-emption, cancel, time limit) ends the job its own way; only an unforwarded one is a kill
     killed = None if outcome["signals"] else guard_kill(job_id, started, ended, int(outcome["pid"]))  # type: ignore[call-overload]
     outcome.update(leg=restart, started_at=started, ended_at=ended, **({"killed_by": killed} if killed else {}))
-    record = gpu_jobs.read_sidecar(job_id, gpu_jobs.current_user()) or {}
+    # the local record only: legs copied back from a part-time machine must never be written into a user's own sidecar
+    record = gpu_jobs.read_json(gpu_jobs.sidecar_path(job_id), gpu_jobs.current_user()) or {}
     earlier = record.get("legs")
     legs = [*(earlier if isinstance(earlier, list) else []), outcome]
     best_effort("sidecar", lambda: gpu_jobs.update_sidecar(job_id, legs=legs, last_leg=outcome))

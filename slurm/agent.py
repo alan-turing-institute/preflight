@@ -121,6 +121,15 @@ COPY_EVERY_S = 60.0
 COPY_IO_TIMEOUT_S = 20
 COPY_CALL_TIMEOUT_S = 300
 COPY_KEY = Path(render.COPY_KEY)  # under the state dir; `install.py part-time add` makes it
+KNOWN_HOSTS = COPY_KEY.parent / "known_hosts"  # and this: the node's host key from the admin's own known_hosts (B7.1)
+#: What the copy takes from a node, as plain files only: no permissions or links from the node, nothing big, and only
+#: the state directories (the node's own manifest in `owners/` says who owned each file there).
+COPY_OPTIONS = [
+    "--no-perms", "--chmod=D755,F644", "--no-links", "--max-size=50M",
+    *(f"--include=/{sub}/***" for sub in ("jobs", "events", "logs", "footprints", "owners")), "--exclude=*",
+]
+#: rsync's "some files could not be transferred" and "some files vanished": the rest was copied.
+RSYNC_PARTIAL = frozenset({23, 24})
 RESUME_PROTECTED = frozenset({gpu_jobs.Partition.URGENT, gpu_jobs.Partition.SERVICE})
 
 #: The idle check (Part C2) looks this often, and tells one project about one holder at most this often.
@@ -479,6 +488,7 @@ class Agent:
         self._copy_at: dict[str, float] = {}  # node -> when it was last tried
         self.copied: dict[str, int] = {}  # node -> when its state was last copied (kept in agent.json)
         self._copy_failing: set[str] = set()  # nodes whose outage is already logged
+        self._copy_partial: set[str] = set()  # nodes whose partial copy is already logged
         self.part_time_conf = part_time_conf
         self.state_dir, self.pid_job = state_dir, pid_job
         self.watch: OomWatch | None = None  # main() starts one; a test drives record_kill itself
@@ -867,18 +877,25 @@ class Agent:
             self._copy_at[node.name] = now
             dest = self.state_dir / gpu_jobs.REMOTE_DIR / node.name
             dest.mkdir(parents=True, exist_ok=True)
-            ssh = f"ssh -i {key} -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new"
-            done = call(self.copier, ["rsync", "-a", "--delete", f"--timeout={COPY_IO_TIMEOUT_S}", "-e", ssh,
+            ssh = (f"ssh -i {key} -o BatchMode=yes -o ConnectTimeout=10 -o UserKnownHostsFile={self.state_dir / KNOWN_HOSTS} "
+                   "-o StrictHostKeyChecking=yes")
+            done = call(self.copier, ["rsync", "-a", "--delete", f"--timeout={COPY_IO_TIMEOUT_S}", *COPY_OPTIONS, "-e", ssh,
                                       f"{render.SLURM_USER}@{node.address}:", f"{dest}/"], COPY_CALL_TIMEOUT_S)
-            if done.returncode == 0:
+            lines = (done.stderr or "").strip().splitlines()
+            why = gpu_jobs.printable(lines[-1] if lines else f"exit {done.returncode}")
+            if done.returncode in {0, *RSYNC_PARTIAL}:
                 self.copied[node.name] = int(now)
                 if node.name in self._copy_failing:
                     self._copy_failing.discard(node.name)
                     print(f"[agent] job state is copied from {node.name} again", file=sys.stderr, flush=True)
+                if done.returncode == 0:
+                    self._copy_partial.discard(node.name)
+                elif node.name not in self._copy_partial:
+                    self._copy_partial.add(node.name)
+                    print(f"[agent] job state from {node.name} was copied in part (exit {done.returncode}): {why}",
+                          file=sys.stderr, flush=True)
             elif node.name not in self._copy_failing:
                 self._copy_failing.add(node.name)
-                lines = (done.stderr or "").strip().splitlines()
-                why = gpu_jobs.printable(lines[-1] if lines else f"exit {done.returncode}")
                 print(f"[agent] copying job state from {node.name} failed: {why}", file=sys.stderr, flush=True)
 
     def _ignore(self, path: Path, why: str) -> None:
@@ -927,7 +944,8 @@ class Agent:
         return self._scontrol_ok(["update", f"NodeName={node}", "State=DRAIN", f"Reason={CLOSED_FROM_PAGE}"], errors)
 
     def _requeue_resume_jobs(self, node: str, errors: list[str]) -> bool:
-        """Requeue every `resume` job running on `node` (never an urgent or service one).
+        """Clear `node` of jobs: requeue every `resume` job running there (never an urgent or service one) and cancel any
+        other, which a part-time machine may not run (B7.1).
 
         From the JSON queue, never `squeue -o` text: a job name may hold a newline and forge rows (review R)."""
         queue = self.read_queue()
@@ -936,9 +954,15 @@ class Agent:
             return False
         ok = True
         for job in queue:
-            if (job.state == gpu_jobs.State.RUNNING and job.node == node and job.job_class is gpu_jobs.JobClass.RESUME
-                    and job.partition not in RESUME_PROTECTED):
+            if job.state != gpu_jobs.State.RUNNING or job.node != node:
+                continue
+            if job.job_class is gpu_jobs.JobClass.RESUME and job.partition not in RESUME_PROTECTED:
                 ok = self._scontrol_ok(["requeue", job.job_id], errors) and ok
+            else:
+                done = call(self.scontrol, ["scancel", job.job_id])
+                if done.returncode != 0:
+                    errors.append(f"scancel {job.job_id} failed: {done.stderr.strip() or 'no answer'}")
+                ok = done.returncode == 0 and ok
         return ok
 
     def _set_thresholds(self, node: str, request: dict[str, object], errors: list[str]) -> bool:
@@ -987,7 +1011,7 @@ class Agent:
         chosen.update({k: request[k] for k in ("jobs_memory_gb", "keep_cpus") if k in request})
         try:
             site_config._check_part_time(dataclasses.replace(site_node, **chosen), "request")  # noqa: SLF001
-        except (site_config.SiteError, TypeError) as exc:
+        except (site_config.SiteError, TypeError, ValueError, OverflowError) as exc:  # NaN and infinity raise the last two
             self._reject(node, str(exc))
             return True
         self.state.part_time_resources[node] = chosen

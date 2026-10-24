@@ -176,6 +176,13 @@ def test_sigterm_is_passed_to_the_child_which_saves_then_the_leg_is_recorded(
         signal.signal(signal.SIGTERM, before)
     assert (leg["signals"], leg["exit"]) == (["SIGTERM"], -signal.SIGTERM)
 
+    # legs copied back from a part-time machine are never written into the user's own sidecar (the merged view is not read)
+    monkeypatch.setattr(job_wrapper.gpu_jobs, "read_sidecar", lambda *a, **k: {"legs": [{"leg": "copied"}]})
+    monkeypatch.setenv("SLURM_JOB_ID", "81")
+    monkeypatch.setattr(sys, "argv", ["job_wrapper.py", "--sample", "0.2", "--", "true"])
+    assert job_wrapper.main() == 0
+    assert [leg["leg"] for leg in json.loads((tmp_path / "state" / "jobs" / "81.json").read_text())["legs"]] == [0]
+
 
 def test_an_unverifiable_manifest_refuses_the_launch(tmp_path: Path) -> None:
     env = dict(os.environ, SLURM_GPU_STATE_DIR=str(tmp_path / "state"), SLURM_JOB_ID="78")

@@ -83,7 +83,7 @@ class World:
                     argv,
                     out=f"NodeName={argv[3]} State={self.nodes[argv[3]]} Reason=x\n",
                 )
-        self.writes.append(argv[1:])
+        self.writes.append(argv if argv[0] == "scancel" else argv[1:])
         return done(argv, int(argv[1] in self.fail))
 
     def new_agent(self) -> agent_module.Agent:
@@ -537,7 +537,7 @@ def test_part_time_requests_are_an_admins_and_each_does_exactly_its_own_thing(wo
     world.part_time("3", action="accept")
     world.step()
     assert world.writes == [["update", "NodeName=lap", "State=RESUME"]]
-    # give back: drain, then requeue the `resume` jobs there and no other
+    # give back: drain, then requeue the `resume` jobs there and cancel every other job (a part-time machine runs only those)
     world.writes.clear()
     # a forged name (a newline and a fake row) is just a name in the JSON queue, never a job to requeue
     world.queue = [gpu_jobs.QueuedJob(i, part, "RUNNING", "None", name, node="lap") for i, name, part in (
@@ -547,7 +547,8 @@ def test_part_time_requests_are_an_admins_and_each_does_exactly_its_own_thing(wo
     world.part_time("4", action="give_back")
     world.step()
     assert world.writes == [
-        ["update", "NodeName=lap", "State=DRAIN", f"Reason={agent_module.CLOSED_FROM_PAGE}"], ["requeue", "11"]]
+        ["update", "NodeName=lap", "State=DRAIN", f"Reason={agent_module.CLOSED_FROM_PAGE}"], ["requeue", "11"],
+        ["scancel", "12"], ["scancel", "13"], ["scancel", "14"]]
 
 
 def test_part_time_limits_are_set_again_when_slurm_forgets_them_and_a_bad_pair_is_refused(world: World) -> None:
@@ -583,6 +584,11 @@ def test_part_time_resources_rewrite_the_included_file_then_reconfigure(world: W
     world.part_time("2", action="resources", jobs_memory_gb=99)  # more than the machine has
     world.step()
     assert world.writes == [["reconfigure"]] and world.agent.state.part_time_resources["lap"]["jobs_memory_gb"] == 20
+    for n, bad in enumerate((float("nan"), float("inf"), -float("inf"), 10**400), start=3):  # JSON can carry these; round() and isfinite() cannot take them
+        asked = world.part_time(str(n), action="resources", jobs_memory_gb=bad)
+        world.step()
+        assert not asked.exists()  # done: the agent did not crash, and did not retry it
+    assert world.writes == [["reconfigure"]] and world.agent.state.part_time_resources["lap"]["jobs_memory_gb"] == 20
 
 
 def test_a_part_times_job_state_is_copied_back_each_minute_and_a_failure_is_logged_once_per_outage(
@@ -590,8 +596,11 @@ def test_a_part_times_job_state_is_copied_back_each_minute_and_a_failure_is_logg
     world.lap = {"name": "lap", "state": ["IDLE"], "reason": "", "extra": ""}
     world.agent = world.new_agent()
     beat = world.step()
-    ssh = f"ssh -i {world.dir}/agent/ssh/id_ed25519 -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new"
-    assert world.copies == [["rsync", "-a", "--delete", "--timeout=20", "-e", ssh, "slurm@10.0.0.2:", f"{world.dir}/remote/lap/"]]
+    ssh = (f"ssh -i {world.dir}/agent/ssh/id_ed25519 -o BatchMode=yes -o ConnectTimeout=10 "
+           f"-o UserKnownHostsFile={world.dir}/agent/ssh/known_hosts -o StrictHostKeyChecking=yes")  # the host key the admin saw
+    only = ["--no-perms", "--chmod=D755,F644", "--no-links", "--max-size=50M", "--include=/jobs/***", "--include=/events/***",
+            "--include=/logs/***", "--include=/footprints/***", "--include=/owners/***", "--exclude=*"]  # plain state files only
+    assert world.copies == [["rsync", "-a", "--delete", "--timeout=20", *only, "-e", ssh, "slurm@10.0.0.2:", f"{world.dir}/remote/lap/"]]
     assert beat["copied"] == {"lap": 1000} and agent_module.read_copied(world.dir) == {"lap": 1000}  # the card's "last copied"
     world.t += 59
     world.step()
@@ -607,6 +616,12 @@ def test_a_part_times_job_state_is_copied_back_each_minute_and_a_failure_is_logg
     world.t += 60
     world.step()
     assert "copied from lap again" in capsys.readouterr().err and world.agent.copied == {"lap": 1299}
+    # a partial copy (23: some files could not be read, 24: some vanished) counts as copied, and is logged once
+    for _ in range(2):
+        world.copy_answer = (24, "file has vanished: logs/x.log\n")
+        world.t += 60
+        world.step()
+    assert capsys.readouterr().err.count("copied in part (exit 24)") == 1 and world.agent.copied == {"lap": 1419}
     world.shared_state, world.copies = True, []  # a shared state directory has nothing to copy
     world.agent = world.new_agent()
     world.step()

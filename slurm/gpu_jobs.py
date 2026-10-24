@@ -453,21 +453,65 @@ def _ran_on(job_ids: Iterable[str]) -> dict[str, dict[str, str]]:
     return out
 
 
+#: SlurmUser: the agent copies part-time machines' state as this user, so only its files count under `remote/`.
+#: Equal to `render.SLURM_USER` (the install-only module cannot be imported here).
+SLURM_USER = "slurm"
+MANIFEST = "owners/manifest.json"  # written on each part-time machine by node_check.py (root): relative path -> owner uid
+
+
+def _manifest(node_dir: Path) -> dict[str, int]:
+    """The copied-back owner manifest of one part-time machine (`{relative path: uid}`); {} when absent or not SlurmUser's."""
+    record = read_json(node_dir / MANIFEST, SLURM_USER) or {}
+    files = record.get("files")
+    return {k: v for k, v in files.items() if isinstance(v, int) and not isinstance(v, bool)} if isinstance(files, dict) else {}
+
+
+def _copier_uid() -> int | None:
+    try:
+        return pwd.getpwnam(SLURM_USER).pw_uid
+    except KeyError:
+        return None
+
+
+def _copied(path: Path) -> bool:
+    """A regular file (never a link) that SlurmUser's copy made: anything else under `remote/` is not from the copy."""
+    try:
+        status = path.lstat()
+    except OSError:
+        return False
+    return stat.S_ISREG(status.st_mode) and status.st_uid == _copier_uid()
+
+
+def _written_by(path: Path, node_dir: Path, manifest: Mapping[str, int], user: str) -> bool:
+    """The node's own manifest lists the file with `user`'s uid: root there saw who owned it, and a copy loses that."""
+    try:
+        return manifest.get(path.relative_to(node_dir).as_posix()) == pwd.getpwnam(user).pw_uid
+    except (KeyError, ValueError):
+        return False
+
+
 def remote_files(sub: str, pattern: str = "*") -> list[tuple[Path, str, str]]:
     """`(path, job id, user)` of each copied-back file in `remote/<node>/<sub>` for a job that sacct says ran on `<node>`.
 
     The trust rule: copied files lose their owner, so nothing in a file or its name says who made it. A file counts
-    only for the job id its name starts with when slurm's accounting puts that job on the node the file came from, and
-    it belongs to the user accounting gives that job. A file for any other job is ignored.
+    only when it is a regular file SlurmUser's copy made, for the job id its name starts with when slurm's accounting
+    puts that job on the node the file came from, and the node's manifest lists it with the uid of the user accounting
+    gives that job. A file for any other job, or one the manifest does not list, is ignored.
     """
     found = []
     for directory in state_dirs(sub)[1:]:
         for path in directory.glob(pattern):
             match = _FILE_JOB.match(path.name)
-            if match and path.is_file() and not path.is_symlink():
-                found.append((path, match[1], directory.parent.name))
+            if match and _copied(path):
+                found.append((path, match[1], directory.parent))
     ran = _ran_on(job_id for _, job_id, _ in found)
-    return [(path, job_id, ran[job_id][node]) for path, job_id, node in found if node in ran.get(job_id, {})]
+    manifests: dict[Path, dict[str, int]] = {}
+    out = []
+    for path, job_id, node_dir in found:
+        user = ran.get(job_id, {}).get(node_dir.name)
+        if user and _written_by(path, node_dir, manifests.setdefault(node_dir, _manifest(node_dir)), user):
+            out.append((path, job_id, user))
+    return out
 
 
 def _legs(record: Mapping[str, object]) -> list[dict[str, object]]:
@@ -488,13 +532,13 @@ def merge_remote(record: dict[str, object] | None, remote: Mapping[str, object])
 
 def remote_log(job_id: str, log: str, user: str | None = None) -> Path | None:
     """The copied-back log `remote/<node>/logs/<basename of log>` of a job that ran on that node, None for none.
-    With `user`, a job accounting gives to someone else is not shown."""
+    The same trust rule as `remote_files`. With `user`, a job accounting gives to someone else is not shown."""
     name = Path(log).name
     for directory in state_dirs("logs")[1:]:
         candidate = directory / name
-        if candidate.is_file() and not candidate.is_symlink():
+        if _copied(candidate):
             owner = _ran_on([job_id]).get(job_id, {}).get(directory.parent.name)
-            if owner and user in (None, owner):
+            if owner and user in (None, owner) and _written_by(candidate, directory.parent, _manifest(directory.parent), owner):
                 return candidate
     return None
 

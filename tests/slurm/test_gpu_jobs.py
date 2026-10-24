@@ -5,8 +5,10 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import pwd
 import signal
 import subprocess
+import types
 from pathlib import Path
 
 import gpu_jobs
@@ -295,15 +297,27 @@ def test_gpu_busy_is_unknown_unless_every_gpu_answers(out: str, busy: float | No
 
 def part_time_copy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ran: dict[str, tuple[str, str]]) -> Path:
     """A state dir with pt1's copied-back files under `remote/pt1`, and a sacct that says where each job ran:
-    `ran` maps a job id to (node, user)."""
+    `ran` maps a job id to (node, user). SlurmUser is the test user, whose files the copy "made"; ann and bob have uids
+    of their own (`list_in_manifest` writes pt1's owner manifest)."""
     monkeypatch.setattr(gpu_jobs, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(gpu_jobs, "SLURM_USER", gpu_jobs.current_user())
+    real = pwd.getpwnam
+    monkeypatch.setattr(pwd, "getpwnam", lambda name: types.SimpleNamespace(pw_uid=UIDS[name]) if name in UIDS else real(name))
     jobs = [{"job_id": int(j), "nodes": node, "user": user} for j, (node, user) in ran.items()]
     monkeypatch.setattr(gpu_jobs, "_sacct_jobs", lambda *sel: jobs if "-D" in sel else None)
     remote = tmp_path / "remote" / "pt1"
-    for sub in ("jobs", "events", "logs"):
+    for sub in ("jobs", "events", "logs", "owners"):
         (remote / sub).mkdir(parents=True)
         (tmp_path / sub).mkdir(exist_ok=True)
     return remote
+
+
+UIDS = {"ann": 1001, "bob": 1002}
+
+
+def list_in_manifest(remote: Path, owners: dict[str, str]) -> None:
+    """pt1's manifest as node_check.py writes it: `{"jobs/5.json": "ann"}` lists that file with ann's uid."""
+    (remote / "owners" / "manifest.json").write_text(json.dumps({"files": {p: UIDS[u] for p, u in owners.items()}}))
 
 
 def test_job_state_copied_back_from_a_part_time_machine_counts_only_for_jobs_that_ran_there(
@@ -318,6 +332,8 @@ def test_job_state_copied_back_from_a_part_time_machine_counts_only_for_jobs_tha
     (remote / "events" / "5-100-push_back.json").write_text(json.dumps({"job": "5", "action": "push_back", "free_mb": 1}))
     (remote / "events" / "6-100-push_back.json").write_text("{}")
     (remote / "logs" / "n-1.log").write_text("from pt1")
+    list_in_manifest(remote, {"jobs/5.json": "ann", "jobs/6.json": "bob", "jobs/7.json": "ann", "events/5-100-push_back.json": "ann",
+                              "events/6-100-push_back.json": "bob", "logs/n-1.log": "ann"})
     # the sidecar: the node's leg joins the local one; for a job accounting did not put there, nothing joins
     assert [leg["leg"] for leg in gpu_jobs.read_sidecar("5")["legs"]] == [0, 1]
     assert [leg["leg"] for leg in gpu_jobs.read_sidecar("5", me)["legs"]] == [0]  # accounting says it is ann's job
@@ -328,12 +344,25 @@ def test_job_state_copied_back_from_a_part_time_machine_counts_only_for_jobs_tha
     # the log only for the job that ran there, and a symlink is never followed
     assert gpu_jobs.remote_log("5", "/anywhere/n-1.log") == remote / "logs" / "n-1.log"
     assert gpu_jobs.remote_log("6", "/anywhere/n-1.log") is None and gpu_jobs.remote_log("5", "/x/n-1.log", "bob") is None
+    # the manifest is the proof of ownership: a file it omits, or lists under another uid (a user on the node made
+    # it), and a file that is not SlurmUser's copy, never count, though accounting puts the job there
+    list_in_manifest(remote, {"jobs/5.json": "bob", "logs/n-1.log": "bob"})
+    assert [leg["leg"] for leg in gpu_jobs.read_sidecar("5")["legs"]] == [0] and gpu_jobs.events() == []
+    assert gpu_jobs.remote_log("5", "/anywhere/n-1.log") is None
+    list_in_manifest(remote, {"jobs/5.json": "ann", "logs/n-1.log": "ann", "events/5-100-push_back.json": "ann"})
+    assert gpu_jobs.remote_log("5", "/anywhere/n-1.log") == remote / "logs" / "n-1.log"
+    with monkeypatch.context() as other:
+        other.setattr(gpu_jobs, "_copier_uid", lambda: os.getuid() + 1)
+        assert gpu_jobs.read_sidecar("5") == {"name": "n", "legs": [{"leg": 0, "ended_at": 1, "exit": 1}]}  # the local record only
+        assert gpu_jobs.events() == [] and gpu_jobs.remote_log("5", "/anywhere/n-1.log") is None
     (remote / "logs" / "n-1.log").unlink()
     (remote / "logs" / "n-1.log").symlink_to("/etc/hostname")
     assert gpu_jobs.remote_log("5", "/anywhere/n-1.log") is None
     # the footprint for --mem auto: a clean leg a part-time machine ran counts, for the user accounting names
     assert gpu_jobs.measured_peak_bytes("n") is None  # accounting says ann, not me: pt1's leg does not count for me
     monkeypatch.setattr(gpu_jobs, "_ran_on", lambda ids: {"5": {"pt1": me}})
+    assert gpu_jobs.measured_peak_bytes("n") is None  # ... and the manifest must list it with my uid too
+    (remote / "owners" / "manifest.json").write_text(json.dumps({"files": {"jobs/5.json": os.getuid()}}))
     assert gpu_jobs.measured_peak_bytes("n") == 7
 
 

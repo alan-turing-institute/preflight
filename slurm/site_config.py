@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import grp
 import ipaddress
+import math
 import os
 import pwd
 import re
@@ -251,7 +252,7 @@ def _check_part_time(node: Node, where: str) -> None:
         raise SiteError(f"site file: [{where}] part_time and mains_only must be true or false")
     for key in ("close_below_gb", "push_back_below_gb"):
         value = getattr(node, key)
-        if value is not None and (isinstance(value, bool) or not isinstance(value, int | float) or value <= 0):
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int | float) or not 0 < value < math.inf):
             raise SiteError(f"site file: [{where}] {key} = {value!r}; expected a positive number of GB")
     if node.push_back_below_mb > node.close_below_mb:
         raise SiteError(f"site file: [{where}] push_back_below_gb must not exceed close_below_gb: "
@@ -270,7 +271,7 @@ def _check_part_time(node: Node, where: str) -> None:
         raise SiteError(f"site file: [{where}] keep_cpus = {node.keep_cpus!r}; expected CPU numbers and ranges "
                         "such as \"0-11\" or \"0,2,4-7\"")
     jobs = node.jobs_memory_gb
-    if jobs is not None and (isinstance(jobs, bool) or not isinstance(jobs, int | float)
+    if jobs is not None and (isinstance(jobs, bool) or not isinstance(jobs, int | float) or not math.isfinite(jobs)
                              or not 0 < round(jobs * MB_PER_GB) < node.real_memory_mb):
         raise SiteError(f"site file: [{where}] jobs_memory_gb = {jobs!r}; expected more than 0 and less than the "
                         f"node's memory ({node.real_memory_mb / MB_PER_GB:g} GB)")
