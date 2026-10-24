@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import grp
 import os
+import pwd
 import re
+import shlex
 import subprocess
 import sys
 from enum import StrEnum
@@ -21,6 +23,8 @@ import components
 
 SLURM_USER = "slurm"
 SSH = ["ssh", "-o", "BatchMode=yes"]
+KNOWN_HOSTS = str(Path(render.COPY_KEY).parent / "known_hosts")  # under the state dir; the agent's ssh trusts only this
+OWNERS_DIR = "owners"  # under the state dir of each part-time machine: node_check.py (root) writes its manifest there
 MUNGE_KEY = "/etc/munge/munge.key"
 SLURMD_DROP_IN = "/etc/systemd/system/slurmd.service.d/10-conf-server.conf"
 SLURMD_PORT = 6818
@@ -56,6 +60,12 @@ def _as_admin(argv: list[str]) -> list[str]:
     return ["sudo", "-u", admin, *argv] if admin and os.geteuid() == 0 else argv
 
 
+def _on_node(address: str, *remote: str) -> list[str]:
+    """`remote` run on the node over ssh, as the admin. ssh hands the words to the node's shell as one string, so each
+    is quoted: a user name from accounting reaches here, and must stay one word."""
+    return _as_admin([*SSH, address, *(shlex.quote(word) for word in remote)])
+
+
 def _ids(argv: list[str]) -> tuple[int, int] | None:
     """(uid, gid) from a `getent passwd` run, None for no such user; any other failure (ssh itself) stops."""
     done = components.run(argv)
@@ -86,7 +96,7 @@ def uid_mismatches(users: list[str], address: str) -> list[str]:
         here = _ids(["getent", "passwd", user])
         if here is None:
             continue
-        there = _ids(_as_admin([*SSH, address, "getent", "passwd", user]))
+        there = _ids(_on_node(address, "getent", "passwd", user))
         if there is None and user != SLURM_USER:
             out.append(f"{user}: uid {here[0]} here, missing on {address}")
         elif there is not None and there[0] != here[0]:
@@ -105,17 +115,18 @@ def cmd_add(site, args) -> int:
         for line in problems:
             print(f"  {line}", file=sys.stderr)
         return 1
+    host_key = "" if site.shared_state else _host_key(node)  # before anything is changed: no key, no join
     key = (components.ROOT / MUNGE_KEY.lstrip("/")).read_bytes()
     install = ["install", "-m", "0400", "-o", "munge", "-g", "munge", "/dev/stdin", MUNGE_KEY]
-    done = send(_as_admin([*SSH, node.address, "sudo", *install]), key)
+    done = send(_on_node(node.address, "sudo", "-n", *install), key)
     if done.returncode != 0:
         raise SystemExit(f"FAILED ({done.returncode}): copying the munge key to {node.address}\n"
                          f"{(done.stderr or b'').decode(errors='replace')}".rstrip())
     # a munge already running holds the key it started with
-    components.run(_as_admin([*SSH, node.address, "sudo", "systemctl", "try-restart", "munge", "slurmd"]))
+    components.run(_on_node(node.address, "sudo", "-n", "systemctl", "try-restart", "munge", "slurmd"))
     print(f"{node.name}: user ids match and the munge key is copied (not shown)")
     if not site.shared_state:
-        _authorize_copy_back(site, node)
+        _authorize_copy_back(site, node, host_key)
     return 0
 
 
@@ -124,7 +135,20 @@ def authorized_line(rrsync: str, state_dir: str, public_key: str) -> str:
     return f'command="{rrsync} -ro {state_dir}",restrict {public_key.strip()}'
 
 
-def _authorize_copy_back(site, node) -> None:
+def _host_key(node) -> str:
+    """The node's host key lines from the invoking admin's own `known_hosts` (they have ssh'd there once, which is how
+    they checked the key): the agent's ssh trusts exactly these and never a key on first use."""
+    admin = os.environ.get("SUDO_USER") or pwd.getpwuid(os.getuid()).pw_name
+    known = Path(pwd.getpwnam(admin).pw_dir) / ".ssh" / "known_hosts"
+    done = components.run(_as_admin(["ssh-keygen", "-F", node.address, "-f", str(known)]))
+    lines = [line for line in (done.stdout or "").splitlines() if line.strip() and not line.startswith("#")]
+    if done.returncode != 0 or not lines:
+        raise SystemExit(f"REFUSED: no host key for {node.address} in {known}; ssh to {node.address} once as yourself "
+                         "first (check its fingerprint), then run this again")
+    return "\n".join(lines) + "\n"
+
+
+def _authorize_copy_back(site, node, host_key: str) -> None:
     """Make SlurmUser's copy-back key here if absent, and let it read the node's state directory (and nothing else)."""
     key = Path(site.state_dir) / render.COPY_KEY
     run = components.run
@@ -134,12 +158,16 @@ def _authorize_copy_back(site, node) -> None:
                      "gpujobs-copy-back", "-f", str(key)]])]:
         if (done := run(argv)).returncode != 0:
             raise SystemExit(f"FAILED ({done.returncode}): {' '.join(argv)}\n{done.stderr or ''}".rstrip())
+    path = Path(site.state_dir) / KNOWN_HOSTS
+    done = send(["install", "-m", "0644", "-o", SLURM_USER, "-g", SLURM_USER, "/dev/stdin", str(path)], host_key.encode())
+    if done.returncode != 0:
+        raise SystemExit(f"FAILED ({done.returncode}): writing {path}\n{(done.stderr or b'').decode(errors='replace')}".rstrip())
     public = (components.ROOT / f"{key}.pub".lstrip("/")).read_text()
     # Ubuntu ships rrsync in /usr/bin; elsewhere `apply --part-time` put it in /usr/local/bin
-    has_usr_bin = run(_as_admin([*SSH, node.address, "test", "-x", USR_BIN_RRSYNC])).returncode == 0
+    has_usr_bin = run(_on_node(node.address, "test", "-x", USR_BIN_RRSYNC)).returncode == 0
     line = authorized_line(USR_BIN_RRSYNC if has_usr_bin else LOCAL_RRSYNC, str(site.state_dir), public)
     install = ["install", "-m", "0600", "-o", SLURM_USER, "-g", SLURM_USER, "/dev/stdin", f"{SLURM_HOME}/.ssh/authorized_keys"]
-    done = send(_as_admin([*SSH, node.address, "sudo", *install]), f"{line}\n".encode())
+    done = send(_on_node(node.address, "sudo", "-n", *install), f"{line}\n".encode())
     if done.returncode != 0:
         raise SystemExit(f"FAILED ({done.returncode}): installing the copy-back key on {node.address}\n"
                          f"{(done.stderr or b'').decode(errors='replace')}".rstrip())
@@ -220,6 +248,8 @@ def _copy_back_node(site) -> list[list[str]]:
         *([] if (components.ROOT / USR_BIN_RRSYNC.lstrip("/")).exists() else [["install", "-m", "0755", DOC_RRSYNC, LOCAL_RRSYNC]]),
         ["install", "-d", "-m", "0755", *own, SLURM_HOME],
         ["install", "-d", "-m", "0700", *own, ssh],
+        # root's alone: node_check.py lists each state file's owner here, and the controller trusts that list
+        ["install", "-d", "-m", "0755", "-o", "root", "-g", "root", f"{site.state_dir}/{OWNERS_DIR}"],
     ]
 
 

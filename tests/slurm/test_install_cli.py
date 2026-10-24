@@ -1,6 +1,7 @@
 import getpass
 import importlib.util
 import os
+import shlex
 import stat
 import subprocess
 import sys
@@ -391,25 +392,31 @@ address = "100.1.1.1"
 [slurm]
 version = '26.05.5'
 sha256 = '""" + "ab" * 32 + "'\n"
+HOST_KEY = "# Host 100.1.1.1 found: line 3\n100.1.1.1 ssh-ed25519 AAAAHOST\n"
 UNIT = "# /usr/lib/systemd/system/slurmd.service\n[Service]\nExecStart=/usr/sbin/slurmd --systemd $SLURMD_OPTIONS\n"
 
 
 class PartTimeFake(Fake):
     """`local` and `remote` map a user to its uid for `getent passwd` here and over ssh; `users` is what accounting lists."""
 
-    def __init__(self, local, remote, users, firewalld=True, unit=UNIT):
+    def __init__(self, local, remote, users, firewalld=True, unit=UNIT, known_host=HOST_KEY):
         super().__init__()
         self.local, self.remote, self.users, self.firewalld, self.unit = local, remote, users, firewalld, unit
+        self.known_host = known_host  # what `ssh-keygen -F` finds in the admin's known_hosts: "" for no entry
 
     def __call__(self, argv):
         if argv[:1] == ["ssh"] and argv[-3:-1] == ["getent", "passwd"] or argv[:2] == ["getent", "passwd"]:
             table = self.remote if argv[:1] == ["ssh"] else self.local
             self.calls.append(argv)
-            uid = table.get(argv[-1])
-            line = f"{argv[-1]}:x:{uid}:{uid}::/home:/bin/sh\n" if uid is not None else ""
+            name = shlex.split(argv[-1])[0] if argv[:1] == ["ssh"] else argv[-1]  # the node's shell unquotes it
+            uid = table.get(name)
+            line = f"{name}:x:{uid}:{uid}::/home:/bin/sh\n" if uid is not None else ""
             return subprocess.CompletedProcess(argv, 0 if uid is not None else 2, line, "")
         if argv[:5] == ["sacctmgr", "-n", "-P", "show", "assoc"]:
             return subprocess.CompletedProcess(argv, 0, "\n".join(self.users) + "\n", "")
+        if argv[:2] == ["ssh-keygen", "-F"] or argv[:1] == ["sudo"] and argv[3:5] == ["ssh-keygen", "-F"]:
+            self.calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0 if self.known_host else 1, self.known_host, "")
         if argv[:3] == ["systemctl", "is-active", "firewalld"]:
             return subprocess.CompletedProcess(argv, 0 if self.firewalld else 3, "", "")
         if argv[:3] == ["systemctl", "cat", "slurmd"]:
@@ -430,8 +437,8 @@ def part_time_env(tmp_path, monkeypatch, fake):
 
 
 def test_part_time_add_refuses_every_uid_mismatch_then_copies_the_key_without_showing_it(tmp_path, monkeypatch, capsys):
-    local = {"alice": 1001, "bob": 1002, "carol": 1003, "slurm": 64030}
-    fake = PartTimeFake(local, {"alice": 2001, "carol": 1003}, ["alice", "bob", "carol"])
+    local = {"alice": 1001, "bob": 1002, "carol": 1003, "slurm": 64030, "x;reboot": 1004}
+    fake = PartTimeFake(local, {"alice": 2001, "carol": 1003, "x;reboot": 1004}, ["alice", "bob", "carol", "x;reboot"])
     site = part_time_env(tmp_path, monkeypatch, fake)
     root = tmp_path / "root"
     (root / "etc/munge").mkdir(parents=True)
@@ -447,19 +454,30 @@ def test_part_time_add_refuses_every_uid_mismatch_then_copies_the_key_without_sh
         assert "alice: uid 1001 here, 2001 on 100.1.1.1" in err and "bob: uid 1002 here, missing" in err
         assert "slurm" not in err and "carol" not in err  # slurm is created by the node install; carol matches
         assert sent == []  # nothing is copied while any id differs
+        # every word sent to the node's shell is quoted, so an account name stays one word there
+        assert next(c for c in fake.calls if c[:1] == ["ssh"] and c[-1] == "'x;reboot'")[-3:-1] == ["getent", "passwd"]
         fake.remote.update(alice=1001, bob=1002)  # slurm may stay missing
+        fake.known_host = ""  # the admin has never ssh'd to the node: no host key to give the agent
+        with pytest.raises(SystemExit, match="ssh to 100.1.1.1 once as yourself first"):
+            run(site, root, "part-time", "add", "laptop")
+        assert sent == []  # nothing is copied or authorized without it
+        fake.known_host = HOST_KEY
         assert run(site, root, "part-time", "add", "laptop") == 0
     finally:
         components.set_runner(None)
     argv, data = sent[0]
-    assert argv[-9:] == ["sudo", "install", "-m", "0400", "-o", "munge", "-g", "munge", "/dev/stdin", "/etc/munge/munge.key"][-9:]
+    assert argv[-10:] == ["sudo", "-n", "install", "-m", "0400", "-o", "munge", "-g", "munge", "/dev/stdin", "/etc/munge/munge.key"][-10:]
     assert data == b"SECRETKEYBYTES"
     # B5b: SlurmUser's key (made here when absent) may only run a read-only rsync of the node's state directory
     keygen = ["runuser", "-u", "slurm", "--", "ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "gpujobs-copy-back",
               "-f", "/var/lib/gpujobs/agent/ssh/id_ed25519"]
     assert keygen in fake.calls and ["install", "-d", "-m", "0700", "-o", "slurm", "-g", "slurm", "/var/lib/gpujobs/agent/ssh"] in fake.calls
+    # the agent's ssh trusts the host key the admin saw, and only that one
     argv, data = sent[1]
-    assert argv[-9:] == ["sudo", "install", "-m", "0600", "-o", "slurm", "-g", "slurm", "/dev/stdin", "/var/lib/slurm/.ssh/authorized_keys"][-9:]
+    assert argv == ["install", "-m", "0644", "-o", "slurm", "-g", "slurm", "/dev/stdin", "/var/lib/gpujobs/agent/ssh/known_hosts"]
+    assert data == b"100.1.1.1 ssh-ed25519 AAAAHOST\n"  # the entry, not ssh-keygen's "# Host ... found" comment
+    argv, data = sent[2]
+    assert argv[-10:] == ["sudo", "-n", "install", "-m", "0600", "-o", "slurm", "-g", "slurm", "/dev/stdin", "/var/lib/slurm/.ssh/authorized_keys"][-10:]
     assert data == b'command="/usr/bin/rrsync -ro /var/lib/gpujobs",restrict ssh-ed25519 AAAAKEY gpujobs-copy-back\n'
     out = capsys.readouterr()
     assert "SECRETKEYBYTES" not in out.out + out.err and not any("SECRETKEYBYTES" in " ".join(c) for c in fake.calls)
@@ -504,6 +522,7 @@ def test_part_time_apply_adds_the_flag_to_the_packages_unit_and_opens_the_port_o
     assert not any(c[:2] == ["systemctl", "enable"] and "gpujobs-agent.service" in c for c in calls)  # no agent here
     assert ["install", "-m", "0755", "/usr/share/doc/rsync/support/rrsync", "/usr/local/bin/rrsync"] in calls
     assert ["install", "-d", "-m", "0700", "-o", "slurm", "-g", "slurm", "/var/lib/slurm/.ssh"] in calls
+    assert ["install", "-d", "-m", "0755", "-o", "root", "-g", "root", "/var/lib/gpujobs/owners"] in calls  # node_check's manifest
     drop_in = (tmp_path / "root/etc/systemd/system/slurmd.service.d/10-conf-server.conf").read_text()
     assert drop_in == "[Service]\nExecStart=\nExecStart=/usr/sbin/slurmd --conf-server 100.2.2.2 --systemd $SLURMD_OPTIONS\n"
     rule = "--add-rich-rule=rule family=ipv4 source address=100.2.2.2 port port=6818 protocol=tcp accept"
