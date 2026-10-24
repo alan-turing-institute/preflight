@@ -73,9 +73,31 @@ def test_example_loads_and_minimal_file_gets_every_default(tmp_path: Path) -> No
     assert stepped.slurm_steps == (("25.05.9", SHA),)
 
 
+PART_TIME = "[[nodes]]\nname = 'p'\ncpus = 4\nreal_memory_mb = 8000\npart_time = true\n"
+
+
+def test_part_time_nodes_and_health_check_defaults(tmp_path: Path) -> None:
+    site = gpujobs_site.load(write(tmp_path, MINIMAL + PART_TIME + "address = 'a'\njobs_memory_gb = 5\nkeep_cpus = '0,2-3'\n"
+                                   "[health_check]\n"))
+    full, part = site.nodes
+    assert (site.full_nodes, site.part_time_nodes) == ((full,), (part,)) and site.health_check == gpujobs_site.HealthCheck(30)
+    assert (full.close_below_mb, full.push_back_below_mb, part.close_below_mb, part.push_back_below_mb) == (16000, 10000, 6000, 2000)
+    assert (part.mem_spec_limit_mb, full.mem_spec_limit_mb, part.mains_only) == (3000, None, None)
+    assert gpujobs_site.load(write(tmp_path, MINIMAL)).health_check is None
+
+
 @pytest.mark.parametrize(
     "text, fragment",
     [
+        (MINIMAL + PART_TIME, "a part_time node needs address"),
+        (MINIMAL + PART_TIME + "address = 'a'\n" + GPU, "a part_time node cannot have GPUs"),
+        (MINIMAL + PART_TIME + "address = 'a'\njobs_memory_gb = 8\n", "jobs_memory_gb = 8"),
+        (MINIMAL + PART_TIME + "address = 'a'\nkeep_cpus = '0-'\n", "keep_cpus = '0-'"),
+        (MINIMAL + "address = 'a'\n", "apply only with part_time = true"),
+        (MINIMAL + "close_below_gb = 4\npush_back_below_gb = 5\n", "push_back_below_gb must not exceed"),
+        (PART_TIME.replace("[[nodes]]", 'name = "x"\n[[nodes]]', 1) + "address = 'a'\n", "every node is part_time"),
+        (MINIMAL + "[health_check]\ninterval_s = 0\n", "health_check.interval_s = 0"),
+        (MINIMAL + "[health_check]\nintervals = 5\n", "unknown key(s) in [health_check]"),
         ("hostgaurd = true\n" + MINIMAL, "unknown key(s) in [top level]: hostgaurd"),
         (MINIMAL + "[metrics]\nmodee = 'off'\n", "unknown key(s) in [metrics]"),
         (MINIMAL + GPU + "extra = 1\n", "unknown key(s) in [nodes[0].gpus[0]]"),

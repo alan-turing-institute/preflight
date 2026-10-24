@@ -7,6 +7,7 @@ Import as `import render` with `slurm/install/` on sys.path (standalone drivers,
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from string import Template
@@ -54,10 +55,55 @@ def _template(component: str, name: str) -> Template:
 def _node_line(node: Node) -> str:
     # gres.conf(5) / slurm.conf(5) typed form: Gres=gpu:<type>:<count> (slurm.conf(5) example "Gres=gpu:tesla:1").
     gres = f" Gres=gpu:{node.gpus[0].type}:{len(node.gpus)}" if node.gpus else ""
+    address = f" NodeAddr={node.address}" if node.part_time else ""
+    spec = f" CpuSpecList={node.keep_cpus}" if node.keep_cpus else ""
+    spec += f" MemSpecLimit={node.mem_spec_limit_mb}" if node.mem_spec_limit_mb is not None else ""
     return (
-        f"NodeName={node.name} CPUs={node.cpus} Boards=1 SocketsPerBoard=1 CoresPerSocket={node.cpus} "
-        f"ThreadsPerCore=1 RealMemory={node.real_memory_mb}{gres} State=UNKNOWN\n"
+        f"NodeName={node.name}{address} CPUs={node.cpus} Boards=1 SocketsPerBoard=1 CoresPerSocket={node.cpus} "
+        f"ThreadsPerCore=1 RealMemory={node.real_memory_mb}{spec}{gres} State=UNKNOWN\n"
     )
+
+
+def _health_lines(site: Site) -> str:
+    """HealthCheck* settings when the site has `[health_check]`, and configless mode (the part-time nodes read
+    slurm.conf from the controller) when it has a part-time node."""
+    lines = ""
+    if site.health_check:
+        lines += (
+            "# Every node runs the health check as root each interval; it closes and reopens the node itself.\n"
+            f"HealthCheckProgram={site.install_dir}/slurm/node_check.py\n"
+            f"HealthCheckInterval={site.health_check.interval_s}\n"
+            "HealthCheckNodeState=ANY\n"
+        )
+    if site.part_time_nodes:
+        lines += "# Part-time nodes fetch their settings from slurmctld (slurmd --conf-server).\nSlurmctldParameters=enable_configless\n"
+    return lines
+
+
+def _part_time_partition(site: Site) -> str:
+    """The `part_time` partition: only the part-time nodes, never pre-empted by slurm, no per-node CPU cap."""
+    if not site.part_time_nodes:
+        return ""
+    names = ",".join(n.name for n in site.part_time_nodes)
+    return ("# part_time: other people's machines, lent when idle (submit.py --anywhere); node_check.py closes them.\n"
+            f"PartitionName=part_time Nodes={names} PriorityTier=1 PreemptMode=OFF MaxTime=INFINITE State=UP\n")
+
+
+def node_check_json(site: Site) -> str:
+    """`/etc/gpujobs/node_check.json`: each node's health-check settings, keyed by node name (the render system
+    writes one file per path, so the nodes share one; node_check.py reads its own hostname's entry)."""
+    return json.dumps({
+        n.name: {
+            "node": n.name,
+            "close_below_mb": n.close_below_mb,
+            "push_back_below_mb": n.push_back_below_mb,
+            "mains_only": n.mains_only,
+            "meminfo_path": "/proc/meminfo",
+            "power_supply_dir": "/sys/class/power_supply",
+            "state_path": "/var/lib/gpujobs/node_check/state.json",
+            "log_path": "/var/log/gpujobs/node_check.log",
+        } for n in site.nodes
+    }, indent=2) + "\n"
 
 
 def _service_partition(site: Site, names: list[str]) -> str:
@@ -73,7 +119,7 @@ def _service_partition(site: Site, names: list[str]) -> str:
 
 
 def _slurm(site: Site, extra: dict[str, str]) -> dict[str, FileSpec]:
-    names = [n.name for n in site.nodes]
+    names = [n.name for n in site.full_nodes]  # slurmctld and the partitions' Nodes: full nodes; part-time ones have theirs
     # One line per GPU with its Type (gres.conf(5) example: "Name=gpu Type=tesla File=/dev/nvidia1 COREs=2,3").
     gres_lines = "".join(
         f"NodeName={n.name} Name=gpu Type={g.type} File={g.device}\n" for n in site.nodes for g in n.gpus
@@ -90,7 +136,9 @@ def _slurm(site: Site, extra: dict[str, str]) -> dict[str, FileSpec]:
         "gres_lines": gres_lines,
         "admin_group": site.admin_group,
         "service_partition": _service_partition(site, names),
-        "def_mem_mb": min(DEF_MEM_MB, *(n.real_memory_mb for n in site.nodes)),
+        "def_mem_mb": min(DEF_MEM_MB, *(n.real_memory_mb - (n.mem_spec_limit_mb or 0) for n in site.nodes)),
+        "health_lines": _health_lines(site),
+        "part_time_partition": _part_time_partition(site),
         "extra_slurm_conf": extra_conf if not extra_conf or extra_conf.endswith("\n") else extra_conf + "\n",
     }
     out = {

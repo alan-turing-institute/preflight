@@ -90,7 +90,7 @@ def test_apply_then_check_against_a_temp_root(env):
     job = dict(os.environ, GPUJOBS_SITE=str(site), SLURM_GPU_STATE_DIR=str(tmp / "state"), SLURM_JOB_ID="1")
     wrapper = [sys.executable, str(root / "opt/gpujobs/slurm/job_wrapper.py"), "--", "true"]
     assert subprocess.run(wrapper, env=job, check=False).returncode == 0
-    gated = SimpleNamespace(install_dir=Path("/opt/gpujobs"), hostguard=False, dgx_gate=True)
+    gated = SimpleNamespace(install_dir=Path("/opt/gpujobs"), hostguard=False, dgx_gate=True, health_check=None)
     shipped = components.load(gated, ["tools"])[0].files(gated)
     assert {"/opt/gpujobs/hostguard/hostguard.py", "/opt/gpujobs/dgx/dgx_submit.sh"} <= shipped.keys()
     assert ((root / "etc/slurm/slurmdbd.conf"), "slurm") in owned

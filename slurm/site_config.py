@@ -19,6 +19,10 @@ from pathlib import Path
 from typing import Any
 
 SITE_FILE = Path(os.environ.get("GPUJOBS_SITE", "/etc/gpujobs/site.toml"))
+MB_PER_GB = 1000  # site-file sizes are decimal gigabytes
+#: Health-check thresholds in GB when a node names none, by `part_time`: (close below, push back below).
+_DEFAULT_THRESHOLDS_GB = {False: (16, 10), True: (6, 2)}
+_CPU_SPEC_LIST = re.compile(r"\d+(-\d+)?(,\d+(-\d+)?)*")
 
 
 class MetricsMode(StrEnum):
@@ -60,11 +64,42 @@ class Node:
     real_memory_mb: int
     gpus: tuple[Gpu, ...]
     cores_per_gpu: int | None = None  # held for GPU jobs; CPU-only jobs never use them (slurm's RestrictedCoresPerGPU)
+    part_time: bool = False  # someone's own machine, lent to the cluster when idle; the health check opens and closes it
+    address: str | None = None  # slurm NodeAddr: where the controller reaches a part-time node (required with part_time)
+    keep_cpus: str | None = None  # CpuSpecList: OS CPUs slurm never hands to jobs on a part-time node, e.g. "0-11"
+    jobs_memory_gb: float | None = None  # part-time: memory jobs may use; MemSpecLimit is the real memory less this
+    mains_only: bool | None = None  # health check: close on battery; None = decided at run time (true with a battery)
+    close_below_gb: float | None = None  # health check: close the node below this much free memory
+    push_back_below_gb: float | None = None  # health check: requeue a resume job below this much free memory
 
     @property
     def gpu_cores(self) -> int:
         """Cores held for GPU jobs on this node: 0 when `cores_per_gpu` is unset."""
         return (self.cores_per_gpu or 0) * len(self.gpus)
+
+    @property
+    def close_below_mb(self) -> int:
+        gb = self.close_below_gb if self.close_below_gb is not None else _DEFAULT_THRESHOLDS_GB[self.part_time][0]
+        return round(gb * MB_PER_GB)
+
+    @property
+    def push_back_below_mb(self) -> int:
+        gb = self.push_back_below_gb if self.push_back_below_gb is not None else _DEFAULT_THRESHOLDS_GB[self.part_time][1]
+        return round(gb * MB_PER_GB)
+
+    @property
+    def mem_spec_limit_mb(self) -> int | None:
+        """MemSpecLimit: memory slurm keeps from jobs; None unless `jobs_memory_gb` is set."""
+        if self.jobs_memory_gb is None:
+            return None
+        return self.real_memory_mb - round(self.jobs_memory_gb * MB_PER_GB)
+
+
+@dataclass(frozen=True)
+class HealthCheck:
+    """`[health_check]`: slurmd runs `node_check.py` on every node each `interval_s` seconds (slurm's HealthCheckInterval)."""
+
+    interval_s: int
 
 
 @dataclass(frozen=True)
@@ -124,10 +159,19 @@ class Site:
     notify_command: tuple[str, ...]  # argv; empty means no notification
     slurm_build: tuple[str, str] | None = None  # ([slurm] version, sha256): build that release, not the distro's slurm
     slurm_steps: tuple[tuple[str, str], ...] = ()  # ([slurm] steps) the releases `upgrade-slurm` passes through, in order
+    health_check: HealthCheck | None = None  # None: no health-check lines and no node_check.json
 
     @property
     def cpu_job_cap(self) -> int | None:
         return _cpu_job_cap(self.nodes)
+
+    @property
+    def part_time_nodes(self) -> tuple[Node, ...]:
+        return tuple(n for n in self.nodes if n.part_time)
+
+    @property
+    def full_nodes(self) -> tuple[Node, ...]:
+        return tuple(n for n in self.nodes if not n.part_time)
 
 
 def _cpu_job_cap(nodes: tuple[Node, ...]) -> int | None:
@@ -180,18 +224,60 @@ def _opt_path(value: str) -> Path | None:
 
 def _parse_node(raw: Any, i: int) -> Node:
     where = f"nodes[{i}]"
-    t = _table(raw, where, {"name", "cpus", "real_memory_mb"}, {"gpus": [], "cores_per_gpu": None})
+    t = _table(raw, where, {"name", "cpus", "real_memory_mb"}, {
+        "gpus": [], "cores_per_gpu": None, "part_time": False, "address": None, "keep_cpus": None,
+        "jobs_memory_gb": None, "mains_only": None, "close_below_gb": None, "push_back_below_gb": None,
+    })
     gpus = tuple(
         Gpu(**_table(g, f"{where}.gpus[{j}]", {"index", "uuid", "device", "type"}, {}))
         for j, g in enumerate(t["gpus"])
     )
-    node = Node(t["name"], t["cpus"], t["real_memory_mb"], gpus, t["cores_per_gpu"])
+    node = Node(t["name"], t["cpus"], t["real_memory_mb"], gpus, t["cores_per_gpu"], t["part_time"], t["address"],
+                t["keep_cpus"], t["jobs_memory_gb"], t["mains_only"], t["close_below_gb"], t["push_back_below_gb"])
+    _check_part_time(node, where)
     if node.cores_per_gpu is not None and not (
         type(node.cores_per_gpu) is int and gpus and node.cores_per_gpu >= 1 and node.gpu_cores < node.cpus
     ):
         raise SiteError(f"site file: [{where}] cores_per_gpu must be a whole number of at least 1, needs GPUs, and must leave CPU-only jobs a core "
                         f"({node.cores_per_gpu} x {len(gpus)} GPU(s) of {node.cpus} cores)")
     return node
+
+
+def _check_part_time(node: Node, where: str) -> None:
+    if type(node.part_time) is not bool or node.mains_only not in (None, True, False):
+        raise SiteError(f"site file: [{where}] part_time and mains_only must be true or false")
+    for key in ("close_below_gb", "push_back_below_gb"):
+        value = getattr(node, key)
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int | float) or value <= 0):
+            raise SiteError(f"site file: [{where}] {key} = {value!r}; expected a positive number of GB")
+    if node.push_back_below_mb > node.close_below_mb:
+        raise SiteError(f"site file: [{where}] push_back_below_gb must not exceed close_below_gb: "
+                        "a node pushes jobs back only after it would already be closed")
+    own = {"address": node.address, "keep_cpus": node.keep_cpus, "jobs_memory_gb": node.jobs_memory_gb}
+    if not node.part_time:
+        stray = sorted(k for k, v in own.items() if v is not None)
+        if stray:
+            raise SiteError(f"site file: [{where}] {', '.join(stray)} apply only with part_time = true")
+        return
+    if not isinstance(node.address, str) or not node.address:
+        raise SiteError(f"site file: [{where}] a part_time node needs address, where the controller reaches it")
+    if node.gpus:
+        raise SiteError(f"site file: [{where}] a part_time node cannot have GPUs")
+    if node.keep_cpus is not None and not (isinstance(node.keep_cpus, str) and _CPU_SPEC_LIST.fullmatch(node.keep_cpus)):
+        raise SiteError(f"site file: [{where}] keep_cpus = {node.keep_cpus!r}; expected CPU numbers and ranges "
+                        "such as \"0-11\" or \"0,2,4-7\"")
+    jobs = node.jobs_memory_gb
+    if jobs is not None and (isinstance(jobs, bool) or not isinstance(jobs, int | float)
+                             or not 0 < round(jobs * MB_PER_GB) < node.real_memory_mb):
+        raise SiteError(f"site file: [{where}] jobs_memory_gb = {jobs!r}; expected more than 0 and less than the "
+                        f"node's memory ({node.real_memory_mb / MB_PER_GB:g} GB)")
+
+
+def _parse_health_check(raw: Any) -> HealthCheck:
+    t = _table(raw, "health_check", set(), {"interval_s": 30})
+    if type(t["interval_s"]) is not int or t["interval_s"] < 1:
+        raise SiteError(f"site file: health_check.interval_s = {t['interval_s']!r}; expected a whole number of seconds, 1 or more")
+    return HealthCheck(t["interval_s"])
 
 
 def _parse_lease(raw: Any) -> Lease:
@@ -253,6 +339,7 @@ def parse(raw: dict[str, Any]) -> Site:
             "lease": None,
             "service": None,
             "slurm": None,
+            "health_check": None,
             "hostguard": False,
             "dgx_gate": False,
             "metrics": {},
@@ -285,6 +372,8 @@ def parse(raw: dict[str, Any]) -> Site:
     if not isinstance(p["session_days"], int) or isinstance(p["session_days"], bool) or p["session_days"] < 0:
         raise SiteError(f"site file: portal.session_days = {p['session_days']!r}; expected a whole number of days, 0 or more")
     nodes = tuple(_parse_node(n, i) for i, n in enumerate(top["nodes"]))
+    if nodes and not any(not n.part_time for n in nodes):
+        raise SiteError("site file: every node is part_time; slurmctld runs on a full node, so list at least one")
     slurm = _parse_slurm(top["slurm"]) if top["slurm"] is not None else (None, ())
     return Site(
         name=top["name"],
@@ -296,7 +385,7 @@ def parse(raw: dict[str, Any]) -> Site:
         nodes=nodes,
         unified_memory=top["unified_memory"],
         lease=_parse_lease(top["lease"]) if top["lease"] is not None else None,
-        service=_parse_service(top["service"], nodes) if top["service"] is not None else None,
+        service=_parse_service(top["service"], tuple(n for n in nodes if not n.part_time)) if top["service"] is not None else None,
         hostguard=top["hostguard"],
         dgx_gate=top["dgx_gate"],
         metrics=Metrics(
@@ -320,6 +409,7 @@ def parse(raw: dict[str, Any]) -> Site:
         notify_command=tuple(top["notify_command"]),
         slurm_build=slurm[0],
         slurm_steps=slurm[1],
+        health_check=_parse_health_check(top["health_check"]) if top["health_check"] is not None else None,
     )
 
 

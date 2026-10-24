@@ -1,5 +1,7 @@
 import difflib
+import importlib
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -136,3 +138,42 @@ def test_eight_gpu_site_and_extra_slot():
     assert len(added) == 2 and added[1].startswith("PartitionName=service ")
     assert added[1].endswith(" PriorityTier=1 PreemptMode=REQUEUE MaxTime=INFINITE State=UP MaxCPUsPerNode=4 "
                              "AllowGroups=gpujobs-service,ops")
+
+
+def test_part_time_node_and_health_check():
+    raw = {
+        "name": "mix",
+        "nodes": [
+            {"name": "head", "cpus": 8, "real_memory_mb": 60000},
+            {"name": "lap", "cpus": 22, "real_memory_mb": 33000, "part_time": True, "address": "100.64.0.2",
+             "keep_cpus": "12-21", "jobs_memory_gb": 20, "mains_only": True, "close_below_gb": 8},
+        ],
+        "service": {"cores": 4},
+    }
+    base = render.render(site_config.parse({**raw, "nodes": raw["nodes"][:1]}), "slurm")["/etc/slurm/slurm.conf"].content
+    site = site_config.parse({**raw, "health_check": {"interval_s": 45}})
+    conf = render.render(site, "slurm")["/etc/slurm/slurm.conf"].content
+    # the full node's lines are unchanged, and the only additions are the part-time node, its partition and the health check
+    added = [ln for ln in conf.splitlines() if ln not in base.splitlines()]
+    assert [ln for ln in added if not ln.startswith("#")] == [
+        "HealthCheckProgram=/opt/gpujobs/slurm/node_check.py",
+        "HealthCheckInterval=45",
+        "HealthCheckNodeState=ANY",
+        "SlurmctldParameters=enable_configless",
+        "NodeName=lap NodeAddr=100.64.0.2 CPUs=22 Boards=1 SocketsPerBoard=1 CoresPerSocket=22 ThreadsPerCore=1 "
+        "RealMemory=33000 CpuSpecList=12-21 MemSpecLimit=13000 State=UNKNOWN",
+        "PartitionName=part_time Nodes=lap PriorityTier=1 PreemptMode=OFF MaxTime=INFINITE State=UP",
+    ]
+    assert "SlurmctldHost=head\n" in conf and "Nodes=lap" not in conf.replace("PartitionName=part_time Nodes=lap", "")
+    # without [health_check]: no health-check lines and no per-node file; with it, one entry per node, GB as decimal MB
+    tools = importlib.import_module("components.tools")
+    assert tools.NODE_CHECK_JSON not in tools.files(site_config.parse(raw))
+    assert "HealthCheck" not in render.render(site_config.parse(raw), "slurm")["/etc/slurm/slurm.conf"].content
+    node_check = json.loads(tools.files(site)[tools.NODE_CHECK_JSON].content)
+    assert node_check["lap"] == {
+        "node": "lap", "close_below_mb": 8000, "push_back_below_mb": 2000, "mains_only": True,
+        "meminfo_path": "/proc/meminfo", "power_supply_dir": "/sys/class/power_supply",
+        "state_path": "/var/lib/gpujobs/node_check/state.json", "log_path": "/var/log/gpujobs/node_check.log",
+    }
+    assert (node_check["head"]["close_below_mb"], node_check["head"]["push_back_below_mb"],
+            node_check["head"]["mains_only"]) == (16000, 10000, None)

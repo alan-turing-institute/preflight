@@ -15,6 +15,7 @@ SLURM_DIR = Path(__file__).resolve().parents[2]
 REPO = SLURM_DIR.parent
 SHIM_DIR = "/usr/local/bin"
 TOOLS = ["submit", "status", "pause", "resume", "kill", "urgent", "wait", "footprint", "audit"]
+NODE_CHECK_JSON = "/etc/gpujobs/node_check.json"
 SHIM = '#!/bin/sh\nexec /usr/bin/python3 {install_dir}/slurm/{tool}.py "$@"\n'
 
 
@@ -46,6 +47,8 @@ def files(site) -> dict[str, render.FileSpec]:
         str(site.install_dir / p.relative_to(REPO)): render.FileSpec(p.read_text(), _mode(p), "root")
         for p in _tree(site)
     }
+    if site.health_check:
+        out[NODE_CHECK_JSON] = render.FileSpec(render.node_check_json(site), render.FILE_MODE, "root")
     for tool in TOOLS:
         shim = SHIM.format(install_dir=site.install_dir, tool=tool)
         out[f"{SHIM_DIR}/gpujobs-{tool}"] = render.FileSpec(shim, render.EXEC_MODE, "root")

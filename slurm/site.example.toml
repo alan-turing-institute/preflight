@@ -37,6 +37,17 @@ real_memory_mb = 64000       # RealMemory in MB slurm may hand out (required)
 # GPU job's default is its GPUs' share of the node's cores (all of them on a one-GPU node). Optional.
 # cores_per_gpu = 4
 
+# A part-time node is someone's own machine lent to the cluster when idle (needs a full node to run slurmctld on).
+# It has no GPUs and its jobs run in the `part_time` partition (submit.py --anywhere). Optional keys, only with part_time:
+# part_time = true
+# address = "100.64.0.2"   # slurm NodeAddr: where the controller reaches it (required)
+# keep_cpus = "12-21"          # CpuSpecList: OS CPUs slurm never gives jobs, e.g. "0-11" or "0,2,4-7". Default: none kept
+# jobs_memory_gb = 20          # memory jobs may use (decimal GB, below real_memory_mb); MemSpecLimit is the rest. Default: no limit
+# Health check keys, any node (see [health_check]):
+# mains_only = true            # close the node while on battery. Default: decided at run time (true when it has a battery)
+# close_below_gb = 6           # close the node below this much free memory (decimal GB). Default: 16 full, 6 part-time
+# push_back_below_gb = 2       # requeue the newest resume job below this much free memory. Default: 10 full, 2 part-time
+
 # One [[nodes.gpus]] table per GPU on that node, belonging to the [[nodes]] table above it. May be omitted.
 [[nodes.gpus]]
 index = 0                                        # GPU index
@@ -66,6 +77,12 @@ python = "/opt/gpujobs/venv/bin/python"       # interpreter with localmodels ins
 # version = "26.05.5"          # the release (required with sha256)
 # sha256 = "4680cafc82b0689865c885eb703441e7ebf764896c40fd03a50f2fcb60664f68"   # its tarball's digest (required with version)
 # steps = ["25.05.9:7be633820df896df819ac2e9f2ebd0824de509515e5fb78ba1c19da2453b39ed"]   # releases `install.py upgrade-slurm` passes through first, "<version>:<sha256>"
+
+# Optional. slurmd runs slurm/node_check.py on every node each interval (as root): it closes a node that is low on
+# memory (or on battery) and reopens it, and requeues a resume job when memory is lower still. Per-node thresholds are
+# in [[nodes]]; settings are rendered to /etc/gpujobs/node_check.json. Leave the table out for no health check.
+# [health_check]
+# interval_s = 30              # seconds between checks (slurm HealthCheckInterval). Default: 30
 
 [metrics]
 mode = "off"            # local (install Prometheus and Grafana here), external (use the URLs below), or off. Default: off
