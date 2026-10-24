@@ -127,6 +127,10 @@ def test_example_loads_and_minimal_file_gets_every_default(tmp_path: Path) -> No
         (MINIMAL + f"[slurm]\nversion = '26.05.5'\nsha256 = '{SHA}'\nsteps = ['25.5:{SHA}']\n", "slurm.steps entry version = '25.5'"),
         (MINIMAL + f"[slurm]\nversion = '26.05.5'\nsha256 = '{SHA}'\nsteps = ['25.05.9:abc']\n", "slurm.steps entry sha256 must be 64"),
         (MINIMAL + f"[slurm]\nsteps = ['25.05.9:{SHA}']\n", "steps needs version and sha256"),
+        # steps run oldest first and each is older than version: out of order, repeated or not below it are refused
+        (MINIMAL + f"[slurm]\nversion = '26.05.5'\nsha256 = '{SHA}'\nsteps = ['25.05.9:{SHA}', '24.11.1:{SHA}']\n", "ascending order"),
+        (MINIMAL + f"[slurm]\nversion = '26.05.5'\nsha256 = '{SHA}'\nsteps = ['25.05.9:{SHA}', '25.05.9:{SHA}']\n", "ascending order"),
+        (MINIMAL + f"[slurm]\nversion = '26.05.5'\nsha256 = '{SHA}'\nsteps = ['26.05.5:{SHA}']\n", "ascending order"),
     ],
 )
 def test_bad_site_files_are_refused(tmp_path: Path, text: str, fragment: str) -> None:
