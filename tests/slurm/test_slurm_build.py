@@ -55,7 +55,7 @@ def test_build_downloads_checks_builds_and_reuses_the_cache(tmp_path, text, fam,
     if fam is sb.Family.DEB:
         source = cache / "26.05.5" / f"deb-{platform.machine()}" / "slurm-26.05.5"
         assert fakes.ran[0][0] == install
-        assert (["mk-build-deps", "-i", "debian/control"], source) in fakes.ran
+        assert (["mk-build-deps", "-i", "-r", "-t", sb.MK_BUILD_DEPS_TOOL, "debian/control"], source) in fakes.ran
         assert (["debuild", "-b", "-uc", "-us"], source) in fakes.ran
         assert names.index("tar") < names.index("mk-build-deps") < names.index("debuild")
     else:

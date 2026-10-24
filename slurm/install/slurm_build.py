@@ -81,13 +81,17 @@ def _packages(workdir: Path, fam: Family) -> list[Path]:
     return sorted(workdir.glob(pattern))
 
 
+# mk-build-deps installs with apt-get and no -y by default, which would wait at a prompt (its man page, noble).
+MK_BUILD_DEPS_TOOL = "apt-get -y -o Debug::pkgProblemResolver=yes --no-install-recommends"
+
+
 def commands(fam: Family, version: str, tarball: Path, source: Path) -> list[tuple[list[str], Path]]:
     """The build's commands with the directory each runs in (`source` is where the tarball unpacks to)."""
     workdir = source.parent
     if fam is Family.DEB:
         return [(DEB_TOOLS, workdir),
                 (["tar", "xjf", str(tarball)], workdir),
-                (["mk-build-deps", "-i", "debian/control"], source),
+                (["mk-build-deps", "-i", "-r", "-t", MK_BUILD_DEPS_TOOL, "debian/control"], source),
                 (["debuild", "-b", "-uc", "-us"], source)]  # the debs land in the parent directory, `workdir`
     return [(["rpmbuild", "-ta", str(tarball), "--define", f"_topdir {workdir / 'rpmbuild'}"], workdir)]
 
