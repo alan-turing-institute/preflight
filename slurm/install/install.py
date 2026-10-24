@@ -29,6 +29,8 @@ import subprocess
 import sys
 import tempfile
 from collections.abc import Callable
+from contextlib import nullcontext
+from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
 
@@ -47,6 +49,8 @@ import site_config  # noqa: E402
 import slurm_build  # noqa: E402
 from install_earlyoom import differing, install  # noqa: E402
 
+#: slurmdbd's output while it converts the accounting database, kept beside the backup
+CONVERSION_LOG = "slurmdbd-conversion.log"
 MIGRATED = ("jobs", "footprints", "events")
 OPERATOR = "Operator"
 #: slurmctld caches who is in a partition's AllowGroups for GroupUpdateTime (600 s by default); a reconfigure reloads it
@@ -267,8 +271,10 @@ def cmd_apply(site, args, modules, chown: Chown | None = _chown) -> int:
     if sources:
         write_files(args.root, sources, chown)
         _run_all([["apt-get", "update"]])
-    _run_all(apt_install_commands(modules, site))
-    _run_all([step for m in modules for step in getattr(m, "install_steps", lambda _site: [])(site)])
+    # a slurm package starts its daemons when installed, on settings that are not written yet: not while we install
+    with slurm_component.daemons_held(package_manager(site)) if any(m.NAME == "slurm" for m in modules) else nullcontext():
+        _run_all(apt_install_commands(modules, site))
+        _run_all([step for m in modules for step in getattr(m, "install_steps", lambda _site: [])(site)])
     files = _all(modules, site, "files")
     write_files(args.root, files, chown)
     _run_all([argv for m in modules for argv in m.post_install(site)])
@@ -307,10 +313,16 @@ def cmd_part_time(site, args, modules) -> int:
     return part_time.cmd_add(site, args)
 
 
-def cmd_upgrade(site, args, modules, chown: Chown | None = _chown) -> int:
-    """Step a running slurm up to the site's `[slurm]` release, through each of its `steps` first (plan A5).
+BUILD_ERRORS = (slurm_build.SlurmBuildError, subprocess.CalledProcessError, OSError)
 
-    Backs up first; a step that fails stops everything and prints the commands that restore the backup (a downgrade is
+
+def cmd_upgrade(site, args, modules, chown: Chown | None = _chown) -> int:
+    """Step a running slurm up to the site's `[slurm]` release, through each of its `steps` first (plan A5, A6.1).
+
+    Builds every release first (a failed build leaves slurm untouched), closes the partitions and checks the queue
+    again, stops the controller and nodes, backs up, then for each release installs it (no daemon starts by itself),
+    converts the accounting database with a foreground slurmdbd and checks the history is intact. A failure before any
+    package changed puts slurm back as it was; later ones print the commands that restore the backup (a downgrade is
     not supported once a newer daemon has started). Ends with an `apply`, so the settings files are the release's.
     """
     previous, running = slurm_component.running_version()
@@ -318,23 +330,61 @@ def cmd_upgrade(site, args, modules, chown: Chown | None = _chown) -> int:
         for r in refusals:
             print(f"REFUSED: {r}", file=sys.stderr)
         return 1
-    state_save, user = slurm_component.config_value("StateSaveLocation"), slurm_component.config_value("SlurmUser")
-    before = slurm_component.history()
-    folder = slurm_component.backup(state_save)
-    version = ""
+    manager = package_manager(site)
     try:
-        for version, sha256 in slurm_component.steps_after(site, running):
+        built = slurm_component.build_all(site, running)
+    except BUILD_ERRORS as error:
+        print(f"slurm build failed: {error}\nslurm was not touched.", file=sys.stderr)
+        return 1
+    state_save, user = slurm_component.config_value("StateSaveLocation"), slurm_component.config_value("SlurmUser")
+    window = slurm_component.history_window(datetime.now())
+    before = slurm_component.history(window)
+    states = slurm_component.partition_states()
+    stopped = installing = False
+    version, folder = "", None
+    try:
+        if failed := slurm_component.set_partitions(dict.fromkeys(states, slurm_component.INACTIVE)):  # nothing new can be queued
+            raise SystemExit("could not close every partition; run by hand:\n" + "\n".join(f"  {c}" for c in failed))
+        if slurm_component.queue_busy():
+            raise SystemExit("jobs were queued after the first check; nothing was changed")
+        _run_all(slurm_component.stop_daemons()[:1])
+        stopped = True
+        folder = slurm_component.backup(state_save)
+        _run_all(slurm_component.stop_daemons()[1:])  # slurmdbd only after the dump
+        installing = True
+        for index, version in enumerate(built):
             print(f"upgrading slurm to {version}")
-            _run_all([*slurm_component.stop_daemons(), lambda v=version, h=sha256: slurm_component.install_release(v, h)])
-            slurm_component.convert_accounting(user)
+            if index:
+                _run_all(slurm_component.stop_daemons())
+            with slurm_component.daemons_held(manager):
+                _run_all([lambda p=built[version]: slurm_component.install_commands(p)])
+            slurm_component.convert_accounting(user, folder / CONVERSION_LOG)
             _run_all([["systemctl", "start", "slurmdbd"], ["systemctl", "start", "slurmctld"], ["systemctl", "start", "slurmd"]])
             slurm_component.await_answers(["sinfo", "-h"])
-            if lost := before - slurm_component.history():
+            if lost := before - slurm_component.history(window):
                 raise SystemExit(f"sacct no longer lists {len(lost)} job(s) it listed before: {', '.join(sorted(lost)[:5])}")
-    except (SystemExit, slurm_build.SlurmBuildError, subprocess.CalledProcessError, OSError) as error:
+    except slurm_component.ConversionUnfinished as error:
+        reopen = "\n".join(f"  scontrol update PartitionName={name} State={state}" for name, state in states.items())
+        print(f"UPGRADE STOPPED at slurm {version}: {error}\nThe backup is {folder}. Do not stop that slurmdbd or restore "
+              f"while it runs. Once it answers, stop it (kill {error.pid}), then as root:\n  systemctl start slurmdbd slurmctld "
+              f"slurmd\nand reopen the partitions, which the upgrade closed:\n{reopen}", file=sys.stderr)
+        return 1
+    except (SystemExit, *BUILD_ERRORS) as error:
+        if not installing:
+            print(f"UPGRADE REFUSED: {error}", file=sys.stderr)
+            try:
+                slurm_component.resume_unchanged(states, stopped)
+            except SystemExit as again:
+                print(again, file=sys.stderr)
+            else:
+                print("No package was changed; slurm is running with its partitions as they were.", file=sys.stderr)
+            return 1
         print(f"UPGRADE FAILED at slurm {version}: {error}", file=sys.stderr)
         print(f"Nothing further was done. To go back, as root:\n"
-              f"{slurm_component.restore_text(folder, state_save, previous, package_manager(site))}", file=sys.stderr)
+              f"{slurm_component.restore_text(folder, state_save, previous, manager, states)}", file=sys.stderr)
+        return 1
+    if failed := slurm_component.set_partitions(states):
+        print("could not reopen the partitions; run by hand:\n" + "\n".join(f"  {c}" for c in failed), file=sys.stderr)
         return 1
     return cmd_apply(site, args, modules, chown)
 

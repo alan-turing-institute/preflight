@@ -325,7 +325,12 @@ def _parse_slurm(raw: Any) -> tuple[tuple[str, str] | None, tuple[tuple[str, str
         if not isinstance(entry, str) or entry.count(":") != 1:
             raise SiteError(f"site file: slurm.steps entry {entry!r}; expected \"<version>:<sha256>\"")
         pairs.append(_release(*entry.split(":"), "slurm.steps entry "))
-    return _release(version, sha256, "slurm."), tuple(pairs)
+    target = _release(version, sha256, "slurm.")
+    order = [tuple(map(int, v.split("."))) for v, _ in (*pairs, target)]
+    if any(a >= b for a, b in zip(order, order[1:])):
+        raise SiteError("site file: slurm.steps must be in ascending order of release, each older than slurm.version "
+                        f"(got {', '.join(v for v, _ in (*pairs, target))})")
+    return target, tuple(pairs)
 
 
 def parse(raw: dict[str, Any]) -> Site:
