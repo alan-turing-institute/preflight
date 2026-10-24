@@ -285,7 +285,8 @@ def _cores(raw: dict) -> frozenset[str]:
     for node in resources.get("allocated_nodes") or []:
         for socket, entry in (node.get("sockets") or {}).items():
             found.update(f"{node.get('nodename')}:{socket}:{core}" for core in (entry.get("cores") or {}))
-    for node in (resources.get("nodes") or {}).get("allocation") or []:
+    nodes = resources.get("nodes")  # 23.11 gives the node list as a string here, 26.05 a table
+    for node in (nodes.get("allocation") if isinstance(nodes, dict) else None) or []:
         for socket in node.get("sockets") or []:
             found.update(
                 f"{node.get('name')}:{socket.get('index')}:{core.get('index')}"
