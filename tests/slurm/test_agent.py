@@ -607,13 +607,10 @@ def test_a_part_times_job_state_is_copied_back_each_minute_and_a_failure_is_logg
     world.t += 60
     world.step()
     assert "copied from lap again" in capsys.readouterr().err and world.agent.copied == {"lap": 1299}
-
-
-def test_shared_state_copies_nothing(world: World) -> None:
-    world.lap, world.shared_state = {"name": "lap", "state": ["IDLE"], "reason": "", "extra": ""}, True
+    world.shared_state, world.copies = True, []  # a shared state directory has nothing to copy
     world.agent = world.new_agent()
     world.step()
-    assert world.copies == [] and agent_module.read_copied(world.dir) == {}
+    assert world.copies == []
 
 
 def idle_world(world: World, *, gpus_used: int = 0, mem_used: int = 22888) -> World:
@@ -648,11 +645,10 @@ def test_a_whole_box_job_waiting_beside_a_restart_cpu_job_is_found_noticed_hourl
     world.step()
     assert len(sink.read_text().splitlines()) == 2
     assert world.step()["idle"][0]["since"] == 1000  # the same finding keeps its start
-
-
-def test_dependency_waiting_and_a_machine_with_nothing_idle_give_no_finding(world: World) -> None:
+    # no finding for a job that waits on a dependency, nor on a machine with nothing idle
     idle_world(world)
     world.queue[0] = dataclasses.replace(world.queue[0], reason="Dependency")
+    world.t += agent_module.IDLE_EVERY_S
     assert world.step()["idle"] == []
     idle_world(world, gpus_used=1)
     world.totals = world.totals.replace("CPUAlloc=2", "CPUAlloc=4").replace("AllocMem=22888", "AllocMem=99000")

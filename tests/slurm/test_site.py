@@ -49,6 +49,9 @@ def test_this_box_site_file_loads() -> None:
     assert site.portal.tls_cert is None and site.notify_command == ()
 
 
+PART_TIME = "[[nodes]]\nname = 'p'\ncpus = 4\nreal_memory_mb = 8000\npart_time = true\n"
+
+
 def test_example_loads_and_minimal_file_gets_every_default(tmp_path: Path) -> None:
     example = gpujobs_site.load(ROOT / "slurm/site.example.toml")
     assert example.nodes[0].gpus[0].index == 0 and example.lease is not None
@@ -75,19 +78,14 @@ def test_example_loads_and_minimal_file_gets_every_default(tmp_path: Path) -> No
     assert built.slurm_build == ("26.05.5", SHA) and built.slurm_steps == ()
     stepped = gpujobs_site.load(write(tmp_path, MINIMAL + f"[slurm]\nversion = '26.05.5'\nsha256 = '{SHA}'\nsteps = ['25.05.9:{SHA}']\n"))
     assert stepped.slurm_steps == (("25.05.9", SHA),)
-
-
-PART_TIME = "[[nodes]]\nname = 'p'\ncpus = 4\nreal_memory_mb = 8000\npart_time = true\n"
-
-
-def test_part_time_nodes_and_health_check_defaults(tmp_path: Path) -> None:
-    site = gpujobs_site.load(write(tmp_path, MINIMAL + PART_TIME + "address = 'a'\njobs_memory_gb = 5\nkeep_cpus = '0,2-3'\n"
+    # part-time nodes: their own limits, and the health check only when its table is there
+    mixed = gpujobs_site.load(write(tmp_path, MINIMAL + PART_TIME + "address = 'a'\njobs_memory_gb = 5\nkeep_cpus = '0,2-3'\n"
                                    "[health_check]\n"))
-    full, part = site.nodes
-    assert (site.full_nodes, site.part_time_nodes) == ((full,), (part,)) and site.health_check == gpujobs_site.HealthCheck(30)
+    full, part = mixed.nodes
+    assert (mixed.full_nodes, mixed.part_time_nodes) == ((full,), (part,)) and mixed.health_check == gpujobs_site.HealthCheck(30)
     assert (full.close_below_mb, full.push_back_below_mb, part.close_below_mb, part.push_back_below_mb) == (16000, 10000, 6000, 2000)
     assert (part.mem_spec_limit_mb, full.mem_spec_limit_mb, part.mains_only) == (3000, None, None)
-    assert gpujobs_site.load(write(tmp_path, MINIMAL)).health_check is None
+    assert site.health_check is None
 
 
 @pytest.mark.parametrize(

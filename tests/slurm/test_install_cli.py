@@ -470,7 +470,7 @@ def apply_part_time(site, tmp_path, *extra):
     return run(site, tmp_path / "root", "apply", *flags, *extra)
 
 
-def test_part_time_apply_needs_the_trust_flag_and_the_controllers_slurm_ids(tmp_path, monkeypatch, capsys):
+def test_part_time_apply_refuses_without_the_trust_flag_or_the_controllers_slurm_ids_or_an_execstart(tmp_path, monkeypatch, capsys):
     fake = PartTimeFake({"slurm": 999}, {}, [])
     site = part_time_env(tmp_path, monkeypatch, fake)
     try:
@@ -482,6 +482,15 @@ def test_part_time_apply_needs_the_trust_flag_and_the_controllers_slurm_ids(tmp_
         assert not [c for c in fake.calls if c[:1] in (["useradd"], ["apt-get"])]
     finally:
         components.set_runner(None)
+    # a slurmd unit the drop-in cannot extend is refused before munge and slurmd are started
+    fake = PartTimeFake({}, {}, [], unit="[Service]\n")
+    site = part_time_env(tmp_path, monkeypatch, fake)
+    try:
+        with pytest.raises(SystemExit, match="no ExecStart"):
+            apply_part_time(site, tmp_path, "--i-accept-cluster-trust")
+    finally:
+        components.set_runner(None)
+    assert ["systemctl", "enable", "--now", "munge", "slurmd"] not in fake.calls
 
 
 @pytest.mark.parametrize("firewalld", [True, False])
@@ -531,14 +540,3 @@ def test_shared_state_copies_nothing_back_and_installs_nothing_for_it(tmp_path, 
     flat = [" ".join(c) for c in fake.calls]
     assert ["apt-get", "install", "-y", "munge"] in fake.calls and len(sent) == 1  # only the munge key
     assert not any("rrsync" in c or "ssh-keygen" in c or ".ssh" in c for c in flat)
-
-
-def test_part_time_apply_refuses_when_the_unit_has_no_execstart(tmp_path, monkeypatch):
-    fake = PartTimeFake({}, {}, [], unit="[Service]\n")
-    site = part_time_env(tmp_path, monkeypatch, fake)
-    try:
-        with pytest.raises(SystemExit, match="no ExecStart"):
-            apply_part_time(site, tmp_path, "--i-accept-cluster-trust")
-    finally:
-        components.set_runner(None)
-    assert ["systemctl", "enable", "--now", "munge", "slurmd"] not in fake.calls

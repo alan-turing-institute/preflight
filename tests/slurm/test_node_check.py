@@ -96,13 +96,6 @@ def box(tmp_path: Path):
     return Box
 
 
-def test_allow_is_logged_and_nothing_is_changed(box):
-    slurm = FakeSlurm()
-    assert box.run(slurm) == []
-    assert slurm.calls == []
-    assert "free=20000 MB allow" in box.log.read_text()
-
-
 def test_push_back_takes_the_latest_started_resume_job_only_and_excludes_at_the_second(box):
     box.free(1000)
     slurm = FakeSlurm(
@@ -121,6 +114,9 @@ def test_push_back_takes_the_latest_started_resume_job_only_and_excludes_at_the_
 
 
 def test_close_for_memory_or_battery_and_only_when_asked(box):
+    quiet = FakeSlurm()  # plenty of memory and no power supply at all: logged as allowed, nothing is changed
+    assert box.run(quiet) == [] and quiet.calls == []
+    assert "free=20000 MB allow" in box.log.read_text()
     box.free(5000)
     slurm = FakeSlurm()
     box.run(slurm)
@@ -151,18 +147,7 @@ def test_urgent_waiting_never_closes_and_reopens_ours(box):
     assert ours.updates() == [RESUME_CALL]
 
 
-def test_foreign_drain_is_never_changed(box):
-    box.free(1000)
-    slurm = FakeSlurm(drained="gpujobs-admin: closed from the page")
-    box.run(slurm)
-    box.free(20000)
-    for _ in range(node_check.REOPEN_AFTER + 1):
-        box.run(slurm)
-    assert slurm.updates() == []
-    assert slurm.drained == "gpujobs-admin: closed from the page"
-
-
-def test_reopen_after_three_passing_runs_not_two(box):
+def test_reopen_after_three_passing_runs_not_two_and_a_foreign_drain_never(box):
     slurm = FakeSlurm(drained=OURS)
     box.run(slurm)
     box.run(slurm)
@@ -176,6 +161,12 @@ def test_reopen_after_three_passing_runs_not_two(box):
     box.run(again)
     box.run(again)
     assert again.updates() == []
+    foreign = FakeSlurm(drained="gpujobs-admin: closed from the page")  # never reopened, however many runs pass
+    for _ in range(node_check.REOPEN_AFTER + 1):
+        box.run(foreign)
+    box.free(1000)  # and never changed while memory is low either
+    box.run(foreign)
+    assert foreign.updates() == [] and foreign.drained == "gpujobs-admin: closed from the page"
 
 
 def test_extra_overrides_valid_keys_only_and_the_settings_may_be_keyed_by_node(box):
