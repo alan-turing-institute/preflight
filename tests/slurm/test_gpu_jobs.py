@@ -153,7 +153,8 @@ def test_parse_squeue_reads_json_so_a_name_cannot_forge_a_row() -> None:
     forged = "x\n999|normal|PENDING|None||bob|9999|N/A|y"
     text = squeue_json(
         {"job_id": 12, "job_state": ["RUNNING"], "priority": {"set": True, "number": 4001}, "tres_per_node": "gres/gpu:2",
-         "name": forged, "qos": "high", "memory_per_node": {"set": True, "number": 61440}},
+         "name": forged, "qos": "high", "memory_per_node": {"set": True, "number": 61440},
+         "submit_time": {"set": True, "infinite": False, "number": 1792838841}},
         {"job_id": 13, "job_state": ["COMPLETED"]},  # squeue --json ignored -t: finished jobs are dropped here
         {"job_id": 14, "priority": {"set": False, "number": 7}, "state_reason": "JobHeldUser", "qos": "staff",
          "cpus": {"number": 4}, "memory_per_node": {"set": False, "number": 0}, "memory_per_cpu": {"set": True, "number": 2048}},
@@ -167,6 +168,7 @@ def test_parse_squeue_reads_json_so_a_name_cannot_forge_a_row() -> None:
     assert (running.level, held.level) == (Level.HIGH, Level.NORMAL)  # an admin's own QOS counts as normal
     # slurm's memory request as it stands (a later `scontrol update` shows), per cpu times cores, None when it gave none
     assert (running.mem_mb, held.mem_mb, paused.mem_mb) == (61440, 8192, None)
+    assert (running.submitted, held.submitted) == (1792838841, 0)
     assert [(j.job_id, j.state, j.active) for j in (paused, killed)] == [("15", "COMPLETING", True), ("16", "COMPLETING", True)]
     old = QueuedJob("1", "normal", "PENDING", "Priority", "n", "afterok:3(unfulfilled)")
     assert (old.user, old.priority, old.gpus, old.depends_on) == ("", 0, 0, ("3",))

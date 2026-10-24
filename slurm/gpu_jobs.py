@@ -159,6 +159,7 @@ class QueuedJob:
     level: Level = Level.NORMAL
     mem_mb: int | None = None  # slurm's memory request now (MB per node; 0 is the whole node), None when it gave none
     cores: frozenset[str] = frozenset()  # "node:socket:core" slurm gave it; a suspended job keeps them for its resume
+    submitted: int = 0  # epoch seconds it last entered the queue (a requeue resets it, measured); 0 when unknown
 
     @property
     def job_class(self) -> JobClass | None:
@@ -240,6 +241,7 @@ def parse_squeue(text: str) -> list[QueuedJob]:
         if state not in set(State):
             continue
         priority = raw.get("priority") or {}
+        submitted = raw.get("submit_time") or {}
         cpus = int((raw.get("cpus") or {}).get("number") or 0)
         jobs.append(
             QueuedJob(
@@ -247,6 +249,7 @@ def parse_squeue(text: str) -> list[QueuedJob]:
                 raw.get("dependency", ""), raw.get("user_name", ""),
                 int(priority.get("number", 0)) if priority.get("set") else 0, parse_gpus(raw.get("tres_per_node") or ""),
                 cpus, level_of(str(raw.get("qos") or "")), _memory_mb(raw, cpus), _cores(raw),
+                int(submitted.get("number", 0)) if submitted.get("set") else 0,
             )
         )
     return jobs

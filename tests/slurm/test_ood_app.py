@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import io
 import json
 import os
@@ -117,6 +118,19 @@ def test_every_get_route_answers(path: str) -> None:
         assert "64.4 GB</td>" in body  # slurm's request now (60 x 2^30 bytes), not the record's 4G
         # who queued each job, and its level, at every width (not hide-sm)
         assert '<td class="inline" data-k="user">alice</td>' in body and '<td class="inline" data-k="level"><span class="pill level-normal"' in body
+        # its own column: when slurm (last) queued a job, and for a waiting one how long ago; unknown shows a dash
+        noon = datetime(2026, 10, 19, 12, 0)  # noqa: DTZ001 - local, like the fake's now
+        waiting = {"kind": app.Kind.WAITING, "state": "PENDING", "submitted": int(datetime(2026, 10, 19, 9, 50).timestamp())}  # noqa: DTZ001
+        assert 'Today 09:50<div class="why">(queued for 2 h 10 min)</div>' in app._queued_cell(waiting, noon)
+        assert ">Today 09:50</td>" in app._queued_cell({**waiting, "kind": app.Kind.RUNNING, "state": "RUNNING"}, noon)
+        assert "—" in app._queued_cell({**waiting, "submitted": 0}, noon)
+        # a finished job: how long it waited to start; one cancelled before it started, until it ended
+        at = lambda h, m: datetime(2026, 10, 19, h, m)  # noqa: DTZ001, E731 - local, like the times sacct prints
+        row = jobs_view.HistoryRow("5", "p:normal:x", "p", "ann", "normal", "COMPLETED", "0:0", at(9, 0), at(10, 30), at(11, 0), 1800, 1, None)
+        assert "Today 09:00<div class=\"why\">(queued for 1 h 30 min)</div>" in app._finished_rows([row], "/", noon)
+        never = dataclasses.replace(row, state="CANCELLED", start=None, elapsed_s=0)
+        assert "(queued for 2 h 00 min)" in app._finished_rows([never], "/", noon)
+        assert "<th scope=\"col\">Running for</th><th scope=\"col\">Queued at</th>" in body
         # nvidia-smi and /proc read the portal's own host: no in-use bar unless that host is slurm's one node
         elsewhere = app._resource_tiles({"cpus": 1, "cpus_used": 0, "mem_mb": 1024, "mem_used_mb": 0, "gpus": 1, "gpus_used": 1,
                                          "nodes": 1, "here": 0}, [], 0.5, {"mem_total": 1, "mem_used": 1, "cores": 1, "cores_busy": 1})

@@ -255,6 +255,7 @@ def job_rows(backend: Backend) -> list[dict[str, object]]:
                 "kind": kind,
                 "state_label": label,
                 "elapsed_s": _seconds(elapsed.get(job.job_id, "")),
+                "submitted": job.submitted,
                 "user": job.user,
                 "level": str(job.level),
                 "project": jobs_view.project_of(job.name),
@@ -572,14 +573,39 @@ def _tiles(items: list[tuple[str, str, str]]) -> str:
     ) + "</div>"
 
 
-def _queue_table(rows: list[dict[str, object]], root: str) -> str:
+def _running_cell(r: dict[str, object]) -> str:
+    if r["kind"] != Kind.RUNNING:
+        return '<td class="num hide-sm">—</td>'
+    return f'<td class="num inline" data-k="for">{esc(_duration(r["elapsed_s"]))}</td>'  # type: ignore[arg-type]
+
+
+_REQUEUE_HINT = ' title="A requeued job counts from when it went back into the queue"'
+
+
+def _queued_html(queued: datetime, until: datetime | None, now: datetime) -> str:
+    """'Today 11:47' with '(queued for …)' beneath, up to `until` (its start, or now while it waits)."""
+    if until is None:
+        return f'<td class="num inline" data-k="queued"{_REQUEUE_HINT}>{esc(_clock(queued, now))}</td>'
+    waited = _duration(max(0, int((until - queued).total_seconds())))
+    return f'<td class="num inline"{_REQUEUE_HINT}>{esc(_clock(queued, now))}<div class="why">(queued for {esc(waited)})</div></td>'
+
+
+def _queued_cell(r: dict[str, object], now: datetime) -> str:
+    """When slurm (last) queued the job; while it waits, also for how long."""
+    submitted = int(r["submitted"])  # type: ignore[call-overload]
+    if not submitted:
+        return '<td class="num hide-sm">—</td>'
+    queued = datetime.fromtimestamp(submitted)  # noqa: DTZ006 - local, as the rest of the page
+    return _queued_html(queued, now if r["state"] == gpu_jobs.State.PENDING else None, now)
+
+
+def _queue_table(rows: list[dict[str, object]], root: str, now: datetime) -> str:
     head = '<div class="card-head"><h2 id="h-queue">Queue</h2><span class="meta">{}</span></div>'
     if not rows:
         return head.format("empty") + '<div class="empty"><strong>Nothing queued</strong>The GPU takes the next job submitted with slurm/submit.py.</div>'
     body = []
     for position, r in enumerate(rows, 1):
         why = f'<div class="why">{esc(_why(str(r["waiting"])))}</div>' if r["waiting"] else ""
-        time_text = _duration(r["elapsed_s"]) if r["kind"] == Kind.RUNNING else "—"  # type: ignore[arg-type]
         body.append(
             "<tr>"
             f'<td class="num muted">{position}</td>'
@@ -588,7 +614,8 @@ def _queue_table(rows: list[dict[str, object]], root: str) -> str:
             f"<td class=\"inline\">{_project(str(r['project']))}</td>"
             f'<td class="inline">{_badge(str(r["kind"]), str(r["state_label"]))}{why}</td>'
             f'<td class="inline" data-k="level">{_level_pill(r["level"])}</td>'
-            + (f'<td class="num inline" data-k="for">{esc(time_text)}</td>' if r["kind"] == Kind.RUNNING else '<td class="num hide-sm">—</td>')
+            + _running_cell(r)
+            + _queued_cell(r, now)
             + f'<td class="hide-sm">{_class_pill(r["class"])}</td>'
             f'<td class="num hide-sm">{esc(r["gpus"])}</td>'
             f'<td class="num hide-sm">{esc(_asked_memory(r["mem_mb"]))}</td>'  # type: ignore[arg-type]
@@ -599,7 +626,7 @@ def _queue_table(rows: list[dict[str, object]], root: str) -> str:
     return (
         head.format(counts)
         + '<div class="table-wrap"><table class="stack"><thead><tr><th scope="col" class="num">#</th><th scope="col">Job</th><th scope="col">Project</th>'
-        '<th scope="col">State</th><th scope="col">Level</th><th scope="col">Running for</th><th scope="col" class="hide-sm">Class</th>'
+        '<th scope="col">State</th><th scope="col">Level</th><th scope="col">Running for</th><th scope="col">Queued at</th><th scope="col" class="hide-sm">Class</th>'
         '<th scope="col" class="hide-sm">GPUs</th><th scope="col" class="hide-sm">Memory asked</th><th scope="col">User</th></tr></thead>'
         f"<tbody>{''.join(body)}</tbody></table></div>"
     )
@@ -616,7 +643,9 @@ def _finished_rows(rows: list[jobs_view.HistoryRow], root: str, now: datetime) -
             f'<td class="lead"><a class="title" href="{root}job/{esc(r.job_id)}">{esc(_short(r.name))}</a> <span class="jobid">#{esc(r.job_id)}</span></td>'
             f'<td class="inline">{_project(r.project)}</td>'
             f'<td class="inline">{_badge(kind, label)}{exit_note}</td>'
-            f'<td class="num inline" data-k="started">{esc(_clock(r.start, now))}</td>'
+            # how long it waited to start; one that never started, until it ended
+            + (_queued_html(r.submit, r.start or r.end, now) if r.submit else '<td class="num hide-sm">—</td>')
+            + f'<td class="num inline" data-k="started">{esc(_clock(r.start, now))}</td>'
             f'<td class="num inline" data-k="took">{esc(_duration(r.elapsed_s) if r.start else "—")}</td>'
             f'<td class="num hide-sm">{esc(r.gpus)}</td>'
             f'<td class="num hide-sm">{esc(_size(r.max_rss_bytes))}</td>'
@@ -629,7 +658,7 @@ def _finished_rows(rows: list[jobs_view.HistoryRow], root: str, now: datetime) -
 def _finished_table(rows: list[jobs_view.HistoryRow], root: str, now: datetime) -> str:
     return (
         '<div class="table-wrap"><table class="stack"><thead><tr><th scope="col">Job</th><th scope="col">Project</th><th scope="col">Result</th>'
-        '<th scope="col">Started</th><th scope="col">Took</th><th scope="col" class="hide-sm">GPUs</th>'
+        '<th scope="col">Queued at</th><th scope="col">Started</th><th scope="col">Took</th><th scope="col" class="hide-sm">GPUs</th>'
         '<th scope="col" class="hide-sm">Peak CPU memory</th><th scope="col">User</th>'
         f"</tr></thead><tbody>{_finished_rows(rows, root, now)}</tbody></table></div>"
     )
@@ -665,7 +694,7 @@ def index_page(backend: Backend, root: str = "") -> str:
         updated=now.strftime("%H:%M:%S"),
         now=_now_card(rows, backend.keeper(), backend, root),
         tiles=tiles,
-        queue=_queue_table(rows, root),
+        queue=_queue_table(rows, root, now),
         recent=recent_html,
     )
     return _page(backend, "Queue", body, root=root, tab=Tab.QUEUE)

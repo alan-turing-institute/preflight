@@ -76,7 +76,7 @@ code, pre, .mono { font-family: ui-monospace, "SF Mono", "Cascadia Mono", Menlo,
   padding: 0 max(16px, env(safe-area-inset-left)); padding-top: env(safe-area-inset-top, 0px);
   position: sticky; top: 0; z-index: 10;
 }
-.topbar-inner { max-width: 1280px; margin: 0 auto; display: flex; align-items: center; gap: 28px; min-height: 52px; flex-wrap: wrap; }
+.topbar-inner { max-width: 1480px; margin: 0 auto; display: flex; align-items: center; gap: 28px; min-height: 52px; flex-wrap: wrap; }
 .brand { display: flex; align-items: center; gap: 10px; font-weight: 650; letter-spacing: -0.01em; color: #fff; }
 .brand svg { flex: none; }
 .brand .host { font-weight: 450; color: var(--bar-muted); }
@@ -92,7 +92,7 @@ code, pre, .mono { font-family: ui-monospace, "SF Mono", "Cascadia Mono", Menlo,
 .role { font-size: 11px; font-weight: 650; text-transform: uppercase; letter-spacing: 0.04em; padding: 2px 7px; border-radius: 999px; background: rgba(255, 255, 255, 0.12); color: #fff; }
 
 /* Page */
-.page { max-width: 1280px; margin: 0 auto; padding: 24px 16px 64px; }
+.page { max-width: 1480px; margin: 0 auto; padding: 24px 16px 64px; }
 .page-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
 .page-head h1 { font-size: 22px; font-weight: 680; letter-spacing: -0.015em; }
 .page-head .sub { color: var(--muted); margin-top: 4px; }
