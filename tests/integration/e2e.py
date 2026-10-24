@@ -107,7 +107,7 @@ def section(title: str) -> None:
     print(f"\n== {title}", flush=True)
 
 
-def wait_for(fn: Callable[[], object], timeout: float, every: float = 2.0) -> object:
+def wait_for(fn: Callable[[], object], timeout: float, every: float = 1.0) -> object:
     """The first truthy result of `fn`, or None at the timeout."""
     end = time.monotonic() + timeout
     while True:
@@ -430,7 +430,7 @@ def stage_jobs() -> None:
           urgent.text[:200])
     direct = cl("sbatch", "--partition=urgent", "--wrap", "true", user="alice")
     dj = (re.search(r"Submitted batch job (\d+)", direct.out) or [None, ""])[1]
-    time.sleep(8)
+    wait_for(lambda: "not_in_group" in jobinfo(dj).get("Reason", ""), 15)  # slurm's first pass over the job names the reason
     why = jobinfo(dj).get("Reason", "")
     check("S6: alice cannot sidestep the tool: a job she sends straight to the urgent partition never runs (slurm: AllowGroups)",
           bool(dj) and state(dj) == "PENDING" and "not_in_group_permitted_to_use_this_partition" in why, f"job {dj} {state(dj)}: {why}")
@@ -493,7 +493,7 @@ def keeps_place(*, agent_on: bool) -> None:
             check(f"S3 ({tag}): when the card frees, the resumed job starts before the job submitted after it",
                   bool(first) and state(jc) == "PENDING", f"job {ja} {state(ja)}, job {jc} {state(jc)}")
         else:
-            time.sleep(12)
+            wait_for(lambda: priority(ja) > 0, 15)  # slurm ranks the released job afresh; with no agent nothing places it
             check(f"S3 ({tag}): without the agent the released job lost its place (behind the later job)",
                   resumed.rc == 0 and priority(ja) < priority(jc),
                   f"job {ja}: place {place}, now {priority(ja)}; later job {jc}: {priority(jc)}")
@@ -563,7 +563,7 @@ def stage_urgent() -> None:
     n2 = submit("bob", "bystander", 600, "--gpus", "1")
     wait_for(lambda: priority(n2) == placed(Level.NORMAL, n2), 30)  # the agent places the waiting job
     out = cl("gpujobs-urgent", "--project", "e2e", "--what", "e2e urgent", "--time", "5:00", "--name", "urgent1", "--",
-             *sleep_cmd(25), user="carol", timeout=120)
+             *sleep_cmd(15), user="carol", timeout=120)
     uj = (re.search(r"job (\d+) submitted", out.out) or [None, ""])[1]
     check("S7: carol (admin) runs urgent.py; it names the job it will pre-empt and holds the waiting job",
           out.rc == 0 and bool(uj) and n1 in out.out and f"held ['{n2}']" in out.out, out.text[-300:])
@@ -733,9 +733,9 @@ def stage_recovery() -> None:
     j = submit("alice", "reboot-control", 600, "--gpu")
     wait_state(j, "RUNNING", 60)
     t0 = lose_the_node(j, agent=False)
-    time.sleep(100)
+    time.sleep(REQUEUE_WITHIN_S + 10)  # the agent's own deadline below, with 10 s to spare
     s = jobinfo(j)
-    check("S9 (CONTROL, agent stopped): 100 s after the restart slurm still thinks the dead job is RUNNING",
+    check(f"S9 (CONTROL, agent stopped): {REQUEUE_WITHIN_S + 10} s after the restart slurm still thinks the dead job is RUNNING",
           s.get("JobState") == "RUNNING" and not job_pids(j), f"state={s.get('JobState')} pids={job_pids(j)} after {time.monotonic() - t0:.0f} s")
     sh("systemctl start gpujobs-agent")
     clear_queue()
