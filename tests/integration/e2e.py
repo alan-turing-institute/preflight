@@ -6,7 +6,7 @@
 
 Runs on the host and drives the container through `run.sh shell`. Every check prints PASS or FAIL with its
 evidence as it happens; the exit status is 1 when any check failed. Stages: install, jobs, urgent, failure,
-recovery, portal, proxy, ssh, lease, host (in this order; `--only` takes a subset, later stages need `install` to have run once).
+recovery, portal, proxy, ssh, lease, host, upgrade (in this order; `--only` takes a subset, later stages need `install` to have run once).
 """
 
 from __future__ import annotations
@@ -1099,6 +1099,37 @@ def stage_host() -> None:
               found == [] and r["free"] is True, f"raw {r['raw']!r}")
 
 
+# SchedMD's digests (plan notes, "Facts"): the release tarballs the harness builds.
+UPGRADE_STEPS = ("25.05.9", "7be633820df896df819ac2e9f2ebd0824de509515e5fb78ba1c19da2453b39ed")
+UPGRADE_TARGET = ("26.05.5", "4680cafc82b0689865c885eb703441e7ebf764896c40fd03a50f2fcb60664f68")
+UPGRADE_SITE = "/tmp/upgrade.site.toml"
+BACKUP_FILES = 3  # database dump, state tar, /etc/slurm tar
+UPGRADE_TIMEOUT_S = 4 * 3600  # two builds and two database conversions
+
+
+def stage_upgrade() -> None:
+    section("upgrade: `install.py upgrade-slurm` from the image's slurm 23.11 to the site file's release (last: it replaces slurm)")
+    clear_queue()
+    old = submit("alice", "before-upgrade", 2)
+    check("before: a job completes on the old slurm, so accounting has history to keep",
+          bool(old) and wait_state(old, "COMPLETED", 60) and old in sh("sacct -X -n -P -S now-7days -o JobID").out.split(), f"job {old}")
+    before = sh("sinfo -V").text
+    site = sh(f"cat {SITE}").out + (f"\n[slurm]\nversion = '{UPGRADE_TARGET[0]}'\nsha256 = '{UPGRADE_TARGET[1]}'\n"
+                                   f"steps = ['{':'.join(UPGRADE_STEPS)}']\n")
+    put(UPGRADE_SITE, site)
+    done = sh(f"{INSTALL} upgrade-slurm --site {UPGRADE_SITE}", timeout=UPGRADE_TIMEOUT_S)
+    check("upgrade-slurm exits 0 after both steps", done.rc == 0, done.text[-300:])
+    after = sh("sinfo -V").text
+    check("slurm now reports the site file's release", UPGRADE_TARGET[0] in after and before != after, f"{before} -> {after}")
+    backups = sh("ls -d /var/backups/gpujobs/slurm-*/slurm_acct_db.sql /var/backups/gpujobs/slurm-*/state_save.tar.gz "
+                 "/var/backups/gpujobs/slurm-*/etc_slurm.tar.gz")
+    check("the backup folder holds the database dump and both tarballs", backups.rc == 0 and len(backups.out.split()) == BACKUP_FILES, backups.text)
+    kept = sh("sacct -X -n -P -S now-7days -o JobID").out.split()
+    check("accounting still lists the job from before the upgrade", old in kept, " ".join(kept))
+    new = submit("alice", "after-upgrade", 2)
+    check("a job submitted after the upgrade runs to completion", bool(new) and wait_state(new, "COMPLETED", 90), f"job {new}")
+
+
 STAGES: dict[str, Callable[[], None]] = {
     "install": stage_install,
     "jobs": stage_jobs,
@@ -1111,6 +1142,7 @@ STAGES: dict[str, Callable[[], None]] = {
     "ssh": stage_ssh,
     "lease": stage_lease,
     "host": stage_host,
+    "upgrade": stage_upgrade,
 }
 
 

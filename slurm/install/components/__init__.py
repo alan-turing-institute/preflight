@@ -52,13 +52,22 @@ def run(argv: list[str]) -> subprocess.CompletedProcess[str]:
     return _runner(argv)
 
 
-def wait_for_accounting(sleep: Callable[[float], None] = time.sleep) -> None:
-    """Until slurmdbd answers; `sacctmgr` exits 1 ("Connection refused") while it is down (measured, 23.11.4)."""
-    for _ in range(ACCOUNTING_WAIT_S):
+#: Starts a long-lived process (`upgrade-slurm`'s foreground slurmdbd); tests swap it as they swap the runner.
+popen = subprocess.Popen
+
+
+def wait_for_accounting(sleep: Callable[[float], None] = time.sleep, limit_s: int = ACCOUNTING_WAIT_S, every_s: int = 1,
+                        alive: Callable[[], bool] = lambda: True) -> None:
+    """Until slurmdbd answers; `sacctmgr` exits 1 ("Connection refused") while it is down (measured, 23.11.4).
+
+    `alive` tells the wait the process it waits for has not died, so a foreground slurmdbd that exits is not waited on."""
+    for _ in range(max(limit_s // every_s, 1)):
         if run(["sacctmgr", "-n", "show", "cluster"]).returncode == 0:
             return
-        sleep(1)
-    raise SystemExit(f"slurmdbd did not answer within {ACCOUNTING_WAIT_S} s")
+        if not alive():
+            raise SystemExit("slurmdbd exited before it answered")
+        sleep(every_s)
+    raise SystemExit(f"slurmdbd did not answer within {limit_s} s")
 
 
 def _lacks(*query: str) -> bool:

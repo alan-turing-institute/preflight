@@ -68,7 +68,9 @@ def test_example_loads_and_minimal_file_gets_every_default(tmp_path: Path) -> No
     assert service == gpujobs_site.Service(2, "gpujobs-service")  # no cores held for GPUs: up to the node's cores
     assert site.slurm_build is None and gpujobs_site.load(write(tmp_path, MINIMAL + "[slurm]\n")).slurm_build is None
     built = gpujobs_site.load(write(tmp_path, MINIMAL + f"[slurm]\nversion = '26.05.5'\nsha256 = '{SHA}'\n"))
-    assert built.slurm_build == ("26.05.5", SHA)
+    assert built.slurm_build == ("26.05.5", SHA) and built.slurm_steps == ()
+    stepped = gpujobs_site.load(write(tmp_path, MINIMAL + f"[slurm]\nversion = '26.05.5'\nsha256 = '{SHA}'\nsteps = ['25.05.9:{SHA}']\n"))
+    assert stepped.slurm_steps == (("25.05.9", SHA),)
 
 
 @pytest.mark.parametrize(
@@ -95,6 +97,10 @@ def test_example_loads_and_minimal_file_gets_every_default(tmp_path: Path) -> No
         (MINIMAL + f"[slurm]\nsha256 = '{SHA}'\n", "needs both version and sha256"),
         (MINIMAL + f"[slurm]\nversion = '26.05'\nsha256 = '{SHA}'\n", "slurm.version = '26.05'"),
         (MINIMAL + "[slurm]\nversion = '26.05.5'\nsha256 = 'abc'\n", "slurm.sha256 must be 64"),
+        (MINIMAL + f"[slurm]\nversion = '26.05.5'\nsha256 = '{SHA}'\nsteps = ['25.05.9']\n", "expected \"<version>:<sha256>\""),
+        (MINIMAL + f"[slurm]\nversion = '26.05.5'\nsha256 = '{SHA}'\nsteps = ['25.5:{SHA}']\n", "slurm.steps entry version = '25.5'"),
+        (MINIMAL + f"[slurm]\nversion = '26.05.5'\nsha256 = '{SHA}'\nsteps = ['25.05.9:abc']\n", "slurm.steps entry sha256 must be 64"),
+        (MINIMAL + f"[slurm]\nsteps = ['25.05.9:{SHA}']\n", "steps needs version and sha256"),
     ],
 )
 def test_bad_site_files_are_refused(tmp_path: Path, text: str, fragment: str) -> None:

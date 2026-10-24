@@ -4,6 +4,7 @@
     install.py render --out DIR                 # write every enabled component's files under DIR
     install.py check                            # exit 1 if the installed files differ from the rendered ones
     sudo install.py apply [--component NAME ...]
+    sudo install.py upgrade-slurm               # step the running slurm up to the site file's [slurm] release
     sudo install.py user add|remove USER          # let USER submit (slurm accounting: the site's account)
     sudo install.py admin add|remove USER
     sudo install.py migrate-state --from DIR    # copy job records from an older state directory
@@ -22,6 +23,7 @@ import pwd
 import re
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 from collections.abc import Callable
@@ -34,9 +36,11 @@ for path in (HERE, HERE.parent, HERE.parents[1] / "machine" / "earlyoom"):
         sys.path.insert(0, str(path))
 
 import components  # noqa: E402 - paths set just above
+import components.slurm as slurm_component  # noqa: E402
 import detect  # noqa: E402
 import render  # noqa: E402
 import site_config  # noqa: E402
+import slurm_build  # noqa: E402
 from install_earlyoom import differing, install  # noqa: E402
 
 MIGRATED = ("jobs", "footprints", "events")
@@ -268,6 +272,38 @@ def cmd_apply(site, args, modules, chown: Chown | None = _chown) -> int:
     return 0
 
 
+def cmd_upgrade(site, args, modules, chown: Chown | None = _chown) -> int:
+    """Step a running slurm up to the site's `[slurm]` release, through each of its `steps` first (plan A5).
+
+    Backs up first; a step that fails stops everything and prints the commands that restore the backup (a downgrade is
+    not supported once a newer daemon has started). Ends with an `apply`, so the settings files are the release's.
+    """
+    previous, running = slurm_component.running_version()
+    if refusals := slurm_component.upgrade_refusals(site, running):
+        for r in refusals:
+            print(f"REFUSED: {r}", file=sys.stderr)
+        return 1
+    state_save, user = slurm_component.config_value("StateSaveLocation"), slurm_component.config_value("SlurmUser")
+    before = slurm_component.history()
+    folder = slurm_component.backup(state_save)
+    version = ""
+    try:
+        for version, sha256 in slurm_component.steps_after(site, running):
+            print(f"upgrading slurm to {version}")
+            _run_all([*slurm_component.stop_daemons(), lambda v=version, h=sha256: slurm_component.install_release(v, h)])
+            slurm_component.convert_accounting(user)
+            _run_all([["systemctl", "start", "slurmdbd"], ["systemctl", "start", "slurmctld"], ["systemctl", "start", "slurmd"]])
+            slurm_component.await_answers(["sinfo", "-h"])
+            if lost := before - slurm_component.history():
+                raise SystemExit(f"sacct no longer lists {len(lost)} job(s) it listed before: {', '.join(sorted(lost)[:5])}")
+    except (SystemExit, slurm_build.SlurmBuildError, subprocess.CalledProcessError, OSError) as error:
+        print(f"UPGRADE FAILED at slurm {version}: {error}", file=sys.stderr)
+        print(f"Nothing further was done. To go back, as root:\n"
+              f"{slurm_component.restore_text(folder, state_save, previous, package_manager(site))}", file=sys.stderr)
+        return 1
+    return cmd_apply(site, args, modules, chown)
+
+
 def cmd_user(site, args, modules) -> int:
     if args.action is Action.ADD:
         _run_all(components.accounting_adds(site, args.user))
@@ -363,6 +399,7 @@ def parser() -> argparse.ArgumentParser:
     sub = ap.add_subparsers(dest="command", required=True)
     sub.add_parser("detect", parents=[shared])
     sub.add_parser("check", parents=[shared])
+    sub.add_parser("upgrade-slurm", parents=[shared])
     sub.add_parser("render", parents=[shared]).add_argument("--out", type=Path, required=True)
     apply = sub.add_parser("apply", parents=[shared])
     apply.add_argument("--component", action="append", choices=components.ORDER, dest="components")
@@ -401,6 +438,8 @@ def main(argv: list[str] | None = None, chown: Chown | None = _chown) -> int:
     modules = components.load(site, getattr(args, "components", None))
     if args.command == "apply":
         return cmd_apply(site, args, modules, chown)
+    if args.command == "upgrade-slurm":
+        return cmd_upgrade(site, args, modules, chown)
     return COMMANDS[args.command](site, args, modules)
 
 

@@ -65,6 +65,7 @@ python = "/opt/gpujobs/venv/bin/python"       # interpreter with localmodels ins
 # [slurm]
 # version = "26.05.5"          # the release (required with sha256)
 # sha256 = "4680cafc82b0689865c885eb703441e7ebf764896c40fd03a50f2fcb60664f68"   # its tarball's digest (required with version)
+# steps = ["25.05.9:7be633820df896df819ac2e9f2ebd0824de509515e5fb78ba1c19da2453b39ed"]   # releases `install.py upgrade-slurm` passes through first, "<version>:<sha256>"
 
 [metrics]
 mode = "off"            # local (install Prometheus and Grafana here), external (use the URLs below), or off. Default: off

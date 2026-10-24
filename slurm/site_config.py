@@ -123,6 +123,7 @@ class Site:
     portal: Portal
     notify_command: tuple[str, ...]  # argv; empty means no notification
     slurm_build: tuple[str, str] | None = None  # ([slurm] version, sha256): build that release, not the distro's slurm
+    slurm_steps: tuple[tuple[str, str], ...] = ()  # ([slurm] steps) the releases `upgrade-slurm` passes through, in order
 
     @property
     def cpu_job_cap(self) -> int | None:
@@ -209,18 +210,32 @@ def _parse_service(raw: Any, nodes: tuple[Node, ...]) -> Service:
     return Service(cores, t["group"])
 
 
-def _parse_slurm(raw: Any) -> tuple[str, str] | None:
-    t = _table(raw, "slurm", set(), {"version": "", "sha256": ""})
-    version, sha256 = t["version"], t["sha256"]
+def _release(version: Any, sha256: Any, where: str) -> tuple[str, str]:
+    if not isinstance(version, str) or not re.fullmatch(r"\d+\.\d+\.\d+", version):
+        raise SiteError(f"site file: {where}version = {version!r}; expected a release such as 26.05.5")
+    if not isinstance(sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", sha256):
+        raise SiteError(f"site file: {where}sha256 must be 64 lowercase hex digits, the release tarball's digest")
+    return version, sha256
+
+
+def _parse_slurm(raw: Any) -> tuple[tuple[str, str] | None, tuple[tuple[str, str], ...]]:
+    """([slurm] version and sha256 or None, the `steps` entries `"<version>:<sha256>"` as pairs)."""
+    t = _table(raw, "slurm", set(), {"version": "", "sha256": "", "steps": []})
+    version, sha256, steps = t["version"], t["sha256"], t["steps"]
     if not version and not sha256:
-        return None
+        if steps:
+            raise SiteError("site file: slurm.steps needs version and sha256, the release the last step leads to")
+        return None, ()
     if not (version and sha256):
         raise SiteError("site file: [slurm] needs both version and sha256, or neither")
-    if not isinstance(version, str) or not re.fullmatch(r"\d+\.\d+\.\d+", version):
-        raise SiteError(f"site file: slurm.version = {version!r}; expected a release such as 26.05.5")
-    if not isinstance(sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", sha256):
-        raise SiteError("site file: slurm.sha256 must be 64 lowercase hex digits, the release tarball's digest")
-    return version, sha256
+    if not isinstance(steps, list):
+        raise SiteError("site file: slurm.steps must be a list of \"<version>:<sha256>\" strings")
+    pairs = []
+    for entry in steps:
+        if not isinstance(entry, str) or entry.count(":") != 1:
+            raise SiteError(f"site file: slurm.steps entry {entry!r}; expected \"<version>:<sha256>\"")
+        pairs.append(_release(*entry.split(":"), "slurm.steps entry "))
+    return _release(version, sha256, "slurm."), tuple(pairs)
 
 
 def parse(raw: dict[str, Any]) -> Site:
@@ -270,6 +285,7 @@ def parse(raw: dict[str, Any]) -> Site:
     if not isinstance(p["session_days"], int) or isinstance(p["session_days"], bool) or p["session_days"] < 0:
         raise SiteError(f"site file: portal.session_days = {p['session_days']!r}; expected a whole number of days, 0 or more")
     nodes = tuple(_parse_node(n, i) for i, n in enumerate(top["nodes"]))
+    slurm = _parse_slurm(top["slurm"]) if top["slurm"] is not None else (None, ())
     return Site(
         name=top["name"],
         cluster_name=top["cluster_name"] or top["name"],
@@ -302,7 +318,8 @@ def parse(raw: dict[str, Any]) -> Site:
             _networks(p["allow_from"], "portal.allow_from"),
         ),
         notify_command=tuple(top["notify_command"]),
-        slurm_build=_parse_slurm(top["slurm"]) if top["slurm"] is not None else None,
+        slurm_build=slurm[0],
+        slurm_steps=slurm[1],
     )
 
 

@@ -282,3 +282,96 @@ def test_slurm_table_installs_the_built_packages_in_place_of_the_distros(env, mo
     assert cli.apt_install_commands(modules, cli.site_config.load(site)) == [["dnf", "install", "-y", "mariadb-server", "munge"]]
     assert cli.platform_refusals(cli.site_config.load(site), modules) == []
     assert cli.platform_refusals(SimpleNamespace(slurm_build=None), modules)
+
+
+class UpgradeFake(Fake):
+    """A running slurm 23.11.4 with job 7 in its history; `fail` is an argv prefix whose command exits 1."""
+
+    def __init__(self, fail=()):
+        super().__init__()
+        self.version, self.fail, self.dead_dbd = "slurm-wlm 23.11.4", list(fail), False
+
+    def __call__(self, argv):
+        out = {"sinfo -V": self.version, "sacct": "7\n", "scontrol show": "StateSaveLocation = /var/spool/slurmctld\nSlurmUser = slurm(64030)\n"}
+        text = " ".join(argv)
+        if self.fail and text.startswith(" ".join(self.fail)):
+            self.calls.append(argv)
+            return subprocess.CompletedProcess(argv, 1, "", "boom")
+        for prefix in ("mariadb-dump", "tar"):  # the backup files exist once the command has run
+            if argv[0] == prefix:
+                Path(next(a.split("=")[-1] for a in argv if a.startswith("/") or "=/" in a)).write_text("x" * 1_500_000)
+        if argv[:4] == ["sacctmgr", "-n", "show", "cluster"] and self.dead_dbd:
+            return subprocess.CompletedProcess(argv, 1, "", "Connection refused")
+        done = super().__call__(argv)
+        match = next((v for k, v in out.items() if text.startswith(k)), None)
+        return done if match is None else subprocess.CompletedProcess(argv, 0, match, "")
+
+
+class FakeDbd:
+    """slurmdbd in the foreground: runs until terminated, or has already exited with `dead`."""
+
+    def __init__(self, calls, dead=False):
+        self.dead, self.calls = dead, calls
+
+    def poll(self):
+        return 1 if self.dead else None
+
+    def terminate(self):
+        self.dead = True
+        self.calls.append(["terminated"])
+
+    def wait(self):
+        pass
+
+
+@pytest.fixture
+def upgrade(env, monkeypatch, capsys):
+    tmp, site, fake = env
+    site.write_text(SITE + f"[slurm]\nversion = '26.05.5'\nsha256 = '{'cd' * 32}'\nsteps = ['25.05.9:{'ab' * 32}']\n")
+    fake = UpgradeFake()
+    components.set_runner(fake)
+    monkeypatch.setattr(slurm_component, "BACKUP_ROOT", tmp / "backups")
+    monkeypatch.setattr(slurm_component, "sleep", lambda _s: None)
+    monkeypatch.setattr(slurm_component.slurm_build, "build", lambda v, s: [tmp / f"slurm-smd_{v}.deb"])
+    monkeypatch.setattr(components, "popen", lambda argv: fake.calls.append(argv) or FakeDbd(fake.calls, fake.dead_dbd))
+    monkeypatch.setattr(cli.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(cli, "cmd_apply", lambda *a: fake.calls.append(["apply"]) or 0)
+    return tmp, site, fake
+
+
+def test_upgrade_slurm_backs_up_then_steps_through_each_release(upgrade, capsys):
+    tmp, site, fake = upgrade
+    assert run(site, tmp / "root", "upgrade-slurm") == 0
+    calls = [" ".join(c) for c in fake.calls]
+    saved = str(next((tmp / "backups").iterdir()))
+    assert [c for c in calls if c.startswith(("mariadb-dump", "tar"))] == [
+        f"mariadb-dump --result-file={saved}/slurm_acct_db.sql slurm_acct_db",
+        f"tar -czf {saved}/state_save.tar.gz -C / var/spool/slurmctld", f"tar -czf {saved}/etc_slurm.tar.gz -C / etc/slurm"]
+    after_backup = calls[calls.index(f"tar -czf {saved}/etc_slurm.tar.gz -C / etc/slurm"):]
+    one = ["systemctl stop slurmctld slurmd", "systemctl stop slurmdbd", "apt-get install -y {deb}",
+           "sudo -u slurm slurmdbd -D -vvv", "terminated", "systemctl start slurmdbd", "systemctl start slurmctld",
+           "systemctl start slurmd"]
+    assert [c for c in after_backup if c.startswith(("systemctl", "apt-get", "sudo", "terminated"))] == [
+        c.format(deb=f"{tmp}/slurm-smd_{v}.deb") for v in ("25.05.9", "26.05.5") for c in one]
+    assert calls[-1] == "apply"
+    assert "state_save.tar.gz: 1.5 MB" in capsys.readouterr().out  # each backup file's size, decimal
+
+
+def test_upgrade_slurm_refuses_before_touching_anything(upgrade, capsys):
+    tmp, site, fake = upgrade
+    fake.queue = "12 jobs\n"
+    assert run(site, tmp / "root", "upgrade-slurm") == 1 and "slurm has jobs" in capsys.readouterr().err
+    fake.queue, fake.version = "", "slurm 26.05.5"
+    assert run(site, tmp / "root", "upgrade-slurm") == 1 and "already at or after" in capsys.readouterr().err
+    assert not any(c[0] in ("mariadb-dump", "tar") for c in fake.calls) and not (tmp / "backups").exists()
+
+
+@pytest.mark.parametrize("fail, dead", [(("apt-get", "install", "-y", "/"), False), ((), True)])
+def test_a_failed_step_prints_the_restore_commands_and_goes_no_further(upgrade, capsys, fail, dead):
+    tmp, site, fake = upgrade
+    fake.fail, fake.dead_dbd = list(fail), dead
+    assert run(site, tmp / "root", "upgrade-slurm") == 1
+    err = capsys.readouterr().err
+    assert "UPGRADE FAILED at slurm 25.05.9" in err and "slurm_acct_db <" in err and "apt-get install -y --allow-downgrades slurm-wlm" in err
+    assert not any("26.05.5" in " ".join(c) for c in fake.calls) and ["apply"] not in fake.calls
+    assert ["systemctl", "start", "slurmctld"] not in fake.calls  # a dead slurmdbd never reaches the controller
