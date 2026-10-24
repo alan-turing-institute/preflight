@@ -206,9 +206,11 @@ def sbatch_script(
     partition: str | None = None,
     extra: tuple[str, ...] = (),
     needs_lease: bool | None = None,
+    node_python: str | None = None,
 ) -> str:
     """The job script: directives, then one line running the wrapper. `urgent.py` passes its own partition and no
-    level (its partition goes first whatever the level)."""
+    level (its partition goes first whatever the level). A job that may land in `part_time` runs the wrapper with
+    `node_python` (the site's interpreter there), never the submitter's own, whose venv path that machine lacks."""
     label = arguments.job_class
     level = getattr(arguments, "level", None) or gpu_jobs.Level.NORMAL
     partition = partition or gpu_jobs.partition_for(
@@ -236,7 +238,8 @@ def sbatch_script(
     if arguments.after:
         lines.append(f"#SBATCH --dependency=afterok:{':'.join(arguments.after)}")
     lines += [f"#SBATCH {directive}" for directive in extra]
-    wrapper = [sys.executable, str(HERE / "job_wrapper.py"), "--wait-limit", str(seconds(arguments.wait_limit))]
+    on_part_time = gpu_jobs.Partition.PART_TIME in partition.split(",")
+    wrapper = [node_python if on_part_time and node_python else sys.executable, str(HERE / "job_wrapper.py"), "--wait-limit", str(seconds(arguments.wait_limit))]
     if arguments.gpu if needs_lease is None else needs_lease:
         wrapper.append("--needs-lease")
     if arguments.gpu:
@@ -380,7 +383,7 @@ def submit(argv: list[str]) -> str:
     gated = bool(arguments.entry) and site.dgx_gate
     manifest = gpu_jobs.STATE_DIR / "manifests" / f"{arguments.name}-{stamp}.json" if gated else None
     consent = may_suspend(arguments) if arguments.service else None
-    script = sbatch_script(arguments, mem=mem, log=log, manifest=manifest)
+    script = sbatch_script(arguments, mem=mem, log=log, manifest=manifest, node_python=site.node_python)
     warn_device(arguments)
     if arguments.dry_run:
         if arguments.service:

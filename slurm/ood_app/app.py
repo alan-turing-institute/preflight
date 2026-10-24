@@ -1174,6 +1174,7 @@ class PartTimeState:
     free_mb: int | None
     resume_jobs: int  # `resume` jobs running there: what "give me my machine back" requeues
     extra: Mapping[str, object]  # the limits the page set (the node's `Extra` JSON), {} for none
+    copied_at: int | None = None  # when the agent last copied this machine's job state here (epoch s); None: never
 
 
 def _free_mb(value: object) -> int | None:
@@ -1191,6 +1192,7 @@ def _part_time_state(names: list[str]) -> dict[str, PartTimeState]:
     except (ValueError, KeyError, TypeError):
         return {}
     out: dict[str, PartTimeState] = {}
+    copied = agent.read_copied()
     for node in nodes:
         name = str(node.get("name"))
         try:
@@ -1204,6 +1206,7 @@ def _part_time_state(names: list[str]) -> dict[str, PartTimeState]:
             free_mb=_free_mb(node.get("free_mem")),
             resume_jobs=sum(gpu_jobs.class_of(job) is gpu_jobs.JobClass.RESUME for job in listed),
             extra=extra if isinstance(extra, dict) else {},
+            copied_at=copied.get(name),
         )
     return out
 
@@ -1218,7 +1221,14 @@ def _field(label: str, name: str, value: object, unit: str, kind: str = "number"
             f'aria-describedby="unit-{name}"> <span id="unit-{name}" class="meta">{esc(unit)}</span></label>')
 
 
-def _part_time_node(node: site_config.Node, state: PartTimeState | None) -> str:
+def _copied_line(state: PartTimeState, shared: bool) -> str:
+    if shared:
+        return '<p class="meta">Job state: read from the shared state directory.</p>'
+    when = "never" if state.copied_at is None else datetime.fromtimestamp(state.copied_at).strftime("%a %-d %b %H:%M:%S")  # noqa: DTZ006 - local
+    return f'<p class="meta">Job state last copied from this machine: {esc(when)}</p>'
+
+
+def _part_time_node(node: site_config.Node, state: PartTimeState | None, shared: bool = False) -> str:
     """One machine: open or closed and why, its free memory, the switch, the give-back button and its settings."""
     name = esc(node.name)
     if state is None:
@@ -1231,7 +1241,7 @@ def _part_time_node(node: site_config.Node, state: PartTimeState | None) -> str:
     jobs_memory = "" if node.jobs_memory_gb is None else node.jobs_memory_gb
     return (
         f'<div class="part-time" data-node="{name}"><h3>{name} {badge}<span class="meta">{why}</span></h3>'
-        f'<p>Free memory on the machine: <b class="num">{esc(free)}</b></p>'
+        f'<p>Free memory on the machine: <b class="num">{esc(free)}</b></p>' + _copied_line(state, shared) +
         '<div class="actions">'
         f'<label class="check"><input type="checkbox" data-part-time="switch" data-node="{name}"'
         f'{"" if state.closed else " checked"}> Accept jobs</label>'
@@ -1257,7 +1267,7 @@ def _part_time_card(backend: Backend) -> str:
     return (
         '<section class="card" aria-labelledby="h-part-time"><div class="card-head"><h2 id="h-part-time">Part-time machines</h2>'
         '<span class="meta">Other people\'s machines, lent to the cluster while they are idle</span></div>'
-        '<div class="card-body">' + "".join(_part_time_node(n, states.get(n.name)) for n in site.part_time_nodes)
+        '<div class="card-body">' + "".join(_part_time_node(n, states.get(n.name), site.shared_state) for n in site.part_time_nodes)
         + '<div id="part-time-result" class="notice" role="status"></div></div></section>'
         '<dialog id="confirm" aria-labelledby="confirm-title"><form method="dialog"><h2 id="confirm-title"></h2>'
         '<pre id="confirm-detail"></pre><p id="confirm-lose-label" hidden><label><input id="confirm-lose" type="checkbox"></label></p>'
@@ -1363,7 +1373,14 @@ def _api(backend: Backend, environ: Mapping[str, object], path: str, query: Mapp
         record = backend.record(job_id, user=job.user if job else None) or {}
         path_text = str(record.get("log") or "")
         text = (query.get("text") or [""])[0] or None
-        log = backend.log_tail(path_text, text=text, errors_only=query.get("errors") == ["1"]) if path_text else jobs_view.NO_LOG
+
+        def tail(where: str) -> str:
+            return backend.log_tail(where, text=text, errors_only=query.get("errors") == ["1"])
+
+        log = tail(path_text) if path_text else jobs_view.NO_LOG
+        if log == jobs_view.NO_LOG and path_text:  # a job that ran on a part-time machine: its copied-back log
+            copied = gpu_jobs.remote_log(job_id, path_text, job.user if job else None)
+            log = tail(str(copied)) if copied else log
         return _json({"log": log})
     raise Refused("404 Not Found", "no such route")
 

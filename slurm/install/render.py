@@ -30,6 +30,8 @@ SLURM_USER = "slurm"
 #: the agent rewrites it when an admin changes a machine's memory or kept cores on the page (agent.py, B4).
 PART_TIME_CONF = "part_time_nodes.conf"
 PART_TIME_CONF_PATH = f"/etc/slurm/{PART_TIME_CONF}"
+#: SlurmUser's ssh key (under the state dir) for the read-only copy of a part-time machine's job state (B5b).
+COPY_KEY = "agent/ssh/id_ed25519"
 #: Slurm's default memory for a job that names none, capped below at the smallest node (bigger refuses such jobs).
 DEF_MEM_MB = 16384
 

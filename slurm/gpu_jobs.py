@@ -22,7 +22,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -428,6 +428,75 @@ def sidecar_path(job_id: str) -> Path:
     return STATE_DIR / "jobs" / f"{job_id}.json"
 
 
+#: Where the agent copies each part-time machine's state directory: `STATE_DIR/remote/<node>/` (plan B5b).
+REMOTE_DIR = "remote"
+_FILE_JOB = re.compile(r"(\d+(?:_\d+)?)(?=[.-])", re.ASCII)  # the job id a state file's name starts with
+
+
+def state_dirs(sub: str) -> list[Path]:
+    """`STATE_DIR/<sub>` and each part-time machine's copy of it, `STATE_DIR/remote/<node>/<sub>`."""
+    return [STATE_DIR / sub, *sorted((STATE_DIR / REMOTE_DIR).glob(f"*/{sub}"))]
+
+
+def _ran_on(job_ids: Iterable[str]) -> dict[str, dict[str, str]]:
+    """`{job id: {node: user}}` from sacct, over every leg of a requeued job (`-D`); {} when sacct does not answer."""
+    ids = sorted(set(job_ids))
+    jobs = _sacct_jobs("-D", "-j", ",".join(ids)) if ids else None
+    out: dict[str, dict[str, str]] = {}
+    for job in jobs or []:
+        user = job.get("user")
+        for node in str(job.get("nodes") or "").split(","):
+            if node and isinstance(user, str):
+                out.setdefault(str(job.get("job_id")), {})[node] = user
+    return out
+
+
+def remote_files(sub: str, pattern: str = "*") -> list[tuple[Path, str, str]]:
+    """`(path, job id, user)` of each copied-back file in `remote/<node>/<sub>` for a job that sacct says ran on `<node>`.
+
+    The trust rule: copied files lose their owner, so nothing in a file or its name says who made it. A file counts
+    only for the job id its name starts with when slurm's accounting puts that job on the node the file came from, and
+    it belongs to the user accounting gives that job. A file for any other job is ignored.
+    """
+    found = []
+    for directory in state_dirs(sub)[1:]:
+        for path in directory.glob(pattern):
+            match = _FILE_JOB.match(path.name)
+            if match and path.is_file() and not path.is_symlink():
+                found.append((path, match[1], directory.parent.name))
+    ran = _ran_on(job_id for _, job_id, _ in found)
+    return [(path, job_id, ran[job_id][node]) for path, job_id, node in found if node in ran.get(job_id, {})]
+
+
+def _legs(record: Mapping[str, object]) -> list[dict[str, object]]:
+    legs = record.get("legs")
+    return [leg for leg in (legs if isinstance(legs, list) else [record.get("last_leg")]) if isinstance(leg, dict)]
+
+
+def merge_remote(record: dict[str, object] | None, remote: Mapping[str, object]) -> dict[str, object]:
+    """`record` with a part-time machine's legs added (its `legs`/`last_leg`, oldest first, none twice)."""
+    out = dict(record or {})
+    legs = list({(leg.get("leg"), leg.get("started_at"), leg.get("ended_at")): leg
+                 for leg in (*_legs(out), *_legs(remote))}.values())
+    if legs:
+        legs.sort(key=lambda leg: leg.get("ended_at") if isinstance(leg.get("ended_at"), int) else 0)
+        out.update(legs=legs, last_leg=legs[-1])
+    return out
+
+
+def remote_log(job_id: str, log: str, user: str | None = None) -> Path | None:
+    """The copied-back log `remote/<node>/logs/<basename of log>` of a job that ran on that node, None for none.
+    With `user`, a job accounting gives to someone else is not shown."""
+    name = Path(log).name
+    for directory in state_dirs("logs")[1:]:
+        candidate = directory / name
+        if candidate.is_file() and not candidate.is_symlink():
+            owner = _ran_on([job_id]).get(job_id, {}).get(directory.parent.name)
+            if owner and user in (None, owner):
+                return candidate
+    return None
+
+
 #: Job states that hold their cores (a SUSPENDED job keeps only its memory and GPUs, and its cores for its resume).
 ON_CORES = frozenset({State.RUNNING, State.CONFIGURING, State.COMPLETING})
 
@@ -507,13 +576,18 @@ def plan_room(
 
 def read_sidecar(job_id: str, user: str | None = None) -> dict[str, object] | None:
     """The job's record. Pass the job's slurm `user` whenever it is known: a record some other user wrote (anyone can
-    create `jobs/<id>.json` for an id not yet issued) is then ignored."""
-    return read_json(sidecar_path(job_id), user)
+    create `jobs/<id>.json` for an id not yet issued) is then ignored. Legs a part-time machine ran are merged in
+    (`remote_files`: only for a job accounting says ran there)."""
+    record = read_json(sidecar_path(job_id), user)
+    for path, _, owner in remote_files("jobs", f"{job_id}.json"):
+        if user in (None, owner) and (remote := read_json(path)):
+            record = merge_remote(record, remote)
+    return record
 
 
 def update_sidecar(job_id: str, **fields: object) -> None:
     """Merge fields into a job's sidecar (read, update, atomic write). Only this user's own record is merged into."""
-    record = read_sidecar(job_id, current_user()) or {"job_id": job_id}
+    record = read_json(sidecar_path(job_id), current_user()) or {"job_id": job_id}  # not the copied-back legs
     record.update(fields)
     write_json(sidecar_path(job_id), record)
 
@@ -613,13 +687,15 @@ def measured_peak_bytes(name: str) -> int | None:
     """
     best: tuple[int, int] | None = None
     me = current_user()
+    remote = {job_id: path for path, job_id, owner in remote_files("jobs", "*.json") if owner == me}
     for path in (STATE_DIR / "jobs").glob("*.json"):
         record = read_json(path, me) or {}
         if record.get("name") != name:
             continue
-        legs = record.get("legs")
-        for leg in legs if isinstance(legs, list) else [record.get("last_leg")]:
-            if not isinstance(leg, dict) or "peak_gpu_mib" not in leg or leg.get("exit") != 0 or leg.get("signals"):
+        if path.stem in remote and (copied := read_json(remote[path.stem])):
+            record = merge_remote(record, copied)
+        for leg in _legs(record):
+            if "peak_gpu_mib" not in leg or leg.get("exit") != 0 or leg.get("signals"):
                 continue
             try:
                 total = int(float(leg["peak_gpu_mib"]) * 1024 * 1024) + int(leg.get("peak_mem_bytes") or 0)
@@ -692,9 +768,13 @@ def _owner(path: Path) -> str:
 
 
 def events(job_id: str | None = None) -> list[Event]:
-    """Every event (of one job, if given), oldest first. Who did it comes from file ownership alone."""
+    """Every event (of one job, if given), oldest first. Who did it comes from file ownership alone; for a file copied
+    back from a part-time machine, from the user accounting gives that job (`remote_files`)."""
+    pattern = "*.json" if job_id is None else f"{job_id}-*.json"
+    candidates = [(path, None) for path in (STATE_DIR / "events").glob(pattern)]
+    candidates += [(path, owner) for path, _, owner in remote_files("events", pattern)]
     found = []
-    for path in (STATE_DIR / "events").glob("*.json" if job_id is None else f"{job_id}-*.json"):
+    for path, copied_owner in candidates:
         match = re.fullmatch(r"(.+)-(\d+)-([a-z_]+)\.json", path.name)
         if not match or (job_id is not None and match[1] != job_id):
             continue  # judged by the name before the file is opened
@@ -703,7 +783,7 @@ def events(job_id: str | None = None) -> list[Event]:
             continue
         extra = {k: v for k, v in record.items() if k not in {"job", "action", "at"}}
         try:
-            found.append(Event(match[1], match[3], _owner(path), int(match[2]), extra))
+            found.append(Event(match[1], match[3], copied_owner or _owner(path), int(match[2]), extra))
         except OSError:
             continue
     return sorted(found, key=lambda event: event.at)

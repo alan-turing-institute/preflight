@@ -38,6 +38,7 @@ for path in (HERE, HERE.parent, HERE.parents[1] / "machine" / "earlyoom"):
         sys.path.insert(0, str(path))
 
 import components  # noqa: E402 - paths set just above
+import components.agent as agent_component  # noqa: E402
 import components.part_time as part_time  # noqa: E402
 import components.slurm as slurm_component  # noqa: E402
 import detect  # noqa: E402
@@ -294,7 +295,10 @@ def cmd_part_time_apply(site, args, chown: Chown | None = _chown) -> int:
         if cmd_apply(site, args, tools, chown):
             raise SystemExit("installing the tools component failed")
 
-    _run_all(part_time.steps(site, args, manager, install_tools))
+    def install_site_copy() -> None:
+        write_files(components.ROOT, agent_component.site_copy(site), chown)
+
+    _run_all(part_time.steps(site, args, manager, install_tools, install_site_copy))
     print(f"{args.part_time}: joined as a part-time node; now run `install.py part-time add {args.part_time}` on the controller")
     return 0
 

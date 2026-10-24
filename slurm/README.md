@@ -519,7 +519,11 @@ as that uid), so check this first, or the controller refuses in step 2.
    This creates `slurm` with the controller's ids (and stops if a different `slurm` already exists), installs `munge`
    and the pinned slurm build, installs the tools (`/opt/gpujobs`, with the health check), adds `--conf-server` to the
    package's own `slurmd` service so the machine takes its settings from the controller, opens port 6818 to the
-   controller's address only when firewalld is running, and enables `munge` and `slurmd`.
+   controller's address only when firewalld is running, and enables `munge` and `slurmd`. It also writes the site file
+   to `/etc/gpujobs/site.toml` and makes the state directories (a job's wrapper there reads the one and writes its
+   records into the other), gives `slurm` a home (`/var/lib/slurm`, with `.ssh`) and the login shell `/bin/sh` (sshd runs
+   a key's forced command through the shell, and `nologin` would refuse it), and installs `rsync` (`rrsync` to
+   `/usr/local/bin` when the distribution ships it only as documentation).
 2. On the controller, as root, run by an admin through `sudo`:
 
        sudo install.py part-time add NODE
@@ -527,8 +531,19 @@ as that uid), so check this first, or the controller refuses in step 2.
    This compares the uid of every cluster user (accounting users, the admin group, `slurm`) here and on the machine
    over ssh, and refuses with every difference listed. When they match it copies the munge key over ssh (never
    printed) and restarts munge and slurmd there. It uses your own ssh login, so you need an ssh login and `sudo` on
-   the machine.
+   the machine. Unless the site file says `shared_state = true`, it also makes an ssh key for `slurm` on the controller
+   (`STATE_DIR/agent/ssh/id_ed25519`) and lets it into the machine's `slurm` account for one thing only: a read-only
+   `rrsync` of the state directory.
 3. Add the node to the controller's site file if it is not there, and `sudo install.py apply` on the controller.
+
+**Where a part-time job's records go.** The job wrapper runs on the machine, so a job's record (`jobs/<id>.json`, with
+its legs and peaks), its events (a pushed-back job's `push_back`) and its log are written to the machine's own state
+directory. Every minute the controller's agent copies each machine's state directory to
+`STATE_DIR/remote/<node>/` (`rsync`, over ssh, read-only) and the page and tools read those copies too; the part-time card
+shows when it last worked. A copied file counts only for a job that slurm's accounting says ran on that machine, and
+belongs to the user accounting names for it (copies lose their owner). If the machines mount the controller's `state_dir`
+(one shared filesystem), set `shared_state = true` and nothing is copied. `node_python` (default `/usr/bin/python3`) is
+the interpreter a part-time job's wrapper runs with there, never the submitter's own.
 
 ## 9. Uninstall
 

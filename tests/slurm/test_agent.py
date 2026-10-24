@@ -28,9 +28,9 @@ def job(
 
 
 def done(
-    argv: list[str], code: int = 0, out: str = ""
+    argv: list[str], code: int = 0, out: str = "", err: str = ""
 ) -> subprocess.CompletedProcess[str]:
-    return subprocess.CompletedProcess(argv, code, out, "")
+    return subprocess.CompletedProcess(argv, code, out, err)
 
 
 class World:
@@ -45,6 +45,9 @@ class World:
         self.t, self.boot, self.ctld_s = 1000.0, "boot-1", 60.0
         self.has_gpus = True
         self.lap: dict[str, object] | None = None  # the part-time node `lap` as `scontrol show node --json` gives it; None: no such node
+        self.shared_state = False
+        self.copies: list[list[str]] = []  # every rsync the agent ran, and what it answers: (exit status, stderr)
+        self.copy_answer: tuple[int, str] = (0, "")
         self.running = ""  # squeue's "%i|%j|%P" lines for the jobs running on it
         self.nodes = {"n1": "IDLE", "n2": "IDLE+DRAIN"}
         self.writes: list[list[str]] = []  # every scontrol update / release, failed ones included
@@ -89,7 +92,8 @@ class World:
         site = site_config.parse(
             {"name": "t", "nodes": nodes + ([{"name": "lap", "cpus": 8, "real_memory_mb": 30000, "part_time": True,
                                                "address": "10.0.0.2"}] if self.lap else []),
-             "notify_command": list(self.notify_command), "metrics": {"mode": self.metrics_mode}}
+             "notify_command": list(self.notify_command), "metrics": {"mode": self.metrics_mode},
+             "shared_state": self.shared_state}
         )
         return agent_module.Agent(
             site,
@@ -104,6 +108,7 @@ class World:
             cgroup_root=self.cgroups,
             pid_job=lambda pid: self.live.get(pid),
             part_time_conf=self.dir / "part_time_nodes.conf",
+            copier=lambda argv, **_kw: self.copies.append(argv) or done(argv, self.copy_answer[0], err=self.copy_answer[1]),
         )
 
     def step(self) -> dict[str, object]:
@@ -578,6 +583,37 @@ def test_part_time_resources_rewrite_the_included_file_then_reconfigure(world: W
     world.part_time("2", action="resources", jobs_memory_gb=99)  # more than the machine has
     world.step()
     assert world.writes == [["reconfigure"]] and world.agent.state.part_time_resources["lap"]["jobs_memory_gb"] == 20
+
+
+def test_a_part_times_job_state_is_copied_back_each_minute_and_a_failure_is_logged_once_per_outage(
+        world: World, capsys: pytest.CaptureFixture[str]) -> None:
+    world.lap = {"name": "lap", "state": ["IDLE"], "reason": "", "extra": ""}
+    world.agent = world.new_agent()
+    beat = world.step()
+    ssh = f"ssh -i {world.dir}/agent/ssh/id_ed25519 -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new"
+    assert world.copies == [["rsync", "-a", "--delete", "--timeout=20", "-e", ssh, "slurm@10.0.0.2:", f"{world.dir}/remote/lap/"]]
+    assert beat["copied"] == {"lap": 1000} and agent_module.read_copied(world.dir) == {"lap": 1000}  # the card's "last copied"
+    world.t += 59
+    world.step()
+    assert len(world.copies) == 1  # once a minute, not every loop
+    world.copy_answer = (255, "ssh: connect to host 10.0.0.2 port 22: Connection timed out\n")
+    for _ in range(3):
+        world.t += 60
+        world.step()
+    err = capsys.readouterr().err
+    assert len(world.copies) == 4 and err.count("copying job state from lap failed: ssh: connect") == 1  # never an error loop
+    assert world.agent.last_error == "" and agent_module.read_copied(world.dir) == {"lap": 1000}  # the old time stays
+    world.copy_answer = (0, "")
+    world.t += 60
+    world.step()
+    assert "copied from lap again" in capsys.readouterr().err and world.agent.copied == {"lap": 1299}
+
+
+def test_shared_state_copies_nothing(world: World) -> None:
+    world.lap, world.shared_state = {"name": "lap", "state": ["IDLE"], "reason": "", "extra": ""}, True
+    world.agent = world.new_agent()
+    world.step()
+    assert world.copies == [] and agent_module.read_copied(world.dir) == {}
 
 
 def idle_world(world: World, *, gpus_used: int = 0, mem_used: int = 22888) -> World:
