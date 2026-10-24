@@ -625,6 +625,7 @@ class EventAction(StrEnum):
     URGENT_HOLD = "urgent_hold"
     RELEASE = "release"
     FAILED = "failed"
+    PUSH_BACK = "push_back"  # node_check.py requeued a job to free memory on a part-time machine
 
 
 @dataclass(frozen=True)
