@@ -47,6 +47,7 @@ requeued job keeps its first leg's log). The job name is `P:class:NAME`.
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import math
 import os
@@ -137,7 +138,7 @@ def warn_memory(mem: str | None, name: str | None, gpu: bool) -> None:
 def warn_device(arguments: argparse.Namespace) -> None:
     """C4: a CPU-only job told `--device cpu` while no GPU job runs or waits: the GPU is free and may finish it far sooner."""
     command = arguments.command
-    on_cpu = "--device=cpu" in command or any(a == "--device" and b == "cpu" for a, b in zip(command, command[1:]))
+    on_cpu = "--device=cpu" in command or any(a == "--device" and b == "cpu" for a, b in itertools.pairwise(command))
     if arguments.gpus or not on_cpu:
         return
     queue = gpu_jobs.read_queue()
