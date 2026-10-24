@@ -218,7 +218,10 @@ def slurmd_drop_in(unit: str, controller: str) -> str:
         raise SystemExit("`systemctl cat slurmd` shows no ExecStart=; cannot add --conf-server to it")
     if "--conf-server" in found[2]:
         raise SystemExit("slurmd's unit already has --conf-server; leave it, or remove it first")
-    return f"[Service]\nExecStart=\nExecStart={found[1]} --conf-server {controller}{found[2]}\n"
+    # After a reboot slurmd may start before the network or the VPN that reaches the controller is up, and then it cannot
+    # fetch its settings and exits: wait for them (tailscaled.service is ignored when it does not exist), and start again
+    return (f"[Unit]\nAfter=network-online.target tailscaled.service\nWants=network-online.target\n\n"
+            f"[Service]\nExecStart=\nExecStart={found[1]} --conf-server {controller}{found[2]}\nRestart=on-failure\nRestartSec=30\n")
 
 
 def _write_drop_in(controller: str) -> list[list[str]]:

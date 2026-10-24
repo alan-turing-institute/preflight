@@ -640,7 +640,8 @@ def test_part_time_apply_adds_the_flag_to_the_packages_unit_and_opens_the_port_o
     assert ["install", "-d", "-m", "0700", "-o", "slurm", "-g", "slurm", "/var/lib/slurm/.ssh"] in calls
     assert ["install", "-d", "-m", "0755", "-o", "root", "-g", "root", "/var/lib/gpujobs/owners"] in calls  # node_check's manifest
     drop_in = (tmp_path / "root/etc/systemd/system/slurmd.service.d/10-conf-server.conf").read_text()
-    assert drop_in == "[Service]\nExecStart=\nExecStart=/usr/sbin/slurmd --conf-server 100.2.2.2 --systemd $SLURMD_OPTIONS\n"
+    assert drop_in == ("[Unit]\nAfter=network-online.target tailscaled.service\nWants=network-online.target\n\n[Service]\nExecStart=\n"
+                       "ExecStart=/usr/sbin/slurmd --conf-server 100.2.2.2 --systemd $SLURMD_OPTIONS\nRestart=on-failure\nRestartSec=30\n")
     for hook in ("prolog.d", "epilog.d"):  # slurm 26.05 fails a job where the glob matches no script
         script = tmp_path / "root/etc/slurm" / hook / "00-none.sh"
         assert script.read_text().endswith("exit 0\n") and os.access(script, os.X_OK)
