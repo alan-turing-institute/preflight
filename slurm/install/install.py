@@ -4,6 +4,8 @@
     install.py render --out DIR                 # write every enabled component's files under DIR
     install.py check                            # exit 1 if the installed files differ from the rendered ones
     sudo install.py apply [--component NAME ...]
+    sudo install.py part-time add NODE          # on the controller: check user ids, copy the munge key to a part-time machine
+    sudo install.py apply --part-time NODE --controller ADDR --slurm-uid U --slurm-gid G --i-accept-cluster-trust
     sudo install.py upgrade-slurm               # step the running slurm up to the site file's [slurm] release
     sudo install.py user add|remove USER          # let USER submit (slurm accounting: the site's account)
     sudo install.py admin add|remove USER
@@ -36,6 +38,7 @@ for path in (HERE, HERE.parent, HERE.parents[1] / "machine" / "earlyoom"):
         sys.path.insert(0, str(path))
 
 import components  # noqa: E402 - paths set just above
+import components.part_time as part_time  # noqa: E402
 import components.slurm as slurm_component  # noqa: E402
 import detect  # noqa: E402
 import render  # noqa: E402
@@ -272,6 +275,34 @@ def cmd_apply(site, args, modules, chown: Chown | None = _chown) -> int:
     return 0
 
 
+def cmd_part_time_apply(site, args, chown: Chown | None = _chown) -> int:
+    """Join this machine to the cluster as the site file's part-time node `args.part_time` (plan B5)."""
+    if not args.accept_cluster_trust:
+        print(f"REFUSED: {part_time.TRUST_WARNING}", file=sys.stderr)
+        return 1
+    if problems := part_time.refusals(site, args):
+        for r in problems:
+            print(f"REFUSED: {r}", file=sys.stderr)
+        return 1
+    manager = package_manager(site)
+    if shutil.which(manager) is None:
+        print(f"REFUSED: {manager} is not on this machine", file=sys.stderr)
+        return 1
+    tools = components.load(site, ["tools"])
+
+    def install_tools() -> None:
+        if cmd_apply(site, args, tools, chown):
+            raise SystemExit("installing the tools component failed")
+
+    _run_all(part_time.steps(site, args, manager, install_tools))
+    print(f"{args.part_time}: joined as a part-time node; now run `install.py part-time add {args.part_time}` on the controller")
+    return 0
+
+
+def cmd_part_time(site, args, modules) -> int:
+    return part_time.cmd_add(site, args)
+
+
 def cmd_upgrade(site, args, modules, chown: Chown | None = _chown) -> int:
     """Step a running slurm up to the site's `[slurm]` release, through each of its `steps` first (plan A5).
 
@@ -405,6 +436,14 @@ def parser() -> argparse.ArgumentParser:
     apply.add_argument("--component", action="append", choices=components.ORDER, dest="components")
     apply.add_argument("--replace-existing-slurm", action="store_true",
                        help="take over a slurm this installer did not set up (its settings files are replaced)")
+    apply.add_argument("--part-time", metavar="NODE", help="join this machine as that part-time node of the site file")
+    apply.add_argument("--i-accept-cluster-trust", action="store_true", dest="accept_cluster_trust")
+    apply.add_argument("--controller", help="with --part-time: the controller's address (slurmd's --conf-server, the firewall)")
+    apply.add_argument("--slurm-uid", type=int, help="with --part-time: the controller's uid for the slurm user")
+    apply.add_argument("--slurm-gid", type=int, help="with --part-time: the controller's gid for the slurm group")
+    away = sub.add_parser("part-time", parents=[shared])
+    away.add_argument("action", type=part_time.PartTimeAction, choices=list(part_time.PartTimeAction))
+    away.add_argument("node")
     for name in ("user", "admin", "service"):
         who = sub.add_parser(name, parents=[shared])
         who.add_argument("action", type=Action, choices=list(Action))
@@ -419,6 +458,7 @@ COMMANDS = {
     "user": cmd_user,
     "admin": cmd_admin,
     "service": cmd_service,
+    "part-time": cmd_part_time,
     "migrate-state": cmd_migrate,
 }
 
@@ -436,6 +476,8 @@ def main(argv: list[str] | None = None, chown: Chown | None = _chown) -> int:
     components.ROOT = getattr(args, "root", Path("/"))
     components.REPLACE_EXISTING_SLURM = getattr(args, "replace_existing_slurm", False)
     modules = components.load(site, getattr(args, "components", None))
+    if args.command == "apply" and args.part_time:
+        return cmd_part_time_apply(site, args, chown)
     if args.command == "apply":
         return cmd_apply(site, args, modules, chown)
     if args.command == "upgrade-slurm":
