@@ -70,6 +70,7 @@ class Partition(StrEnum):
     CPU = "cpu"  # a job without GPUs, either class: kept off the cores held for GPU jobs; slurm never pre-empts it
     URGENT = "urgent"  # urgent.py only; pre-empts `normal`
     SERVICE = "service"  # submit.py --service only (D20): a service's CPU stand-in; suspends `cpu` jobs to start
+    PART_TIME = "part_time"  # the part-time machines (someone's own, lent when idle); only `--anywhere` jobs reach it
 
 
 class JobClass(StrEnum):
@@ -88,11 +89,19 @@ def class_of(name: str) -> JobClass | None:
     return JobClass(label) if label in set(JobClass) else None
 
 
-def partition_for(job_class: JobClass, gpus: int, *, service: bool = False) -> Partition:
+#: What `--anywhere` asks slurm for: it starts in whichever of the two has room first. Once running, squeue names the
+#: one it got, so a job is only ever shown in `cpu` or `part_time`.
+ANYWHERE_PARTITIONS = f"{Partition.CPU},{Partition.PART_TIME}"
+
+
+def partition_for(job_class: JobClass, gpus: int, *, service: bool = False, anywhere: bool = False) -> str:
     """The partition a job runs in: a service's stand-in in `service`; one without GPUs in `cpu` (one partition, so its
-    MaxCPUsPerNode caps all CPU-only jobs together: slurm counts that limit per partition), else by its class."""
+    MaxCPUsPerNode caps all CPU-only jobs together: slurm counts that limit per partition), else by its class.
+    `anywhere` (a CPU-only `resume` job) adds the part-time machines: `ANYWHERE_PARTITIONS`."""
     if service:
         return Partition.SERVICE
+    if anywhere:
+        return ANYWHERE_PARTITIONS
     if not gpus:
         return Partition.CPU
     return Partition.NORMAL if job_class is JobClass.RESUME else Partition.STEADY
@@ -160,6 +169,7 @@ class QueuedJob:
     mem_mb: int | None = None  # slurm's memory request now (MB per node; 0 is the whole node), None when it gave none
     cores: frozenset[str] = frozenset()  # "node:socket:core" slurm gave it; a suspended job keeps them for its resume
     submitted: int = 0  # epoch seconds it last entered the queue (a requeue resets it, measured); 0 when unknown
+    node: str = ""  # the node a running job is on (squeue's `nodes`); "" while it waits
 
     @property
     def job_class(self) -> JobClass | None:
@@ -250,6 +260,7 @@ def parse_squeue(text: str) -> list[QueuedJob]:
                 int(priority.get("number", 0)) if priority.get("set") else 0, parse_gpus(raw.get("tres_per_node") or ""),
                 cpus, level_of(str(raw.get("qos") or "")), _memory_mb(raw, cpus), _cores(raw),
                 int(submitted.get("number", 0)) if submitted.get("set") else 0,
+                str(raw.get("nodes") or ""),
             )
         )
     return jobs

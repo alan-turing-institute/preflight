@@ -94,6 +94,8 @@ def test_a_hostile_or_foreign_record_is_ignored_and_never_blocks(tmp_path: Path,
     named = QueuedJob("8", "normal", "PENDING", "None", "p:resume:\x1b]0;forged\x07")
     assert all(line.isprintable() for line in status.lines([named]))  # a terminal shows a name, never acts on it
     assert "[status] 8 PENDING    ?          normal 0 GPU" in "\n".join(status.lines([named]))  # the level after the user
+    running = QueuedJob("9", "part_time", "RUNNING", "None", "p:resume:n", node="laptop")
+    assert " p:resume:n on laptop |" in "\n".join(status.lines([running]))  # a running job says where it is
     keeper = any(line.startswith("[status] keeper:") for line in status.lines([named]))
     monkeypatch.setattr(status.gpu_jobs, "LEASE_DIR", None)  # a site without a lease (Turing box) has no keeper line
     assert keeper and not any(line.startswith("[status] keeper:") for line in status.lines([named]))
@@ -153,7 +155,7 @@ def test_parse_squeue_reads_json_so_a_name_cannot_forge_a_row() -> None:
     forged = "x\n999|normal|PENDING|None||bob|9999|N/A|y"
     text = squeue_json(
         {"job_id": 12, "job_state": ["RUNNING"], "priority": {"set": True, "number": 4001}, "tres_per_node": "gres/gpu:2",
-         "name": forged, "qos": "high", "memory_per_node": {"set": True, "number": 61440},
+         "name": forged, "qos": "high", "nodes": "gpu-node-1", "memory_per_node": {"set": True, "number": 61440},
          "submit_time": {"set": True, "infinite": False, "number": 1792838841}},
         {"job_id": 13, "job_state": ["COMPLETED"]},  # squeue --json ignored -t: finished jobs are dropped here
         {"job_id": 14, "priority": {"set": False, "number": 7}, "state_reason": "JobHeldUser", "qos": "staff",
@@ -169,6 +171,7 @@ def test_parse_squeue_reads_json_so_a_name_cannot_forge_a_row() -> None:
     # slurm's memory request as it stands (a later `scontrol update` shows), per cpu times cores, None when it gave none
     assert (running.mem_mb, held.mem_mb, paused.mem_mb) == (61440, 8192, None)
     assert (running.submitted, held.submitted) == (1792838841, 0)
+    assert (running.node, held.node) == ("gpu-node-1", "")  # only a running job has a node
     assert [(j.job_id, j.state, j.active) for j in (paused, killed)] == [("15", "COMPLETING", True), ("16", "COMPLETING", True)]
     old = QueuedJob("1", "normal", "PENDING", "Priority", "n", "afterok:3(unfulfilled)")
     assert (old.user, old.priority, old.gpus, old.depends_on) == ("", 0, 0, ("3",))

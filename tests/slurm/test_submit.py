@@ -16,9 +16,10 @@ DIRECTIVE = "#S" + "BATCH"  # spelled in two halves so a text-matching guard doe
 
 
 def fake_site(monkeypatch: pytest.MonkeyPatch, *, lease: object, dgx_gate: bool, nodes: tuple = (),
-              cpu_job_cap: int | None = None, service: object = None) -> None:
+              cpu_job_cap: int | None = None, service: object = None, part_time_nodes: tuple = ()) -> None:
     """`load` returns just the fields submit.py reads."""
-    site = SimpleNamespace(lease=lease, dgx_gate=dgx_gate, nodes=nodes, cpu_job_cap=cpu_job_cap, service=service)
+    site = SimpleNamespace(lease=lease, dgx_gate=dgx_gate, nodes=nodes, cpu_job_cap=cpu_job_cap, service=service,
+                           part_time_nodes=part_time_nodes)
     monkeypatch.setattr(site_config, "load", lambda *_p: site)
 
 
@@ -58,6 +59,9 @@ def test_restart_job_runs_in_steady_still_requeueable() -> None:
         (["--class", "restart", "--entry", "a.py", "--", "x"], "--entry needs --repo"),
         (["--class", "restart", "--wait-limit", "soon", "--", "x"], "not a duration"),
         (["--class", "restart"], "no command"),
+        (["--class", "restart", "--anywhere", "--", "x"], "--anywhere needs --class resume"),
+        (["--class", "resume", "--resume-ok", "--gpu", "--anywhere", "--", "x"], "--anywhere needs --class resume"),
+        (["--class", "resume", "--resume-ok", "--anywhere", "--", "x"], "no part-time node"),
         (["--project", "x:resume", "--class", "restart", "--", "x"], "no ':' in a project name"),  # would fake the class
     ],
 )
@@ -65,6 +69,13 @@ def test_refusals(argv: list[str], why: str, tmp_path: Path, monkeypatch: pytest
     monkeypatch.setattr(gpu_jobs, "STATE_DIR", tmp_path)
     with pytest.raises(submit.Refused, match=why):
         dry("--project", "p", "--what", "w", *argv)
+
+
+def test_anywhere_asks_for_the_cpu_and_part_time_partitions(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_site(monkeypatch, lease=None, dgx_gate=False, part_time_nodes=(object(),))
+    script = dry("--project", "p", "--what", "w", "--class", "resume", "--resume-ok", "--anywhere", "--mem", "4G",
+                 "--", "x")
+    assert f"{DIRECTIVE} --partition=cpu,part_time" in script and f"{DIRECTIVE} --requeue" in script
 
 
 def test_an_unknown_class_is_refused_by_the_parser() -> None:

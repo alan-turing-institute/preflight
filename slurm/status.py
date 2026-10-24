@@ -20,6 +20,7 @@ PAUSES = {
     gpu_jobs.Partition.STEADY: "never pre-empted (a requeue redoes it)",
     gpu_jobs.Partition.URGENT: "urgent",
     gpu_jobs.Partition.SERVICE: "a service's CPU stand-in; requeued for GPU or urgent work",
+    gpu_jobs.Partition.PART_TIME: "a part-time machine; requeued when its owner needs it, resumes from its checkpoint",
 }
 
 
@@ -51,6 +52,7 @@ def lines(queue: list[gpu_jobs.QueuedJob] | None) -> list[str]:
         why = jobs_view.waiting_reason(job, by_id, records, events)
         out.append(gpu_jobs.printable(  # names and descriptions are what their submitters typed
             f"[status] {job.job_id} {job.state:<10} {job.user or '?':<10} {job.level:<6} {job.gpus} GPU {job.name}"
+            f"{f' on {job.node}' if job.node else ''}"
             f" | {record.get('mem') or 'default mem'}, {_pauses(job)}"
             f" | {record.get('what', '(no sidecar)')}{f' | {why}' if why else ''}"
         ))

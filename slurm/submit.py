@@ -5,7 +5,12 @@ Design 3.3 (`design notes`).
 
     slurm/submit.py --project P --what 'one line' --class resume|restart [--mem 24G|auto] [--gpu|--gpus N] \
         [--entry script.py --repo DIR] [--after JOBID]... [--cpus N] [--name NAME] [--log FILE] \
-        [--workdir DIR] [--wait-limit 1h] [--resume-ok] [--level low|normal|high] [--service] -- <command...>
+        [--workdir DIR] [--wait-limit 1h] [--resume-ok] [--level low|normal|high] [--service] [--anywhere] -- <command...>
+
+ANYWHERE: `--anywhere` lets a CPU-only `resume` job start on a part-time machine (someone's own, lent to the cluster
+while idle) as well as on the main node: it is submitted to `cpu,part_time`. Only with `--class resume` and no GPUs,
+because the health check requeues such a job whenever the machine's owner needs the memory back, and the job then
+continues from its checkpoint elsewhere. Refused on a site with no part-time node.
 
 SERVICE (D20, sites with `[service]`): `--service` runs a background service's CPU stand-in in the `service` partition
 (`--mem` required). When cores are short the agent suspends CPU-only jobs for it within seconds (they keep their memory,
@@ -164,7 +169,8 @@ def sbatch_script(
     label = arguments.job_class
     level = getattr(arguments, "level", None) or gpu_jobs.Level.NORMAL
     partition = partition or gpu_jobs.partition_for(
-        gpu_jobs.JobClass(label), arguments.gpus, service=getattr(arguments, "service", False)
+        gpu_jobs.JobClass(label), arguments.gpus, service=getattr(arguments, "service", False),
+        anywhere=getattr(arguments, "anywhere", False),
     )
     lines = [
         "#!/bin/bash",
@@ -254,6 +260,8 @@ def parser() -> argparse.ArgumentParser:
     consent.add_argument("--suspend", default=None, metavar="J[,J]",
                          help="with --service: the only jobs it may suspend (their owner's consent, D9)")
     consent.add_argument("--no-suspend", action="store_true", help="with --service: suspend nothing; wait instead")
+    p.add_argument("--anywhere", action="store_true",
+                   help="a CPU-only resume job may also start on a part-time machine (cpu,part_time)")
     p.add_argument("--dry-run", action="store_true", help="print the sbatch script and submit nothing")
     p.add_argument("command", nargs=argparse.REMAINDER)
     return p
@@ -288,6 +296,15 @@ def submit(argv: list[str]) -> str:
     mem = resolve_mem(arguments.mem, named, arguments.gpu)
     named_cpus = arguments.cpus
     arguments.cpus = resolve_cpus(arguments.cpus, arguments.gpus, site)
+    if arguments.anywhere:
+        if arguments.job_class != gpu_jobs.JobClass.RESUME or arguments.gpus or arguments.service:
+            msg = ("--anywhere needs --class resume with no GPUs and no --service: the owner of a part-time machine "
+                   "can take it back at any moment, which requeues the job, and only a job that continues from its "
+                   "checkpoint loses nothing")
+            raise Refused(msg)
+        if not site.part_time_nodes:
+            msg = "--anywhere: this site has no part-time node (part_time = true on a node in the site file)"
+            raise Refused(msg)
     if arguments.service:
         if arguments.gpus:
             msg = "--service runs a CPU stand-in: no --gpu or --gpus"
@@ -363,8 +380,12 @@ def submit(argv: list[str]) -> str:
         submitted_at=int(time.time()),
         **({"may_suspend": None if consent is None else sorted(consent)} if arguments.service else {}),
     )
-    partition = gpu_jobs.partition_for(gpu_jobs.JobClass(arguments.job_class), arguments.gpus, service=arguments.service)
+    partition = gpu_jobs.partition_for(
+        gpu_jobs.JobClass(arguments.job_class), arguments.gpus, service=arguments.service, anywhere=arguments.anywhere
+    )
     pauses = {
+        gpu_jobs.ANYWHERE_PARTITIONS: "requeued for urgent work or when a part-time machine's owner needs it back; "
+                                      "resumed from its checkpoint",
         gpu_jobs.Partition.NORMAL: "pre-empted and resumed from its checkpoint",
         gpu_jobs.Partition.STEADY: "never pre-empted",
         gpu_jobs.Partition.SERVICE: "the agent suspends CPU-only jobs it may to make room; requeued for urgent work",

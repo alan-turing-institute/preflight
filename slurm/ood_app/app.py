@@ -268,6 +268,7 @@ def job_rows(backend: Backend) -> list[dict[str, object]]:
                 "gpus": job.gpus,
                 "cpus": job.cpus,
                 "mem_mb": jobs_view.requested_mem_mb(job, record),
+                "node": job.node,
             }
         )
     return rows
@@ -599,6 +600,11 @@ def _queued_cell(r: dict[str, object], now: datetime) -> str:
     return _queued_html(queued, now if r["state"] == gpu_jobs.State.PENDING else None, now)
 
 
+def _node_line(node: str) -> str:
+    """Where a job runs or ran, as a small line under its state badge (inside the cell, so the table stays as wide)."""
+    return f'<div class="why">on {esc(node)}</div>' if node else ""
+
+
 def _queue_table(rows: list[dict[str, object]], root: str, now: datetime) -> str:
     head = '<div class="card-head"><h2 id="h-queue">Queue</h2><span class="meta">{}</span></div>'
     if not rows:
@@ -606,6 +612,7 @@ def _queue_table(rows: list[dict[str, object]], root: str, now: datetime) -> str
     body = []
     for position, r in enumerate(rows, 1):
         why = f'<div class="why">{esc(_why(str(r["waiting"])))}</div>' if r["waiting"] else ""
+        why += _node_line(str(r["node"]))
         body.append(
             "<tr>"
             f'<td class="num muted">{position}</td>'
@@ -642,7 +649,7 @@ def _finished_rows(rows: list[jobs_view.HistoryRow], root: str, now: datetime) -
             "<tr>"
             f'<td class="lead"><a class="title" href="{root}job/{esc(r.job_id)}">{esc(_short(r.name))}</a> <span class="jobid">#{esc(r.job_id)}</span></td>'
             f'<td class="inline">{_project(r.project)}</td>'
-            f'<td class="inline">{_badge(kind, label)}{exit_note}</td>'
+            f'<td class="inline">{_badge(kind, label)}{exit_note}{_node_line(r.node)}</td>'
             # how long it waited to start; one that never started, until it ended
             + (_queued_html(r.submit, r.start or r.end, now) if r.submit else '<td class="num hide-sm">—</td>')
             + f'<td class="num inline" data-k="started">{esc(_clock(r.start, now))}</td>'
@@ -808,6 +815,7 @@ EVENT_WORDS = {
     gpu_jobs.EventAction.URGENT_HOLD: "Held for urgent work",
     gpu_jobs.EventAction.RELEASE: "Released",
     gpu_jobs.EventAction.FAILED: "Failed",
+    gpu_jobs.EventAction.PUSH_BACK: "Pushed back",
 }
 
 
@@ -820,6 +828,11 @@ def _timeline_html(row: jobs_view.HistoryRow | None, events: list[gpu_jobs.Event
     for event in events:
         moment = datetime.fromtimestamp(event.at / 1e9)  # noqa: DTZ006 - local, like slurm's times above
         words = EVENT_WORDS.get(event.action, event.action.replace("_", " ").capitalize())  # type: ignore[call-overload]
+        if event.action == gpu_jobs.EventAction.PUSH_BACK:  # the health check's own record: no person to name
+            free_mb = event.fields.get("free_mb")
+            free = f"{_size(free_mb * MB)} free" if isinstance(free_mb, int | float) else "memory short"
+            items.append((moment, f"{words}: {free} on {event.fields.get('node') or 'its node'}"))
+            continue
         items.append((moment, f"{words} by {event.actor}"))
     if row and row.end and _is_finished(row):
         items.append((row.end, f"{_result(row.state)[1]} after {_duration(row.elapsed_s)}"))

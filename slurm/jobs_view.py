@@ -95,6 +95,7 @@ class HistoryRow:
     gpus: int
     req_mem_bytes: int | None
     max_rss_bytes: int | None = None
+    node: str = ""  # where it ran (sacct's `nodes`); "" if it never started
 
 
 @dataclass(frozen=True)
@@ -278,6 +279,7 @@ def _row(job: Mapping[str, object]) -> HistoryRow:
         gpus=_tres_count(_field(job, "tres", "allocated"), "gres", "gpu") or 0,
         req_mem_bytes=_mib(_tres_count(_field(job, "tres", "requested"), "mem")),
         max_rss_bytes=_peak_rss(job),
+        node=str(job.get("nodes") or ""),
     )
 
 

@@ -26,7 +26,8 @@ MOUNT = "/pun/sys/gpujobs"  # where OOD serves the app (Passenger's SCRIPT_NAME)
 
 def queued(job_id: str, user: str, name: str = "proj:normal:train", partition: str = "normal") -> gpu_jobs.QueuedJob:
     # 60 GiB: slurm's request, after an `scontrol update` the record's "4G" never saw
-    return gpu_jobs.QueuedJob(job_id, partition, "RUNNING", "None", name, user=user, gpus=1, mem_mb=61440)
+    return gpu_jobs.QueuedJob(job_id, partition, "RUNNING", "None", name, user=user, gpus=1, mem_mb=61440,
+                              node="gpu-node-1")
 
 
 class Fake:
@@ -40,7 +41,9 @@ class Fake:
         self.backend = app.Backend(
             queue=lambda: [queued("7", "alice", name), queued("8", "bob", partition="steady")],
             record=lambda job_id, user=None: self.asked.append((job_id, user)) or record,
-            events=lambda _j: [gpu_jobs.Event("7", "pause", "alice", 1_700_000_000_000_000_000)],
+            events=lambda _j: [gpu_jobs.Event("7", "pause", "alice", 1_700_000_000_000_000_000),
+                               gpu_jobs.Event("7", "push_back", "root", 1_700_000_100_000_000_000,
+                                              {"node": "laptop", "free_mb": 7300})],
             elapsed=lambda: {"7": "1:00"},
             efficiency=lambda job_id, record=None: jobs_view.Efficiency(job_id, 4 * 1024**3, None, None, 0.5),
             history=lambda *_a: [],
@@ -116,6 +119,9 @@ def test_every_get_route_answers(path: str) -> None:
         assert "GiB" not in body and "MiB" not in body and "memory in use" not in body.split('class="card box"')[0]
         assert body.count("used warn") == 1 and "fill warn" not in body  # only real memory in use warns; a full reservation or a busy GPU does not
         assert "64.4 GB</td>" in body  # slurm's request now (60 x 2^30 bytes), not the record's 4G
+        # where a running job is, as a small line inside the state cell; a pushed-back job's timeline says why it moved
+        assert '<div class="why">on gpu-node-1</div>' in body
+        assert "Pushed back: 7.3 GB free on laptop" in call(fake, "/job/7")[1]
         # who queued each job, and its level, at every width (not hide-sm)
         assert '<td class="inline" data-k="user">alice</td>' in body and '<td class="inline" data-k="level"><span class="pill level-normal"' in body
         # its own column: when slurm (last) queued a job, and for a waiting one how long ago; unknown shows a dash
