@@ -13,7 +13,7 @@ import gpu_jobs
 import pytest
 import submit
 from gpu_lease_keeper import Keeper, Phase, beat, remove_leases_from_before_boot
-from localmodels.lease import GpuLease
+from localmodels.lease import FreezeError, GpuLease
 
 
 def job(job_id: str, state: str = "RUNNING", reason: str = "None", dependency: str = "") -> gpu_jobs.QueuedJob:
@@ -142,12 +142,22 @@ def test_a_held_job_is_not_demand_nor_is_a_chain_waiting_only_on_it(tmp_path: Pa
     assert world.step()["phase"] == Phase.ADMITTED
 
 
-def test_a_silent_controller_keeps_the_last_state(tmp_path: Path) -> None:
+def test_a_silent_controller_keeps_the_last_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(gpu_jobs, "STATE_DIR", tmp_path / "state")
     world = World(tmp_path)
     world.queue = [job("1")]
     world.step()
     world.queue = None
-    state = world.step()
+    calls = []
+
+    def wake_fails() -> list[object]:
+        calls.append(1)
+        raise FreezeError("could not wake: x.service (still frozen)")
+
+    monkeypatch.setattr(world.keeper.lease, "wake_abandoned_freezes", wake_fails)
+    state = beat(world.keeper, gpu_jobs.keeper_state_path())
+    assert calls  # the freeze safety net still runs while squeue is silent, and its failure does not end the loop
+    assert "x.service" in state["wake_failed"]
     assert state["phase"] == Phase.ADMITTED
     assert "squeue did not answer" in state["note"]
     assert world.lease() is not None

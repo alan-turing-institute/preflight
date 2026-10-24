@@ -41,7 +41,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import gpu_jobs  # noqa: E402 - path set just above
 
-from localmodels.lease import GpuLease, GpuLeaseClient, LeaseRecord  # noqa: E402
+from localmodels.lease import FreezeError, GpuLease, GpuLeaseClient, LeaseRecord  # noqa: E402
 
 
 class Phase(StrEnum):
@@ -153,8 +153,19 @@ def remove_leases_from_before_boot(lease_dir: Path, booted_at: float) -> list[st
 
 
 def beat(keeper: Keeper, state_path: Path) -> dict[str, object]:
-    """One look at the queue, and the state file `submit.keeper_running` reads as the heartbeat."""
+    """One look at the queue, and the state file `submit.keeper_running` reads as the heartbeat.
+
+    First localmodels' safety net wakes any service frozen by a requester that died or held it too long;
+    it runs before the step, which returns early when squeue does not answer.
+    """
+    try:
+        woken = [record.unit for record in keeper.lease.wake_abandoned_freezes()]
+    except FreezeError as exc:  # every record was tried; uncaught it would end the keeper's loop
+        woken, failed = [], str(exc)
+    else:
+        failed = ""
     state = keeper.step()
+    state["woken"], state["wake_failed"] = woken, failed
     gpu_jobs.write_json(state_path, state)
     return state
 
@@ -184,6 +195,8 @@ def main() -> int:
     # while removing it at a restart would open exactly the gap this keeper exists to close.
     while True:
         state = beat(keeper, state_path)
+        if state["woken"] or state["wake_failed"]:
+            print(f"[keeper] abandoned freezes: woke {state['woken']} {state['wake_failed']}", flush=True)
         summary = (state["phase"], tuple(state["blockers"]), state["note"])
         if summary != last:
             print(f"[keeper] {state['phase']}; jobs {state['jobs']}; blockers {state['blockers']} {state['note']}",
