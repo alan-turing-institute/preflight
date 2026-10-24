@@ -22,6 +22,11 @@ unified_memory = false
 hostguard = false
 # Require the DGX submission gate for jobs submitted with --entry. Default: false
 dgx_gate = false
+# Part-time machines only. True when they mount this state_dir (one shared filesystem): then no job state is copied back
+# from them. Default: false (the agent copies each machine's state_dir here every minute, over ssh, read-only)
+# shared_state = false
+# The interpreter a job's wrapper runs with on a part-time machine, whose own paths are not the submitter's. Default: /usr/bin/python3
+# node_python = "/usr/bin/python3"
 # Command (argv, no shell) run when a job fails, with GPUJOBS_JOB, GPUJOBS_STATE, GPUJOBS_USER and GPUJOBS_NAME in its
 # environment; empty means no notification. Default: []
 notify_command = []

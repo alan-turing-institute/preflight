@@ -63,6 +63,9 @@ def test_example_loads_and_minimal_file_gets_every_default(tmp_path: Path) -> No
     assert site.metrics.allow_from == ()
     assert site.nodes[0].gpus == ()
     assert site.cluster_name == site.name and site.account == "gpujobs"  # defaults
+    assert (site.shared_state, site.node_python) == (False, "/usr/bin/python3")  # part-time job state is copied back
+    shared = gpujobs_site.load(write(tmp_path, 'shared_state = true\nnode_python = "/opt/py/bin/python"\n' + MINIMAL))
+    assert (shared.shared_state, shared.node_python) == (True, "/opt/py/bin/python")
     assert site.service is None  # no [service] table: no service partition
     service = gpujobs_site.load(write(tmp_path, MINIMAL + "[service]\ncores = 2\n")).service
     assert service == gpujobs_site.Service(2, "gpujobs-service")  # no cores held for GPUs: up to the node's cores
@@ -98,6 +101,8 @@ def test_part_time_nodes_and_health_check_defaults(tmp_path: Path) -> None:
         (PART_TIME.replace("[[nodes]]", 'name = "x"\n[[nodes]]', 1) + "address = 'a'\n", "every node is part_time"),
         (MINIMAL + "[health_check]\ninterval_s = 0\n", "health_check.interval_s = 0"),
         (MINIMAL + "[health_check]\nintervals = 5\n", "unknown key(s) in [health_check]"),
+        ("shared_state = 'yes'\n" + MINIMAL, "shared_state must be true or false"),
+        ("node_python = 'python3'\n" + MINIMAL, "node_python = 'python3'; expected an absolute path"),
         ("hostgaurd = true\n" + MINIMAL, "unknown key(s) in [top level]: hostgaurd"),
         (MINIMAL + "[metrics]\nmodee = 'off'\n", "unknown key(s) in [metrics]"),
         (MINIMAL + GPU + "extra = 1\n", "unknown key(s) in [nodes[0].gpus[0]]"),

@@ -197,7 +197,8 @@ def test_part_time_card_is_the_admins_and_its_buttons_leave_requests_the_agent_r
     site = site_config.parse({"name": "t", "nodes": [
         {"name": "head", "cpus": 8, "real_memory_mb": 60000},
         {"name": "lap", "cpus": 8, "real_memory_mb": 30000, "part_time": True, "address": "10.0.0.2", "keep_cpus": "0-3"}]})
-    state = app.PartTimeState(closed=True, reason="gpujobs-check: 4 GB free", free_mb=3500, resume_jobs=2, extra={"close_below_mb": 7000})
+    state = app.PartTimeState(closed=True, reason="gpujobs-check: 4 GB free", free_mb=3500, resume_jobs=2, extra={"close_below_mb": 7000},
+                              copied_at=0)
     plain, boss = Fake(), Fake(viewer="root", admin=True)
     for fake in (plain, boss):
         fake.backend.site, fake.backend.requests_dir = (lambda: site), tmp_path
@@ -205,12 +206,25 @@ def test_part_time_card_is_the_admins_and_its_buttons_leave_requests_the_agent_r
     assert "Part-time machines" not in call(plain, "/")[1]
     page = call(boss, "/")[1]
     assert "Part-time machines" in page and "3.5 GB" in page and 'data-jobs="2"' in page and 'name="close_below_gb" type="number" step="any" min="0" value="7"' in page
+    assert "Job state last copied from this machine:" in page and "read from the shared state directory" not in page
+    shared = dataclasses.replace(site, shared_state=True)
+    boss.backend.site = lambda: shared
+    assert "read from the shared state directory" in call(boss, "/")[1] and "last copied" not in call(boss, "/")[1]
+    boss.backend.site = lambda: site
     assert call(plain, "/api/part-time/lap/close", "POST", {})[0][:3] == "403" and list(tmp_path.iterdir()) == []
     assert call(boss, "/api/part-time/head/close", "POST", {})[0][:3] == "404"  # a full node is not lent
     assert json.loads(call(boss, "/api/part-time/lap/thresholds", "POST", {"close_below_gb": 9, "evil": "x"})[1])["ok"]
     (request,) = tmp_path.glob("part_time-lap-*.json")
     assert json.loads(request.read_text()) == {"action": "thresholds", "close_below_gb": 9}
 
+
+
+def test_the_log_of_a_job_that_ran_on_a_part_time_machine_is_its_copied_back_one(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = Fake()
+    fake.backend.log_tail = lambda path, text=None, errors_only=False: "" if path == "/copy/x.log" else jobs_view.NO_LOG
+    monkeypatch.setattr(gpu_jobs, "remote_log", lambda job, log, user=None: Path("/copy/x.log") if job == "7" else None)
+    assert json.loads(call(fake, "/api/job/7/log")[1]) == {"log": ""}
+    assert json.loads(call(fake, "/api/job/8/log")[1]) == {"log": jobs_view.NO_LOG}
 
 
 def test_a_fifo_script_and_a_bad_content_length_never_hang_or_run(tmp_path: Path) -> None:

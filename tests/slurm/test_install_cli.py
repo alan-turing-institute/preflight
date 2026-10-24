@@ -131,6 +131,7 @@ def test_apply_then_check_against_a_temp_root(env):
         state: ("0755", "root"),
         f"{state}/agent": ("0755", "slurm"),
         f"{state}/metrics": ("0755", "slurm"),  # only the agent writes the per-job textfiles
+        f"{state}/remote": ("0755", "slurm"),  # and the copied-back job state of the part-time machines
         f"{state}/keeper": ("0755", USER),  # its heartbeat's home
         f"{state}/requests": ("1777", "slurm"),
         **{f"{state}/{name}": ("1777", None) for name in sticky},
@@ -435,6 +436,8 @@ def test_part_time_add_refuses_every_uid_mismatch_then_copies_the_key_without_sh
     root = tmp_path / "root"
     (root / "etc/munge").mkdir(parents=True)
     (root / "etc/munge/munge.key").write_bytes(b"SECRETKEYBYTES")
+    (root / "var/lib/gpujobs/agent/ssh").mkdir(parents=True)
+    (root / "var/lib/gpujobs/agent/ssh/id_ed25519.pub").write_text("ssh-ed25519 AAAAKEY gpujobs-copy-back\n")
     sent = []
     monkeypatch.setattr(importlib.import_module("components.part_time"), "send",
                         lambda argv, data: sent.append((argv, data)) or subprocess.CompletedProcess(argv, 0, b"", b""))
@@ -451,6 +454,13 @@ def test_part_time_add_refuses_every_uid_mismatch_then_copies_the_key_without_sh
     argv, data = sent[0]
     assert argv[-9:] == ["sudo", "install", "-m", "0400", "-o", "munge", "-g", "munge", "/dev/stdin", "/etc/munge/munge.key"][-9:]
     assert data == b"SECRETKEYBYTES"
+    # B5b: SlurmUser's key (made here when absent) may only run a read-only rsync of the node's state directory
+    keygen = ["runuser", "-u", "slurm", "--", "ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "gpujobs-copy-back",
+              "-f", "/var/lib/gpujobs/agent/ssh/id_ed25519"]
+    assert keygen in fake.calls and ["install", "-d", "-m", "0700", "-o", "slurm", "-g", "slurm", "/var/lib/gpujobs/agent/ssh"] in fake.calls
+    argv, data = sent[1]
+    assert argv[-9:] == ["sudo", "install", "-m", "0600", "-o", "slurm", "-g", "slurm", "/dev/stdin", "/var/lib/slurm/.ssh/authorized_keys"][-9:]
+    assert data == b'command="/usr/bin/rrsync -ro /var/lib/gpujobs",restrict ssh-ed25519 AAAAKEY gpujobs-copy-back\n'
     out = capsys.readouterr()
     assert "SECRETKEYBYTES" not in out.out + out.err and not any("SECRETKEYBYTES" in " ".join(c) for c in fake.calls)
 
@@ -486,7 +496,14 @@ def test_part_time_apply_adds_the_flag_to_the_packages_unit_and_opens_the_port_o
     calls = fake.calls
     order = [c[0] for c in calls if c[0] in ("groupadd", "useradd")] + [c[:3] for c in calls if c[:1] == ["apt-get"]]
     assert order == ["groupadd", "useradd", ["apt-get", "install", "-y"], ["apt-get", "install", "-y"]]  # slurm user first
-    assert ["useradd", "-r", "-u", "64030", "-g", "slurm", "-d", "/var/lib/slurm", "-s", "/usr/sbin/nologin", "slurm"] in calls
+    assert ["useradd", "-r", "-u", "64030", "-g", "slurm", "-d", "/var/lib/slurm", "-s", "/bin/sh", "slurm"] in calls
+    # job state (B5b): the wrapper's site file and state dirs, rrsync from the doc copy (Fedora), a home with .ssh for `slurm`
+    assert ["apt-get", "install", "-y", "munge", "rsync"] in calls
+    assert (tmp_path / "root/etc/gpujobs/site.toml").read_text() == PART_TIME_SITE
+    assert ["install", "-d", "-m", "1777", "/var/lib/gpujobs/jobs"] in calls and ["install", "-d", "-m", "0755", "-o", "slurm", "-g", "slurm", "/var/lib/gpujobs/remote"] in calls
+    assert not any(c[:2] == ["systemctl", "enable"] and "gpujobs-agent.service" in c for c in calls)  # no agent here
+    assert ["install", "-m", "0755", "/usr/share/doc/rsync/support/rrsync", "/usr/local/bin/rrsync"] in calls
+    assert ["install", "-d", "-m", "0700", "-o", "slurm", "-g", "slurm", "/var/lib/slurm/.ssh"] in calls
     drop_in = (tmp_path / "root/etc/systemd/system/slurmd.service.d/10-conf-server.conf").read_text()
     assert drop_in == "[Service]\nExecStart=\nExecStart=/usr/sbin/slurmd --conf-server 100.2.2.2 --systemd $SLURMD_OPTIONS\n"
     rule = "--add-rich-rule=rule family=ipv4 source address=100.2.2.2 port port=6818 protocol=tcp accept"
@@ -494,6 +511,26 @@ def test_part_time_apply_adds_the_flag_to_the_packages_unit_and_opens_the_port_o
     assert (["firewall-cmd", "--reload"] in calls) is firewalld
     assert calls[-1] == ["systemctl", "enable", "--now", "munge", "slurmd"]
     assert (tmp_path / "root/opt/gpujobs").exists()  # the tools component, so node_check.py is there
+
+
+def test_shared_state_copies_nothing_back_and_installs_nothing_for_it(tmp_path, monkeypatch):
+    fake = PartTimeFake({"slurm": 64030, "alice": 1}, {"slurm": 64030, "alice": 1}, ["alice"])
+    site = part_time_env(tmp_path, monkeypatch, fake)
+    site.write_text('shared_state = true\n' + PART_TIME_SITE)
+    root = tmp_path / "root"
+    (root / "etc/munge").mkdir(parents=True)
+    (root / "etc/munge/munge.key").write_bytes(b"K")
+    sent = []
+    monkeypatch.setattr(importlib.import_module("components.part_time"), "send",
+                        lambda argv, data: sent.append(argv) or subprocess.CompletedProcess(argv, 0, b"", b""))
+    try:
+        assert apply_part_time(site, tmp_path, "--i-accept-cluster-trust") == 0
+        assert run(site, root, "part-time", "add", "laptop") == 0
+    finally:
+        components.set_runner(None)
+    flat = [" ".join(c) for c in fake.calls]
+    assert ["apt-get", "install", "-y", "munge"] in fake.calls and len(sent) == 1  # only the munge key
+    assert not any("rrsync" in c or "ssh-keygen" in c or ".ssh" in c for c in flat)
 
 
 def test_part_time_apply_refuses_when_the_unit_has_no_execstart(tmp_path, monkeypatch):

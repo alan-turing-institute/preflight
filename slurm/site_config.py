@@ -160,6 +160,8 @@ class Site:
     slurm_build: tuple[str, str] | None = None  # ([slurm] version, sha256): build that release, not the distro's slurm
     slurm_steps: tuple[tuple[str, str], ...] = ()  # ([slurm] steps) the releases `upgrade-slurm` passes through, in order
     health_check: HealthCheck | None = None  # None: no health-check lines and no node_check.json
+    shared_state: bool = False  # the part-time nodes see this state_dir (a shared filesystem): nothing is copied back
+    node_python: str = "/usr/bin/python3"  # the interpreter a part-time job's wrapper runs with, there
 
     @property
     def cpu_job_cap(self) -> int | None:
@@ -340,6 +342,8 @@ def parse(raw: dict[str, Any]) -> Site:
             "service": None,
             "slurm": None,
             "health_check": None,
+            "shared_state": False,
+            "node_python": "/usr/bin/python3",
             "hostguard": False,
             "dgx_gate": False,
             "metrics": {},
@@ -371,6 +375,10 @@ def parse(raw: dict[str, Any]) -> Site:
     )
     if not isinstance(p["session_days"], int) or isinstance(p["session_days"], bool) or p["session_days"] < 0:
         raise SiteError(f"site file: portal.session_days = {p['session_days']!r}; expected a whole number of days, 0 or more")
+    if type(top["shared_state"]) is not bool:
+        raise SiteError("site file: shared_state must be true or false")
+    if not isinstance(top["node_python"], str) or not top["node_python"].startswith("/"):
+        raise SiteError(f"site file: node_python = {top['node_python']!r}; expected an absolute path")
     nodes = tuple(_parse_node(n, i) for i, n in enumerate(top["nodes"]))
     if nodes and not any(not n.part_time for n in nodes):
         raise SiteError("site file: every node is part_time; slurmctld runs on a full node, so list at least one")
@@ -410,6 +418,8 @@ def parse(raw: dict[str, Any]) -> Site:
         slurm_build=slurm[0],
         slurm_steps=slurm[1],
         health_check=_parse_health_check(top["health_check"]) if top["health_check"] is not None else None,
+        shared_state=top["shared_state"],
+        node_python=top["node_python"],
     )
 
 

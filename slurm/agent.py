@@ -116,6 +116,11 @@ PART_TIME_REQUEST = re.compile(r"part_time-(.+)-(\d+)\.json")
 #: The node `Extra` keys the health check reads (node_check.EXTRA_KEYS), by the request field that sets each.
 THRESHOLD_FIELDS = {"close_below_gb": "close_below_mb", "push_back_below_gb": "push_back_below_mb"}
 MAX_THRESHOLD_GB = 1000
+#: Job state is copied back from each part-time machine this often (plan B5b); rsync gives up after its own timeout.
+COPY_EVERY_S = 60.0
+COPY_IO_TIMEOUT_S = 20
+COPY_CALL_TIMEOUT_S = 300
+COPY_KEY = Path(render.COPY_KEY)  # under the state dir; `install.py part-time add` makes it
 RESUME_PROTECTED = frozenset({gpu_jobs.Partition.URGENT, gpu_jobs.Partition.SERVICE})
 
 #: The idle check (Part C2) looks this often, and tells one project about one holder at most this often.
@@ -172,10 +177,10 @@ _NOT_ENDED = frozenset(
 )
 
 
-def call(runner: Runner, argv: list[str]) -> subprocess.CompletedProcess[str]:
-    """Run one command through `runner`: text, captured, 30 s; a missing or hung command is a failed result."""
+def call(runner: Runner, argv: list[str], timeout: float = 30) -> subprocess.CompletedProcess[str]:
+    """Run one command through `runner`: text, captured, 30 s unless told; a missing or hung command is a failed result."""
     try:
-        return runner(argv, capture_output=True, text=True, timeout=30, check=False)
+        return runner(argv, capture_output=True, text=True, timeout=timeout, check=False)
     except (OSError, subprocess.TimeoutExpired) as exc:
         return subprocess.CompletedProcess(argv, 1, "", str(exc))
 
@@ -312,6 +317,13 @@ def read_idle(state_dir: Path | None = None) -> list[dict[str, object]]:
     beat = gpu_jobs.read_json((state_dir or gpu_jobs.STATE_DIR) / "agent" / "agent.json") or {}
     found = beat.get("idle")
     return [f for f in found if isinstance(f, dict)] if isinstance(found, list) else []
+
+
+def read_copied(state_dir: Path | None = None) -> dict[str, int]:
+    """When the agent last copied each part-time machine's job state (`agent/agent.json`), by node; {} for none."""
+    beat = gpu_jobs.read_json((state_dir or gpu_jobs.STATE_DIR) / "agent" / "agent.json") or {}
+    found = beat.get("copied")
+    return {k: v for k, v in found.items() if isinstance(v, int)} if isinstance(found, dict) else {}
 
 
 @dataclass
@@ -460,8 +472,13 @@ class Agent:
         cgroup_root: Path = gpu_jobs.CGROUP_ROOT,
         pid_job: Callable[[int], str | None] = job_of_pid,
         part_time_conf: Path = Path(render.PART_TIME_CONF_PATH),
+        copier: Runner = subprocess.run,
     ) -> None:
         self.site = site
+        self.copier = copier
+        self._copy_at: dict[str, float] = {}  # node -> when it was last tried
+        self.copied: dict[str, int] = {}  # node -> when its state was last copied (kept in agent.json)
+        self._copy_failing: set[str] = set()  # nodes whose outage is already logged
         self.part_time_conf = part_time_conf
         self.state_dir, self.pid_job = state_dir, pid_job
         self.watch: OomWatch | None = None  # main() starts one; a test drives record_kill itself
@@ -504,6 +521,8 @@ class Agent:
             if isinstance(saved.get("idle_told"), dict) else {},
         )
         beat = gpu_jobs.read_json(self.dir / "agent.json") or {}
+        saved_copies = beat.get("copied")
+        self.copied = {k: v for k, v in saved_copies.items() if isinstance(v, int)} if isinstance(saved_copies, dict) else {}
         self.boot_reconciled_at = beat.get("boot_reconciled_at")
         self.last_error, self.last_error_at = (
             str(beat.get("last_error") or ""),
@@ -541,6 +560,7 @@ class Agent:
                 self._idle_check(queue, now, errors)
         if self.site.part_time_nodes:  # needs no queue: only slurm's node records
             self._part_time(errors)
+            self._copy_back(now)
         if self.watch is not None and self.watch.error:
             errors.append(self.watch.error)
         if now - self._notices_at >= NOTICES_EVERY_S:
@@ -580,6 +600,7 @@ class Agent:
             "last_error": self.last_error,
             "last_error_at": self.last_error_at,
             "note": self.note,
+            "copied": self.copied,
             "idle": [dataclasses.asdict(f) | {"text": f.text} for f in self.idle],
         }
         gpu_jobs.write_json(self.dir / "agent.json", beat)
@@ -833,6 +854,32 @@ class Agent:
                 s.part_time_done.append(key)
                 gpu_jobs.remove_quietly(path)
         s.part_time_done = [key for key in s.part_time_done if key in present]
+
+    def _copy_back(self, now: float) -> None:
+        """Copy each part-time machine's state directory to `remote/<node>/` (read-only, over ssh; plan B5b). A failure
+        is logged once per outage and never reaches `errors`: the machine is often off, and that is not an error."""
+        if self.site.shared_state:
+            return
+        key = self.state_dir / COPY_KEY
+        for node in self.site.part_time_nodes:
+            if now - self._copy_at.get(node.name, -COPY_EVERY_S) < COPY_EVERY_S:
+                continue
+            self._copy_at[node.name] = now
+            dest = self.state_dir / gpu_jobs.REMOTE_DIR / node.name
+            dest.mkdir(parents=True, exist_ok=True)
+            ssh = f"ssh -i {key} -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new"
+            done = call(self.copier, ["rsync", "-a", "--delete", f"--timeout={COPY_IO_TIMEOUT_S}", "-e", ssh,
+                                      f"{render.SLURM_USER}@{node.address}:", f"{dest}/"], COPY_CALL_TIMEOUT_S)
+            if done.returncode == 0:
+                self.copied[node.name] = int(now)
+                if node.name in self._copy_failing:
+                    self._copy_failing.discard(node.name)
+                    print(f"[agent] job state is copied from {node.name} again", file=sys.stderr, flush=True)
+            elif node.name not in self._copy_failing:
+                self._copy_failing.add(node.name)
+                lines = (done.stderr or "").strip().splitlines()
+                why = gpu_jobs.printable(lines[-1] if lines else f"exit {done.returncode}")
+                print(f"[agent] copying job state from {node.name} failed: {why}", file=sys.stderr, flush=True)
 
     def _ignore(self, path: Path, why: str) -> None:
         if path.name not in self._ignored:

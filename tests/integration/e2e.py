@@ -1115,8 +1115,10 @@ PT = "pt1"  # the part-time node: the compose service `part-time`, a configless 
 PT_MEMINFO = "/var/tmp/fake-meminfo"  # what the rendered node_check.json's meminfo_path is pointed at on pt1
 PT_LOG = "/var/log/gpujobs/node_check.log"
 NODE_CHECK_JSON = "/etc/gpujobs/node_check.json"
-SITE_COPY = "/etc/gpujobs/site.toml"
-STICKY_DIRS = ("jobs", "events", "footprints", "requests", "logs", "scripts", "manifests")  # components/agent.py STICKY
+PT_SITE = "/root/pt1.site.toml"  # the site file pt1's `apply --part-time` reads: the harness file plus a [slurm] table
+FAKE_SLURM = "\n[slurm]\nversion = '26.05.5'\nsha256 = '" + "ab" * 32 + "'\n"  # required by apply --part-time; the build is stubbed
+COPY_WAIT_S = 90  # the agent copies pt1's state every 60 s (agent.COPY_EVERY_S)
+PT_AUTHORIZED = "/var/lib/slurm/.ssh/authorized_keys"
 CHECK_REASON = "gpujobs-check: "  # slurm/node_check.py REASON_PREFIX; node_check imports gpu_jobs, which needs a site file
 ADMIN_REASON = "gpujobs-admin: "  # slurm/agent.py ADMIN_REASON_PREFIX
 CHECK_EVERY_S = 5  # harness.site.toml [health_check] interval_s
@@ -1128,18 +1130,22 @@ PAGE_CLOSE_GB, PAGE_PUSH_GB, FREE_BETWEEN_GB = 8, 3, 7  # the page's thresholds,
 PASSES_TO_REOPEN = 3  # node_check.REOPEN_AFTER
 PUSHES_BEFORE_BAR = 2  # node_check.PUSHES_BEFORE_EXCLUDE
 UNUSABLE = {"DOWN", "INVAL", "FAIL", "UNKNOWN"}
-PT_DROP_IN = (  # the real function behind the slurmd drop-in of `install.py apply --part-time`
+PT_APPLY = (  # the real `install.py apply --part-time pt1`, with only the pinned slurm's download and build left out
     "import sys; sys.path[:0] = ['/src/slurm/install', '/src/slurm']\n"
-    "import components.part_time as p; print(p.slurmd_drop_in(sys.stdin.read(), 'testnode'), end='')"
+    "import install, components.slurm as s; s.install_release = lambda *a: []\n"
+    "site, uid, gid = sys.argv[1:]\n"
+    "sys.exit(install.main(['--site', site, 'apply', '--part-time', 'pt1', '--controller', 'testnode', '--slurm-uid', uid,"
+    " '--slurm-gid', gid, '--i-accept-cluster-trust']))"
 )
 PT_EDIT_SETTINGS = (  # point pt1's entry of the rendered node_check.json at the fake meminfo
     "import json, sys; path, node, meminfo = sys.argv[1:]\n"
     "settings = json.load(open(path)); settings[node]['meminfo_path'] = meminfo; json.dump(settings, open(path, 'w'), indent=2)"
 )
-PT_PUSHES = (
-    f"import glob, json; print(json.dumps(sorted((json.load(open(f)) for f in glob.glob('{STATE}/events/*-push_back.json')),"
-    " key=lambda e: e['at'])))"
+PT_PUSHES = (  # the events as the controller's tools read them: pt1's copied back, for jobs accounting says ran there
+    "import json, gpu_jobs; print(json.dumps(sorted(({'job': e.job, 'at': e.at, **e.fields} for e in gpu_jobs.events() "
+    "if e.action == 'push_back'), key=lambda e: e['at'])))"
 )
+PT_REMOTE_LOG = "import sys, gpu_jobs; print(gpu_jobs.remote_log(sys.argv[1], sys.argv[2]) or '')"
 
 
 def ptsh(script: str, timeout: int = 300) -> Out:
@@ -1180,9 +1186,9 @@ def pt_log() -> list[tuple[int, str]]:
 
 
 def pt_pushes(job: str | None = None) -> list[dict]:
-    """The push_back events node_check wrote on pt1 (its own state directory), oldest first."""
+    """The push_back events node_check wrote on pt1 that the agent has copied back (up to COPY_WAIT_S late), oldest first."""
     try:
-        found = json.loads(pt("python3", "-c", PT_PUSHES).out)
+        found = json.loads(cl("env", "PYTHONPATH=/opt/gpujobs/slurm", "python3", "-c", PT_PUSHES).out)
     except ValueError:
         return []
     return [e for e in found if job is None or e["job"] == job]
@@ -1219,37 +1225,51 @@ def user_ids(run: Callable[..., Out]) -> list[str]:
     return sorted(line.split(":")[0] + ":" + line.split(":")[2] for line in run("getent", "passwd", "slurm", "alice", "bob", "carol").out.split())
 
 
-def join_part_time() -> bool:
-    """Bring pt1 up as `install.py apply --part-time pt1` + `part-time add pt1` would leave it. The harness substitutes
-    (README, "What the run does outside the installer"):
+def join_part_time() -> list[tuple[str, bool, str]]:
+    """Bring pt1 up with the real commands: `install.py apply --part-time pt1` on pt1, then `install.py part-time add pt1`
+    on the controller, over ssh as root. The harness substitutes (README, "What the run does outside the installer"):
       - `apply --part-time` needs the pinned slurm build (a download and a compile) and the controller runs the distro's
-        slurm: pt1 keeps the image's packages. The tools component is replaced by a symlink to /src/slurm, the slurmd
-        drop-in is made by the installer's own `slurmd_drop_in`, and no firewall is in the container.
-      - `part-time add` needs ssh, which the containers do not have: the harness compares the user ids itself and copies
-        the munge key through `docker exec`.
-      - what a real node install does NOT make, and the health check and the job wrapper need: the site file and the
-        state directories (see Findings in the run's report)."""
+        slurm: that one step is left out, so pt1 keeps the image's packages (the site file given to pt1 carries a made-up
+        [slurm] table only so that apply accepts it).
+      - the containers have no ssh or rsync: both are installed here with apt (this needs the network), root's key on the
+        controller is let into pt1's root, and pt1's host key is trusted for root's BatchMode ssh.
+    Returns (check, ok, evidence) for the caller to report."""
+    out: list[tuple[str, bool, str]] = []
     ptsh("systemctl disable --now slurmctld slurmdbd mariadb gpujobs-db-init gpujobs-accounts-init slurmd; "
          "rm -f /etc/slurm/slurm.conf /etc/slurm/gres.conf /etc/slurm/cgroup.conf /etc/slurm/slurmdbd.conf "
          "/etc/systemd/system/slurmd.service.d/10-conf-server.conf")  # the image's bootstrap; a re-run starts clean
-    ptsh("install -d /opt/gpujobs /var/log/gpujobs && ln -sfn /src/slurm /opt/gpujobs/slurm && install -d -m 0755 "
-         f"{STATE} && for d in {' '.join(STICKY_DIRS)}; do install -d -m 1777 {STATE}/$d; done")
-    put(SITE_COPY, cl("cat", SITE_COPY).out, run=pt)
-    put(NODE_CHECK_JSON, cl("cat", NODE_CHECK_JSON).out, run=pt)
-    # The rendered file points at /proc/meminfo, which in the container is the host's: edit pt1's copy to a file the stage writes.
+    ptsh("rm -rf /opt/gpujobs")  # an earlier run's symlink into /src must not be written through
+    apt = "apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends"
+    ours = sh(f"{apt} openssh-client rsync && install -d -m 0700 /root/.ssh && "
+              "{ test -f /root/.ssh/id_ed25519 || ssh-keygen -q -t ed25519 -N '' -f /root/.ssh/id_ed25519; }", timeout=600)
+    theirs = ptsh(f"{apt} openssh-server rsync && systemctl enable --now ssh && install -d -m 0700 /root/.ssh", timeout=600)
+    out.append(("ssh and rsync are installed on both machines (apt, needs the network)", ours.rc == 0 and theirs.rc == 0,
+                f"{ours.text[-150:]} | {theirs.text[-150:]}"))
+    public = cl("cat", "/root/.ssh/id_ed25519.pub").out
+    put("/root/.ssh/authorized_keys", public, "0600", run=pt)
+    trusted = sh("ssh-keyscan -T 10 pt1 >> /root/.ssh/known_hosts")
+    reach = sh("ssh -o BatchMode=yes pt1 true")
+    out.append(("root on the controller reaches pt1 over ssh without a password", trusted.rc == 0 and reach.rc == 0, reach.text[-200:]))
+    put(PT_SITE, Path(HERE / "harness.site.toml").read_text() + FAKE_SLURM, run=pt)
+    ids = cl("getent", "passwd", "slurm").out.strip().split(":")
+    applied = pt("python3", "-c", PT_APPLY, PT_SITE, ids[2], ids[3], timeout=900)
+    out.append(("`install.py apply --part-time pt1` runs on pt1 (tools, site file, state dirs, rrsync, slurmd drop-in)",
+                applied.rc == 0, applied.text[-300:]))
+    added = sh(f"{INSTALL} --site {SITE} part-time add {PT}", timeout=300)
+    out.append(("`install.py part-time add pt1` compares user ids, copies the munge key and installs the copy-back key",
+                added.rc == 0, added.text[-300:]))
+    # The rendered node_check.json points at /proc/meminfo, which in the container is the host's: edit pt1's copy to a
+    # file the stage writes.
     edited = pt("python3", "-c", PT_EDIT_SETTINGS, NODE_CHECK_JSON, PT, PT_MEMINFO)
     set_free(FREE_OK_GB)
-    # The key travels on stdin (base64, as the container helpers carry text), never in an argv.
-    key = cl("base64", "-w0", "/etc/munge/munge.key").out
-    keyed = pt("bash", "-c", "base64 -d | install -m 0400 -o munge -g munge /dev/stdin /etc/munge/munge.key && systemctl restart munge",
-               stdin=key, timeout=60)
-    return edited.rc == 0 and key != "" and keyed.rc == 0
+    out.append(("pt1's node_check.json (from the tools component there) is pointed at the fake meminfo", edited.rc == 0, edited.text[-200:]))
+    return out
 
 
 def stage_part_time() -> None:
     section("part_time: a second container as a configless part-time node; the health check, --anywhere and the page's actions")
-    note("part_time: the harness stands in for `install.py apply --part-time pt1` (needs the pinned slurm build) and "
-         "`install.py part-time add pt1` (needs ssh); see README, \"What the run does outside the installer\"")
+    note("part_time: `install.py apply --part-time pt1` and `part-time add pt1` run for real, over ssh; only the pinned slurm's "
+         "download and build is left out, and ssh and rsync are installed with apt; see README, \"What the run does outside the installer\"")
     up = pt("true")
     if not check("the part-time container is running (compose service part-time, hostname pt1)", up.rc == 0, up.text[:200]):
         return
@@ -1261,14 +1281,18 @@ def stage_part_time() -> None:
     executable = [sh("test -x /opt/gpujobs/slurm/node_check.py").rc, pt("test", "-x", "/src/slurm/node_check.py").rc]
     check("node_check.py is executable where slurmd will run it (slurm execs HealthCheckProgram directly)", executable == [0, 0],
           f"exit statuses of test -x: installed copy on testnode {executable[0]}, repository file on pt1 {executable[1]}")
-    ready = join_part_time()
-    check("pt1 is made ready: bootstrap removed, tools, site file and settings in place, munge key copied", ready)
-
-    drop_in = pt("python3", "-c", PT_DROP_IN, stdin=pt("systemctl", "cat", "slurmd").out)
-    put("/etc/systemd/system/slurmd.service.d/10-conf-server.conf", drop_in.out, run=pt)
-    started = ptsh("systemctl daemon-reload && systemctl enable --now slurmd", timeout=120)
-    check("the installer's slurmd_drop_in adds --conf-server testnode and slurmd starts", "--conf-server testnode" in drop_in.out and started.rc == 0,
-          f"{drop_in.text} | {started.text[-200:]}")
+    for name, ok, evidence in join_part_time():
+        if not check(name, ok, evidence):
+            return
+    dropped = pt("cat", "/etc/systemd/system/slurmd.service.d/10-conf-server.conf")
+    check("the installer's slurmd drop-in adds --conf-server testnode", "--conf-server testnode" in dropped.out, dropped.text)
+    node_files = [pt("test", "-f", "/etc/gpujobs/site.toml").rc, pt("test", "-d", f"{STATE}/jobs").rc, pt("test", "-d", f"{STATE}/remote").rc]
+    stat = pt("stat", "-c", "%a", f"{STATE}/jobs").out.strip()
+    check("pt1 has the site file and the sticky state directories the job wrapper needs (made by the installer)",
+          node_files == [0, 0, 0] and stat == "1777", f"test exit statuses {node_files}; jobs/ mode {stat}")
+    authorized = pt("cat", PT_AUTHORIZED).out
+    check("the node's authorized_keys line for slurm only lets a read-only rsync of the state directory run",
+          re.match(rf'command="/usr/(local/)?bin/rrsync -ro {STATE}",restrict ssh-ed25519 ', authorized) is not None, authorized[:160])
     registered = wait_for(lambda: sh(f"sinfo -h -N -n {PT} -o %T").out.strip() in ("idle", "mixed", "allocated"), 150, 3)
     cache = pt("ls", "/var/spool/slurmd/conf-cache").out.split()
     check("pt1 registers with slurmctld with no slurm.conf of its own (configless: the config is in slurmd's cache)",
@@ -1287,6 +1311,11 @@ def stage_part_time() -> None:
     b1 = anywhere("pt-b1")
     if not check("--anywhere: with the full node busy the job starts on pt1, in partition part_time", runs_on(b1, PT, "part_time"), str(jobinfo(b1))):
         return
+    log = Path(jobinfo(b1).get("StdOut", "")).name
+    check("the agent copies pt1's job log back (remote/pt1/logs) and the page's lookup finds it for a job that ran there",
+          bool(wait_for(lambda: log != "" and cl("test", "-f", f"{STATE}/remote/{PT}/logs/{log}").rc == 0, COPY_WAIT_S, 5))
+          and cl("env", "PYTHONPATH=/opt/gpujobs/slurm", "python3", "-c", PT_REMOTE_LOG, b1, f"{STATE}/logs/{log}").out.strip().endswith(f"/remote/{PT}/logs/{log}"),
+          f"{log}; {sh(f'ls {STATE}/remote/{PT}/logs').out[:150]}")
     time.sleep(2)  # slurm records start times in whole seconds: b2 must be strictly newer
     b2 = anywhere("pt-b2")
     check("a second --anywhere job also runs on pt1, started after the first", runs_on(b2, PT, "part_time"), str(jobinfo(b2)))
@@ -1301,7 +1330,7 @@ def stage_part_time() -> None:
     # rule 2: below the push-back limit the newest resume job is requeued
     set_free(FREE_PUSH_GB)
     check("1 GB free (below 2): the newest resume job is requeued", bool(wait_for(lambda: state(b2) == "PENDING", 90, 2)), f"{b2}: {state(b2)}")
-    pushes = pt_pushes()
+    pushes = wait_for(pt_pushes, COPY_WAIT_S, 5) or []  # copied back by the agent, up to a minute later
     check("it was the newest (the first push_back event names b2, not b1), with the free memory recorded",
           bool(pushes) and pushes[0]["job"] == b2 and pushes[0]["node"] == PT and pushes[0]["free_mb"] < PUSH_GB * MB_PER_GB,
           str(pushes[:1]))
@@ -1325,6 +1354,7 @@ def stage_part_time() -> None:
     if check("one job alone on pt1 (the full node is full)", runs_on(b3, PT, "part_time"), str(jobinfo(b3))):
         set_free(FREE_PUSH_GB)
         wait_for(lambda: state(b3) == "PENDING", 90, 2)
+        wait_for(lambda: pt_pushes(b3), COPY_WAIT_S, 5)
         check("first push: requeued, one push_back event, not yet barred", len(pt_pushes(b3)) == 1 and jobinfo(b3).get("ExcNodeList") in ("", "(null)"),
               f"events {len(pt_pushes(b3))}; ExcNodeList {jobinfo(b3).get('ExcNodeList')}")
         set_free(FREE_OK_GB)
@@ -1333,6 +1363,7 @@ def stage_part_time() -> None:
               str(jobinfo(b3))[:200])
         set_free(FREE_PUSH_GB)
         barred = wait_for(lambda: PT in jobinfo(b3).get("ExcNodeList", ""), 90, 2)
+        wait_for(lambda: len(pt_pushes(b3)) >= PUSHES_BEFORE_BAR, COPY_WAIT_S, 5)
         check("second push: the job is barred from pt1 (ExcNodeList names it) after two push_back events",
               bool(barred) and len(pt_pushes(b3)) == PUSHES_BEFORE_BAR, f"events {len(pt_pushes(b3))}; ExcNodeList {jobinfo(b3).get('ExcNodeList')}")
         set_free(FREE_OK_GB)

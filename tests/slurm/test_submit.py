@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -16,10 +17,11 @@ DIRECTIVE = "#S" + "BATCH"  # spelled in two halves so a text-matching guard doe
 
 
 def fake_site(monkeypatch: pytest.MonkeyPatch, *, lease: object, dgx_gate: bool, nodes: tuple = (),
-              cpu_job_cap: int | None = None, service: object = None, part_time_nodes: tuple = ()) -> None:
+              cpu_job_cap: int | None = None, service: object = None, part_time_nodes: tuple = (),
+              node_python: str = "/usr/bin/python3") -> None:
     """`load` returns just the fields submit.py reads."""
     site = SimpleNamespace(lease=lease, dgx_gate=dgx_gate, nodes=nodes, cpu_job_cap=cpu_job_cap, service=service,
-                           part_time_nodes=part_time_nodes)
+                           part_time_nodes=part_time_nodes, node_python=node_python)
     monkeypatch.setattr(site_config, "load", lambda *_p: site)
 
 
@@ -76,6 +78,10 @@ def test_anywhere_asks_for_the_cpu_and_part_time_partitions(monkeypatch: pytest.
     script = dry("--project", "p", "--what", "w", "--class", "resume", "--resume-ok", "--anywhere", "--mem", "4G",
                  "--", "x")
     assert f"{DIRECTIVE} --partition=cpu,part_time" in script and f"{DIRECTIVE} --requeue" in script
+    # the machine has no copy of the submitter's venv: the wrapper runs with the site's node_python, and only there
+    assert f"exec /usr/bin/python3 {submit.HERE / 'job_wrapper.py'}" in script
+    local = dry("--project", "p", "--what", "w", "--class", "resume", "--resume-ok", "--mem", "4G", "--", "x")
+    assert f"exec {sys.executable} " in local
 
 
 def test_an_unknown_class_is_refused_by_the_parser() -> None:

@@ -284,3 +284,56 @@ def test_state_dir_resolution_env_over_site_file_and_no_fallback(tmp_path: Path,
 def test_gpu_busy_is_unknown_unless_every_gpu_answers(out: str, busy: float | None, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a, 0, stdout=out))
     assert gpu_jobs.gpu_busy() == busy  # an average over only the GPUs that answered would misstate the box
+
+
+def part_time_copy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ran: dict[str, tuple[str, str]]) -> Path:
+    """A state dir with pt1's copied-back files under `remote/pt1`, and a sacct that says where each job ran:
+    `ran` maps a job id to (node, user)."""
+    monkeypatch.setattr(gpu_jobs, "STATE_DIR", tmp_path)
+    jobs = [{"job_id": int(j), "nodes": node, "user": user} for j, (node, user) in ran.items()]
+    monkeypatch.setattr(gpu_jobs, "_sacct_jobs", lambda *sel: jobs if "-D" in sel else None)
+    remote = tmp_path / "remote" / "pt1"
+    for sub in ("jobs", "events", "logs"):
+        (remote / sub).mkdir(parents=True)
+        (tmp_path / sub).mkdir(exist_ok=True)
+    return remote
+
+
+def test_job_state_copied_back_from_a_part_time_machine_counts_only_for_jobs_that_ran_there(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    remote = part_time_copy(tmp_path, monkeypatch, {"5": ("pt1", "ann"), "6": ("dgx", "bob")})
+    me = gpu_jobs.current_user()
+    done = {"peak_gpu_mib": 0, "peak_mem_bytes": 7, "ended_at": 9, "exit": 0, "signals": []}
+    (tmp_path / "jobs" / "5.json").write_text(json.dumps({"name": "n", "legs": [{"leg": 0, "ended_at": 1, "exit": 1}]}))
+    (remote / "jobs" / "5.json").write_text(json.dumps({"legs": [{"leg": 1, "ended_at": 9, **done}], "last_leg": done}))
+    (remote / "jobs" / "6.json").write_text(json.dumps({"legs": [done], "last_leg": done}))  # sacct: ran on dgx, not pt1
+    (remote / "jobs" / "7.json").write_text(json.dumps({"legs": [done]}))  # sacct knows no job 7
+    (remote / "events" / "5-100-push_back.json").write_text(json.dumps({"job": "5", "action": "push_back", "free_mb": 1}))
+    (remote / "events" / "6-100-push_back.json").write_text("{}")
+    (remote / "logs" / "n-1.log").write_text("from pt1")
+    # the sidecar: the node's leg joins the local one; for a job accounting did not put there, nothing joins
+    assert [leg["leg"] for leg in gpu_jobs.read_sidecar("5")["legs"]] == [0, 1]
+    assert [leg["leg"] for leg in gpu_jobs.read_sidecar("5", me)["legs"]] == [0]  # accounting says it is ann's job
+    assert gpu_jobs.read_sidecar("6") is None and gpu_jobs.read_sidecar("7") is None
+    # events are attributed to accounting's user (copied files lose their owner), and only for jobs that ran there
+    found = gpu_jobs.events()
+    assert [(e.job, e.actor, e.fields) for e in found] == [("5", "ann", {"free_mb": 1})] and gpu_jobs.events("6") == []
+    # the log only for the job that ran there, and a symlink is never followed
+    assert gpu_jobs.remote_log("5", "/anywhere/n-1.log") == remote / "logs" / "n-1.log"
+    assert gpu_jobs.remote_log("6", "/anywhere/n-1.log") is None and gpu_jobs.remote_log("5", "/x/n-1.log", "bob") is None
+    (remote / "logs" / "n-1.log").unlink()
+    (remote / "logs" / "n-1.log").symlink_to("/etc/hostname")
+    assert gpu_jobs.remote_log("5", "/anywhere/n-1.log") is None
+    # the footprint for --mem auto: a clean leg a part-time machine ran counts, for the user accounting names
+    assert gpu_jobs.measured_peak_bytes("n") is None  # accounting says ann, not me: pt1's leg does not count for me
+    monkeypatch.setattr(gpu_jobs, "_ran_on", lambda ids: {"5": {"pt1": me}})
+    assert gpu_jobs.measured_peak_bytes("n") == 7
+
+
+def test_with_nothing_copied_back_the_readers_never_ask_sacct(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(gpu_jobs, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(gpu_jobs, "_sacct_jobs", lambda *sel: pytest.fail("sacct asked"))
+    (tmp_path / "jobs").mkdir()
+    (tmp_path / "jobs" / "5.json").write_text(json.dumps({"name": "n"}))
+    assert gpu_jobs.read_sidecar("5") == {"name": "n"} and gpu_jobs.events() == []
+    assert gpu_jobs.state_dirs("jobs") == [tmp_path / "jobs"]

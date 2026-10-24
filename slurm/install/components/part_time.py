@@ -13,6 +13,9 @@ import re
 import subprocess
 import sys
 from enum import StrEnum
+from pathlib import Path
+
+import render
 
 import components
 
@@ -23,7 +26,11 @@ SLURMD_DROP_IN = "/etc/systemd/system/slurmd.service.d/10-conf-server.conf"
 SLURMD_PORT = 6818
 PASSWD_UID, PASSWD_GID = 2, 3  # fields of a `getent passwd` line
 NOT_FOUND = 2  # `getent` exit status for a missing entry, passed through by ssh
-SLURM_HOME, NOLOGIN = "/var/lib/slurm", "/usr/sbin/nologin"
+# sshd runs a key's forced command through the user's login shell (`-c`), and nologin refuses it: `slurm` needs a real
+# shell on a part-time machine for the read-only copy-back of job state (its password stays locked, B5b)
+SLURM_HOME, SLURM_SHELL = "/var/lib/slurm", "/bin/sh"
+USR_BIN_RRSYNC, LOCAL_RRSYNC = "/usr/bin/rrsync", "/usr/local/bin/rrsync"
+DOC_RRSYNC = "/usr/share/doc/rsync/support/rrsync"  # where Fedora ships it, mode 0644
 
 TRUST_WARNING = """\
 This makes this machine part of the cluster, and that is a trust decision.
@@ -107,7 +114,36 @@ def cmd_add(site, args) -> int:
     # a munge already running holds the key it started with
     components.run(_as_admin([*SSH, node.address, "sudo", "systemctl", "try-restart", "munge", "slurmd"]))
     print(f"{node.name}: user ids match and the munge key is copied (not shown)")
+    if not site.shared_state:
+        _authorize_copy_back(site, node)
     return 0
+
+
+def authorized_line(rrsync: str, state_dir: str, public_key: str) -> str:
+    """The node's `~slurm/.ssh/authorized_keys` entry: the key may only run a read-only rsync of the state directory."""
+    return f'command="{rrsync} -ro {state_dir}",restrict {public_key.strip()}'
+
+
+def _authorize_copy_back(site, node) -> None:
+    """Make SlurmUser's copy-back key here if absent, and let it read the node's state directory (and nothing else)."""
+    key = Path(site.state_dir) / render.COPY_KEY
+    run = components.run
+    for argv in [["install", "-d", "-m", "0700", "-o", render.SLURM_USER, "-g", render.SLURM_USER, str(key.parent)],
+                 *([] if (components.ROOT / str(key).lstrip("/")).exists() else
+                   [["runuser", "-u", render.SLURM_USER, "--", "ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C",
+                     "gpujobs-copy-back", "-f", str(key)]])]:
+        if (done := run(argv)).returncode != 0:
+            raise SystemExit(f"FAILED ({done.returncode}): {' '.join(argv)}\n{done.stderr or ''}".rstrip())
+    public = (components.ROOT / f"{key}.pub".lstrip("/")).read_text()
+    # Ubuntu ships rrsync in /usr/bin; elsewhere `apply --part-time` put it in /usr/local/bin
+    has_usr_bin = run(_as_admin([*SSH, node.address, "test", "-x", USR_BIN_RRSYNC])).returncode == 0
+    line = authorized_line(USR_BIN_RRSYNC if has_usr_bin else LOCAL_RRSYNC, str(site.state_dir), public)
+    install = ["install", "-m", "0600", "-o", SLURM_USER, "-g", SLURM_USER, "/dev/stdin", f"{SLURM_HOME}/.ssh/authorized_keys"]
+    done = send(_as_admin([*SSH, node.address, "sudo", *install]), f"{line}\n".encode())
+    if done.returncode != 0:
+        raise SystemExit(f"FAILED ({done.returncode}): installing the copy-back key on {node.address}\n"
+                         f"{(done.stderr or b'').decode(errors='replace')}".rstrip())
+    print(f"{node.name}: the agent may copy its job state, read-only (key {key}.pub)")
 
 
 def _group_user_commands(uid: int, gid: int) -> list[list[str]]:
@@ -116,7 +152,9 @@ def _group_user_commands(uid: int, gid: int) -> list[list[str]]:
     if _ids(["getent", "passwd", SLURM_USER]) is None:
         if components.run(["getent", "group", SLURM_USER]).returncode != 0:
             out.append(["groupadd", "-g", str(gid), SLURM_USER])
-        out.append(["useradd", "-r", "-u", str(uid), "-g", SLURM_USER, "-d", SLURM_HOME, "-s", NOLOGIN, SLURM_USER])
+        out.append(["useradd", "-r", "-u", str(uid), "-g", SLURM_USER, "-d", SLURM_HOME, "-s", SLURM_SHELL, SLURM_USER])
+    else:
+        out.append(["usermod", "-d", SLURM_HOME, "-s", SLURM_SHELL, SLURM_USER])
     return out
 
 
@@ -172,16 +210,34 @@ def _firewall(controller: str) -> list[list[str]]:
     return [["firewall-cmd", "--permanent", f"--add-rich-rule={rule}"], ["firewall-cmd", "--reload"]]
 
 
-def steps(site, args, manager: str, tools_apply) -> list:
+def _copy_back_node(site) -> list[list[str]]:
+    """What the controller's read-only rsync needs here: rrsync, and a home for `slurm` with its `.ssh` (B5b)."""
+    if site.shared_state:
+        return []
+    ssh = f"{SLURM_HOME}/.ssh"
+    own = ["-o", SLURM_USER, "-g", SLURM_USER]
+    return [
+        *([] if (components.ROOT / USR_BIN_RRSYNC.lstrip("/")).exists() else [["install", "-m", "0755", DOC_RRSYNC, LOCAL_RRSYNC]]),
+        ["install", "-d", "-m", "0755", *own, SLURM_HOME],
+        ["install", "-d", "-m", "0700", *own, ssh],
+    ]
+
+
+def steps(site, args, manager: str, tools_apply, site_copy_apply) -> list:
     """The install, in order, for `_run_all`: a function in the list gives its argvs when reached. `tools_apply` is
-    called for the tools component (it writes files itself)."""
+    called for the tools component and `site_copy_apply` writes `/etc/gpujobs/site.toml` (each writes files itself)."""
+    from . import agent as agent_component
     from . import slurm as slurm_component
 
     return [
         *_group_user_commands(args.slurm_uid, args.slurm_gid),
-        [manager, "install", "-y", "munge"],
+        [manager, "install", "-y", "munge", *([] if site.shared_state else ["rsync"])],
         lambda: slurm_component.install_release(*site.slurm_build),
         lambda: _after(tools_apply),
+        # a job's wrapper reads the site file and writes its records here, and the controller copies them back
+        lambda: _after(site_copy_apply),
+        *agent_component.state_dir_commands(site),
+        lambda: _copy_back_node(site),
         lambda: _write_drop_in(args.controller),
         lambda: _firewall(args.controller),
         ["systemctl", "enable", "--now", "munge", "slurmd"],
