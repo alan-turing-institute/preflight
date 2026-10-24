@@ -65,7 +65,7 @@ def _node_line(node: Node) -> str:
     spec = f" CpuSpecList={node.keep_cpus}" if node.keep_cpus else ""
     spec += f" MemSpecLimit={node.mem_spec_limit_mb}" if node.mem_spec_limit_mb is not None else ""
     return (
-        f"NodeName={node.name}{address} CPUs={node.cpus} Boards=1 SocketsPerBoard=1 CoresPerSocket={node.cpus} "
+        f"NodeName={node.name}{address} CPUs={node.cpus} Boards=1 SocketsPerBoard=1 CoresPerSocket={node.cores_per_socket or node.cpus} "
         f"ThreadsPerCore=1 RealMemory={node.real_memory_mb}{spec}{gres} State=UNKNOWN\n"
     )
 

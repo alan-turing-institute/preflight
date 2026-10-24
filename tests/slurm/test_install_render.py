@@ -161,7 +161,7 @@ def test_part_time_node_and_health_check():
         "nodes": [
             {"name": "head", "cpus": 8, "real_memory_mb": 60000},
             {"name": "lap", "cpus": 22, "real_memory_mb": 33000, "part_time": True, "address": "100.64.0.2",
-             "keep_cpus": "12-21", "jobs_memory_gb": 20, "mains_only": True, "close_below_gb": 8},
+             "keep_cpus": "12-21", "jobs_memory_gb": 20, "mains_only": True, "close_below_gb": 8, "cores_per_socket": 16},
         ],
         "service": {"cores": 4},
     }
@@ -183,7 +183,7 @@ def test_part_time_node_and_health_check():
     part_time = render.render(site, "slurm")[render.PART_TIME_CONF_PATH]
     assert (part_time.mode, part_time.owner) == (0o644, "slurm")
     assert [ln for ln in part_time.content.splitlines() if not ln.startswith("#")] == [
-        "NodeName=lap NodeAddr=100.64.0.2 CPUs=22 Boards=1 SocketsPerBoard=1 CoresPerSocket=22 ThreadsPerCore=1 "
+        "NodeName=lap NodeAddr=100.64.0.2 CPUs=22 Boards=1 SocketsPerBoard=1 CoresPerSocket=16 ThreadsPerCore=1 "
         "RealMemory=33000 CpuSpecList=12-21 MemSpecLimit=13000 State=UNKNOWN"]
     assert "NodeName=lap" not in conf and render.PART_TIME_CONF_PATH not in render.render(
         site_config.parse({**raw, "nodes": raw["nodes"][:1]}), "slurm")

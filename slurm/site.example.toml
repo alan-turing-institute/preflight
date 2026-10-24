@@ -51,6 +51,9 @@ real_memory_mb = 64000       # RealMemory in MB slurm may hand out (required)
 # address = "100.64.0.2"   # slurm NodeAddr: where the controller reaches it (required)
 # keep_cpus = "12-21"          # CpuSpecList: OS CPUs slurm never gives jobs, e.g. "0-11" or "0,2,4-7". Default: none kept
 # jobs_memory_gb = 20          # memory jobs may use (decimal GB, below real_memory_mb); MemSpecLimit is the rest. Default: no limit
+# cores_per_socket = 16        # CoresPerSocket as `slurmd -C` prints it on the machine, when that is not cpus: a hybrid Intel CPU
+#                              # (6 two-thread + 10 one-thread cores) is 22 CPUs but 16 cores, and slurm drains a node whose
+#                              # configured sockets*cores*threads exceeds what it reports ("Low socket*core*thread count"). Default: cpus
 # Health check keys, any node (see [health_check]):
 # mains_only = true            # close the node while on battery. Default: decided at run time (true when it has a battery)
 # close_below_gb = 6           # close the node below this much free memory (decimal GB). Default: 16 full, 6 part-time

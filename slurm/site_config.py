@@ -72,6 +72,7 @@ class Node:
     mains_only: bool | None = None  # health check: close on battery; None = decided at run time (true with a battery)
     close_below_gb: float | None = None  # health check: close the node below this much free memory
     push_back_below_gb: float | None = None  # health check: requeue a resume job below this much free memory
+    cores_per_socket: int | None = None  # CoresPerSocket as `slurmd -C` prints it, when that is not `cpus` (hybrid Intel CPUs); None: cpus
 
     @property
     def gpu_cores(self) -> int:
@@ -232,14 +233,18 @@ def _parse_node(raw: Any, i: int) -> Node:
     t = _table(raw, where, {"name", "cpus", "real_memory_mb"}, {
         "gpus": [], "cores_per_gpu": None, "part_time": False, "address": None, "keep_cpus": None,
         "jobs_memory_gb": None, "mains_only": None, "close_below_gb": None, "push_back_below_gb": None,
+        "cores_per_socket": None,
     })
     gpus = tuple(
         Gpu(**_table(g, f"{where}.gpus[{j}]", {"index", "uuid", "device", "type"}, {}))
         for j, g in enumerate(t["gpus"])
     )
     node = Node(t["name"], t["cpus"], t["real_memory_mb"], gpus, t["cores_per_gpu"], t["part_time"], t["address"],
-                t["keep_cpus"], t["jobs_memory_gb"], t["mains_only"], t["close_below_gb"], t["push_back_below_gb"])
+                t["keep_cpus"], t["jobs_memory_gb"], t["mains_only"], t["close_below_gb"], t["push_back_below_gb"],
+                t["cores_per_socket"])
     _check_part_time(node, where)
+    if node.cores_per_socket is not None and not (type(node.cores_per_socket) is int and 1 <= node.cores_per_socket <= node.cpus):
+        raise SiteError(f"site file: [{where}] cores_per_socket = {node.cores_per_socket!r}; expected a whole number from 1 to cpus ({node.cpus})")
     if node.cores_per_gpu is not None and not (
         type(node.cores_per_gpu) is int and gpus and node.cores_per_gpu >= 1 and node.gpu_cores < node.cpus
     ):
