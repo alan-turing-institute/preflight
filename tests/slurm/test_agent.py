@@ -226,6 +226,9 @@ def test_slurmctld_uptime_probe_reads_the_monotonic_timestamp() -> None:
 def test_nodes_are_undrained_once_per_boot_after_slurmctld_settles_and_drained_ones_are_skipped(
     world: World,
 ) -> None:
+    world.lap = {"name": "lap", "state": ["IDLE"], "reason": "", "extra": ""}
+    world.agent = world.new_agent()
+    world.nodes["lap"] = "DOWN*"  # a part-time node switched off: left to its health check, it does not stall the boot
     world.boot, world.ctld_s = "boot-2", 10.0
     world.step()
     assert (

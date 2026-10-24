@@ -641,6 +641,8 @@ class Agent:
         if not nodes:
             errors.append("boot re-registration: slurm lists no nodes; will retry")
             return
+        part_time = {n.name for n in self.site.part_time_nodes}  # their health check opens them; one may be switched off
+        nodes = [n for n in nodes if n not in part_time]
         for node in nodes:
             if node in self._undrained:
                 continue
