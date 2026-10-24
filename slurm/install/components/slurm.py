@@ -120,10 +120,15 @@ def _policy_rc_d() -> Iterator[None]:
             os.replace(saved, path)
 
 
+#: squeue's own listing without the waiting jobs: a restart of the daemons kills or requeues a job that is running, but a
+#: job still waiting is kept in slurmctld's saved state (backed up, and converted by an upgrade) and keeps its place.
+ACTIVE_JOBS = ["squeue", "-h", "-t", "RUNNING,SUSPENDED,COMPLETING,CONFIGURING"]
+
+
 def refusals(site, upgrading: bool = False) -> list[str]:
     """A slurm someone else set up is never replaced unasked (its slurm.conf lacks `render.RENDERED_MARK`), `apply`
     never changes the slurm release (`upgrade-slurm` does, with `upgrading`), and a restart requeues or kills running
-    jobs, so the queue must be empty (an absent `squeue` means no slurm yet)."""
+    jobs, so none may be running (an absent `squeue` means no slurm yet); jobs that are only waiting do not count."""
     out = []
     conf = components.ROOT / "etc/slurm/slurm.conf"
     try:
@@ -137,13 +142,13 @@ def refusals(site, upgrading: bool = False) -> list[str]:
         out.append(f"slurm {installed} is installed and the site file's [slurm] version is {site.slurm_build[0]}: "
                    "apply never changes the release; use install.py upgrade-slurm")
     try:
-        done = components.run(["squeue", "-h"])
+        done = components.run(ACTIVE_JOBS)
     except FileNotFoundError:
         return out
     if done.returncode != 0 and _never_ran():
         return out  # a first apply that stopped before starting the controller can be run again
     if done.returncode != 0 or done.stdout.strip():
-        out.append("slurm has jobs (or squeue failed); restarting its daemons now would requeue or kill them")
+        out.append("slurm has running jobs (or squeue failed); restarting its daemons now would requeue or kill them")
     return out
 
 
@@ -283,7 +288,7 @@ def set_partitions(states: dict[str, str]) -> list[str]:
 
 
 def queue_busy() -> bool:
-    done = components.run(["squeue", "-h"])
+    done = components.run(ACTIVE_JOBS)
     return done.returncode != 0 or bool((done.stdout or "").strip())
 
 

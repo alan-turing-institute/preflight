@@ -89,8 +89,9 @@ and pass `--site` each time.
    is changed. Then apt sources, packages, files, and the post-install steps (service restarts) run. The `slurm`
    component also gives slurm's accounting the cluster (`cluster_name`) and the site's `account`, between restarting
    `slurmdbd` and starting `slurmctld`; records that already exist are left alone. **`apply`
-   refuses while slurm has jobs**, or when `squeue` fails, because restarting the slurm daemons would requeue or
-   kill them. Wait for the queue to empty, or install only other components with
+   refuses while a slurm job is running** (or completing or suspended), or when `squeue` fails, because restarting the
+   slurm daemons would requeue or kill it; jobs that are only waiting are kept in slurmctld's saved state and do not
+   count. Wait for the running jobs to end (`pause.py` sends a `resume` job back to its checkpoint), or install only other components with
    `apply --component NAME` (repeat the option for several; the choices are `slurm`, `tools`, `agent`, `lease`,
    `metrics`, `portal`). The slurm refusal belongs to the `slurm` component, so `--component portal` does not
    trigger it.

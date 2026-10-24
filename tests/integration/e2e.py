@@ -1437,6 +1437,8 @@ def stage_upgrade() -> None:
     old = submit("alice", "before-upgrade", 2)
     check("before: a job completes on the old slurm, so accounting has history to keep",
           bool(old) and wait_state(old, "COMPLETED", 60) and old in sh("sacct -X -n -P -S now-7days -o JobID").out.split(), f"job {old}")
+    waiting = submit("alice", "waits-through-upgrade", 2)  # a job still waiting is no reason to refuse; it must come through
+    sh(f"scontrol hold {waiting}")
     before = sh("sinfo -V").text
     site = sh(f"cat {SITE}").out + (f"\n[slurm]\nversion = '{UPGRADE_TARGET[0]}'\nsha256 = '{UPGRADE_TARGET[1]}'\n"
                                    f"steps = ['{':'.join(UPGRADE_STEPS)}']\n")
@@ -1451,7 +1453,11 @@ def stage_upgrade() -> None:
     kept = sh("sacct -X -n -P -S now-7days -o JobID").out.split()
     check("accounting still lists the job from before the upgrade", old in kept, " ".join(kept))
     new = submit("alice", "after-upgrade", 2)
-    check("a job submitted after the upgrade runs to completion", bool(new) and wait_state(new, "COMPLETED", 90), f"job {new}")
+    held = state(waiting) == "PENDING"
+    sh(f"scontrol release {waiting}")
+    check("a job submitted after the upgrade, and one held through it, run to completion",
+          bool(new) and held and wait_state(new, "COMPLETED", 90) and wait_state(waiting, "COMPLETED", 90),
+          f"jobs {new} and {waiting} (held through the upgrade: {held})")
 
 
 STAGES: dict[str, Callable[[], None]] = {

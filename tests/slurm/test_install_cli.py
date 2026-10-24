@@ -397,9 +397,9 @@ def test_upgrade_slurm_backs_up_then_steps_through_each_release(upgrade, capsys)
             "systemctl start slurmdbd", "systemctl start slurmctld", "systemctl start slurmd"]
     interesting = ("build", "systemctl", "apt-get", "sudo", "terminated", "scontrol update", "squeue", "mariadb-dump", "tar", "apply")
     assert [c for c in calls if c.startswith(interesting)] == [
-        "squeue -h",  # the first empty-queue check, then both releases are built, all before anything stops
+        " ".join(slurm_component.ACTIVE_JOBS),  # the first no-running-jobs check, then both releases are built, all before anything stops
         "build 25.05.9", "build 26.05.5",
-        *close, "squeue -h",  # no partition takes a job, then the queue is checked again
+        *close, " ".join(slurm_component.ACTIVE_JOBS),  # no partition takes a job, then the jobs are checked again
         "systemctl stop slurmctld slurmd", dump, state, conf, "systemctl stop slurmdbd",  # slurmdbd only after the dump
         *(c.format(deb=f"{tmp}/slurm-smd_25.05.9.deb") for c in step),
         "systemctl stop slurmctld slurmd", "systemctl stop slurmdbd",
@@ -419,7 +419,7 @@ def test_upgrade_slurm_backs_up_then_steps_through_each_release(upgrade, capsys)
 def test_upgrade_slurm_refuses_before_touching_anything(upgrade, capsys, monkeypatch):
     tmp, site, fake = upgrade
     fake.queue = "12 jobs\n"
-    assert run(site, tmp / "root", "upgrade-slurm") == 1 and "slurm has jobs" in capsys.readouterr().err
+    assert run(site, tmp / "root", "upgrade-slurm") == 1 and "slurm has running jobs" in capsys.readouterr().err
     fake.queue, fake.version = "", "slurm 26.05.5"
     assert run(site, tmp / "root", "upgrade-slurm") == 1 and "already at or after" in capsys.readouterr().err
     fake.version = "slurm-wlm 23.11.4"
