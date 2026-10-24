@@ -1,5 +1,6 @@
 import hashlib
 import importlib.util
+import io
 import platform
 from pathlib import Path
 
@@ -60,8 +61,20 @@ def test_build_downloads_checks_builds_and_reuses_the_cache(tmp_path, text, fam,
         assert names.index("tar") < names.index("mk-build-deps") < names.index("debuild")
     else:
         assert names == ["rpmbuild"] and fakes.ran[0][0][1] == "-ta"
+    workdir = cache / "26.05.5" / f"{fam}-{platform.machine()}"
+    assert (workdir / sb.MARKER).read_text().strip() == SHA  # written once the build finished
     assert sb.build("26.05.5", SHA, cache, **kwargs) == packages  # the second call builds and downloads nothing
     assert len(fakes.urls) == 1 and len(fakes.ran) == len(names)
+    # packages without the marker, or with one for another tarball, are a build that did not finish: built again, and
+    # what it left is cleared first
+    for marker in (None, "00"):
+        stale = workdir / "stale.deb"
+        stale.write_bytes(b"old")
+        (workdir / sb.MARKER).unlink()
+        marker and (workdir / sb.MARKER).write_text(marker)
+        before = len(fakes.ran)
+        assert [p.name for p in sb.build("26.05.5", SHA, cache, **kwargs)] == [leaves] and not stale.exists()
+        assert len(fakes.ran) == before + len(names) and len(fakes.urls) == 1
 
 
 def test_refusals(tmp_path):
@@ -74,3 +87,14 @@ def test_refusals(tmp_path):
         sb.family(release(tmp_path, 'ID=arch\nPRETTY_NAME="Arch Linux"\n'))
     with pytest.raises(sb.SlurmBuildError, match="not of the form"):
         sb.tarball_url("../26.05")
+
+
+def test_the_download_has_a_timeout_and_only_the_installed_packages_are_chosen(monkeypatch, tmp_path):
+    seen = {}
+    monkeypatch.setattr(sb.urllib.request, "urlopen", lambda url, timeout=None: seen.update(timeout=timeout) or io.BytesIO(BODY))
+    sb._download(URL, tmp_path / "t")
+    assert seen == {"timeout": sb.DOWNLOAD_TIMEOUT_S} and (tmp_path / "t").read_bytes() == BODY
+    debs = ["slurm-smd-dbgsym_1_a.deb", "slurm-smd-dev_1_a.deb", "slurm-smd-slurmdbd_1_a.deb", "slurm-smd_1_a.deb", "slurm-smd-sview_1_a.deb"]
+    assert [p.name for p in sb.installable([Path(n) for n in debs])] == ["slurm-smd_1_a.deb", "slurm-smd-slurmdbd_1_a.deb"]
+    rpms = ["slurm-26.05.5-1.x86_64.rpm", "slurm-devel-26.05.5-1.x86_64.rpm", "slurm-slurmd-26.05.5-1.x86_64.rpm", "slurm-sview-26.05.5-1.x86_64.rpm"]
+    assert [p.name for p in sb.installable([Path(n) for n in rpms])] == [rpms[0], rpms[2]]

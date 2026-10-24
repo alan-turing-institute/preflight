@@ -13,6 +13,7 @@ import argparse
 import hashlib
 import platform
 import re
+import shutil
 import subprocess
 import urllib.request
 from collections.abc import Callable
@@ -24,6 +25,13 @@ OS_RELEASE = Path("/etc/os-release")
 #: SchedMD's release tag spells the version with dashes: slurm-26-05-5-1
 URL = "https://github.com/SchedMD/slurm/releases/download/slurm-{dashed}-1/slurm-{version}.tar.bz2"
 VERSION = re.compile(r"\d+\.\d+\.\d+")
+#: The cache is valid only once a build finished: the file holds the sha256 of the tarball it was built from.
+MARKER = ".built-sha256"
+DOWNLOAD_TIMEOUT_S = 60
+#: The packages `upgrade-slurm`, `apply` and the restore install (names as SchedMD packages them): the daemons, the
+#: client commands and the base package. The rest of what the build leaves (-dev, -doc, -dbgsym, sview, ...) is not.
+DEB_INSTALL = ["slurm-smd", "slurm-smd-client", "slurm-smd-slurmctld", "slurm-smd-slurmd", "slurm-smd-slurmdbd"]
+RPM_INSTALL = ["slurm", "slurm-perlapi", "slurm-slurmctld", "slurm-slurmd", "slurm-slurmdbd"]
 DEB_TOOLS = ["apt-get", "install", "-y", "build-essential", "fakeroot", "devscripts", "equivs"]
 
 Download = Callable[[str, Path], None]
@@ -59,7 +67,7 @@ def family(os_release: Path = OS_RELEASE) -> Family:
 
 
 def _download(url: str, dest: Path) -> None:
-    with urllib.request.urlopen(url) as src, dest.open("wb") as out:
+    with urllib.request.urlopen(url, timeout=DOWNLOAD_TIMEOUT_S) as src, dest.open("wb") as out:
         while chunk := src.read(1 << 20):
             out.write(chunk)
 
@@ -81,6 +89,18 @@ def _packages(workdir: Path, fam: Family) -> list[Path]:
     return sorted(workdir.glob(pattern))
 
 
+def package_name(path: Path) -> str:
+    """`slurm-smd-slurmd_26.05.5_arm64.deb` -> `slurm-smd-slurmd`; `slurm-slurmd-26.05.5-1.fc44.x86_64.rpm` -> `slurm-slurmd`."""
+    return re.split(r"_|-\d", path.name, maxsplit=1)[0]
+
+
+def installable(packages: list[Path]) -> list[Path]:
+    """Only the packages the installer puts on a machine (`DEB_INSTALL` or `RPM_INSTALL`), in that order."""
+    wanted = DEB_INSTALL if any(p.suffix == ".deb" for p in packages) else RPM_INSTALL
+    by_name = {package_name(p): p for p in packages}
+    return [by_name[name] for name in wanted if name in by_name]
+
+
 # mk-build-deps installs with apt-get and no -y by default, which would wait at a prompt (its man page, noble).
 MK_BUILD_DEPS_TOOL = "apt-get -y -o Debug::pkgProblemResolver=yes --no-install-recommends"
 
@@ -98,13 +118,17 @@ def commands(fam: Family, version: str, tarball: Path, source: Path) -> list[tup
 
 def build(version: str, sha256: str, cache_root: Path = DEFAULT_CACHE, *, download: Download = _download,
           run: Run = _run, os_release: Path = OS_RELEASE) -> list[Path]:
-    """The package files for `version`, built from the tarball whose sha256 is `sha256` unless already built."""
+    """The package files for `version`, built from the tarball whose sha256 is `sha256` unless already built (a finished
+    build leaves `MARKER` with that sha256; without it the directory is cleared and built again)."""
     url = tarball_url(version)
     fam = family(os_release)
     base = cache_root / version
     workdir = base / f"{fam}-{platform.machine()}"
-    if found := _packages(workdir, fam):
+    marker = workdir / MARKER
+    if marker.exists() and marker.read_text(encoding="utf-8").strip() == sha256 and (found := _packages(workdir, fam)):
         return found
+    if workdir.exists():  # a build that did not finish, or one of another tarball: its files are not to be installed
+        shutil.rmtree(workdir)
     base.mkdir(parents=True, exist_ok=True)
     tarball = base / Path(url).name
     if not tarball.exists():
@@ -117,6 +141,7 @@ def build(version: str, sha256: str, cache_root: Path = DEFAULT_CACHE, *, downlo
         run(argv, cwd)
     if not (found := _packages(workdir, fam)):
         raise SlurmBuildError(f"the build finished but left no {fam} files under {workdir}")
+    marker.write_text(f"{sha256}\n", encoding="utf-8")
     return found
 
 
