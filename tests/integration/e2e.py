@@ -41,7 +41,8 @@ GRAFANA_TLS = "https://testnode:3443"
 USERS = ("alice", "bob", "carol")
 # Test-only portal passwords of the throwaway accounts (only their bcrypt hashes go into the container).
 PASSWORDS: dict[str, str] = {u: f"pw-{u}-e2e" for u in (*USERS, "dave")}
-PT_COMPOSE = ["docker", "compose", "-p", "gpujobs-test", "-f", str(HERE / "compose.yml")]
+# GPUJOBS_TEST_PROJECT names the compose project, so several test clusters can run at once (run.sh reads it too).
+PT_COMPOSE = ["docker", "compose", "-p", os.environ.get("GPUJOBS_TEST_PROJECT", "gpujobs-test"), "-f", str(HERE / "compose.yml")]
 RESULTS: list[tuple[str, bool, str]] = []
 CHAIN_LENGTH = 3  # jobs in the chain S1 submits
 CPU_CAP = 2  # cores S3 lets the CPU-only partition use on the 4-core harness node
@@ -1492,11 +1493,16 @@ def main() -> int:
     chosen = args.only.split(",")
     if unknown := [s for s in chosen if s not in STAGES]:
         parser.error(f"unknown stage(s) {unknown}; stages: {', '.join(STAGES)}")
+    took: dict[str, float] = {}
     for name, stage in STAGES.items():
         if name in chosen:
+            started = time.monotonic()
             stage()
+            took[name] = time.monotonic() - started
+            print(f"== {name} took {took[name]:.0f} s")
     failed = [(n, e) for n, ok, e in RESULTS if not ok]
     print(f"\n{len(RESULTS) - len(failed)} passed, {len(failed)} failed of {len(RESULTS)} checks")
+    print("  time per stage: " + ", ".join(f"{n} {t:.0f} s" for n, t in took.items()))
     for text in NOTES:
         print(f"  NOTE: {text}")
     for name, evidence in failed:

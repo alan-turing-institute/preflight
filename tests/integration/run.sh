@@ -4,7 +4,8 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-COMPOSE=(docker compose -p gpujobs-test -f "$HERE/compose.yml")
+# GPUJOBS_TEST_PROJECT: the compose project, so several test clusters can run at once (one per stage group).
+COMPOSE=(docker compose -p "${GPUJOBS_TEST_PROJECT:-gpujobs-test}" -f "$HERE/compose.yml")
 SERVICE=cluster
 READY_TIMEOUT=240
 
