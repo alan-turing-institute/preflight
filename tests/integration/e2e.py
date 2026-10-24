@@ -1444,6 +1444,7 @@ def stage_upgrade() -> None:
                                    f"steps = ['{':'.join(UPGRADE_STEPS)}']\n")
     put(UPGRADE_SITE, site)
     done = sh(f"{INSTALL} upgrade-slurm --site {UPGRADE_SITE}", timeout=UPGRADE_TIMEOUT_S)
+    done.rc and print(done.text[-4000:])  # the failing step and apt's own message, which the check below shortens
     check("upgrade-slurm exits 0 after both steps", done.rc == 0, done.text[-330:])
     after = sh("sinfo -V").text
     check("slurm now reports the site file's release", UPGRADE_TARGET[0] in after and before != after, f"{before} -> {after}")
