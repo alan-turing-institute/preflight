@@ -4,9 +4,15 @@ name: gpujobs-test
 
 services:
   cluster:
-    image: gpujobs-testcluster:dev
+    image: ${GPUJOBS_TEST_IMAGE:-gpujobs-testcluster:dev}
     build:
       context: .
+      # slurm_build.py comes from the repository; SLURM_VERSION/SLURM_SHA256 (both or neither) pick SchedMD's slurm.
+      additional_contexts:
+        src: ../..
+      args:
+        SLURM_VERSION: ${SLURM_VERSION:-}
+        SLURM_SHA256: ${SLURM_SHA256:-}
     hostname: testnode
     # Torn down with `run.sh down`; nothing here outlives a test run.
     labels:
