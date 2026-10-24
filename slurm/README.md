@@ -494,6 +494,42 @@ prints a job's last measured peak memory. `gpujobs-status` and `gpujobs-audit` t
   tools refuse, naming the file and what is wrong with it; there is no built-in fallback. `$SLURM_GPU_STATE_DIR`
   and `$GPU_LEASE_DIR` override the site file's two directories (the unit tests use them).
 
+### Part-time machines
+
+A part-time machine is somebody's own computer (a laptop, a workstation) that lends its spare capacity to the
+cluster as an extra compute node. List it in the site file as a `[[nodes]]` entry with `part_time = true` and an
+`address` (section 4); it never runs the controller, the database or the web page.
+
+**Read this before joining a machine.** The cluster knows who is who through one shared secret, the munge key. A
+machine that holds the key can claim to be any user of the whole cluster, the admins included, and the controller can
+run jobs on the machine as any cluster user. So root on a part-time machine has the cluster's power over everyone,
+and the cluster's admins have root-like reach into that machine. Join only a machine whose root you trust the cluster
+with, and if you are a colleague asked to join a shared site, know that joining gives whoever is root on your
+machine cluster-wide power. For that reason `apply --part-time` does nothing until you pass `--i-accept-cluster-trust`.
+
+The site file must have a `[slurm]` table: a part-time machine always runs the pinned slurm build, never the
+distribution's. The user ids of every cluster user must be the same on the machine and on the controller (jobs run
+as that uid), so check this first, or the controller refuses in step 2.
+
+1. On the part-time machine, as root, with the controller's `slurm` ids (`getent passwd slurm` there) and address:
+
+       sudo install.py apply --part-time NODE --controller CONTROLLER_ADDRESS \
+           --slurm-uid UID --slurm-gid GID --i-accept-cluster-trust
+
+   This creates `slurm` with the controller's ids (and stops if a different `slurm` already exists), installs `munge`
+   and the pinned slurm build, installs the tools (`/opt/gpujobs`, with the health check), adds `--conf-server` to the
+   package's own `slurmd` service so the machine takes its settings from the controller, opens port 6818 to the
+   controller's address only when firewalld is running, and enables `munge` and `slurmd`.
+2. On the controller, as root, run by an admin through `sudo`:
+
+       sudo install.py part-time add NODE
+
+   This compares the uid of every cluster user (accounting users, the admin group, `slurm`) here and on the machine
+   over ssh, and refuses with every difference listed. When they match it copies the munge key over ssh (never
+   printed) and restarts munge and slurmd there. It uses your own ssh login, so you need an ssh login and `sudo` on
+   the machine.
+3. Add the node to the controller's site file if it is not there, and `sudo install.py apply` on the controller.
+
 ## 9. Uninstall
 
 There is no uninstall command. Removal is manual and not tested. Stop and disable the services you installed

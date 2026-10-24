@@ -1,0 +1,189 @@
+"""A part-time machine: someone's own computer that joins the cluster as a configless compute node (plan B5).
+
+Not a component the installer loads by name (`components.ORDER` does not list it): `install.py part-time add NODE` runs
+on the controller, and `install.py apply --part-time NODE` runs on the machine itself. Every command goes through
+`components.run`, so a test swaps the one runner; the key travels through `send`, which a test swaps too.
+"""
+
+from __future__ import annotations
+
+import grp
+import os
+import re
+import subprocess
+import sys
+from enum import StrEnum
+
+import components
+
+SLURM_USER = "slurm"
+SSH = ["ssh", "-o", "BatchMode=yes"]
+MUNGE_KEY = "/etc/munge/munge.key"
+SLURMD_DROP_IN = "/etc/systemd/system/slurmd.service.d/10-conf-server.conf"
+SLURMD_PORT = 6818
+PASSWD_UID, PASSWD_GID = 2, 3  # fields of a `getent passwd` line
+NOT_FOUND = 2  # `getent` exit status for a missing entry, passed through by ssh
+SLURM_HOME, NOLOGIN = "/var/lib/slurm", "/usr/sbin/nologin"
+
+TRUST_WARNING = """\
+This makes this machine part of the cluster, and that is a trust decision.
+  - The cluster's accounts are authenticated by a shared munge key; anyone who is root here can use it to act as ANY
+    user of the whole cluster, including its admins, and run anything as them.
+  - The controller can run any job on this machine, as any cluster user.
+Only do this on a machine whose root you are willing to give that power to, and only for a cluster whose admins you
+trust with this machine. Re-run with --i-accept-cluster-trust to go on."""
+
+
+class PartTimeAction(StrEnum):
+    ADD = "add"
+
+
+def send(argv: list[str], data: bytes) -> subprocess.CompletedProcess[bytes]:
+    """Run `argv` with `data` on its standard input (the munge key; never echoed, and not part of any argv)."""
+    return subprocess.run(argv, input=data, capture_output=True, check=False)
+
+
+def _as_admin(argv: list[str]) -> list[str]:
+    """Run as the admin who called sudo, so their ssh keys and agent apply; root has none of them."""
+    admin = os.environ.get("SUDO_USER")
+    return ["sudo", "-u", admin, *argv] if admin and os.geteuid() == 0 else argv
+
+
+def _ids(argv: list[str]) -> tuple[int, int] | None:
+    """(uid, gid) from a `getent passwd` run, None for no such user; any other failure (ssh itself) stops."""
+    done = components.run(argv)
+    if done.returncode == NOT_FOUND:
+        return None
+    if done.returncode != 0:
+        raise SystemExit(f"FAILED ({done.returncode}): {' '.join(argv)}\n{done.stderr or ''}".rstrip())
+    fields = (done.stdout or "").strip().split(":")
+    return int(fields[PASSWD_UID]), int(fields[PASSWD_GID])
+
+
+def site_users(site) -> list[str]:
+    """Who the installer manages: the accounting users of the site's account, the admin group, and `slurm`."""
+    done = components.run(["sacctmgr", "-n", "-P", "show", "assoc", "where", f"cluster={site.cluster_name}",
+                           f"account={site.account}", "format=user"])
+    try:
+        admins = list(grp.getgrnam(site.admin_group).gr_mem)
+    except KeyError:
+        admins = []
+    return sorted({*(done.stdout or "").split(), *admins, SLURM_USER})
+
+
+def uid_mismatches(users: list[str], address: str) -> list[str]:
+    """One line per user whose uid differs on the node, or who is missing there (only `slurm` may be: the node install
+    creates it). A user the controller itself does not have is not compared."""
+    out = []
+    for user in users:
+        here = _ids(["getent", "passwd", user])
+        if here is None:
+            continue
+        there = _ids(_as_admin([*SSH, address, "getent", "passwd", user]))
+        if there is None and user != SLURM_USER:
+            out.append(f"{user}: uid {here[0]} here, missing on {address}")
+        elif there is not None and there[0] != here[0]:
+            out.append(f"{user}: uid {here[0]} here, {there[0]} on {address}")
+    return out
+
+
+def cmd_add(site, args) -> int:
+    node = next((n for n in site.part_time_nodes if n.name == args.node), None)
+    if node is None:
+        print(f"REFUSED: {args.node} is not a part_time node in the site file", file=sys.stderr)
+        return 1
+    if problems := uid_mismatches(site_users(site), node.address):
+        print(f"REFUSED: user ids differ on {node.name} ({node.address}); jobs would run as the wrong person. "
+              "Make them match, then run this again:", file=sys.stderr)
+        for line in problems:
+            print(f"  {line}", file=sys.stderr)
+        return 1
+    key = (components.ROOT / MUNGE_KEY.lstrip("/")).read_bytes()
+    install = ["install", "-m", "0400", "-o", "munge", "-g", "munge", "/dev/stdin", MUNGE_KEY]
+    done = send(_as_admin([*SSH, node.address, "sudo", *install]), key)
+    if done.returncode != 0:
+        raise SystemExit(f"FAILED ({done.returncode}): copying the munge key to {node.address}\n"
+                         f"{(done.stderr or b'').decode(errors='replace')}".rstrip())
+    # a munge already running holds the key it started with
+    components.run(_as_admin([*SSH, node.address, "sudo", "systemctl", "try-restart", "munge", "slurmd"]))
+    print(f"{node.name}: user ids match and the munge key is copied (not shown)")
+    return 0
+
+
+def _group_user_commands(uid: int, gid: int) -> list[list[str]]:
+    """`slurm` with the controller's ids, made before the packages so their scripts do not pick others."""
+    out = []
+    if _ids(["getent", "passwd", SLURM_USER]) is None:
+        if components.run(["getent", "group", SLURM_USER]).returncode != 0:
+            out.append(["groupadd", "-g", str(gid), SLURM_USER])
+        out.append(["useradd", "-r", "-u", str(uid), "-g", SLURM_USER, "-d", SLURM_HOME, "-s", NOLOGIN, SLURM_USER])
+    return out
+
+
+def refusals(site, args) -> list[str]:
+    out = []
+    if not any(n.name == args.part_time for n in site.part_time_nodes):
+        out.append(f"{args.part_time} is not a part_time node in the site file")
+    if not site.slurm_build:
+        out.append("the site file has no [slurm] table: a part-time machine always runs the pinned build")
+    for flag in ("slurm_uid", "slurm_gid", "controller"):
+        if getattr(args, flag) is None:
+            out.append(f"--{flag.replace('_', '-')} is needed (the controller's `slurm` ids from `getent passwd slurm`, "
+                       "and the controller's address)")
+    if out:
+        return out
+    existing = _ids(["getent", "passwd", SLURM_USER])
+    if existing and existing != (args.slurm_uid, args.slurm_gid):
+        out.append(f"a `slurm` user already exists here with uid/gid {existing[0]}/{existing[1]}, not the controller's "
+                   f"{args.slurm_uid}/{args.slurm_gid}")
+    return out
+
+
+def slurmd_drop_in(unit: str, controller: str) -> str:
+    """The unit's own ExecStart with `--conf-server` added after the program; read from the installed package."""
+    found = re.search(r"^ExecStart=(\S+)(.*)$", unit, re.MULTILINE)
+    if not found:
+        raise SystemExit("`systemctl cat slurmd` shows no ExecStart=; cannot add --conf-server to it")
+    if "--conf-server" in found[2]:
+        raise SystemExit("slurmd's unit already has --conf-server; leave it, or remove it first")
+    return f"[Service]\nExecStart=\nExecStart={found[1]} --conf-server {controller}{found[2]}\n"
+
+
+def _write_drop_in(controller: str) -> list[list[str]]:
+    done = components.run(["systemctl", "cat", "slurmd"])
+    if done.returncode != 0:
+        raise SystemExit(f"FAILED ({done.returncode}): systemctl cat slurmd\n{done.stderr or ''}".rstrip())
+    path = components.ROOT / SLURMD_DROP_IN.lstrip("/")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(slurmd_drop_in(done.stdout or "", controller))
+    return [["systemctl", "daemon-reload"]]
+
+
+def _after(action) -> list[list[str]]:
+    """Run a step that does its own work, then add no commands."""
+    action()
+    return []
+
+
+def _firewall(controller: str) -> list[list[str]]:
+    if components.run(["systemctl", "is-active", "firewalld"]).returncode != 0:
+        return []
+    rule = f"rule family=ipv4 source address={controller} port port={SLURMD_PORT} protocol=tcp accept"
+    return [["firewall-cmd", "--permanent", f"--add-rich-rule={rule}"], ["firewall-cmd", "--reload"]]
+
+
+def steps(site, args, manager: str, tools_apply) -> list:
+    """The install, in order, for `_run_all`: a function in the list gives its argvs when reached. `tools_apply` is
+    called for the tools component (it writes files itself)."""
+    from . import slurm as slurm_component
+
+    return [
+        *_group_user_commands(args.slurm_uid, args.slurm_gid),
+        [manager, "install", "-y", "munge"],
+        lambda: slurm_component.install_release(*site.slurm_build),
+        lambda: _after(tools_apply),
+        lambda: _write_drop_in(args.controller),
+        lambda: _firewall(args.controller),
+        ["systemctl", "enable", "--now", "munge", "slurmd"],
+    ]
+

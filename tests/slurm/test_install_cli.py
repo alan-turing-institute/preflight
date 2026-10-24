@@ -378,3 +378,130 @@ def test_a_failed_step_prints_the_restore_commands_and_goes_no_further(upgrade, 
     assert not any("26.05.5" in " ".join(c) for c in fake.calls) and ["apply"] not in fake.calls
     assert lose or ["systemctl", "start", "slurmctld"] not in fake.calls  # a dead slurmdbd never reaches the controller
     assert not lose or "sacct no longer lists 1 job(s)" in err
+
+
+PART_TIME_SITE = SITE + """
+[[nodes]]
+name = "laptop"
+cpus = 4
+real_memory_mb = 1000
+part_time = true
+address = "100.1.1.1"
+[slurm]
+version = '26.05.5'
+sha256 = '""" + "ab" * 32 + "'\n"
+UNIT = "# /usr/lib/systemd/system/slurmd.service\n[Service]\nExecStart=/usr/sbin/slurmd --systemd $SLURMD_OPTIONS\n"
+
+
+class PartTimeFake(Fake):
+    """`local` and `remote` map a user to its uid for `getent passwd` here and over ssh; `users` is what accounting lists."""
+
+    def __init__(self, local, remote, users, firewalld=True, unit=UNIT):
+        super().__init__()
+        self.local, self.remote, self.users, self.firewalld, self.unit = local, remote, users, firewalld, unit
+
+    def __call__(self, argv):
+        if argv[:1] == ["ssh"] and argv[-3:-1] == ["getent", "passwd"] or argv[:2] == ["getent", "passwd"]:
+            table = self.remote if argv[:1] == ["ssh"] else self.local
+            self.calls.append(argv)
+            uid = table.get(argv[-1])
+            line = f"{argv[-1]}:x:{uid}:{uid}::/home:/bin/sh\n" if uid is not None else ""
+            return subprocess.CompletedProcess(argv, 0 if uid is not None else 2, line, "")
+        if argv[:5] == ["sacctmgr", "-n", "-P", "show", "assoc"]:
+            return subprocess.CompletedProcess(argv, 0, "\n".join(self.users) + "\n", "")
+        if argv[:3] == ["systemctl", "is-active", "firewalld"]:
+            return subprocess.CompletedProcess(argv, 0 if self.firewalld else 3, "", "")
+        if argv[:3] == ["systemctl", "cat", "slurmd"]:
+            return subprocess.CompletedProcess(argv, 0, self.unit, "")
+        if argv[:3] == ["getent", "group", "slurm"]:
+            return subprocess.CompletedProcess(argv, 2, "", "")
+        return super().__call__(argv)
+
+
+def part_time_env(tmp_path, monkeypatch, fake):
+    site = tmp_path / "site.toml"
+    site.write_text(PART_TIME_SITE)
+    components.set_runner(fake)
+    monkeypatch.setattr(importlib.import_module("components.lease"), "_home", lambda _user: tmp_path / "home")
+    monkeypatch.setattr(cli.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(slurm_component.slurm_build, "build", lambda v, s: [tmp_path / "slurm-smd_26.05.5_arm64.deb"])
+    return site
+
+
+def test_part_time_add_refuses_every_uid_mismatch_then_copies_the_key_without_showing_it(tmp_path, monkeypatch, capsys):
+    local = {"alice": 1001, "bob": 1002, "carol": 1003, "slurm": 64030}
+    fake = PartTimeFake(local, {"alice": 2001, "carol": 1003}, ["alice", "bob", "carol"])
+    site = part_time_env(tmp_path, monkeypatch, fake)
+    root = tmp_path / "root"
+    (root / "etc/munge").mkdir(parents=True)
+    (root / "etc/munge/munge.key").write_bytes(b"SECRETKEYBYTES")
+    sent = []
+    monkeypatch.setattr(importlib.import_module("components.part_time"), "send",
+                        lambda argv, data: sent.append((argv, data)) or subprocess.CompletedProcess(argv, 0, b"", b""))
+    try:
+        assert run(site, root, "part-time", "add", "laptop") == 1
+        err = capsys.readouterr().err
+        assert "alice: uid 1001 here, 2001 on 100.1.1.1" in err and "bob: uid 1002 here, missing" in err
+        assert "slurm" not in err and "carol" not in err  # slurm is created by the node install; carol matches
+        assert sent == []  # nothing is copied while any id differs
+        fake.remote.update(alice=1001, bob=1002)  # slurm may stay missing
+        assert run(site, root, "part-time", "add", "laptop") == 0
+    finally:
+        components.set_runner(None)
+    argv, data = sent[0]
+    assert argv[-9:] == ["sudo", "install", "-m", "0400", "-o", "munge", "-g", "munge", "/dev/stdin", "/etc/munge/munge.key"][-9:]
+    assert data == b"SECRETKEYBYTES"
+    out = capsys.readouterr()
+    assert "SECRETKEYBYTES" not in out.out + out.err and not any("SECRETKEYBYTES" in " ".join(c) for c in fake.calls)
+
+
+def apply_part_time(site, tmp_path, *extra):
+    flags = ["--part-time", "laptop", "--controller", "100.2.2.2", "--slurm-uid", "64030", "--slurm-gid", "64030"]
+    return run(site, tmp_path / "root", "apply", *flags, *extra)
+
+
+def test_part_time_apply_needs_the_trust_flag_and_the_controllers_slurm_ids(tmp_path, monkeypatch, capsys):
+    fake = PartTimeFake({"slurm": 999}, {}, [])
+    site = part_time_env(tmp_path, monkeypatch, fake)
+    try:
+        assert apply_part_time(site, tmp_path) == 1
+        assert "anyone who is root here can use it to act as ANY" in capsys.readouterr().err
+        assert not [c for c in fake.calls if c[:1] in (["useradd"], ["apt-get"])]
+        assert apply_part_time(site, tmp_path, "--i-accept-cluster-trust") == 1  # slurm is uid 999 here, 64030 there
+        assert "uid/gid 999/999" in capsys.readouterr().err
+        assert not [c for c in fake.calls if c[:1] in (["useradd"], ["apt-get"])]
+    finally:
+        components.set_runner(None)
+
+
+@pytest.mark.parametrize("firewalld", [True, False])
+def test_part_time_apply_adds_the_flag_to_the_packages_unit_and_opens_the_port_only_with_firewalld(
+        tmp_path, monkeypatch, firewalld):
+    fake = PartTimeFake({}, {}, [], firewalld=firewalld)
+    site = part_time_env(tmp_path, monkeypatch, fake)
+    try:
+        assert apply_part_time(site, tmp_path, "--i-accept-cluster-trust") == 0
+    finally:
+        components.set_runner(None)
+    calls = fake.calls
+    order = [c[0] for c in calls if c[0] in ("groupadd", "useradd")] + [c[:3] for c in calls if c[:1] == ["apt-get"]]
+    assert order == ["groupadd", "useradd", ["apt-get", "install", "-y"], ["apt-get", "install", "-y"]]  # slurm user first
+    assert ["useradd", "-r", "-u", "64030", "-g", "slurm", "-d", "/var/lib/slurm", "-s", "/usr/sbin/nologin", "slurm"] in calls
+    drop_in = (tmp_path / "root/etc/systemd/system/slurmd.service.d/10-conf-server.conf").read_text()
+    assert drop_in == "[Service]\nExecStart=\nExecStart=/usr/sbin/slurmd --conf-server 100.2.2.2 --systemd $SLURMD_OPTIONS\n"
+    rule = "--add-rich-rule=rule family=ipv4 source address=100.2.2.2 port port=6818 protocol=tcp accept"
+    assert (["firewall-cmd", "--permanent", rule] in calls) is firewalld
+    assert (["firewall-cmd", "--reload"] in calls) is firewalld
+    assert calls[-1] == ["systemctl", "enable", "--now", "munge", "slurmd"]
+    assert (tmp_path / "root/opt/gpujobs").exists()  # the tools component, so node_check.py is there
+
+
+def test_part_time_apply_refuses_when_the_unit_has_no_execstart(tmp_path, monkeypatch):
+    fake = PartTimeFake({}, {}, [], unit="[Service]\n")
+    site = part_time_env(tmp_path, monkeypatch, fake)
+    try:
+        with pytest.raises(SystemExit, match="no ExecStart"):
+            apply_part_time(site, tmp_path, "--i-accept-cluster-trust")
+    finally:
+        components.set_runner(None)
+    assert ["systemctl", "enable", "--now", "munge", "slurmd"] not in fake.calls
