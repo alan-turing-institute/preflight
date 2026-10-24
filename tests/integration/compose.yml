@@ -30,6 +30,8 @@ x-node: &node
   # The repository, read-only, where the installer and the tools are exercised from.
   volumes:
     - ../..:/src:ro
+    # slurm_build.py's package cache outlives `run.sh down` (external volume), so a release is compiled once, not per run.
+    - slurm-build-cache:/var/cache/gpujobs/slurm
 
 services:
   cluster:
@@ -57,3 +59,8 @@ services:
     mem_limit: 3g
     memswap_limit: 3g
     cpus: 2
+
+volumes:
+  slurm-build-cache:
+    external: true
+    name: gpujobs-slurm-build-cache

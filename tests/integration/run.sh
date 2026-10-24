@@ -52,6 +52,7 @@ wait_booted() {
 }
 
 cmd_up() {
+    docker volume create gpujobs-slurm-build-cache >/dev/null  # external: kept across runs (compose.yml)
     "${COMPOSE[@]}" up -d --build
     wait_booted
     wait_ready
