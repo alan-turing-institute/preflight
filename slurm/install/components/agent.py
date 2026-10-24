@@ -30,7 +30,10 @@ def files(site) -> dict[str, render.FileSpec]:
     unit = Template((render.TEMPLATES / NAME / UNIT).read_text()).substitute(
         slurm_user=render.SLURM_USER, site_file=SITE_COPY, install_dir=site.install_dir
     )
+    render_py = Path(render.__file__)  # the agent rewrites part_time_nodes.conf with the installer's own line format
     return {
+        str(Path(site.install_dir) / "slurm" / "install" / render_py.name): render.FileSpec(
+            render_py.read_text(), render.FILE_MODE, "root"),
         SITE_COPY: render.FileSpec(components.SITE_PATH.read_text(), render.FILE_MODE, "root"),
         f"/etc/systemd/system/{UNIT}": render.FileSpec(unit, render.FILE_MODE, "root"),
     }

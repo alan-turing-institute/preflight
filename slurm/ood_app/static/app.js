@@ -66,7 +66,11 @@ async function loadLog(form) {
 }
 
 async function post(job, action, payload) {
-  const reply = await fetch(ROOT + "api/job/" + job + "/" + action, {
+  return postJson(ROOT + "api/job/" + job + "/" + action, payload);
+}
+
+async function postJson(url, payload) {
+  const reply = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json", Accept: "application/json" },
     body: JSON.stringify(payload),
@@ -118,7 +122,47 @@ async function act(button) {
   else for (const b of document.querySelectorAll("button[data-action]")) b.disabled = false;
 }
 
+// The admin card for part-time machines: each control leaves one request for the agent, which applies it.
+async function partTime(node, action, payload) {
+  const result = document.getElementById("part-time-result");
+  const done = await postJson(ROOT + "api/part-time/" + encodeURIComponent(node) + "/" + action, payload);
+  result.className = "notice " + (done.ok ? "ok" : "err");
+  result.textContent = (done.ok ? "Done: " : "Failed: ") + (done.output || done.error || action);
+  if (done.ok) setTimeout(() => location.reload(), 3000);
+}
+
+function partTimeForm(form) {
+  const payload = {};
+  for (const input of form.querySelectorAll("input[name]")) {
+    if (input.type === "number") {
+      if (input.value !== "") payload[input.name] = Number(input.value);
+      else if (input.name === "jobs_memory_gb") payload[input.name] = null;
+    } else {
+      payload[input.name] = input.value || null;
+    }
+  }
+  partTime(form.dataset.node, form.dataset.partTime, payload);
+}
+
+function partTimeControls() {
+  for (const form of document.querySelectorAll("form[data-part-time]")) {
+    form.addEventListener("submit", (event) => { event.preventDefault(); partTimeForm(form); });
+  }
+  for (const box of document.querySelectorAll("input[data-part-time=switch]")) {
+    box.addEventListener("change", () => partTime(box.dataset.node, box.checked ? "accept" : "close", {}));
+  }
+  for (const button of document.querySelectorAll("button[data-part-time=give_back]")) {
+    button.addEventListener("click", async () => {
+      const jobs = Number(button.dataset.jobs);
+      const detail = "This closes " + button.dataset.node + " and sends back " + jobs + " running job" + (jobs === 1 ? "" : "s")
+        + " to the queue; each starts again from its checkpoint elsewhere.";
+      if (await confirmInPage("Give " + button.dataset.node + " back?", detail, false)) partTime(button.dataset.node, "give_back", {});
+    });
+  }
+}
+
 document.addEventListener("DOMContentLoaded", () => {
+  partTimeControls();
   if (document.querySelector("[data-live]")) setInterval(refreshLive, REFRESH_MS);
   if (document.querySelector("[data-tip]")) tooltips();
   const log = document.getElementById("log-viewer");

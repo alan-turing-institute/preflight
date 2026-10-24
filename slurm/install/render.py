@@ -26,6 +26,10 @@ EXEC_MODE = 0o755
 SECRET_MODE = 0o600
 #: slurm's SlurmUser; `templates/slurm/slurm.conf` sets the same name.
 SLURM_USER = "slurm"
+#: The part-time nodes' NodeName lines live in their own file, which slurm.conf includes (no path, so configless ships it):
+#: the agent rewrites it when an admin changes a machine's memory or kept cores on the page (agent.py, B4).
+PART_TIME_CONF = "part_time_nodes.conf"
+PART_TIME_CONF_PATH = f"/etc/slurm/{PART_TIME_CONF}"
 #: Slurm's default memory for a job that names none, capped below at the smallest node (bigger refuses such jobs).
 DEF_MEM_MB = 16384
 
@@ -62,6 +66,18 @@ def _node_line(node: Node) -> str:
         f"NodeName={node.name}{address} CPUs={node.cpus} Boards=1 SocketsPerBoard=1 CoresPerSocket={node.cpus} "
         f"ThreadsPerCore=1 RealMemory={node.real_memory_mb}{spec}{gres} State=UNKNOWN\n"
     )
+
+
+def part_time_nodes_conf(site: Site) -> str:
+    """The part-time nodes' NodeName lines: the content of `part_time_nodes.conf` ("" when the site has none)."""
+    if not site.part_time_nodes:
+        return ""
+    return ("# The part-time nodes: written by slurm/install/render.py, and by the agent when the page changes a\n"
+            "# machine's memory or kept cores.\n" + "".join(_node_line(n) for n in site.part_time_nodes))
+
+
+def _part_time_include(site: Site) -> str:
+    return f"# The part-time nodes are in their own file.\nInclude {PART_TIME_CONF}\n" if site.part_time_nodes else ""
 
 
 def _health_lines(site: Site) -> str:
@@ -132,7 +148,8 @@ def _slurm(site: Site, extra: dict[str, str]) -> dict[str, FileSpec]:
         "partition_nodes": ",".join(names),
         # slurm.conf(5) MaxCPUsPerNode: a partition limited to a subset of the cores keeps the rest for GPU jobs
         "cpu_job_limit": f" MaxCPUsPerNode={site.cpu_job_cap}" if site.cpu_job_cap else "",
-        "node_lines": "".join(_node_line(n) for n in site.nodes),
+        "node_lines": "".join(_node_line(n) for n in site.full_nodes),
+        "part_time_include": _part_time_include(site),
         "gres_lines": gres_lines,
         "admin_group": site.admin_group,
         "service_partition": _service_partition(site, names),
@@ -152,6 +169,8 @@ def _slurm(site: Site, extra: dict[str, str]) -> dict[str, FileSpec]:
             _template("slurm", "mariadb-slurm.cnf").substitute(values), FILE_MODE, "root"
         ),
     }
+    if site.part_time_nodes:  # owned by SlurmUser: the agent, which runs as it, rewrites the file in place
+        out[PART_TIME_CONF_PATH] = FileSpec(part_time_nodes_conf(site), FILE_MODE, SLURM_USER)
     dropin = _template("slurm", DROPIN).substitute(values)
     for unit in UNITS:
         out[f"/etc/systemd/system/{unit}.service.d/{DROPIN}"] = FileSpec(dropin, FILE_MODE, "root")

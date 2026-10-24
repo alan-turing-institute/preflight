@@ -160,10 +160,17 @@ def test_part_time_node_and_health_check():
         "HealthCheckInterval=45",
         "HealthCheckNodeState=ANY",
         "SlurmctldParameters=enable_configless",
-        "NodeName=lap NodeAddr=100.64.0.2 CPUs=22 Boards=1 SocketsPerBoard=1 CoresPerSocket=22 ThreadsPerCore=1 "
-        "RealMemory=33000 CpuSpecList=12-21 MemSpecLimit=13000 State=UNKNOWN",
+        "Include part_time_nodes.conf",
         "PartitionName=part_time Nodes=lap PriorityTier=1 PreemptMode=OFF MaxTime=INFINITE State=UP",
     ]
+    # the part-time node's line is in its own file, owned by SlurmUser so the agent can rewrite it; slurm.conf has no copy
+    part_time = render.render(site, "slurm")[render.PART_TIME_CONF_PATH]
+    assert (part_time.mode, part_time.owner) == (0o644, "slurm")
+    assert [ln for ln in part_time.content.splitlines() if not ln.startswith("#")] == [
+        "NodeName=lap NodeAddr=100.64.0.2 CPUs=22 Boards=1 SocketsPerBoard=1 CoresPerSocket=22 ThreadsPerCore=1 "
+        "RealMemory=33000 CpuSpecList=12-21 MemSpecLimit=13000 State=UNKNOWN"]
+    assert "NodeName=lap" not in conf and render.PART_TIME_CONF_PATH not in render.render(
+        site_config.parse({**raw, "nodes": raw["nodes"][:1]}), "slurm")
     assert "SlurmctldHost=head\n" in conf and "Nodes=lap" not in conf.replace("PartitionName=part_time Nodes=lap", "")
     # without [health_check]: no health-check lines and no per-node file; with it, one entry per node, GB as decimal MB
     tools = importlib.import_module("components.tools")
