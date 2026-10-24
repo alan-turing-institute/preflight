@@ -58,6 +58,7 @@ class Fake:
             slurm_dir=Path("/slurm"),
             host=lambda: "box",
             keeper=lambda: {"blockers": []},
+            idle=lambda: [{"text": "Waiting: #596 needs all memory; #611 p holds 24.0 GB (restart, cannot be moved) <b>"}],
             live_memory=lambda _j: {"gpu": 3 * 1024**3},
             finished=lambda _j: None,
             now=lambda: datetime(2026, 10, 19, 12, 0),  # noqa: DTZ001 - local, like the times sacct prints
@@ -111,6 +112,7 @@ def test_every_get_route_answers(path: str) -> None:
     assert all(user == {"7": "alice", "8": "bob"}[job_id] for job_id, user in fake.asked)
     if path == "/":  # both jobs hold a GPU; a CPU-only job running beside them is not said to be on it
         assert "On the GPU now" in body and "on the GPU now" in body
+        assert "Waiting: #596 needs all memory; #611 p holds 24.0 GB (restart, cannot be moved) &lt;b&gt;" in body  # the agent's idle finding, escaped
         assert (app._running_note(2, 0), app._running_note(2, 1)) == ("none on the GPU", "1 on the GPU")
         # each resource as reserved by jobs (of what slurm can give) beside really in use (of the whole machine), in GB
         assert "Reserved by jobs" in body and "1 of 1" in body and "37%" in body

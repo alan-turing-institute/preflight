@@ -77,6 +77,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import gpu_jobs  # the path is set just above
+import jobs_view
 import levels
 import site_config
 
@@ -116,6 +117,27 @@ PART_TIME_REQUEST = re.compile(r"part_time-(.+)-(\d+)\.json")
 THRESHOLD_FIELDS = {"close_below_gb": "close_below_mb", "push_back_below_gb": "push_back_below_mb"}
 MAX_THRESHOLD_GB = 1000
 RESUME_PROTECTED = frozenset({gpu_jobs.Partition.URGENT, gpu_jobs.Partition.SERVICE})
+
+#: The idle check (Part C2) looks this often, and tells one project about one holder at most this often.
+IDLE_EVERY_S = 600.0
+IDLE_NOTICE_EVERY_S = 3600.0
+#: Unreserved memory this large (decimal GB) counts as idle, as does one free core or an unreserved GPU.
+IDLE_MEMORY_GB = 8
+#: Holders named per finding (and told per look), largest first.
+IDLE_HOLDERS = 3
+#: Waiting for room, as opposed to a dependency, a hold or a begin time.
+IDLE_WAITING_REASONS = frozenset({gpu_jobs.Reason.RESOURCES, gpu_jobs.Reason.PRIORITY})
+#: Partitions whose `resume` jobs slurm requeues for a waiting job; a `cpu` job is never moved until it has a fill partition.
+MOVABLE_PARTITIONS = frozenset({gpu_jobs.Partition.NORMAL, gpu_jobs.Partition.PART_TIME})
+
+
+class IdleRule(StrEnum):
+    """What a waiting job lacks while the machine has something idle."""
+
+    MEMORY = "memory"
+    CORES = "cores"
+    CPU_CORE_CAP = "cpu_core_cap"
+    GPU = "gpu"
 
 
 class PartTimeAction(StrEnum):
@@ -203,6 +225,96 @@ def notify_run(argv: list[str], env: dict[str, str]) -> None:
 
 
 @dataclass
+class Holder:
+    job: str
+    project: str
+    amount: str  # with its unit: "24.0 GB", "8 cores", "1 GPU"
+    job_class: str
+    movable: bool
+
+    @property
+    def text(self) -> str:
+        return (f"#{self.job} {self.project} holds {self.amount} "
+                f"({self.job_class}, {'can be moved' if self.movable else 'cannot be moved'})")
+
+
+@dataclass
+class IdleFinding:
+    waiting: str
+    project: str
+    lacks: str
+    rule: IdleRule
+    holders: list[Holder]
+    idle: str  # what is unused meanwhile
+    since: int = 0
+
+    @property
+    def text(self) -> str:
+        held = "; ".join(h.text for h in self.holders) or "no running job holds it"
+        return gpu_jobs.printable(f"Waiting: #{self.waiting} needs {self.lacks}; {held}")
+
+
+def _gb(mb: float) -> float:
+    """Slurm's MB (binary) as decimal GB."""
+    return mb * 1048576 / 1e9
+
+
+def _holder(job: gpu_jobs.QueuedJob, amount: str) -> Holder:
+    cls = job.job_class
+    movable = cls is gpu_jobs.JobClass.RESUME and job.partition in MOVABLE_PARTITIONS
+    return Holder(job.job_id, jobs_view.project_of(job.name), amount, cls.value if cls else "unknown class", movable)
+
+
+def idle_findings(queue: list[gpu_jobs.QueuedJob], total: dict[str, int], cpu_cap: int | None) -> list[IdleFinding]:
+    """One finding per job waiting for room while the machine has a GPU unreserved, a core free or memory unreserved.
+
+    `total` is `gpu_jobs.capacity()`. The lacking resource is the first of memory, cores, the cpu partition's core cap
+    and GPUs the job asks for more of than is free; its holders are the running jobs holding it, largest first."""
+    free_mem, free_cpus = total["mem_mb"] - total["mem_used_mb"], total["cpus"] - total["cpus_used"]
+    free_gpus = total["gpus"] - total["gpus_used"]
+    idle = [
+        what for what, unused in (
+            ("a GPU unreserved", total["gpus"] and not total["gpus_used"]),
+            (f"{free_cpus} cores free", free_cpus >= 1),
+            (f"{_gb(free_mem):.1f} GB unreserved", _gb(free_mem) >= IDLE_MEMORY_GB),
+        ) if unused
+    ]
+    if not idle:
+        return []
+    active = [j for j in queue if j.active]
+    in_cpu = [j for j in active if j.partition == gpu_jobs.Partition.CPU]
+    found = []
+    for job in queue:
+        if job.state != gpu_jobs.State.PENDING or job.reason not in IDLE_WAITING_REASONS:
+            continue
+        need_mem = total["mem_mb"] if job.mem_mb == 0 else job.mem_mb or 0
+        cpu_only = not job.gpus and gpu_jobs.Partition.CPU in job.partition.split(",")
+        held_mem = lambda j: total["mem_mb"] if j.mem_mb == 0 else j.mem_mb or 0  # noqa: E731
+        options = (
+            (IdleRule.MEMORY, need_mem > free_mem, "all memory" if job.mem_mb == 0 else f"{_gb(need_mem):.1f} GB memory",
+             [(held_mem(j), f"{_gb(held_mem(j)):.1f} GB", j) for j in active]),
+            (IdleRule.CORES, job.cpus > free_cpus, f"{job.cpus} cores", [(j.cpus, f"{j.cpus} cores", j) for j in active]),
+            (IdleRule.CPU_CORE_CAP, cpu_only and cpu_cap is not None and job.cpus + sum(j.cpus for j in in_cpu) > (cpu_cap or 0),
+             f"{job.cpus} cores under the cpu cap of {cpu_cap}", [(j.cpus, f"{j.cpus} cores", j) for j in in_cpu]),
+            (IdleRule.GPU, job.gpus > free_gpus, f"{job.gpus} GPU", [(j.gpus, f"{j.gpus} GPU", j) for j in active]),
+        )
+        for rule, lacking, lacks, held in options:
+            if lacking:
+                holders = [_holder(j, label) for amount, label, j in sorted(held, key=lambda h: -h[0])
+                           if amount > 0 and j.job_id != job.job_id][:IDLE_HOLDERS]
+                found.append(IdleFinding(job.job_id, jobs_view.project_of(job.name), lacks, rule, holders, ", ".join(idle)))
+                break
+    return found
+
+
+def read_idle(state_dir: Path | None = None) -> list[dict[str, object]]:
+    """The idle findings the agent last wrote (`agent/agent.json`), as plain dicts; [] when there are none."""
+    beat = gpu_jobs.read_json((state_dir or gpu_jobs.STATE_DIR) / "agent" / "agent.json") or {}
+    found = beat.get("idle")
+    return [f for f in found if isinstance(f, dict)] if isinstance(found, list) else []
+
+
+@dataclass
 class State:
     """What the agent has seen, kept in `agent/state.json` so a restart does not forget it."""
 
@@ -220,6 +332,8 @@ class State:
     part_time_done: list[str] = field(default_factory=list)  # "<file>:<mtime_ns>" of part-time requests carried out
     part_time_extra: dict[str, dict[str, object]] = field(default_factory=dict)  # node -> health-check limits the page set
     part_time_resources: dict[str, dict[str, object]] = field(default_factory=dict)  # node -> jobs_memory_gb, keep_cpus
+    idle_since: dict[str, int] = field(default_factory=dict)  # "<waiting job>:<rule>" -> when the finding first showed
+    idle_told: dict[str, float] = field(default_factory=dict)  # "<waiting job>:<holder job>" -> when it was last told
 
 
 def _by_id(job_id: str) -> tuple[int, str]:
@@ -384,6 +498,10 @@ class Agent:
             part_time_done=_strings(saved.get("part_time_done")),
             part_time_extra=_dicts(saved.get("part_time_extra")),
             part_time_resources=_dicts(saved.get("part_time_resources")),
+            idle_since={k: v for k, v in (saved.get("idle_since") or {}).items() if isinstance(v, int)}
+            if isinstance(saved.get("idle_since"), dict) else {},
+            idle_told={k: v for k, v in (saved.get("idle_told") or {}).items() if isinstance(v, (int, float))}
+            if isinstance(saved.get("idle_told"), dict) else {},
         )
         beat = gpu_jobs.read_json(self.dir / "agent.json") or {}
         self.boot_reconciled_at = beat.get("boot_reconciled_at")
@@ -397,6 +515,8 @@ class Agent:
         )  # nodes handled this boot, so a retry after a partial failure skips them
         self._ignored: set[str] = set()  # requests already logged as not from an admin
         self._notices_at = -NOTICES_EVERY_S  # the first step looks at once
+        self._idle_at = -IDLE_EVERY_S
+        self.idle: list[IdleFinding] = []  # the last check's findings, kept in agent.json until the next one
 
     # -- one step -------------------------------------------------------------------------------------------
 
@@ -416,6 +536,9 @@ class Agent:
                 self._make_room(queue, now, errors)
             self._pid_jobs = self._running_pids(queue)
             self._prune_oom_kills(queue)
+            if now - self._idle_at >= IDLE_EVERY_S:
+                self._idle_at = now
+                self._idle_check(queue, now, errors)
         if self.site.part_time_nodes:  # needs no queue: only slurm's node records
             self._part_time(errors)
         if self.watch is not None and self.watch.error:
@@ -444,6 +567,8 @@ class Agent:
                 "part_time_done": s.part_time_done,
                 "part_time_extra": s.part_time_extra,
                 "part_time_resources": s.part_time_resources,
+                "idle_since": s.idle_since,
+                "idle_told": s.idle_told,
             },
         )
 
@@ -455,6 +580,7 @@ class Agent:
             "last_error": self.last_error,
             "last_error_at": self.last_error_at,
             "note": self.note,
+            "idle": [dataclasses.asdict(f) | {"text": f.text} for f in self.idle],
         }
         gpu_jobs.write_json(self.dir / "agent.json", beat)
         return beat
@@ -897,6 +1023,39 @@ class Agent:
             self.notify(list(self.site.notify_command), env)
         except (OSError, subprocess.SubprocessError) as exc:
             errors.append(f"notify command for job {job_id} failed: {exc}")
+
+    # -- 5b. idle resources while jobs wait (Part C2) ----------------------------------------------------------
+
+    def _idle_check(self, queue: list[gpu_jobs.QueuedJob], now: float, errors: list[str]) -> None:
+        """Record who waits while the machine has something unused, log each new finding, and tell the holders' and the
+        waiting job's projects (once an hour per waiting job and holder, through the site's notify command)."""
+        s = self.state
+        total = gpu_jobs.capacity(self.scontrol)
+        if not total:
+            errors.append("scontrol did not answer; the idle check waits")
+            return
+        found = idle_findings(queue, total, self.site.cpu_job_cap)
+        seen = {f"{f.waiting}:{f.rule}" for f in found}
+        s.idle_since = {k: v for k, v in s.idle_since.items() if k in seen}
+        for finding in found:
+            key = f"{finding.waiting}:{finding.rule}"
+            if key not in s.idle_since:
+                print(f"[agent] idle ({finding.rule}): {finding.text}; unused: {finding.idle}", flush=True)
+            finding.since = s.idle_since.setdefault(key, int(now))
+        s.idle_told = {k: v for k, v in s.idle_told.items() if now - v < IDLE_NOTICE_EVERY_S}
+        users = {j.job_id: j.user for j in queue}
+        told = 0
+        for finding in found:
+            for holder in finding.holders:
+                key = f"{finding.waiting}:{holder.job}"
+                if key in s.idle_told or told >= NOTICES_PER_LOOK:
+                    continue
+                s.idle_told[key] = now
+                told += 1
+                message = (f"idle resources ({finding.rule}): {finding.project} job #{finding.waiting} waits, "
+                           f"{holder.project} job #{holder.job} holds it; {finding.text}")
+                self._notify(finding.waiting, "idle", users.get(finding.waiting, ""), message, errors)
+        self.idle = found
 
     # -- 6. OOM guard kills ----------------------------------------------------------------------------------
 
