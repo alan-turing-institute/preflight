@@ -615,7 +615,7 @@ def test_part_time_apply_refuses_without_the_trust_flag_or_the_controllers_slurm
             apply_part_time(site, tmp_path, "--i-accept-cluster-trust")
     finally:
         components.set_runner(None)
-    assert ["systemctl", "enable", "--now", "munge", "slurmd"] not in fake.calls
+    assert not any(c[:2] == ["systemctl", "enable"] and "slurmd" in c for c in fake.calls)
 
 
 @pytest.mark.parametrize("firewalld", [True, False])
@@ -648,7 +648,11 @@ def test_part_time_apply_adds_the_flag_to_the_packages_unit_and_opens_the_port_o
     rule = "--add-rich-rule=rule family=ipv4 source address=100.2.2.2 port port=6818 protocol=tcp accept"
     assert (["firewall-cmd", "--permanent", rule] in calls) is firewalld
     assert (["firewall-cmd", "--reload"] in calls) is firewalld
-    assert calls[-1] == ["systemctl", "enable", "--now", "munge", "slurmd"]
+    assert calls[-1] == ["systemctl", "enable", "munge", "slurmd"]  # no key here yet (Fedora): enabled for boot, not started
+    key = tmp_path / "root/etc/munge/munge.key"
+    key.parent.mkdir(parents=True)
+    key.write_text("k")
+    assert importlib.import_module("components.part_time")._enable_services() == [["systemctl", "enable", "--now", "munge", "slurmd"]]  # the key is here: start now
     assert (tmp_path / "root/opt/gpujobs").exists()  # the tools component, so node_check.py is there
 
 

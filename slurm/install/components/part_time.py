@@ -129,7 +129,8 @@ def cmd_add(site, args) -> int:
         raise SystemExit(f"FAILED ({done.returncode}): copying the munge key to {node.address}\n"
                          f"{(done.stderr or b'').decode(errors='replace')}".rstrip())
     # a munge already running holds the key it started with
-    components.run(_on_node(node.address, "sudo", "-n", "systemctl", "try-restart", "munge", "slurmd"))
+    # restart, not try-restart: on Fedora munge has no key until now, so neither unit has started yet
+    components.run(_on_node(node.address, "sudo", "-n", "systemctl", "restart", "munge", "slurmd"))
     print(f"{node.name}: user ids match and the munge key is copied (not shown)")
     if not site.shared_state:
         _authorize_copy_back(site, node, host_key)
@@ -243,6 +244,15 @@ def _write_noop_hooks() -> list[list[str]]:
     return []
 
 
+def _enable_services() -> list[list[str]]:
+    """Enable munge and slurmd for every boot; start them now only when the controller's key is already here (Fedora's
+    munge makes none, and `part-time add` copies the key and starts both)."""
+    if (components.ROOT / MUNGE_KEY.lstrip("/")).exists():
+        return [["systemctl", "enable", "--now", "munge", "slurmd"]]
+    print("munge has no key yet: munge and slurmd are enabled and start when `part-time add` has copied the controller's key")
+    return [["systemctl", "enable", "munge", "slurmd"]]
+
+
 def _after(action) -> list[list[str]]:
     """Run a step that does its own work, then add no commands."""
     action()
@@ -289,6 +299,6 @@ def steps(site, args, manager: str, tools_apply, site_copy_apply) -> list:
         lambda: _write_drop_in(args.controller),
         _write_noop_hooks,
         lambda: _firewall(args.controller),
-        ["systemctl", "enable", "--now", "munge", "slurmd"],
+        _enable_services,
     ]
 
