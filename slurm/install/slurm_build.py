@@ -39,8 +39,11 @@ RPM_TOOLS = ["dnf", "install", "-y", "rpm-build", "dnf-plugins-core", "tar", "bz
 #: SchedMD's spec builds neither unless asked: without cgroupv2 slurmd cannot start on a cgroup v2 system (Fedora is one:
 #: "cannot create cgroup context for cgroup/v2", found joining the laptop), and hwloc gives the CPU topology the Debian
 #: build gets. `dnf builddep` of the spec as it stands does not list their development packages.
-RPM_WITH = ["--with", "cgroupv2", "--with", "hwloc"]
-RPM_EXTRA_DEVEL = ["dnf", "install", "-y", "dbus-devel", "hwloc-devel", "kernel-headers", "libbpf-devel"]
+#: json-c gives `scontrol --json` and `squeue --json` (the health check and our tools read them); the others match what the
+#: Debian build has (yaml, curl, http-parser, lz4).
+RPM_WITH = ["--with", "cgroupv2", "--with", "hwloc", "--with", "yaml", "--with", "libcurl"]
+RPM_EXTRA_DEVEL = ["dnf", "install", "-y", "dbus-devel", "hwloc-devel", "kernel-headers", "libbpf-devel", "json-c-devel",
+                   "libyaml-devel", "libcurl-devel", "http-parser-devel", "lz4-devel"]
 DEB_TOOLS = ["apt-get", "install", "-y", "build-essential", "fakeroot", "devscripts", "equivs"]
 
 Download = Callable[[str, Path], None]
