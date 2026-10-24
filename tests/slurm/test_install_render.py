@@ -173,6 +173,7 @@ def test_part_time_node_and_health_check():
     assert [ln for ln in added if not ln.startswith("#")] == [
         "HealthCheckProgram=/opt/gpujobs/slurm/node_check.py",
         "HealthCheckInterval=45",
+        "HealthCheckTimeout=40",  # below the interval, or slurmd logs an error
         "HealthCheckNodeState=ANY",
         "SlurmctldParameters=enable_configless",
         "Include part_time_nodes.conf",

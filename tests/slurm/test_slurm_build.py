@@ -67,7 +67,10 @@ def test_build_downloads_checks_builds_and_reuses_the_cache(tmp_path, text, fam,
         assert (["debuild", "-b", "-uc", "-us"], source) in fakes.ran
         assert names.index("tar") < names.index("mk-build-deps") < names.index("debuild")
     else:
-        assert names == ["rpmbuild"] and fakes.ran[0][0][1] == "-ta"
+        assert names == ["dnf", "tar", "dnf", "dnf", "rpmbuild"]
+        built = fakes.ran[-1][0]
+        assert built[1] == "-ta" and ["--with", "cgroupv2", "--with", "hwloc"] == built[3:7]  # no cgroup v2 plugin, no slurmd on Fedora
+        assert fakes.ran[2][0][:3] == ["dnf", "builddep", "-y"] and "dbus-devel" in fakes.ran[3][0]
     workdir = cache / "26.05.5" / f"{fam}-{platform.machine()}"
     assert (workdir / sb.MARKER).read_text().strip() == SHA  # written once the build finished
     assert sb.build("26.05.5", SHA, cache, **kwargs) == packages  # the second call builds and downloads nothing

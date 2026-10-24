@@ -298,6 +298,7 @@ def steps(site, args, manager: str, tools_apply, site_copy_apply) -> list:
         lambda: _copy_back_node(site),
         lambda: _write_drop_in(args.controller),
         _write_noop_hooks,
+        ["install", "-d", "-m", "0755", "/var/log/slurm"],  # the controller's slurm.conf logs slurmd there; Fedora's rpm makes no such directory
         lambda: _firewall(args.controller),
         _enable_services,
     ]

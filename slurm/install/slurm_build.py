@@ -35,6 +35,12 @@ DOWNLOAD_TIMEOUT_S = 60
 #: client commands and the base package. The rest of what the build leaves (-dev, -doc, -dbgsym, sview, ...) is not.
 DEB_INSTALL = ["slurm-smd", "slurm-smd-client", "slurm-smd-slurmctld", "slurm-smd-slurmd", "slurm-smd-slurmdbd"]
 RPM_INSTALL = ["slurm", "slurm-perlapi", "slurm-slurmctld", "slurm-slurmd", "slurm-slurmdbd"]
+RPM_TOOLS = ["dnf", "install", "-y", "rpm-build", "dnf-plugins-core", "tar", "bzip2"]
+#: SchedMD's spec builds neither unless asked: without cgroupv2 slurmd cannot start on a cgroup v2 system (Fedora is one:
+#: "cannot create cgroup context for cgroup/v2", found joining the laptop), and hwloc gives the CPU topology the Debian
+#: build gets. `dnf builddep` of the spec as it stands does not list their development packages.
+RPM_WITH = ["--with", "cgroupv2", "--with", "hwloc"]
+RPM_EXTRA_DEVEL = ["dnf", "install", "-y", "dbus-devel", "hwloc-devel", "kernel-headers", "libbpf-devel"]
 DEB_TOOLS = ["apt-get", "install", "-y", "build-essential", "fakeroot", "devscripts", "equivs"]
 
 Download = Callable[[str, Path], None]
@@ -116,7 +122,12 @@ def commands(fam: Family, version: str, tarball: Path, source: Path) -> list[tup
                 (["tar", "xjf", str(tarball)], workdir),
                 (["mk-build-deps", "-i", "-r", "-t", MK_BUILD_DEPS_TOOL, "debian/control"], source),
                 (["debuild", "-b", "-uc", "-us"], source)]  # the debs land in the parent directory, `workdir`
-    return [(["rpmbuild", "-ta", str(tarball), "--define", f"_topdir {workdir / 'rpmbuild'}"], workdir)]
+    spec = f"slurm-{version}/slurm.spec"
+    return [(RPM_TOOLS, workdir),
+            (["tar", "xjf", str(tarball), "-C", str(workdir), spec], workdir),
+            (["dnf", "builddep", "-y", str(workdir / spec)], workdir),
+            (RPM_EXTRA_DEVEL, workdir),
+            (["rpmbuild", "-ta", str(tarball), *RPM_WITH, "--define", f"_topdir {workdir / 'rpmbuild'}"], workdir)]
 
 
 def build(version: str, sha256: str, cache_root: Path = DEFAULT_CACHE, *, download: Download = _download,

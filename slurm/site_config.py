@@ -280,8 +280,9 @@ def _check_part_time(node: Node, where: str) -> None:
 
 def _parse_health_check(raw: Any) -> HealthCheck:
     t = _table(raw, "health_check", set(), {"interval_s": 30})
-    if type(t["interval_s"]) is not int or t["interval_s"] < 1:
-        raise SiteError(f"site file: health_check.interval_s = {t['interval_s']!r}; expected a whole number of seconds, 1 or more")
+    if type(t["interval_s"]) is not int or t["interval_s"] < 10:
+        raise SiteError(f"site file: health_check.interval_s = {t['interval_s']!r}; expected a whole number of seconds, 10 or more "
+                        "(slurm's HealthCheckTimeout must stay below it)")
     return HealthCheck(t["interval_s"])
 
 
