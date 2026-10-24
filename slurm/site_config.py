@@ -160,6 +160,7 @@ class Site:
     slurm_build: tuple[str, str] | None = None  # ([slurm] version, sha256): build that release, not the distro's slurm
     slurm_steps: tuple[tuple[str, str], ...] = ()  # ([slurm] steps) the releases `upgrade-slurm` passes through, in order
     health_check: HealthCheck | None = None  # None: no health-check lines and no node_check.json
+    constrain_devices: bool = True  # cgroup.conf ConstrainDevices: a job sees only the GPUs it holds
 
     @property
     def cpu_job_cap(self) -> int | None:
@@ -342,6 +343,7 @@ def parse(raw: dict[str, Any]) -> Site:
             "health_check": None,
             "hostguard": False,
             "dgx_gate": False,
+            "constrain_devices": True,
             "metrics": {},
             "portal": {},
             "notify_command": [],
@@ -410,6 +412,7 @@ def parse(raw: dict[str, Any]) -> Site:
         slurm_build=slurm[0],
         slurm_steps=slurm[1],
         health_check=_parse_health_check(top["health_check"]) if top["health_check"] is not None else None,
+        constrain_devices=top["constrain_devices"],
     )
 
 

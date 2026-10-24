@@ -22,6 +22,9 @@ unified_memory = false
 hostguard = false
 # Require the DGX submission gate for jobs submitted with --entry. Default: false
 dgx_gate = false
+# Confine each job to the GPUs it holds (cgroup.conf ConstrainDevices). Turn off only where the host cannot load slurm's
+# BPF device filter (a container): slurm 26.05 fails every job launch there, 23.11 only logged it. Default: true
+constrain_devices = true
 # Command (argv, no shell) run when a job fails, with GPUJOBS_JOB, GPUJOBS_STATE, GPUJOBS_USER and GPUJOBS_NAME in its
 # environment; empty means no notification. Default: []
 notify_command = []

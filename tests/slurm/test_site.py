@@ -63,6 +63,7 @@ def test_example_loads_and_minimal_file_gets_every_default(tmp_path: Path) -> No
     assert site.metrics.allow_from == ()
     assert site.nodes[0].gpus == ()
     assert site.cluster_name == site.name and site.account == "gpujobs"  # defaults
+    assert site.constrain_devices  # default: jobs are confined to their GPUs
     assert site.service is None  # no [service] table: no service partition
     service = gpujobs_site.load(write(tmp_path, MINIMAL + "[service]\ncores = 2\n")).service
     assert service == gpujobs_site.Service(2, "gpujobs-service")  # no cores held for GPUs: up to the node's cores

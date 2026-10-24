@@ -108,6 +108,7 @@ def test_eight_gpu_site_and_extra_slot():
     raw = {
         "name": "big",
         "admin_group": "ops",
+        "constrain_devices": False,
         "nodes": [
             {
                 "name": "n1",
@@ -122,6 +123,7 @@ def test_eight_gpu_site_and_extra_slot():
     }
     site = site_config.parse(raw)
     files = render.render(site, "slurm", {"slurm_conf": "Prolog=/x"})
+    assert "\nConstrainDevices=no\n" in files["/etc/slurm/cgroup.conf"].content  # the golden default is yes
     gres = files["/etc/slurm/gres.conf"].content.splitlines()
     assert [ln for ln in gres if not ln.startswith("#")] == [
         f"NodeName=n1 Name=gpu Type=h100 File=/dev/nvidia{i}" for i in range(8)

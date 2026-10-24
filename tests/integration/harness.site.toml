@@ -10,6 +10,8 @@ admin_group = "gpujobs-admin"
 unified_memory = false
 hostguard = true                  # the installed job wrapper must find hostguard beside install_dir/slurm
 dgx_gate = false
+# Containers cannot load slurm's BPF device filter, which 26.05 treats as fatal (23.11 only logged it); real machines keep true.
+constrain_devices = false
 notify_command = ["/usr/local/bin/harness-notify"]   # e2e.py installs this script; the agent runs it on a failure
 
 # The container's node as the bootstrap slurm.conf declares it. Four fake GPUs: slurm 23.11.4 refuses a bare count,
