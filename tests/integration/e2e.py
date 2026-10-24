@@ -1444,7 +1444,7 @@ def stage_upgrade() -> None:
                                    f"steps = ['{':'.join(UPGRADE_STEPS)}']\n")
     put(UPGRADE_SITE, site)
     done = sh(f"{INSTALL} upgrade-slurm --site {UPGRADE_SITE}", timeout=UPGRADE_TIMEOUT_S)
-    check("upgrade-slurm exits 0 after both steps", done.rc == 0, done.text[:600] + " ... " + done.text[-1500:])
+    check("upgrade-slurm exits 0 after both steps", done.rc == 0, done.text[-330:])
     after = sh("sinfo -V").text
     check("slurm now reports the site file's release", UPGRADE_TARGET[0] in after and before != after, f"{before} -> {after}")
     backups = sh("ls -d /var/backups/gpujobs/slurm-*/slurm_acct_db.sql /var/backups/gpujobs/slurm-*/state_save.tar.gz "
