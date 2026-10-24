@@ -9,7 +9,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import audit  # noqa: E402 - path set just above
+import agent  # noqa: E402 - path set just above
+import audit  # noqa: E402
 import gpu_jobs  # noqa: E402
 import jobs_view  # noqa: E402
 from wait import all_sidecars
@@ -56,6 +57,7 @@ def lines(queue: list[gpu_jobs.QueuedJob] | None) -> list[str]:
             f" | {record.get('mem') or 'default mem'}, {_pauses(job)}"
             f" | {record.get('what', '(no sidecar)')}{f' | {why}' if why else ''}"
         ))
+    out += [gpu_jobs.printable(f"[idle] {f['text']}") for f in agent.read_idle() if f.get("text")]
     out += audit.report(audit.unregistered())
     return out
 

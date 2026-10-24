@@ -216,6 +216,7 @@ class Backend:
     metrics_on: Callable[[], bool] = _metrics_on
     host: Callable[[], str] = _host
     keeper: Callable[[], Mapping[str, object]] = _keeper
+    idle: Callable[[], list[dict[str, object]]] = lambda: agent.read_idle()  # the agent's idle-resource findings
     live_memory: Callable[[str], Mapping[str, int]] = lambda job_id: _live_memory(job_id)
     finished: Callable[[str], jobs_view.HistoryRow | None] = jobs_view.finished_job
     now: Callable[[], datetime] = datetime.now
@@ -510,6 +511,20 @@ def _now_card(rows: list[dict[str, object]], keeper: Mapping[str, object], backe
     )
 
 
+def _idle_card(backend: Backend) -> str:
+    """What the agent found unused while jobs wait (Part C2), under the now card; nothing when there is no finding."""
+    texts = [str(f["text"]) for f in backend.idle() if f.get("text")]
+    if not texts:
+        return ""
+    lines = "".join(f'<div class="now-desc">{esc(t)}</div>' for t in texts)
+    return (
+        '<section class="card now" aria-label="Idle resources">'
+        '<div class="now-icon blocked"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">'
+        '<path d="M12 8v5M12 16h.01"/><circle cx="12" cy="12" r="9"/></svg></div>'
+        f'<div><div class="now-label">Resources idle while jobs wait</div>{lines}</div></section>'
+    )
+
+
 def _running_note(running: int, on_gpu: int) -> str:
     """The Running tile's line: how many of the running jobs hold the GPU (a CPU-only job runs beside it)."""
     if not running:
@@ -705,7 +720,7 @@ def index_page(backend: Backend, root: str = "") -> str:
     )
     body = _template("index.html").substitute(
         updated=now.strftime("%H:%M:%S"),
-        now=_now_card(rows, backend.keeper(), backend, root),
+        now=_now_card(rows, backend.keeper(), backend, root) + _idle_card(backend),
         tiles=tiles,
         queue=_queue_table(rows, root, now),
         recent=recent_html,

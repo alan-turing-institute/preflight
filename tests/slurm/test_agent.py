@@ -48,6 +48,7 @@ class World:
         self.running = ""  # squeue's "%i|%j|%P" lines for the jobs running on it
         self.nodes = {"n1": "IDLE", "n2": "IDLE+DRAIN"}
         self.writes: list[list[str]] = []  # every scontrol update / release, failed ones included
+        self.totals = ""  # CPUTot=.. fields of node n1 in `scontrol show nodes -o`, for the idle check
         self.fail: set[str] = set()  # scontrol subcommands that answer with an error
         self.records: dict[str, dict[str, str]] = {}
         self.notify_command: tuple[str, ...] = ()
@@ -72,7 +73,7 @@ class World:
                 return done(argv, out=self.running)
             case ["show", "nodes"]:
                 return done(
-                    argv, out="".join(f"NodeName={n} Arch=x\n" for n in self.nodes)
+                    argv, out="".join(f"NodeName={n} Arch=x {self.totals if n == 'n1' else ''}\n" for n in self.nodes)
                 )
             case ["show", "node"]:
                 return done(
@@ -572,3 +573,47 @@ def test_part_time_resources_rewrite_the_included_file_then_reconfigure(world: W
     world.part_time("2", action="resources", jobs_memory_gb=99)  # more than the machine has
     world.step()
     assert world.writes == [["reconfigure"]] and world.agent.state.part_time_resources["lap"]["jobs_memory_gb"] == 20
+
+
+def idle_world(world: World, *, gpus_used: int = 0, mem_used: int = 22888) -> World:
+    """The 596/611 case: a whole-box GPU job waits, a 24 GB `restart` CPU job runs, the GPU is unreserved."""
+    world.totals = (f"CPUTot=4 CPUAlloc=2 RealMemory=100000 AllocMem={mem_used} "
+                    f"CfgTRES=cpu=4,gres/gpu=1 AllocTRES=gres/gpu={gpus_used}")
+    waiting = gpu_jobs.QueuedJob("596", "normal", "PENDING", "Resources", "wait:resume:big", user="a", gpus=1, cpus=4, mem_mb=0)
+    holder = gpu_jobs.QueuedJob("611", "cpu", "RUNNING", "None", "crypto-quant-research:restart:scan", user="b", cpus=2, mem_mb=22888)
+    world.queue = [waiting, holder]
+    return world
+
+
+def test_a_whole_box_job_waiting_beside_a_restart_cpu_job_is_found_noticed_hourly_and_shown(world: World, tmp_path: Path) -> None:
+    sink = tmp_path / "notified"
+    script = "import os,sys; open(sys.argv[1],'a').write(os.environ['GPUJOBS_JOB']+' '+os.environ['GPUJOBS_NAME']+'\\n')"
+    world.notify_command = (sys.executable, "-c", script, str(sink))
+    idle_world(world)
+    world.agent = world.new_agent()
+    world.agent.notify = agent_module.notify_run
+    beat = world.step()
+    [finding] = beat["idle"]
+    assert finding["rule"] == "memory" and finding["since"] == 1000
+    assert finding["text"] == "Waiting: #596 needs all memory; #611 crypto-quant-research holds 24.0 GB (restart, cannot be moved)"
+    assert [(h["job"], h["movable"]) for h in finding["holders"]] == [("611", False)]
+    assert agent_module.read_idle(world.dir) == beat["idle"]
+    assert len(sink.read_text().splitlines()) == 1 and "wait job #596" in sink.read_text()
+    world.step()  # inside the 600 s timer: not looked at again
+    world.t += agent_module.IDLE_EVERY_S
+    world.step()
+    assert len(sink.read_text().splitlines()) == 1  # told once an hour per (waiting job, holder)
+    world.t += agent_module.IDLE_NOTICE_EVERY_S
+    world.step()
+    assert len(sink.read_text().splitlines()) == 2
+    assert world.step()["idle"][0]["since"] == 1000  # the same finding keeps its start
+
+
+def test_dependency_waiting_and_a_machine_with_nothing_idle_give_no_finding(world: World) -> None:
+    idle_world(world)
+    world.queue[0] = dataclasses.replace(world.queue[0], reason="Dependency")
+    assert world.step()["idle"] == []
+    idle_world(world, gpus_used=1)
+    world.totals = world.totals.replace("CPUAlloc=2", "CPUAlloc=4").replace("AllocMem=22888", "AllocMem=99000")
+    world.t += agent_module.IDLE_EVERY_S
+    assert world.step()["idle"] == []
