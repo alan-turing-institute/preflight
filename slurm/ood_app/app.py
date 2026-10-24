@@ -17,6 +17,7 @@ import shlex
 import stat
 import subprocess
 import sys
+import time
 from collections.abc import Callable, Iterable, Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -26,6 +27,7 @@ from pathlib import Path
 from string import Template
 from urllib.parse import parse_qs, urlencode, urlsplit
 
+import agent
 import gpu_jobs
 import jobs_view
 import site_config
@@ -108,6 +110,7 @@ JOB_ID = re.compile(r"\d+")
 WHEN = re.compile(r"\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}:\d{2})?")
 ROUTE_JOB = re.compile(r"/job/(\d+)")
 ROUTE_API = re.compile(r"/api/job/([^/]+)/([a-z-]+)")
+ROUTE_PART_TIME = re.compile(r"/api/part-time/([^/]+)/([a-z_]+)")
 
 
 class Action(StrEnum):
@@ -223,6 +226,9 @@ class Backend:
     run: Run = run_tool
     python: str = field(default_factory=lambda: sys.executable)
     slurm_dir: Path = SLURM_DIR
+    site: Callable[[], site_config.Site | None] = _site
+    part_time_state: Callable[[list[str]], Mapping[str, PartTimeState]] = lambda names: _part_time_state(names)
+    requests_dir: Path = field(default_factory=lambda: gpu_jobs.STATE_DIR / "requests")
 
 
 def esc(value: object) -> str:
@@ -696,6 +702,7 @@ def index_page(backend: Backend, root: str = "") -> str:
         tiles=tiles,
         queue=_queue_table(rows, root, now),
         recent=recent_html,
+        part_time=_part_time_card(backend),
     )
     return _page(backend, "Queue", body, root=root, tab=Tab.QUEUE)
 
@@ -1130,6 +1137,133 @@ def projects_page(backend: Backend, query: Mapping[str, list[str]], root: str = 
     return _page(backend, "Use per project", body, root=root, tab=Tab.PROJECTS)
 
 
+@dataclass(frozen=True)
+class PartTimeState:
+    """What slurm says about one part-time node, for its card."""
+
+    closed: bool
+    reason: str
+    free_mb: int | None
+    resume_jobs: int  # `resume` jobs running there: what "give me my machine back" requeues
+    extra: Mapping[str, object]  # the limits the page set (the node's `Extra` JSON), {} for none
+
+
+def _free_mb(value: object) -> int | None:
+    """slurm's `free_mem`: a number, or the {"set", "number"} form of its newer JSON."""
+    if isinstance(value, Mapping):
+        value = value.get("number") if value.get("set") else None
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _part_time_state(names: list[str]) -> dict[str, PartTimeState]:
+    """The nodes' state from `scontrol show node --json`, and each one's running `resume` jobs from `squeue`."""
+    try:
+        nodes = json.loads(jobs_view.run_command(["scontrol", "show", "node", ",".join(names), "--json"]))["nodes"]
+    except (ValueError, KeyError, TypeError):
+        return {}
+    out: dict[str, PartTimeState] = {}
+    for node in nodes:
+        name = str(node.get("name"))
+        try:
+            extra = json.loads(str(node.get("extra") or ""))
+        except ValueError:
+            extra = None
+        states = node.get("state") or []
+        listed = jobs_view.run_command(["squeue", "-h", "-t", "R", "-w", name, "-o", "%j"]).splitlines()
+        out[name] = PartTimeState(
+            closed=any(flag in states for flag in ("DRAIN", "DOWN")), reason=str(node.get("reason") or ""),
+            free_mb=_free_mb(node.get("free_mem")),
+            resume_jobs=sum(gpu_jobs.class_of(job) is gpu_jobs.JobClass.RESUME for job in listed),
+            extra=extra if isinstance(extra, dict) else {},
+        )
+    return out
+
+
+def _gb(megabytes: float) -> str:
+    return f"{megabytes / (GB / MB):g}"
+
+
+def _field(label: str, name: str, value: object, unit: str, kind: str = "number") -> str:
+    step = ' step="any" min="0"' if kind == "number" else ""
+    return (f'<label class="field">{esc(label)} <input name="{name}" type="{kind}"{step} value="{esc(value)}" '
+            f'aria-describedby="unit-{name}"> <span id="unit-{name}" class="meta">{esc(unit)}</span></label>')
+
+
+def _part_time_node(node: site_config.Node, state: PartTimeState | None) -> str:
+    """One machine: open or closed and why, its free memory, the switch, the give-back button and its settings."""
+    name = esc(node.name)
+    if state is None:
+        return f'<div class="part-time"><h3>{name}</h3><p class="meta">Slurm does not answer for this machine.</p></div>'
+    close_mb = state.extra.get("close_below_mb", node.close_below_mb)
+    push_mb = state.extra.get("push_back_below_mb", node.push_back_below_mb)
+    free = "unknown" if state.free_mb is None else _size(state.free_mb * MB)
+    why = f" · {esc(state.reason)}" if state.reason else ""
+    badge = _badge("paused", "Closed") if state.closed else _badge("running", "Open")
+    jobs_memory = "" if node.jobs_memory_gb is None else node.jobs_memory_gb
+    return (
+        f'<div class="part-time" data-node="{name}"><h3>{name} {badge}<span class="meta">{why}</span></h3>'
+        f'<p>Free memory on the machine: <b class="num">{esc(free)}</b></p>'
+        '<div class="actions">'
+        f'<label class="check"><input type="checkbox" data-part-time="switch" data-node="{name}"'
+        f'{"" if state.closed else " checked"}> Accept jobs</label>'
+        f'<button type="button" class="danger" data-part-time="give_back" data-node="{name}" '
+        f'data-jobs="{state.resume_jobs}">Give me my machine back</button></div>'
+        f'<form class="actions" data-part-time="thresholds" data-node="{name}">'
+        + _field("Close below", "close_below_gb", _gb(close_mb), "GB free")  # type: ignore[arg-type]
+        + _field("Push jobs back below", "push_back_below_gb", _gb(push_mb), "GB free")  # type: ignore[arg-type]
+        + '<button type="submit">Save limits</button></form>'
+        f'<form class="actions" data-part-time="resources" data-node="{name}">'
+        + _field("Memory for jobs", "jobs_memory_gb", jobs_memory, "GB (empty: all)")
+        + _field("Cores kept for you", "keep_cpus", node.keep_cpus or "", "e.g. 0-11", "text")
+        + '<button type="submit">Save resources</button></form></div>'
+    )
+
+
+def _part_time_card(backend: Backend) -> str:
+    """The admin-only card for the part-time machines; "" for anyone else and for a site without any."""
+    site = backend.site()
+    if site is None or not site.part_time_nodes or not backend.is_admin(backend.viewer()):
+        return ""
+    states = backend.part_time_state([n.name for n in site.part_time_nodes])
+    return (
+        '<section class="card" aria-labelledby="h-part-time"><div class="card-head"><h2 id="h-part-time">Part-time machines</h2>'
+        '<span class="meta">Other people\'s machines, lent to the cluster while they are idle</span></div>'
+        '<div class="card-body">' + "".join(_part_time_node(n, states.get(n.name)) for n in site.part_time_nodes)
+        + '<div id="part-time-result" class="notice" role="status"></div></div></section>'
+        '<dialog id="confirm" aria-labelledby="confirm-title"><form method="dialog"><h2 id="confirm-title"></h2>'
+        '<pre id="confirm-detail"></pre><p id="confirm-lose-label" hidden><label><input id="confirm-lose" type="checkbox"></label></p>'
+        '<div class="actions"><button id="confirm-no" value="no">Keep it</button>'
+        '<button id="confirm-yes" value="yes" class="danger">Confirm</button></div></form></dialog>'
+    )
+
+
+#: The request fields each part-time action may carry; anything else the page was sent is dropped.
+PART_TIME_FIELDS = {
+    agent.PartTimeAction.THRESHOLDS: ("close_below_gb", "push_back_below_gb", "mains_only"),
+    agent.PartTimeAction.RESOURCES: ("jobs_memory_gb", "keep_cpus"),
+}
+
+
+def part_time_request(backend: Backend, node: str, action: str, body: Mapping[str, object]) -> dict[str, object]:
+    """Leave a request for the agent (`requests/part_time-<node>-<ns>.json`); it checks the writer is an admin too.
+    The file is the viewer's own, which is how the agent knows who asked."""
+    site = backend.site()
+    if site is None or node not in {n.name for n in site.part_time_nodes}:
+        raise Refused("404 Not Found", "no such part-time machine")
+    if not backend.is_admin(backend.viewer()):
+        raise Refused("403 Forbidden", "only an admin changes a part-time machine")
+    try:
+        kind = agent.PartTimeAction(action)
+    except ValueError:
+        raise Refused("404 Not Found", "no such action") from None
+    payload = {"action": kind.value, **{k: body[k] for k in PART_TIME_FIELDS.get(kind, ()) if k in body}}
+    try:
+        gpu_jobs.write_json(backend.requests_dir / f"part_time-{node}-{time.time_ns()}.json", payload)
+    except OSError as exc:
+        return {"ok": False, "output": f"could not leave the request: {exc}"}
+    return {"ok": True, "output": "the agent applies it within a few seconds"}
+
+
 def _check_post(environ: Mapping[str, object]) -> None:
     """The cross-site and content-type defences every action goes through."""
     if environ.get("REQUEST_METHOD") != "POST":
@@ -1179,6 +1313,9 @@ def _json(payload: object) -> tuple[str, str, bytes]:
 def _api(backend: Backend, environ: Mapping[str, object], path: str, query: Mapping[str, list[str]]) -> tuple[str, str, bytes]:
     if path == "/api/jobs":
         return _json({"jobs": job_rows(backend)})
+    if match := ROUTE_PART_TIME.fullmatch(path):
+        _check_post(environ)
+        return _json(part_time_request(backend, match[1], match[2], _read_json(environ)))
     match = ROUTE_API.fullmatch(path)
     if not match:
         raise Refused("404 Not Found", "no such route")

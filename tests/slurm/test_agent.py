@@ -44,6 +44,8 @@ class World:
         self.queue: list[gpu_jobs.QueuedJob] | None = []
         self.t, self.boot, self.ctld_s = 1000.0, "boot-1", 60.0
         self.has_gpus = True
+        self.lap: dict[str, object] | None = None  # the part-time node `lap` as `scontrol show node --json` gives it; None: no such node
+        self.running = ""  # squeue's "%i|%j|%P" lines for the jobs running on it
         self.nodes = {"n1": "IDLE", "n2": "IDLE+DRAIN"}
         self.writes: list[list[str]] = []  # every scontrol update / release, failed ones included
         self.fail: set[str] = set()  # scontrol subcommands that answer with an error
@@ -64,6 +66,10 @@ class World:
         self, argv: list[str], **_kw: object
     ) -> subprocess.CompletedProcess[str]:
         match argv[1:3]:
+            case ["show", "node"] if "--json" in argv:
+                return done(argv, out=json.dumps({"nodes": [self.lap]}))
+            case ["-h", "-t"]:  # squeue -h -t R -w NODE
+                return done(argv, out=self.running)
             case ["show", "nodes"]:
                 return done(
                     argv, out="".join(f"NodeName={n} Arch=x\n" for n in self.nodes)
@@ -80,7 +86,9 @@ class World:
         gpus = [{"index": 0, "uuid": "GPU-x", "device": "/dev/nvidia0", "type": "t"}] if self.has_gpus else []
         nodes = [{"name": "n1", "cpus": 4, "real_memory_mb": 1000, "gpus": gpus}]
         site = site_config.parse(
-            {"name": "t", "nodes": nodes, "notify_command": list(self.notify_command), "metrics": {"mode": self.metrics_mode}}
+            {"name": "t", "nodes": nodes + ([{"name": "lap", "cpus": 8, "real_memory_mb": 30000, "part_time": True,
+                                               "address": "10.0.0.2"}] if self.lap else []),
+             "notify_command": list(self.notify_command), "metrics": {"mode": self.metrics_mode}}
         )
         return agent_module.Agent(
             site,
@@ -94,10 +102,16 @@ class World:
             gpu_usage=lambda: self.smi,
             cgroup_root=self.cgroups,
             pid_job=lambda pid: self.live.get(pid),
+            part_time_conf=self.dir / "part_time_nodes.conf",
         )
 
     def step(self) -> dict[str, object]:
         return self.agent.step()
+
+    def part_time(self, name: str, **request: object) -> Path:
+        path = self.dir / "requests" / f"part_time-lap-{name}.json"
+        gpu_jobs.write_json(path, request)
+        return path
 
     def request(self, urgent: str, victims: list[str], held: list[str]) -> Path:
         path = self.dir / "requests" / "restore_order-1.json"
@@ -490,3 +504,67 @@ def test_a_service_job_that_does_not_start_once_room_is_made_gets_it_taken_back(
     world.t += agent_module.ROOM_RETRY_S
     world.step()
     assert ["suspend", "2"] in world.writes  # ...then helped again
+
+
+def test_part_time_requests_are_an_admins_and_each_does_exactly_its_own_thing(world: World) -> None:
+    world.lap = {"name": "lap", "state": ["IDLE"], "reason": "", "extra": ""}
+    world.agent = world.new_agent()
+    asked = world.part_time("1", action="close")
+    world.step()
+    assert world.writes == []  # the writer is not an admin: nothing is closed
+    world.admins = {gpu_jobs._owner(asked)}
+    world.step()
+    assert world.writes == [["update", "NodeName=lap", "State=DRAIN", f"Reason={agent_module.CLOSED_FROM_PAGE}"]]
+    assert not asked.exists()
+    world.writes.clear()
+    # accept resumes only the page's own drain: never the health check's, never an operator's
+    world.lap.update(state=["IDLE", "DRAIN"], reason="gpujobs-check: 4 GB free")
+    world.part_time("2", action="accept")
+    world.step()
+    assert world.writes == []
+    world.lap["reason"] = agent_module.CLOSED_FROM_PAGE
+    world.part_time("3", action="accept")
+    world.step()
+    assert world.writes == [["update", "NodeName=lap", "State=RESUME"]]
+    # give back: drain, then requeue the `resume` jobs there and no other
+    world.writes.clear()
+    world.running = "11|p:resume:a|part_time\n12|p:steady:b|part_time\n13|p:resume:c|urgent\n"
+    world.part_time("4", action="give_back")
+    world.step()
+    assert world.writes == [
+        ["update", "NodeName=lap", "State=DRAIN", f"Reason={agent_module.CLOSED_FROM_PAGE}"], ["requeue", "11"]]
+
+
+def test_part_time_limits_are_set_again_when_slurm_forgets_them_and_a_bad_pair_is_refused(world: World) -> None:
+    world.lap = {"name": "lap", "state": ["IDLE"], "reason": "", "extra": ""}
+    world.agent = world.new_agent()
+    world.admins = {gpu_jobs._owner(world.part_time("1", action="thresholds", close_below_gb=8, push_back_below_gb=3))}
+    world.step()
+    extra = 'Extra={"close_below_mb":8000,"push_back_below_mb":3000}'
+    assert world.writes == [["update", "NodeName=lap", extra]]
+    world.writes.clear()
+    world.lap["extra"] = json.dumps({"close_below_mb": 8000, "push_back_below_mb": 3000})
+    world.step()
+    assert world.writes == []  # slurm still has them
+    world.lap["extra"] = ""
+    world.step()
+    assert world.writes == [["update", "NodeName=lap", extra]]
+    world.writes.clear()
+    world.lap["extra"] = json.dumps({"close_below_mb": 8000, "push_back_below_mb": 3000})
+    world.part_time("2", action="thresholds", push_back_below_gb=9)  # above the close limit of 8
+    world.step()
+    assert world.writes == []
+    assert world.agent.state.part_time_extra["lap"]["push_back_below_mb"] == 3000
+
+
+def test_part_time_resources_rewrite_the_included_file_then_reconfigure(world: World) -> None:
+    world.lap = {"name": "lap", "state": ["IDLE"], "reason": "", "extra": ""}
+    world.agent = world.new_agent()
+    world.admins = {gpu_jobs._owner(world.part_time("1", action="resources", jobs_memory_gb=20, keep_cpus="0-3"))}
+    world.step()
+    conf = (world.dir / "part_time_nodes.conf").read_text()
+    assert "NodeName=lap NodeAddr=10.0.0.2 CPUs=8" in conf and "CpuSpecList=0-3 MemSpecLimit=10000" in conf
+    assert world.writes == [["reconfigure"]]
+    world.part_time("2", action="resources", jobs_memory_gb=99)  # more than the machine has
+    world.step()
+    assert world.writes == [["reconfigure"]] and world.agent.state.part_time_resources["lap"]["jobs_memory_gb"] == 20

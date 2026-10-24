@@ -282,3 +282,10 @@ dialog .actions { justify-content: flex-end; margin-top: 16px; }
   .chart svg { min-width: 640px; }
 }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+
+/* Part-time machines card */
+.part-time + .part-time { margin-top: 18px; padding-top: 18px; border-top: 1px solid var(--border); }
+.part-time h3 { font-size: 14px; font-weight: 650; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+.part-time h3 .meta { color: var(--muted); font-size: 12.5px; font-weight: 400; }
+.part-time form.actions { margin-top: 10px; align-items: flex-end; }
+.part-time .field input { width: 7rem; }

@@ -20,6 +20,12 @@ Plan 3.5 (`plan notes`). One system service, run as SlurmUser
    once the urgent job has left the queue and every victim is running, gone or held (a pre-empted victim can run
    again only after the urgent job; one slurm did not pre-empt never stopped). A file owned by a non-admin, or
    naming no urgent job, is ignored.
+3a. PART-TIME MACHINES (D22, sites with part-time nodes): `requests/part_time-<node>-<ns>.json` written by an admin from
+   the page: `accept` (resume the node, only when the page's own drain is what holds it, never a health-check or
+   foreign one), `close` (drain, reason `gpujobs-admin: closed from the page`), `give_back` (close, then requeue every
+   `resume` job running there), `thresholds` (the health check's limits, kept in the node's `Extra` and set again
+   whenever slurm's copy differs) and `resources` (jobs' memory and kept cores: rewrites `part_time_nodes.conf`, which
+   slurm.conf includes, then `scontrol reconfigure`). A request from a non-admin, or naming no part-time node, is ignored.
 3b. ROOM FOR SERVICE JOBS (D20, sites with `[service]`; `gpu_jobs.plan_room` decides): a `service` job (a background
    service's CPU stand-in, placed in the high band) waiting for cores that fits in memory gets them from the `cpu`
    jobs its owner agreed to, which the agent suspends (`scontrol suspend`: slurm takes back their cores, keeps their
@@ -55,6 +61,7 @@ paused, request already released) lives in `agent/state.json`, and deleting the 
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import os
 import re
@@ -72,6 +79,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import gpu_jobs  # the path is set just above
 import levels
 import site_config
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "install"))  # the installer ships render.py there
+
+import render  # noqa: E402 - path set just above
 
 BOOT_ID_FILE = Path("/proc/sys/kernel/random/boot_id")
 #: slurmctld must have been up this long before the nodes are re-registered (it needs time to read its state).
@@ -95,6 +106,26 @@ OOM_GUARD_UNIT = "earlyoom.service"
 KILL_LINE = re.compile(r'sending (SIGTERM|SIGKILL) to process (\d+) uid \d+ "')
 #: Seconds before a stopped journal follower is started again.
 WATCH_RETRY_S = 30.0
+
+
+#: The page's own drain of a part-time node; `accept` resumes a node only while its reason starts so.
+ADMIN_REASON_PREFIX = "gpujobs-admin: "
+CLOSED_FROM_PAGE = f"{ADMIN_REASON_PREFIX}closed from the page"
+PART_TIME_REQUEST = re.compile(r"part_time-(.+)-(\d+)\.json")
+#: The node `Extra` keys the health check reads (node_check.EXTRA_KEYS), by the request field that sets each.
+THRESHOLD_FIELDS = {"close_below_gb": "close_below_mb", "push_back_below_gb": "push_back_below_mb"}
+MAX_THRESHOLD_GB = 1000
+RESUME_PROTECTED = frozenset({gpu_jobs.Partition.URGENT, gpu_jobs.Partition.SERVICE})
+
+
+class PartTimeAction(StrEnum):
+    """The `action` of a `part_time-<node>-*.json` request."""
+
+    ACCEPT = "accept"
+    CLOSE = "close"
+    GIVE_BACK = "give_back"
+    THRESHOLDS = "thresholds"
+    RESOURCES = "resources"
 
 
 class EndedBadly(StrEnum):
@@ -186,6 +217,9 @@ class State:
     held: dict[str, int] = field(default_factory=dict)  # job -> when (ns) the agent held it while one is suspended
     helping: dict[str, float] = field(default_factory=dict)  # service job -> when the agent first suspended for it
     given_up: dict[str, float] = field(default_factory=dict)  # service job -> when it did not start once room was made
+    part_time_done: list[str] = field(default_factory=list)  # "<file>:<mtime_ns>" of part-time requests carried out
+    part_time_extra: dict[str, dict[str, object]] = field(default_factory=dict)  # node -> health-check limits the page set
+    part_time_resources: dict[str, dict[str, object]] = field(default_factory=dict)  # node -> jobs_memory_gb, keep_cpus
 
 
 def _by_id(job_id: str) -> tuple[int, str]:
@@ -283,6 +317,10 @@ def may_suspend(job: gpu_jobs.QueuedJob) -> frozenset[str] | None:
     return None
 
 
+def _dicts(value: object) -> dict[str, dict[str, object]]:
+    return {k: v for k, v in value.items() if isinstance(v, dict)} if isinstance(value, dict) else {}
+
+
 def _strings(value: object) -> list[str]:
     return [str(item) for item in value] if isinstance(value, list) else []
 
@@ -307,8 +345,10 @@ class Agent:
         gpu_usage: Callable[[], dict[int, float] | None] = gpu_jobs.gpu_usage,
         cgroup_root: Path = gpu_jobs.CGROUP_ROOT,
         pid_job: Callable[[int], str | None] = job_of_pid,
+        part_time_conf: Path = Path(render.PART_TIME_CONF_PATH),
     ) -> None:
         self.site = site
+        self.part_time_conf = part_time_conf
         self.state_dir, self.pid_job = state_dir, pid_job
         self.watch: OomWatch | None = None  # main() starts one; a test drives record_kill itself
         self._pid_jobs: dict[int, str] = {}  # each running job's processes at the last step, for a kill seen late
@@ -341,6 +381,9 @@ class Agent:
             if isinstance(saved.get("helping"), dict) else {},
             given_up={k: v for k, v in (saved.get("given_up") or {}).items() if isinstance(v, (int, float))}
             if isinstance(saved.get("given_up"), dict) else {},
+            part_time_done=_strings(saved.get("part_time_done")),
+            part_time_extra=_dicts(saved.get("part_time_extra")),
+            part_time_resources=_dicts(saved.get("part_time_resources")),
         )
         beat = gpu_jobs.read_json(self.dir / "agent.json") or {}
         self.boot_reconciled_at = beat.get("boot_reconciled_at")
@@ -373,6 +416,8 @@ class Agent:
                 self._make_room(queue, now, errors)
             self._pid_jobs = self._running_pids(queue)
             self._prune_oom_kills(queue)
+        if self.site.part_time_nodes:  # needs no queue: only slurm's node records
+            self._part_time(errors)
         if self.watch is not None and self.watch.error:
             errors.append(self.watch.error)
         if now - self._notices_at >= NOTICES_EVERY_S:
@@ -396,6 +441,9 @@ class Agent:
                 "held": s.held,
                 "helping": s.helping,
                 "given_up": s.given_up,
+                "part_time_done": s.part_time_done,
+                "part_time_extra": s.part_time_extra,
+                "part_time_resources": s.part_time_resources,
             },
         )
 
@@ -626,6 +674,162 @@ class Agent:
             s.released_requests.append(key)
             gpu_jobs.remove_quietly(path)
         s.released_requests = [key for key in s.released_requests if key in present]
+
+    # -- 3a. part-time machines ---------------------------------------------------------------------------
+
+    def _part_time(self, errors: list[str]) -> None:
+        s = self.state
+        nodes = {n.name for n in self.site.part_time_nodes}
+        present: set[str] = set()
+        self._reapply_extra(errors)  # before the requests: one a request has just set is not set twice
+        for path in sorted(self.requests.glob("part_time-*.json")):
+            match = PART_TIME_REQUEST.fullmatch(path.name)
+            try:
+                key, owner = f"{path.name}:{path.stat().st_mtime_ns}", gpu_jobs._owner(path)
+            except OSError:
+                continue
+            present.add(key)
+            if key in s.part_time_done:
+                continue
+            if not site_config.is_admin(self.site, owner):
+                self._ignore(path, f"owned by {owner}, not an admin")
+                continue
+            request = gpu_jobs.read_json(path)
+            if match is None or match[1] not in nodes or not request:
+                self._ignore(path, "it names no part-time node of this site")
+                continue
+            try:
+                action = PartTimeAction(request.get("action"))
+            except ValueError:
+                self._ignore(path, f"unknown action {request.get('action')!r}")
+                continue
+            if self._apply_part_time(action, match[1], request, errors):
+                s.part_time_done.append(key)
+                gpu_jobs.remove_quietly(path)
+        s.part_time_done = [key for key in s.part_time_done if key in present]
+
+    def _ignore(self, path: Path, why: str) -> None:
+        if path.name not in self._ignored:
+            self._ignored.add(path.name)
+            print(gpu_jobs.printable(f"[agent] ignoring {path}: {why}"), file=sys.stderr, flush=True)
+
+    def _node_json(self, node: str) -> dict[str, object] | None:
+        done = call(self.scontrol, ["scontrol", "show", "node", node, "--json"])
+        try:
+            found = json.loads(done.stdout)["nodes"][0] if done.returncode == 0 else None
+        except (ValueError, KeyError, IndexError):
+            found = None
+        return found if isinstance(found, dict) else None
+
+    def _scontrol_ok(self, argv: list[str], errors: list[str]) -> bool:
+        done = call(self.scontrol, ["scontrol", *argv])
+        if done.returncode != 0:
+            errors.append(f"scontrol {' '.join(argv[:2])} failed: {done.stderr.strip() or 'no answer'}")
+        return done.returncode == 0
+
+    def _apply_part_time(self, action: PartTimeAction, node: str, request: dict[str, object], errors: list[str]) -> bool:
+        """Carry out one request; False when it must be tried again (slurm did not answer or refused)."""
+        match action:
+            case PartTimeAction.CLOSE:
+                return self._close(node, errors)
+            case PartTimeAction.GIVE_BACK:
+                return self._close(node, errors) and self._requeue_resume_jobs(node, errors)
+            case PartTimeAction.ACCEPT:
+                info = self._node_json(node)
+                if info is None:
+                    errors.append(f"could not read node {node}; will retry")
+                    return False
+                reason = str(info.get("reason") or "")
+                if "DRAIN" in (info.get("state") or []) and not reason.startswith(ADMIN_REASON_PREFIX):
+                    print(gpu_jobs.printable(f"[agent] not resuming {node}: drained for {reason!r}, not from the page"),
+                          flush=True)
+                    return True
+                return self._scontrol_ok(["update", f"NodeName={node}", "State=RESUME"], errors)
+            case PartTimeAction.THRESHOLDS:
+                return self._set_thresholds(node, request, errors)
+            case PartTimeAction.RESOURCES:
+                return self._set_resources(node, request, errors)
+
+    def _close(self, node: str, errors: list[str]) -> bool:
+        return self._scontrol_ok(["update", f"NodeName={node}", "State=DRAIN", f"Reason={CLOSED_FROM_PAGE}"], errors)
+
+    def _requeue_resume_jobs(self, node: str, errors: list[str]) -> bool:
+        """Requeue every `resume` job running on `node` (never an urgent or service one)."""
+        done = call(self.scontrol, ["squeue", "-h", "-t", "R", "-w", node, "-o", "%i|%j|%P"])
+        if done.returncode != 0:
+            errors.append(f"squeue for {node} failed; will retry")
+            return False
+        ok = True
+        for line in done.stdout.splitlines():
+            job_id, _, rest = line.partition("|")
+            name, _, partition = rest.rpartition("|")
+            if (gpu_jobs.JOB_ID.fullmatch(job_id) and gpu_jobs.class_of(name) is gpu_jobs.JobClass.RESUME
+                    and partition not in RESUME_PROTECTED):
+                ok = self._scontrol_ok(["requeue", job_id], errors) and ok
+        return ok
+
+    def _set_thresholds(self, node: str, request: dict[str, object], errors: list[str]) -> bool:
+        """The limits go into the node's `Extra`, the health check's override; kept here too, for slurm forgetting them."""
+        new: dict[str, object] = {}
+        for gb_key, mb_key in THRESHOLD_FIELDS.items():
+            if gb_key in request:
+                gb = request[gb_key]
+                if isinstance(gb, bool) or not isinstance(gb, (int, float)) or not 0 <= gb <= MAX_THRESHOLD_GB:
+                    self._reject(node, f"{gb_key} must be a number of GB from 0 to {MAX_THRESHOLD_GB}")
+                    return True
+                new[mb_key] = round(gb * site_config.MB_PER_GB)
+        if "mains_only" in request:
+            if not isinstance(request["mains_only"], bool):
+                self._reject(node, "mains_only must be true or false")
+                return True
+            new["mains_only"] = request["mains_only"]
+        site_node = next(n for n in self.site.part_time_nodes if n.name == node)
+        merged = {**self.state.part_time_extra.get(node, {}), **new}
+        close = merged.get("close_below_mb", site_node.close_below_mb)
+        push = merged.get("push_back_below_mb", site_node.push_back_below_mb)
+        if not new or push > close:  # type: ignore[operator]
+            self._reject(node, "no threshold given, or push-back is above close")
+            return True
+        self.state.part_time_extra[node] = merged
+        return self._scontrol_ok(["update", f"NodeName={node}", f"Extra={json.dumps(merged, separators=(',', ':'))}"], errors)
+
+    def _reapply_extra(self, errors: list[str]) -> None:
+        """Slurm lost a node's `Extra` (a re-registered node, a slurmctld started without state): set it again."""
+        for node, saved in self.state.part_time_extra.items():
+            info = self._node_json(node)
+            if info is None:
+                continue
+            try:
+                current = json.loads(str(info.get("extra") or ""))
+            except ValueError:
+                current = None
+            if current != saved:
+                self._scontrol_ok(["update", f"NodeName={node}", f"Extra={json.dumps(saved, separators=(',', ':'))}"], errors)
+
+    def _set_resources(self, node: str, request: dict[str, object], errors: list[str]) -> bool:
+        """Jobs' memory and kept cores: the part-time nodes' file is rewritten (with every node's saved choice), then
+        slurm rereads it. The choice is saved first so a failed reconfigure is retried with it."""
+        site_node = next(n for n in self.site.part_time_nodes if n.name == node)
+        chosen = {**self.state.part_time_resources.get(node, {})}
+        chosen.update({k: request[k] for k in ("jobs_memory_gb", "keep_cpus") if k in request})
+        try:
+            site_config._check_part_time(dataclasses.replace(site_node, **chosen), "request")  # noqa: SLF001
+        except (site_config.SiteError, TypeError) as exc:
+            self._reject(node, str(exc))
+            return True
+        self.state.part_time_resources[node] = chosen
+        site = dataclasses.replace(self.site, nodes=tuple(
+            dataclasses.replace(n, **self.state.part_time_resources.get(n.name, {})) if n.part_time else n
+            for n in self.site.nodes))
+        try:
+            self.part_time_conf.write_text(render.part_time_nodes_conf(site), encoding="utf-8")  # in place: SlurmUser owns it
+        except OSError as exc:
+            errors.append(f"could not write {self.part_time_conf}: {exc}")
+            return False
+        return self._scontrol_ok(["reconfigure"], errors)
+
+    def _reject(self, node: str, why: str) -> None:
+        print(gpu_jobs.printable(f"[agent] part-time request for {node} refused: {why}"), file=sys.stderr, flush=True)
 
     def _release_in_order(self, held: list[str], jobs: dict[str, gpu_jobs.QueuedJob], errors: list[str]) -> bool:
         """Release one job at a time, best place first, each placed at once: a release starts a scheduling pass, and
