@@ -2,7 +2,22 @@
 # slurmdbd, MariaDB and munge from the distro packages (the same packages and the 23.11 line this box runs), a
 # bootstrap single-node config with four fake GPUs, and the users alice, bob (plain) and carol (admin).
 # The project is mounted read-only at /src at run time; nothing of ours is baked in (installer test, F1).
+# SLURM_VERSION / SLURM_SHA256 (build args, both or neither): empty, the distro's slurm packages (23.11); set, SchedMD's
+# `slurm-smd*` debs built by slurm/install/slurm_build.py (passed as the `src` build context, the repository root).
+FROM ubuntu:24.04 AS slurm-debs
+ARG SLURM_VERSION=
+ARG SLURM_SHA256=
+ENV DEBIAN_FRONTEND=noninteractive
+RUN install -d /debs
+RUN --mount=type=bind,from=src,source=slurm/install/slurm_build.py,target=/build/slurm_build.py \
+    if [ -n "$SLURM_VERSION" ]; then \
+      apt-get update && apt-get install -y --no-install-recommends python3 ca-certificates \
+      && python3 -I /build/slurm_build.py --version "$SLURM_VERSION" --sha256 "$SLURM_SHA256" --cache /cache \
+      && cp /cache/"$SLURM_VERSION"/deb-*/*.deb /debs/ ; \
+    fi
+
 FROM ubuntu:24.04
+ARG SLURM_VERSION=
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -13,9 +28,26 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       systemd systemd-sysv dbus libpam-systemd dbus-user-session \
-      slurm-wlm slurmdbd mariadb-server munge \
+      mariadb-server munge \
       sudo python3 procps ca-certificates \
  && rm -rf /var/lib/apt/lists/*
+
+# The slurm packages: the distro's, or the built debs (the daemons, client and accounting; no -dev or -dbgsym). The
+# slurm-smd debs do not create the `slurm` user (the distro's do), so it is made first.
+COPY --from=slurm-debs /debs /debs
+RUN apt-get update \
+ && if [ -n "$SLURM_VERSION" ]; then \
+      useradd --system --home-dir /var/lib/slurm --shell /usr/sbin/nologin slurm \
+      && apt-get install -y --no-install-recommends /debs/slurm-smd_*.deb /debs/slurm-smd-client_*.deb \
+        /debs/slurm-smd-slurmctld_*.deb /debs/slurm-smd-slurmd_*.deb /debs/slurm-smd-slurmdbd_*.deb ; \
+    else apt-get install -y --no-install-recommends slurm-wlm slurmdbd ; fi \
+ && rm -rf /var/lib/apt/lists/*
+# The built debs stay where slurm_build.py caches them, so the installer's `[slurm]` step finds them instead of building.
+RUN if [ -n "$SLURM_VERSION" ]; then \
+      install -d "/var/cache/gpujobs/slurm/$SLURM_VERSION/deb-$(uname -m)" \
+      && cp /debs/*.deb "/var/cache/gpujobs/slurm/$SLURM_VERSION/deb-$(uname -m)/" ; \
+    fi \
+ && rm -rf /debs
 
 # alice and bob: plain users. carol: admin (the Unix group the plan's admin model uses). Fixed ids so tests can name them.
 RUN groupadd --gid 2000 gpujobs-admin \

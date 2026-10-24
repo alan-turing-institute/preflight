@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shlex
 import subprocess
@@ -30,7 +31,8 @@ from levels import Level, priority_for  # noqa: E402 - stdlib only; the priority
 
 TOP_PRIORITY = 0xFFFF0000  # slurm's job_mgr.c: the most priority/basic gives a job by itself
 RUN = HERE / "run.sh"
-SITE = "/src/tests/integration/harness.site.toml"
+# E2E_SITE: the site file with a [slurm] table, for an image built with SLURM_VERSION (harness.site.slurm.toml).
+SITE = os.environ.get("E2E_SITE", "/src/tests/integration/harness.site.toml")
 INSTALL = "python3 /src/slurm/install/install.py"
 STATE = "/var/lib/gpujobs"
 PORTAL = "https://testnode"
