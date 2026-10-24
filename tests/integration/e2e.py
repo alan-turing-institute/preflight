@@ -1303,7 +1303,7 @@ def stage_part_time() -> None:
 
     # an --anywhere job prefers the full node; the part-time one takes it only when the full node is busy
     a = anywhere("pt-first")
-    check("--anywhere: with both nodes free the job starts on the full node, in partition cpu", runs_on(a, "testnode", "cpu"), str(jobinfo(a)))
+    check("--anywhere: with both nodes free the job starts on the full node, in partition cpu_fill (a resume job)", runs_on(a, "testnode", "cpu_fill"), str(jobinfo(a)))
     fill = filler("pt-fill", 3)  # a restart job takes the other cores of the 4-core full node
     check("a restart cpu job fills the rest of the full node", runs_on(fill, "testnode", "cpu"), str(jobinfo(fill)))
     b1 = anywhere("pt-b1")
