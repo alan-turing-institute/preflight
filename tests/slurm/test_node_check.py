@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -13,6 +14,8 @@ import pytest
 NODE = "laptop"
 URGENT_NAME = "p:resume:urgent"
 OURS = f"{node_check.REASON_PREFIX}low"
+JOB_UID = 1234
+HOSTLISTS = {"n[1,3],x": "n1\nn3\nx", f"n[1,3],{NODE}": f"n1\nn3\n{NODE}"}  # `scontrol show hostnames`, expanded
 RESUME_CALL = ["scontrol", "update", f"NodeName={NODE}", "State=RESUME"]
 
 
@@ -21,18 +24,21 @@ def done(stdout: str = "", code: int = 0) -> subprocess.CompletedProcess:
 
 
 def job(job_id: str, started: int = 0, *, name: str = "p:resume:j", partition: str = "cpu", state: str = "RUNNING",
-        node: str = NODE) -> dict:
+        node: str = NODE, batch: bool = True, requeue: bool = True, excluded: str = "") -> dict:
     return {
         "job_id": job_id, "job_state": [state], "partition": partition, "name": name,
         "nodes": node if state == "RUNNING" else "", "start_time": {"set": True, "number": started},
+        "batch_flag": batch, "requeue": requeue, "excluded_nodes": excluded, "user_id": JOB_UID,
     }
 
 
 class FakeSlurm:
     """Answers the two reads the check makes, applies drain/resume/requeue, and records every other call."""
 
-    def __init__(self, jobs: list[dict] | None = None, *, drained: str | None = None, extra: str = "") -> None:
+    def __init__(self, jobs: list[dict] | None = None, *, drained: str | None = None, extra: str = "",
+                 requeue_fails: bool = False) -> None:
         self.jobs, self.drained, self.extra, self.calls, self.fail = jobs or [], drained, extra, [], False
+        self.requeue_fails = requeue_fails
 
     def __call__(self, command: list[str]) -> subprocess.CompletedProcess:
         if self.fail:
@@ -43,7 +49,13 @@ class FakeSlurm:
             return done(json.dumps({"nodes": [node]}))
         if command[0] == "squeue":
             return done(json.dumps({"jobs": self.jobs}))
+        if command[:3] == ["scontrol", "show", "hostnames"]:
+            return done(HOSTLISTS[command[3]])
         self.calls.append(command)
+        if command[:2] == ["scontrol", "requeue"] and self.requeue_fails:
+            return done(code=1)
+        if command[0] == "scancel":
+            self.jobs = [entry for entry in self.jobs if entry["job_id"] != command[1]]
         if command[:2] == ["scontrol", "requeue"]:
             for entry in self.jobs:
                 if entry["job_id"] == command[2]:
@@ -66,14 +78,14 @@ def box(tmp_path: Path):
     settings = {
         "node": NODE, "close_below_mb": 6000, "push_back_below_mb": 2000, "mains_only": None,
         "meminfo_path": str(meminfo), "power_supply_dir": str(power), "state_path": str(tmp_path / "state.json"),
-        "log_path": str(tmp_path / "check.log"),
+        "log_path": str(tmp_path / "check.log"), "state_dir": str(tmp_path / "state"),
     }
     path = tmp_path / "node_check.json"
     path.write_text(json.dumps(settings))
     events: list[tuple] = []
 
     class Box:
-        settings_path, log = path, Path(settings["log_path"])
+        settings_path, log, state_dir = path, Path(settings["log_path"]), tmp_path / "state"
         pushes = events
 
         @staticmethod
@@ -89,7 +101,8 @@ def box(tmp_path: Path):
         @staticmethod
         def run(slurm: FakeSlurm) -> list[str]:
             return node_check.check(
-                path, slurm, lambda *args, **fields: events.append((*args, fields)), hostname=NODE + ".lan"
+                path, slurm, lambda *args, **fields: (events.append((*args, fields)), Path("/events") / args[0])[1],
+                hostname=NODE + ".lan"
             )
 
     Box.free(20000)
@@ -118,6 +131,13 @@ def test_push_back_takes_the_latest_started_resume_job_only_and_excludes_at_the_
     box.run(slurm)
     assert slurm.calls[-1] == ["scontrol", "update", "JobId=2", f"ExcNodeList={NODE}"]
     assert slurm.updates() == [slurm.calls[-1]]  # barred only at the second push
+    # a job that already carries an exclusion list keeps it, joined raw (never split on commas); one already barred is left
+    for before, updates in [("n[1,3],x", [f"ExcNodeList=n[1,3],x,{NODE}"]), (f"n[1,3],{NODE}", [])]:
+        again = FakeSlurm([job("6", 99, excluded=before)], drained="gpujobs-admin: held")
+        box.run(again)
+        slurm.jobs, again.jobs = [], [job("6", 99, excluded=before)]
+        box.run(again)  # the second push of job 6 from this node
+        assert [c[3] for c in again.updates()] == updates
 
 
 def test_close_for_memory_or_battery_and_only_when_asked(box):
@@ -206,3 +226,50 @@ def test_any_failure_fails_closed_and_leaves_a_foreign_drain(box):
     timeout.fail = True
     node_check.fail_closed(OSError("y"), timeout, NODE, box.log)  # even the drain times out: logged, no raise
     assert "could not drain" in box.log.read_text()
+
+
+def test_a_part_time_machine_runs_only_batch_requeueable_resume_jobs(box, monkeypatch):
+    chowned: list[tuple] = []
+    monkeypatch.setattr(node_check.os, "chown", lambda *args: chowned.append(args))
+    box.free(20000)  # plenty of memory: the rule applies every run, not only when memory is low
+    pt = gpu_jobs.Partition.PART_TIME
+    slurm = FakeSlurm([
+        job("1", 1, partition=pt), job("2", 2, partition=pt, batch=False), job("3", 3, partition=pt, requeue=False),
+        job("4", 4, partition=pt, name="p:restart:r"), job("5", 5, partition=pt, name="not-ours"),
+        job("6", 6, partition="cpu", batch=False),  # not on a part-time machine: not this rule's business
+    ])
+    decisions = box.run(slurm)
+    assert slurm.calls == [["scancel", j] for j in ("2", "3", "4", "5")]
+    assert [d.split(" (")[0] for d in decisions] == [f"cancel {j}" for j in ("2", "3", "4", "5")]
+    assert [e[0] for e in box.pushes] == ["2", "3", "4", "5"]
+    assert chowned == [(Path("/events") / j, JOB_UID, -1) for j in ("2", "3", "4", "5")]  # each event goes to the job's user
+    assert all(e[1] is gpu_jobs.EventAction.KILL and e[2] == {"node": NODE, "reason": node_check.KILL_REASON} for e in box.pushes)
+    # a push-back that slurm refuses to requeue falls back to cancelling, and the check still completes
+    box.pushes.clear()
+    box.free(1000)
+    stuck = FakeSlurm([job("7", 7, partition=pt)], requeue_fails=True)
+    decisions = box.run(stuck)
+    assert stuck.calls[:2] == [["scontrol", "requeue", "7"], ["scancel", "7"]] and "cancelled" in decisions[0]
+    assert box.pushes == [("7", gpu_jobs.EventAction.KILL, {"node": NODE, "reason": "requeue failed", "free_mb": 1000})]
+
+
+def test_the_owner_manifest_lists_each_regular_state_file_with_its_owner_and_only_in_our_own_directory(box):
+    state = box.state_dir
+    for sub in node_check.MANIFEST_DIRS:
+        (state / sub).mkdir(parents=True)
+    (state / "jobs" / "5.json").write_text("{}")
+    (state / "events" / "5-1-kill.json").write_text("{}")
+    (state / "logs" / "n-5.log").symlink_to("/etc/hostname")  # a link is no file of anyone's
+    (state / "other").mkdir()
+    (state / "other" / "x.json").write_text("{}")  # not a directory the controller copies
+    box.run(FakeSlurm())
+    assert not (state / "owners").exists()  # no `owners/`: not a part-time machine, nothing is written
+    (state / "owners").mkdir(mode=0o755)
+    box.run(FakeSlurm())
+    uid = os.getuid()
+    assert json.loads((state / "owners" / "manifest.json").read_text()) == {"files": {"jobs/5.json": uid, "events/5-1-kill.json": uid}}
+    assert (state / "owners" / "manifest.json").stat().st_mode & 0o777 == 0o644
+    (state / "owners").chmod(0o777)  # a directory others can write is not ours to put the manifest in
+    (state / "owners" / "manifest.json").unlink()
+    box.run(FakeSlurm())
+    assert not (state / "owners" / "manifest.json").exists() and "manifest not written" in box.log.read_text()

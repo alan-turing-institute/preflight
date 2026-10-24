@@ -4,20 +4,25 @@
     node_check.py [--settings /etc/gpujobs/node_check.json]
 
 Rules, in order, each run (plan B2, `plan notes`):
+0. A running job on a part-time machine that is not batch, requeueable and `resume`-class is cancelled (B7.1).
 1. An urgent job is pending: never close the node; reopen it if we closed it.
 2. Free memory below `push_back_below_mb`: requeue the newest-started `resume` job here (one per run; at its second
    push from this node the job is also barred from the node).
 3. Free memory below `close_below_mb`, or `mains_only` and on battery: drain, reason `gpujobs-check: ...`.
 4. We closed it and the last 3 runs all passed rule 3: resume.
 A drain whose reason does not start `gpujobs-check:` is never changed. Any exception drains the node (fail closed).
-Every run logs one line, a decision to allow included.
+Every run logs one line, a decision to allow included, and (when `owners/` exists, made by `apply --part-time`) writes
+`owners/manifest.json`: who owns each state file here, which the controller trusts for the copy of them (B7.1).
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
+import os
 import socket
+import stat
 import subprocess
 import sys
 import time
@@ -42,6 +47,11 @@ KB_BYTES = 1024
 MB_BYTES = 1_000_000  # decimal, as everything shown to people
 GB_MB = 1000
 DRAIN_FLAG = "DRAIN"
+#: The state subdirectories whose files the manifest lists (what the controller copies back), and where it is written.
+MANIFEST_DIRS = ("jobs", "events", "logs", "footprints")
+OWNERS_DIR = "owners"
+MANIFEST_NAME = "manifest.json"
+KILL_REASON = "not allowed on a part-time machine"
 #: The keys the node's `Extra` may override, and the type each must have.
 EXTRA_KEYS: dict[str, type] = {"close_below_mb": int, "push_back_below_mb": int, "mains_only": bool}
 
@@ -64,6 +74,7 @@ class Settings:
     power_supply_dir: Path
     state_path: Path
     log_path: Path
+    state_dir: Path = gpu_jobs.STATE_DIR
 
 
 def load_settings(path: Path, names: tuple[str, ...]) -> Settings:
@@ -76,6 +87,7 @@ def load_settings(path: Path, names: tuple[str, ...]) -> Settings:
         push_back_below_mb=int(raw["push_back_below_mb"]), mains_only=raw.get("mains_only"),
         meminfo_path=Path(raw["meminfo_path"]), power_supply_dir=Path(raw["power_supply_dir"]),
         state_path=Path(raw["state_path"]), log_path=Path(raw["log_path"]),
+        **({"state_dir": Path(raw["state_dir"])} if raw.get("state_dir") else {}),
     )
 
 
@@ -148,6 +160,14 @@ class Running:
     job: gpu_jobs.QueuedJob
     started: int
     excluded: str
+    batch: bool  # a batch script: the only kind that runs the wrapper, which is what makes a job safe to requeue
+    requeueable: bool
+    uid: int | None  # the submitter's uid, which owns the events written for the job
+
+    @property
+    def sanctioned(self) -> bool:
+        """A job a part-time machine may run: batch, requeueable and a `resume` job."""
+        return self.batch and self.requeueable and self.job.job_class is gpu_jobs.JobClass.RESUME
 
 
 def read_queue(run: Runner, node: str) -> tuple[bool, list[Running], set[str]]:
@@ -163,7 +183,12 @@ def read_queue(run: Runner, node: str) -> tuple[bool, list[Running], set[str]]:
         entry = raw[job.job_id]
         if job.state == gpu_jobs.State.RUNNING and node in str(entry.get("nodes") or "").split(","):
             started = entry.get("start_time") or {}
-            here.append(Running(job, int(started.get("number") or 0), str(entry.get("excluded_nodes") or "")))
+            uid = entry.get("user_id")
+            here.append(Running(
+                job, int(started.get("number") or 0), str(entry.get("excluded_nodes") or ""),
+                entry.get("batch_flag") is True, entry.get("requeue") is True,
+                uid if isinstance(uid, int) and not isinstance(uid, bool) else None,
+            ))
     return urgent, here, {job.job_id for job in jobs}
 
 
@@ -175,6 +200,62 @@ def push_victim(running: list[Running]) -> Running | None:
         and r.job.partition not in {gpu_jobs.Partition.URGENT, gpu_jobs.Partition.SERVICE}
     ]
     return max(candidates, key=lambda r: r.started, default=None)
+
+
+def exclusion(run: Runner, existing: str, node: str) -> str | None:
+    """`ExcNodeList` value that adds `node` to a job's `existing` one (a slurm host list, joined raw, never split on
+    commas: `n[1,3]` is one entry); None when it already covers `node`."""
+    if not existing:
+        return node
+    done = run(["scontrol", "show", "hostnames", existing])
+    if done.returncode != 0:
+        raise RuntimeError(f"show hostnames {existing!r} failed: {done.stderr.strip()}")
+    return None if node in done.stdout.split() else f"{existing},{node}"
+
+
+def end_job(run: Runner, record: Recorder, victim: Running, node: str, reason: str, **fields: object) -> None:
+    """Cancel a job here and record the kill, the event owned by the job's submitter (the manifest says so)."""
+    job = victim.job.job_id
+    done = run(["scancel", job])
+    if done.returncode != 0:
+        raise RuntimeError(f"scancel {job} failed: {done.stderr.strip()}")
+    event(record, victim, gpu_jobs.EventAction.KILL, node=node, reason=reason, **fields)
+
+
+def event(record: Recorder, victim: Running, action: gpu_jobs.EventAction, **fields: object) -> None:
+    """Record an event for a job. The file is root's, and the controller trusts a copied file only when the manifest
+    lists it with the uid of the job's user, so it is handed to that user (best effort: unlisted, it is not shown)."""
+    path = record(victim.job.job_id, action, **fields)
+    if isinstance(path, Path) and victim.uid is not None:
+        with contextlib.suppress(OSError):
+            os.chown(path, victim.uid, -1)
+
+
+def write_manifest(state_dir: Path) -> str:
+    """Write `owners/manifest.json`: every regular file under the state subdirectories (lstat; a link is skipped) and
+    the uid that owns it, for the controller to trust the copy by (B7.1). Only when `owners/` exists and is ours alone
+    (made by `apply --part-time`); returns why not, "" when written."""
+    owners = state_dir / OWNERS_DIR
+    try:
+        status = owners.lstat()
+    except FileNotFoundError:
+        return ""  # not a part-time machine
+    if not stat.S_ISDIR(status.st_mode) or status.st_uid != os.geteuid() or status.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        return f"{owners} is not a directory only we can write: manifest not written"
+    files: dict[str, int] = {}
+    for sub in MANIFEST_DIRS:
+        top = state_dir / sub
+        if top.is_symlink():
+            continue
+        for directory, _, names in os.walk(top):
+            for name in names:
+                path = Path(directory) / name
+                with contextlib.suppress(OSError):
+                    status = path.lstat()
+                    if stat.S_ISREG(status.st_mode):
+                        files[path.relative_to(state_dir).as_posix()] = status.st_uid
+    gpu_jobs.write_json(owners / MANIFEST_NAME, {"files": files})
+    return ""
 
 
 def drain(run: Runner, node: str, why: str) -> None:
@@ -218,21 +299,27 @@ def check(
     state["pushes"] = {k: n for k, n in state["pushes"].items() if k.split("@")[0] in unfinished}  # a pushed job waits in the queue: keep it
     decisions = [note] if note else []
 
+    for stray in [r for r in running if r.job.partition == gpu_jobs.Partition.PART_TIME and not r.sanctioned]:
+        end_job(run, record, stray, info.name, KILL_REASON)
+        decisions.append(f"cancel {stray.job.job_id} ({KILL_REASON})")
+    running = [r for r in running if r.job.partition != gpu_jobs.Partition.PART_TIME or r.sanctioned]
+
     if free < settings.push_back_below_mb and (victim := push_victim(running)):
         job = victim.job.job_id
         key = f"{job}@{info.name}"
-        state["pushes"][key] = state["pushes"].get(key, 0) + 1
         done = run(["scontrol", "requeue", job])
-        if done.returncode != 0:
-            raise RuntimeError(f"requeue {job} failed: {done.stderr.strip()}")
-        record(job, gpu_jobs.EventAction.PUSH_BACK, node=info.name, free_mb=free)
-        decisions.append(f"push back {job} ({free} MB free)")
-        if state["pushes"][key] >= PUSHES_BEFORE_EXCLUDE:
-            excluded = sorted({*filter(None, victim.excluded.split(",")), info.name})
-            done = run(["scontrol", "update", f"JobId={job}", f"ExcNodeList={','.join(excluded)}"])
-            if done.returncode != 0:
-                raise RuntimeError(f"exclude on {job} failed: {done.stderr.strip()}")
-            decisions.append(f"{job} barred from {info.name}")
+        if done.returncode != 0:  # slurm will not requeue it: a job that cannot be pushed back must not stay and starve the owner
+            end_job(run, record, victim, info.name, "requeue failed", free_mb=free)
+            decisions.append(f"requeue {job} failed ({done.stderr.strip()}): cancelled ({free} MB free)")
+        else:
+            state["pushes"][key] = state["pushes"].get(key, 0) + 1
+            event(record, victim, gpu_jobs.EventAction.PUSH_BACK, node=info.name, free_mb=free)
+            decisions.append(f"push back {job} ({free} MB free)")
+            if state["pushes"][key] >= PUSHES_BEFORE_EXCLUDE and (value := exclusion(run, victim.excluded, info.name)):
+                done = run(["scontrol", "update", f"JobId={job}", f"ExcNodeList={value}"])
+                if done.returncode != 0:
+                    raise RuntimeError(f"exclude on {job} failed: {done.stderr.strip()}")
+                decisions.append(f"{job} barred from {info.name}")
 
     mains_only = battery if settings.mains_only is None else settings.mains_only
     why = ""
@@ -259,6 +346,11 @@ def check(
         decisions.append(f"reopen ({REOPEN_AFTER} passing runs)")
 
     gpu_jobs.write_json(settings.state_path, state)
+    try:
+        if skipped := write_manifest(settings.state_dir):
+            log_line(settings.log_path, f"{info.name} {skipped}")
+    except OSError as error:  # a manifest that is stale only hides copied files; it never closes the node
+        log_line(settings.log_path, f"{info.name} manifest not written: {error}")
     log_line(settings.log_path, f"{info.name} free={free} MB {'; '.join(decisions) or 'allow'}")
     return decisions
 
