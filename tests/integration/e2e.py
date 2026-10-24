@@ -328,8 +328,10 @@ def stage_install() -> None:
     units = ("slurmctld", "slurmd", "slurmdbd", "mariadb", "munge", "gpujobs-agent", "gpujobs-node-exporter",
              "gpujobs-cgroup-exporter", "prometheus", "grafana-server", "ondemand-dex", "apache2")
     active = {u: sh(f"systemctl is-active {u}").out.strip() for u in units}
-    check("services are active: slurm, accounting, agent, exporters, Prometheus, Grafana, Dex, Apache",
-          all(v == "active" for v in active.values()), str({k: v for k, v in active.items() if v != "active"} or "all active"))
+    boot = {u: sh(f"systemctl is-enabled {u}").out.strip() for u in units}  # a reboot starts only what is enabled
+    check("services are active and enabled at boot: slurm, accounting, agent, exporters, Prometheus, Grafana, Dex, Apache",
+          all(v == "active" for v in active.values()) and all(v == "enabled" for v in boot.values()),
+          str({k: (v, boot[k]) for k, v in active.items() if (v, boot[k]) != ("active", "enabled")} or "all active and enabled"))
     gpu = sh("systemctl is-active gpujobs-gpu-exporter; journalctl -u gpujobs-gpu-exporter --no-pager | grep -m1 'initialize nvml'")
     check("the GPU exporter is down only because the container has no NVML library (expected here)",
           gpu.out.split()[0] in ("failed", "inactive") and "ERROR_LIBRARY_NOT_FOUND" in gpu.out, gpu.text[-200:])
