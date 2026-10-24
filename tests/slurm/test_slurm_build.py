@@ -1,3 +1,4 @@
+import fcntl
 import hashlib
 import importlib.util
 import io
@@ -26,7 +27,7 @@ class Fakes:
     """Stands in for the download and the commands; a command that builds leaves the package it would."""
 
     def __init__(self, leaves):
-        self.urls, self.ran, self.leaves = [], [], leaves
+        self.urls, self.ran, self.leaves, self.unlocked = [], [], leaves, []
 
     def download(self, url, dest):
         self.urls.append(url)
@@ -35,6 +36,12 @@ class Fakes:
     def run(self, argv, cwd):
         self.ran.append((argv, cwd))
         if argv[0] in ("debuild", "rpmbuild"):
+            with ((cwd.parent.parent if argv[0] == "debuild" else cwd.parent) / sb.LOCK).open("a") as other:
+                try:  # another build of this version must wait while this one runs
+                    fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    self.unlocked.append(argv[0])
+                except BlockingIOError:
+                    pass
             target = cwd.parent if argv[0] == "debuild" else cwd / "rpmbuild/RPMS/x86_64"
             target.mkdir(parents=True, exist_ok=True)
             (target / self.leaves).write_bytes(b"pkg")
@@ -75,6 +82,7 @@ def test_build_downloads_checks_builds_and_reuses_the_cache(tmp_path, text, fam,
         before = len(fakes.ran)
         assert [p.name for p in sb.build("26.05.5", SHA, cache, **kwargs)] == [leaves] and not stale.exists()
         assert len(fakes.ran) == before + len(names) and len(fakes.urls) == 1
+    assert fakes.unlocked == []
 
 
 def test_refusals(tmp_path):

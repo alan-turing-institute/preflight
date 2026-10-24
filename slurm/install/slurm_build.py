@@ -10,6 +10,7 @@ the cache lacks them. The build runs as root (it installs build dependencies) an
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import platform
 import re
@@ -27,6 +28,8 @@ URL = "https://github.com/SchedMD/slurm/releases/download/slurm-{dashed}-1/slurm
 VERSION = re.compile(r"\d+\.\d+\.\d+")
 #: The cache is valid only once a build finished: the file holds the sha256 of the tarball it was built from.
 MARKER = ".built-sha256"
+#: Held while one version is checked and built: a second build of it (two installs sharing a cache) waits, then reuses it
+LOCK = ".lock"
 DOWNLOAD_TIMEOUT_S = 60
 #: The packages `upgrade-slurm`, `apply` and the restore install (names as SchedMD packages them): the daemons, the
 #: client commands and the base package. The rest of what the build leaves (-dev, -doc, -dbgsym, sview, ...) is not.
@@ -125,24 +128,26 @@ def build(version: str, sha256: str, cache_root: Path = DEFAULT_CACHE, *, downlo
     base = cache_root / version
     workdir = base / f"{fam}-{platform.machine()}"
     marker = workdir / MARKER
-    if marker.exists() and marker.read_text(encoding="utf-8").strip() == sha256 and (found := _packages(workdir, fam)):
-        return found
-    if workdir.exists():  # a build that did not finish, or one of another tarball: its files are not to be installed
-        shutil.rmtree(workdir)
     base.mkdir(parents=True, exist_ok=True)
-    tarball = base / Path(url).name
-    if not tarball.exists():
-        download(url, tarball)
-    if (got := _sha256(tarball)) != sha256:
-        tarball.unlink()
-        raise SlurmBuildError(f"{url} has sha256 {got}, not the {sha256} the site file names; nothing was built")
-    workdir.mkdir(parents=True, exist_ok=True)
-    for argv, cwd in commands(fam, version, tarball, workdir / f"slurm-{version}"):
-        run(argv, cwd)
-    if not (found := _packages(workdir, fam)):
-        raise SlurmBuildError(f"the build finished but left no {fam} files under {workdir}")
-    marker.write_text(f"{sha256}\n", encoding="utf-8")
-    return found
+    with (base / LOCK).open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if marker.exists() and marker.read_text(encoding="utf-8").strip() == sha256 and (found := _packages(workdir, fam)):
+            return found
+        if workdir.exists():  # a build that did not finish, or one of another tarball: its files are not to be installed
+            shutil.rmtree(workdir)
+        tarball = base / Path(url).name
+        if not tarball.exists():
+            download(url, tarball)
+        if (got := _sha256(tarball)) != sha256:
+            tarball.unlink()
+            raise SlurmBuildError(f"{url} has sha256 {got}, not the {sha256} the site file names; nothing was built")
+        workdir.mkdir(parents=True, exist_ok=True)
+        for argv, cwd in commands(fam, version, tarball, workdir / f"slurm-{version}"):
+            run(argv, cwd)
+        if not (found := _packages(workdir, fam)):
+            raise SlurmBuildError(f"the build finished but left no {fam} files under {workdir}")
+        marker.write_text(f"{sha256}\n", encoding="utf-8")
+        return found
 
 
 def main(argv: list[str] | None = None) -> int:
