@@ -36,7 +36,9 @@ EXPECTED_DIFF = {
         "+# priority a hold had restored.",
         "+PriorityType=priority/basic",
         "-# Pre-emption by partition priority, no accounting database: an `urgent` job takes resources from `normal` jobs,",
-        "+# Pre-emption by partition priority (accounting is through slurmdbd, below): an `urgent` job takes resources from `normal` jobs,",
+        "-# which are requeued (SIGTERM to every process of the job, then SIGKILL after KillWait) and start again when resources free.",
+        "+# Pre-emption by partition priority, strictly lower tiers only (accounting is through slurmdbd, below): an `urgent` job (tier 3) takes",
+        "+# resources from `normal` and `cpu_fill` jobs, and a `normal` GPU job (tier 2) from `cpu_fill` jobs; they are requeued (SIGTERM to every process of the job, then SIGKILL after KillWait) and start again when resources free.",
         "-# (stage C, 2026-10-16). It also records each job's GPU use (`sacct`), which this box's ledger never had.",
         "+# (stage C, 2026-10-16). It also keeps the finished-job history that `sacct` reads.",
         "+# Keep each job's --comment in the accounting record.",
@@ -45,17 +47,26 @@ EXPECTED_DIFF = {
         "-# the base use with the GPU idle and the box quiet (median 12,132 MB, flight recorder 2026-10-12..16) minus the",
         "-# host memory guard's 12 GiB.",
         "-NodeName=gpu-node-1 CPUs=20 Boards=1 SocketsPerBoard=1 CoresPerSocket=20 ThreadsPerCore=1 RealMemory=100000 Gres=gpu:1 State=UNKNOWN",
+        "-# normal: resumes from its checkpoint, pre-emptable. steady: cannot resume, never pre-empted. urgent:",
         "+# RealMemory is what slurm hands out: the node's real_memory_mb in the site file (its memory minus the background",
         "+# services' base use minus the host memory guard's reserve).",
         "+NodeName=gpu-node-1 CPUs=20 Boards=1 SocketsPerBoard=1 CoresPerSocket=20 ThreadsPerCore=1 RealMemory=100000 Gres=gpu:gb10:1 State=UNKNOWN",
+        "+# normal: resumes from its checkpoint, pre-emptable. steady: cannot resume, never pre-empted. Both tier 2. urgent (tier 3):",
+        "-PartitionName=normal Nodes=gpu-node-1 Default=YES PriorityTier=1 PreemptMode=REQUEUE MaxTime=INFINITE State=UP",
+        "-PartitionName=steady Nodes=gpu-node-1 PriorityTier=1 PreemptMode=OFF MaxTime=INFINITE State=UP",
         "-PartitionName=urgent Nodes=gpu-node-1 PriorityTier=2 PreemptMode=OFF MaxTime=INFINITE State=UP",
-        "+# cpu: every job without GPUs (submit.py routes it here), kept off the cores the site file holds for GPU jobs",
+        "+PartitionName=normal Nodes=gpu-node-1 Default=YES PriorityTier=2 PreemptMode=REQUEUE MaxTime=INFINITE State=UP",
+        "+PartitionName=steady Nodes=gpu-node-1 PriorityTier=2 PreemptMode=OFF MaxTime=INFINITE State=UP",
+        "+# cpu: every `restart` job without GPUs (submit.py routes it here), kept off the cores the site file holds for GPU jobs",
         "+# (cores_per_gpu), so a free GPU never waits for cores. ONE partition: MaxCPUsPerNode counts only its own jobs.",
-        "+# Never pre-empted by slurm; urgent.py requeues a resume-class job in its way itself.",
+        "+# Never pre-empted by slurm.",
         "+PartitionName=cpu Nodes=gpu-node-1 PriorityTier=1 PreemptMode=OFF MaxTime=INFINITE State=UP MaxCPUsPerNode=8",
-        "+PartitionName=urgent Nodes=gpu-node-1 PriorityTier=2 PreemptMode=OFF MaxTime=INFINITE State=UP AllowGroups=gpujobs-admin",
+        "+# cpu_fill: every `resume` job without GPUs: no core cap, so it uses idle cores; tier 1 REQUEUE, so GPU (tier 2) and urgent",
+        "+# (tier 3) jobs take its cores and memory back when they need them (it resumes from its checkpoint).",
+        "+PartitionName=cpu_fill Nodes=gpu-node-1 PriorityTier=1 PreemptMode=REQUEUE MaxTime=INFINITE State=UP",
+        "+PartitionName=urgent Nodes=gpu-node-1 PriorityTier=3 PreemptMode=OFF MaxTime=INFINITE State=UP AllowGroups=gpujobs-admin",
         "+# service: background services' CPU stand-ins (submit.py --service); the agent suspends cpu jobs to make room.",
-        "+PartitionName=service Nodes=gpu-node-1 PriorityTier=1 PreemptMode=REQUEUE MaxTime=INFINITE State=UP MaxCPUsPerNode=4 AllowGroups=gpujobs-service,gpujobs-admin",
+        "+PartitionName=service Nodes=gpu-node-1 PriorityTier=2 PreemptMode=REQUEUE MaxTime=INFINITE State=UP MaxCPUsPerNode=4 AllowGroups=gpujobs-service,gpujobs-admin",
     ],
     "gres.conf": [
         "-# The GB10's one GPU as a schedulable token. Its memory is system RAM (unified), so no memory is declared here.",
@@ -136,7 +147,7 @@ def test_eight_gpu_site_and_extra_slot():
     served = render.render(site_config.parse({**raw, "service": {"cores": 4}}), "slurm")["/etc/slurm/slurm.conf"].content
     added = [line for line in served.splitlines() if line not in conf.splitlines()]
     assert len(added) == 2 and added[1].startswith("PartitionName=service ")
-    assert added[1].endswith(" PriorityTier=1 PreemptMode=REQUEUE MaxTime=INFINITE State=UP MaxCPUsPerNode=4 "
+    assert added[1].endswith(" PriorityTier=2 PreemptMode=REQUEUE MaxTime=INFINITE State=UP MaxCPUsPerNode=4 "
                              "AllowGroups=gpujobs-service,ops")
 
 

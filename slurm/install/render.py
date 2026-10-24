@@ -123,13 +123,14 @@ def node_check_json(site: Site) -> str:
 
 
 def _service_partition(site: Site, names: list[str]) -> str:
-    """The service partition (D20), when the site has one: background services' CPU stand-ins. Slurm itself never
-    pre-empts for it; the agent suspends CPU-only jobs to make room (agent.py, step 3b). Urgent work requeues it."""
+    """The service partition (D20), when the site has one: background services' CPU stand-ins. The agent suspends
+    CPU-only jobs to make room (agent.py, step 3b). Urgent work requeues it. PriorityTier=2, the tier of `normal`: slurm
+    pre-empts only strictly lower tiers, so a GPU job never requeues a service job (C3 trial, D23)."""
     if site.service is None:
         return ""
     return (
         "# service: background services' CPU stand-ins (submit.py --service); the agent suspends cpu jobs to make room.\n"
-        f"PartitionName=service Nodes={','.join(names)} PriorityTier=1 PreemptMode=REQUEUE MaxTime=INFINITE State=UP "
+        f"PartitionName=service Nodes={','.join(names)} PriorityTier=2 PreemptMode=REQUEUE MaxTime=INFINITE State=UP "
         f"MaxCPUsPerNode={site.service.cores} AllowGroups={site.service.group},{site.admin_group}\n"
     )
 

@@ -433,6 +433,7 @@ def submit(argv: list[str]) -> str:
                                       "resumed from its checkpoint",
         gpu_jobs.Partition.NORMAL: "pre-empted and resumed from its checkpoint",
         gpu_jobs.Partition.STEADY: "never pre-empted",
+        gpu_jobs.Partition.CPU_FILL: "fills idle cores; requeued for GPU or urgent work and resumed from its checkpoint",
         gpu_jobs.Partition.SERVICE: "the agent suspends CPU-only jobs it may to make room; requeued for urgent work",
     }.get(partition) or (
         "requeued for urgent work and resumed from its checkpoint" if arguments.job_class == gpu_jobs.JobClass.RESUME

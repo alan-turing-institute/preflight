@@ -83,7 +83,7 @@ def plan(
         if not in_way or not (job.active or job.partition == gpu_jobs.Partition.URGENT):
             continue
         what = f"{job.job_id} {job.name} ({record.get('what', 'no sidecar')}), running {elapsed(job.job_id)}"
-        if job.partition == gpu_jobs.Partition.NORMAL:
+        if job.partition in {gpu_jobs.Partition.NORMAL, gpu_jobs.Partition.CPU_FILL}:
             victims.append(job.job_id)
             lines.append(f"[urgent] PAUSABLE  {what}: may be pre-empted (slurm picks as many as the urgent job needs); "
                          "loses at most the time since its last checkpoint")
