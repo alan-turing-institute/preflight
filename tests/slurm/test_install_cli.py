@@ -41,7 +41,7 @@ class Fake:
         self.calls, self.queue, self.client_ok, self.known = [], queue, client_ok, set()
         self.squeue_rc, self.ctld_rc = 0, 0  # squeue's exit status; `systemctl is-active slurmctld`'s (0: running)
         self.policy = "slurm-wlm:\n  Installed: (none)\n  Candidate: 23.11.4-1.2ubuntu5\n"
-        self.distro_slurm = ""  # what `dpkg-query -W` reports installed, e.g. "ii slurm-wlm\nii slurmd\n"
+        self.distro_slurm = ""  # what `dpkg-query -W` reports installed, as dpkg prints it, e.g. "ii  slurm-wlm\nii  slurmd\n" (the abbreviation has its own trailing space)
         self.sinfo = ""  # what `sinfo -V` prints ("" = no slurm installed)
         self.dbd_active = False  # `systemctl is-active slurmdbd`
         self.held = []  # (argv, whether policy-rc.d stood) for each package install or removal
@@ -280,7 +280,7 @@ def test_slurm_table_installs_the_built_packages_in_place_of_the_distros(env, mo
     names = ["slurm-smd-dbgsym", "slurm-smd-dev", "slurm-smd-slurmdbd", "slurm-smd-doc", "slurm-smd", "slurm-smd-sview"]
     debs = [tmp / f"{n}_26.05.5_arm64.deb" for n in names]
     monkeypatch.setattr(slurm_component.slurm_build, "build", lambda v, s: built.append((v, s)) or debs)
-    fake.distro_slurm = "ii slurm-wlm\nii slurmd\n"
+    fake.distro_slurm = "ii  slurm-wlm\nii  slurmd\nrc  slurmdbd\n"
     fake.policy = "  Candidate: 21.08.5-2ubuntu1\n"  # an old distro slurm no longer matters: it is not installed
     root = tmp / "root"
     policy = root / "usr/sbin/policy-rc.d"

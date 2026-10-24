@@ -69,7 +69,7 @@ def install_commands(built: list[Path]) -> list[list[str]]:
     if not wanted[0].endswith(".deb"):
         return [["dnf", "install", "-y", *wanted]]
     status = components.run(["dpkg-query", "-W", "-f=${db:Status-Abbrev} ${Package}\\n", *DISTRO_SLURM]).stdout or ""
-    installed = [line[3:] for line in status.splitlines() if line.startswith("ii ")]
+    installed = [fields[1] for line in status.splitlines() if len(fields := line.split()) == 2 and fields[0] == "ii"]
     return [*([["apt-get", "remove", "-y", *installed]] if installed else []), ["apt-get", "install", "-y", *wanted]]
 
 
