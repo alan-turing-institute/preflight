@@ -289,10 +289,11 @@ class UpgradeFake(Fake):
 
     def __init__(self, fail=()):
         super().__init__()
-        self.version, self.fail, self.dead_dbd = "slurm-wlm 23.11.4", list(fail), False
+        self.version, self.fail, self.dead_dbd, self.lose_history = "slurm-wlm 23.11.4", list(fail), False, False
 
     def __call__(self, argv):
-        out = {"sinfo -V": self.version, "sacct": "7\n", "scontrol show": "StateSaveLocation = /var/spool/slurmctld\nSlurmUser = slurm(64030)\n"}
+        installed = any(c[:2] == ["apt-get", "install"] for c in self.calls)
+        out = {"sinfo -V": self.version, "sacct": "" if self.lose_history and installed else "7\n", "scontrol show": "StateSaveLocation = /var/spool/slurmctld\nSlurmUser = slurm(64030)\n"}
         text = " ".join(argv)
         if self.fail and text.startswith(" ".join(self.fail)):
             self.calls.append(argv)
@@ -366,12 +367,14 @@ def test_upgrade_slurm_refuses_before_touching_anything(upgrade, capsys):
     assert not any(c[0] in ("mariadb-dump", "tar") for c in fake.calls) and not (tmp / "backups").exists()
 
 
-@pytest.mark.parametrize("fail, dead", [(("apt-get", "install", "-y", "/"), False), ((), True)])
-def test_a_failed_step_prints_the_restore_commands_and_goes_no_further(upgrade, capsys, fail, dead):
+# a failed install, a slurmdbd that dies converting, and a conversion that loses job history (data loss)
+@pytest.mark.parametrize("fail, dead, lose", [(("apt-get", "install", "-y", "/"), False, False), ((), True, False), ((), False, True)])
+def test_a_failed_step_prints_the_restore_commands_and_goes_no_further(upgrade, capsys, fail, dead, lose):
     tmp, site, fake = upgrade
-    fake.fail, fake.dead_dbd = list(fail), dead
+    fake.fail, fake.dead_dbd, fake.lose_history = list(fail), dead, lose
     assert run(site, tmp / "root", "upgrade-slurm") == 1
     err = capsys.readouterr().err
     assert "UPGRADE FAILED at slurm 25.05.9" in err and "slurm_acct_db <" in err and "apt-get install -y --allow-downgrades slurm-wlm" in err
     assert not any("26.05.5" in " ".join(c) for c in fake.calls) and ["apply"] not in fake.calls
-    assert ["systemctl", "start", "slurmctld"] not in fake.calls  # a dead slurmdbd never reaches the controller
+    assert lose or ["systemctl", "start", "slurmctld"] not in fake.calls  # a dead slurmdbd never reaches the controller
+    assert not lose or "sacct no longer lists 1 job(s)" in err
