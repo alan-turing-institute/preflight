@@ -142,6 +142,9 @@ def test_the_agent_writes_the_metrics_of_running_jobs_with_the_queues_user_and_r
     (scope / "job_5" / "step_0").mkdir(parents=True)
     (scope / "job_5" / "step_0" / "cgroup.procs").write_text("10\n")
     (scope / "job_5" / "memory.current").write_text("4096\n")
+    sluid = world.cgroups / "system.slice" / "slurmstepd.scope" / "s8VSM5Q2WYAV00"  # 26.05: named by the job's SLUID
+    sluid.mkdir(parents=True)
+    (sluid / "memory.current").write_text("2048\n")
     (scope / "job_7").mkdir()  # job 7 is being torn down: its cgroup lingers, its series should not
     world.metrics_mode, world.smi = "local", {10: 300.0, 20: 50.0}
     world.agent = world.new_agent()
@@ -150,12 +153,14 @@ def test_the_agent_writes_the_metrics_of_running_jobs_with_the_queues_user_and_r
     for planted in ("job_5.prom", "job_9.prom", "job_8.prom.tmp"):  # another user's forgery, a dead job's file, a stale temp
         (metrics / planted).write_text("forged\n")
     running = dataclasses.replace(job("5"), user="ann", name="proj:train")
-    world.queue = [running, job("7", "COMPLETING"), dataclasses.replace(job("6"), user="bob")]
+    world.queue = [running, job("7", "COMPLETING"), dataclasses.replace(job("6"), user="bob"),
+                   dataclasses.replace(job("8"), sluid="s8VSM5Q2WYAV00")]
     world.step()
-    assert sorted(path.name for path in metrics.iterdir()) == ["job_5.prom"]  # job 6 runs, but on another node (no cgroup here), 7 is ending, the rest is gone
+    assert sorted(path.name for path in metrics.iterdir()) == ["job_5.prom", "job_8.prom"]  # job 6 runs, but on another node (no cgroup here), 7 is ending, the rest is gone
     text = (metrics / "job_5.prom").read_text()
     assert 'jobid="5",user="ann",project="proj"' in text  # the queue's user, never the writer's
     assert f"}} {300 * agent_module.MIB}\n" in text and "} 4096\n" in text  # pid 20 is nobody's here
+    assert "} 2048\n" in (metrics / "job_8.prom").read_text()
     world.queue, world.smi = [], None  # job 5 ended, but nvidia-smi is silent: unknown is not zero
     assert "nvidia-smi did not answer" in str(world.step())
     assert (metrics / "job_5.prom").exists()

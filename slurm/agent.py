@@ -1076,7 +1076,7 @@ class Agent:
     def _running_pids(self, queue: list[gpu_jobs.QueuedJob]) -> dict[int, str]:
         found: dict[int, str] = {}
         for job in queue:
-            cgroup = self._job_cgroup(job.job_id) if job.state == gpu_jobs.State.RUNNING else None
+            cgroup = self._job_cgroup(job) if job.state == gpu_jobs.State.RUNNING else None
             found.update(dict.fromkeys(gpu_jobs.cgroup_pids(cgroup), job.job_id) if cgroup else {})
         return found
 
@@ -1089,9 +1089,11 @@ class Agent:
 
     # -- 5. job metrics -------------------------------------------------------------------------------------
 
-    def _job_cgroup(self, job_id: str) -> Path | None:
-        """The job's cgroup under slurm's scope (`system.slice/<node>_slurmstepd.scope`); None on another node."""
-        return next(iter(self.cgroup_root.glob(f"system.slice/*_slurmstepd.scope/job_{job_id}")), None)
+    def _job_cgroup(self, job: gpu_jobs.QueuedJob) -> Path | None:
+        """The job's cgroup under slurm's scope: `job_<id>` in `<node>_slurmstepd.scope` (23.11), its SLUID in
+        `slurmstepd.scope` (26.05); None on another node."""
+        names = [f"job_{job.job_id}", *([job.sluid] if job.sluid else [])]
+        return next((path for name in names for path in self.cgroup_root.glob(f"system.slice/*slurmstepd.scope/{name}")), None)
 
     def _job_metrics(self, queue: list[gpu_jobs.QueuedJob], errors: list[str]) -> None:
         # a site without GPUs has no nvidia-smi to ask: its jobs' GPU memory is 0, not unknown
@@ -1101,7 +1103,7 @@ class Agent:
             return
         texts: dict[str, str] = {}
         for job in queue:
-            cgroup = self._job_cgroup(job.job_id) if job.state == gpu_jobs.State.RUNNING else None
+            cgroup = self._job_cgroup(job) if job.state == gpu_jobs.State.RUNNING else None
             if cgroup is None:
                 continue
             pids = gpu_jobs.job_pids(cgroup, set(), job.job_id, set(usage))

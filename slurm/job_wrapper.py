@@ -145,17 +145,20 @@ def wait_for_card(
         sleep(poll_s)
 
 
-def job_cgroup(job_id: str, proc_cgroup: Path = Path("/proc/self/cgroup")) -> Path | None:
-    """This job's cgroup directory (the `job_<id>` component of our own cgroup path)."""
+def job_cgroup(proc_cgroup: Path = Path("/proc/self/cgroup")) -> Path | None:
+    """This job's cgroup directory: the component right after slurm's `*slurmstepd.scope`.
+
+    That is `job_<id>` on 23.11 (`<node>_slurmstepd.scope`) and the job's SLUID on 26.05 (`slurmstepd.scope`).
+    """
     try:
         line = proc_cgroup.read_text(encoding="utf-8").strip().splitlines()[0]
     except (OSError, IndexError):
         return None
     parts = line.split("::", 1)[-1].strip("/").split("/")
-    marker = f"job_{job_id}"
-    if marker not in parts:
+    scopes = [i for i, part in enumerate(parts) if part.endswith("slurmstepd.scope")]
+    if not scopes or scopes[0] + 1 >= len(parts):
         return None
-    return CGROUP_ROOT.joinpath(*parts[: parts.index(marker) + 1])
+    return CGROUP_ROOT.joinpath(*parts[: scopes[0] + 2])
 
 
 def sample(cgroup: Path | None, fallback_pids: set[int], job_id: str = "") -> dict[str, object]:
@@ -329,7 +332,7 @@ def main() -> int:
         print(f"[job] DECLARED SHARING: up to {arguments.max_jobs} GPU jobs on the card", flush=True)
 
     site = gpu_jobs.load_site()
-    cgroup = job_cgroup(job_id)
+    cgroup = job_cgroup()
     if arguments.needs_lease or arguments.needs_card:
         ok, reason = wait_for_card(
             needs_lease=arguments.needs_lease and site.lease is not None,

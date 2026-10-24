@@ -54,9 +54,12 @@ def test_proceeds_once_the_lease_is_held_and_the_card_is_free() -> None:
 def test_job_cgroup_is_the_job_component_of_our_cgroup(tmp_path: Path) -> None:
     proc = tmp_path / "cgroup"
     proc.write_text("0::/system.slice/gpu-node-1_slurmstepd.scope/job_42/step_batch/user/task_0\n")
-    path = job_wrapper.job_cgroup("42", proc)
+    path = job_wrapper.job_cgroup(proc)
     assert path == job_wrapper.CGROUP_ROOT / "system.slice/gpu-node-1_slurmstepd.scope/job_42"
-    assert job_wrapper.job_cgroup("43", proc) is None
+    proc.write_text("0::/system.slice/slurmstepd.scope/s8VSM5Q2WYAV00/step_batch/user/task_0\n")  # 26.05
+    assert job_wrapper.job_cgroup(proc) == job_wrapper.CGROUP_ROOT / "system.slice/slurmstepd.scope/s8VSM5Q2WYAV00"
+    proc.write_text("0::/user.slice/session-1.scope\n")
+    assert job_wrapper.job_cgroup(proc) is None
 
 
 SMI = "100, GPU-aaa\n200, GPU-bbb\n300, GPU-bbb\n"

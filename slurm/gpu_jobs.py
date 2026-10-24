@@ -170,6 +170,7 @@ class QueuedJob:
     cores: frozenset[str] = frozenset()  # "node:socket:core" slurm gave it; a suspended job keeps them for its resume
     submitted: int = 0  # epoch seconds it last entered the queue (a requeue resets it, measured); 0 when unknown
     node: str = ""  # the node a running job is on (squeue's `nodes`); "" while it waits
+    sluid: str = ""  # 26.05 names the job's cgroup by this (`step_id.sluid`) instead of `job_<id>`; "" on 23.11
 
     @property
     def job_class(self) -> JobClass | None:
@@ -260,10 +261,15 @@ def parse_squeue(text: str) -> list[QueuedJob]:
                 int(priority.get("number", 0)) if priority.get("set") else 0, parse_gpus(raw.get("tres_per_node") or ""),
                 cpus, level_of(str(raw.get("qos") or "")), _memory_mb(raw, cpus), _cores(raw),
                 int(submitted.get("number", 0)) if submitted.get("set") else 0,
-                str(raw.get("nodes") or ""),
+                str(raw.get("nodes") or ""), _sluid(raw),
             )
         )
     return jobs
+
+
+def _sluid(raw: dict) -> str:
+    step = raw.get("step_id")
+    return str(step.get("sluid") or "") if isinstance(step, dict) else ""
 
 
 def _cores(raw: dict) -> frozenset[str]:
