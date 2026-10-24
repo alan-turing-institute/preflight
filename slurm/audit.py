@@ -78,7 +78,7 @@ def unregistered(
     found = []
     for pid, mib in sorted(usage.items()):
         cgroup = cgroup_of(pid, proc)
-        if "/job_" in cgroup or cgroup in lease_cgroups or any(descends_from(pid, owner, proc) for owner in leases):
+        if "/job_" in cgroup or "slurmstepd.scope/" in cgroup or cgroup in lease_cgroups or any(descends_from(pid, owner, proc) for owner in leases):
             continue
         if label_of(cgroup, "gpu-lease-project") in leases.values():
             continue

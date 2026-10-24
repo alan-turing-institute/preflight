@@ -26,6 +26,7 @@ def test_attribution_by_job_cgroup_service_cgroup_and_ancestry(tmp_path: Path) -
     (leases / "service-a.json").write_text(json.dumps({"pid": owner, "project": "service-a"}))
     fake_proc(proc, owner, "/user.slice/service-a-models.service", 1)
     fake_proc(proc, 101, "/system.slice/gpu-node-1_slurmstepd.scope/job_5/step_batch", 1)
+    fake_proc(proc, 108, "/system.slice/slurmstepd.scope/s00000000000RN/step_batch/user/task_0", 1)  # 26.05: the SLUID
     fake_proc(proc, 102, "/user.slice/service-a-models.service", 1)  # same unit as the lease owner
     fake_proc(proc, 103, "/user.slice/other.scope", owner)  # a child of the lease owner
     fake_proc(proc, 104, "/user.slice/autocast-swe32-patch4.service", 1, "python train patch4\x1b[2J")
@@ -35,7 +36,7 @@ def test_attribution_by_job_cgroup_service_cgroup_and_ancestry(tmp_path: Path) -
     fake_proc(proc, 106, f"/system.slice/docker-{other}.scope", 2)
     fake_proc(proc, 107, f"/system.slice/docker-{bare}.scope", 2)
     labels = {labelled: "service-a", other: "service-b"}
-    usage = {101: 100.0, 102: 200.0, 103: 300.0, 104: 400.0, 105: 1.0, 106: 2.0, 107: 3.0}
+    usage = {101: 100.0, 102: 200.0, 103: 300.0, 104: 400.0, 105: 1.0, 106: 2.0, 107: 3.0, 108: 5.0}
     found = audit.unregistered(usage, leases, proc, lambda cgroup, _label: next((v for k, v in labels.items() if k in cgroup), ""))
     assert [(pid, mib) for pid, mib, _ in found] == [(104, 400.0), (106, 2.0), (107, 3.0)]
     assert "patch4" in found[0][2] and found[0][2].isprintable()  # any user's command line reaches admins' terminals
