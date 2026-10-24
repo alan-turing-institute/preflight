@@ -176,6 +176,10 @@ def test_parse_squeue_reads_json_so_a_name_cannot_forge_a_row() -> None:
     # slurm 26.05.5's own output (`squeue --json` of a running job, saved from the container trial)
     (sample,) = gpu_jobs.parse_squeue((Path(__file__).parent / "fixtures" / "squeue_26.05.json").read_text())
     assert sample.sluid == "s4EXM5Q0DHSC00" and running.sluid == ""
+    assert sample.cores == {"testnode:0:0"}  # core 0 ALLOCATED, 1-3 UNALLOCATED
+    old = {"job_id": 1, "job_state": ["RUNNING"], "job_resources": {"allocated_nodes": [
+        {"nodename": "n1", "sockets": {"0": {"cores": {"2": "allocated", "3": "allocated"}}}}]}}
+    assert gpu_jobs.parse_squeue(squeue_json(old))[0].cores == {"n1:0:2", "n1:0:3"}  # the 23.11 shape
     old = QueuedJob("1", "normal", "PENDING", "Priority", "n", "afterok:3(unfulfilled)")
     assert (old.user, old.priority, old.gpus, old.depends_on) == ("", 0, 0, ("3",))
     with pytest.raises(ValueError):

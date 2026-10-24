@@ -273,11 +273,23 @@ def _sluid(raw: dict) -> str:
 
 
 def _cores(raw: dict) -> frozenset[str]:
-    """The cores slurm gave a job (`job_resources.allocated_nodes[].sockets.<s>.cores.<c>`, 23.11 --json)."""
+    """The cores slurm gave a job, as `node:socket:core`.
+
+    23.11 --json: `job_resources.allocated_nodes[].sockets.<s>.cores.<c>`; 26.05: `job_resources.nodes.allocation[]`
+    with every core of the node listed under `sockets[].cores[]` and the held ones marked `ALLOCATED` in `status`.
+    """
+    resources = raw.get("job_resources") or {}
     found = set()
-    for node in (raw.get("job_resources") or {}).get("allocated_nodes") or []:
+    for node in resources.get("allocated_nodes") or []:
         for socket, entry in (node.get("sockets") or {}).items():
             found.update(f"{node.get('nodename')}:{socket}:{core}" for core in (entry.get("cores") or {}))
+    for node in (resources.get("nodes") or {}).get("allocation") or []:
+        for socket in node.get("sockets") or []:
+            found.update(
+                f"{node.get('name')}:{socket.get('index')}:{core.get('index')}"
+                for core in socket.get("cores") or []
+                if "ALLOCATED" in (core.get("status") or [])
+            )
     return frozenset(found)
 
 
