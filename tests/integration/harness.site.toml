@@ -18,6 +18,11 @@ notify_command = ["/usr/local/bin/harness-notify"]   # e2e.py installs this scri
 name = "testnode"
 cpus = 4
 real_memory_mb = 4096
+# The health check runs here too (HealthCheckNodeState=ANY). It reads the real /proc/meminfo, which is the host's: the
+# thresholds are as low as the site file allows (positive) so this node never closes, whatever else the box is doing.
+close_below_gb = 0.001
+push_back_below_gb = 0.001
+mains_only = false
 
 [[nodes.gpus]]
 index = 0
@@ -42,6 +47,22 @@ index = 3
 uuid = "GPU-00000000-0000-0000-0000-000000000003"
 device = "/opt/fakegpu/gpu3"
 type = "fake"
+
+# The part-time machine: the second container (compose.yml, service part-time), a configless slurmd the `part_time` stage
+# brings up. Default thresholds for a part-time node (close below 6 GB free, push back below 2 GB); the stage fakes the
+# free memory it sees.
+[[nodes]]
+name = "pt1"
+cpus = 2
+real_memory_mb = 4096
+part_time = true
+address = "pt1"                   # the compose network alias
+jobs_memory_gb = 3.5
+mains_only = false                # the container has no battery either way; explicit so no hardware decides
+
+# Every node runs node_check.py each interval_s; short, so the scenarios run in seconds, not minutes.
+[health_check]
+interval_s = 5
 
 # No [lease]: nothing else shares the container's fake GPUs.
 

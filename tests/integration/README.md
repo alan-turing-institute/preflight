@@ -1,6 +1,6 @@
 # Integration test cluster
 
-A one-node slurm cluster in a container, for testing the portable GPU jobs build (installer, tools, agent, portal)
+A one-node slurm cluster in a container (plus a second container that plays a part-time machine in the `part_time` stage), for testing the portable GPU jobs build (installer, tools, agent, portal)
 without touching this box's `/etc`, systemd, slurm daemons or queue.
 
     tests/integration/run.sh up      # build the image if needed, start the container, wait for the node to be idle
@@ -45,7 +45,7 @@ So the harness uses four symlinks to `/dev/null` (`/opt/fakegpu/gpu0` to `gpu3`,
 
 ## Container limits and what it cannot touch
 
-`compose.yml`: label `lifecycle: ephemeral`, 8 GiB memory (no extra swap), 4 CPUs, 2048 processes, no GPU, no host
+`compose.yml`: label `lifecycle: ephemeral` (both containers; the part-time one has 3 GB and 2 CPUs), 8 GiB memory (no extra swap), 4 CPUs, 2048 processes, no GPU, no host
 network, no published ports, no host `/etc` or munge socket, not privileged. systemd runs with a private cgroup
 namespace, Docker's `--security-opt writable-cgroups=true` (a writable `/sys/fs/cgroup` that is the container's own
 subtree) and tmpfs on `/run`, `/run/lock` and `/tmp`. The only host path mounted is this repository, read-only.
@@ -69,7 +69,7 @@ subtree) and tmpfs on `/run`, `/run/lock` and `/tmp`. The only host path mounted
 `run.sh e2e` installs every component into the container through the real installer from `harness.site.toml`, runs the
 scenarios below as alice, bob and carol, and exits 1 if any check failed. Each check prints `PASS` or `FAIL` with its evidence
 as it happens; the summary lists the failures and any `NOTE` (something that could not be exercised). `--only` takes
-`install,jobs,urgent,service,failure,recovery,portal,proxy,ssh,lease,host`; later stages need `install` to have run once on that cluster.
+`install,jobs,urgent,service,failure,recovery,portal,proxy,ssh,lease,host,part_time,upgrade`; later stages need `install` to have run once on that cluster.
 
 Disk: the image stays 569 MB, but an installed container's writable layer grows to about 4 GB (Open OnDemand, Grafana,
 Prometheus, a Go toolchain, caches) in Docker's data root. `run.sh down` removes it; run it when you are done.
@@ -84,6 +84,17 @@ Only what an operator would supply, or what the container cannot do:
   switch off namespace sandboxing, which the unprivileged container refuses (`Failed to set up mount namespacing: Operation not
   supported`, `Failed to keep CAP_SYS_ADMIN`). A real host does not need them.
 - **A TLS front for Grafana** (an Apache virtual host on 3443 proxying to Grafana on 3001); see the decision below.
+- **The part-time machine** (`part_time` stage; compose service `part-time`, hostname and network alias `pt1`, the same image,
+  3 GB and 2 CPUs). The harness stands in for two installer commands and says so in a `NOTE`:
+  `install.py apply --part-time pt1` needs the pinned slurm build (a download and a compile; the controller runs the
+  distro's slurm), so pt1 keeps the image's packages, `/opt/gpujobs/slurm` is a symlink to `/src/slurm`, and the slurmd drop-in
+  is made by the installer's own `components.part_time.slurmd_drop_in`; `install.py part-time add pt1` needs ssh, which the
+  containers do not have, so the stage compares the ids of `slurm`, alice, bob and carol itself and copies the munge key
+  through `docker exec` (on stdin, never in an argument list). It also gives pt1 what a real node install does not make: the
+  site file `/etc/gpujobs/site.toml`, the state directories under `/var/lib/gpujobs`, and a copy of the rendered
+  `/etc/gpujobs/node_check.json` whose `meminfo_path` points at `/var/tmp/fake-meminfo`, a file the stage rewrites to fake
+  the free memory. The image's own controller-side units on pt1 (slurmctld, slurmdbd, MariaDB, first-boot units) are
+  disabled and its bootstrap slurm.conf removed, so slurmd is configless (`--conf-server testnode`).
 - **`systemctl restart slurmctld`** right after `user add` / `admin add`, to work around an open bug (below).
 
 ### Stages and what each check proves
@@ -97,6 +108,7 @@ Only what an operator would supply, or what the container cannot do:
 | `recovery` | S9 slurmctld+slurmd restart with the job's processes killed: requeued by the agent's boot step, with a control run without the agent; S10 a slurmctld-only restart keeps the live job |
 | `portal` | anonymous request goes to the login; Dex local login over HTTPS (wrong password refused); the app's first-visit initialization; symlinked sys app; Passenger starts our `bin/python`; every page loads; every user's jobs listed; buttons hidden or shown by owner and admin; `Origin` and `Host` reach the app; pause, preview and resume through the portal |
 | `lease` | `apply --component lease` refuses a `lease.python` without localmodels; the keeper's user unit installed, enabled and started with `systemctl --user --machine=dave@.host`, surviving the installer's session |
+| `part_time` | pt1 joins configless; `--anywhere` starts on the full node first and on pt1 when the full node is busy; fake free memory drives the health check (below 6 GB: drained, jobs left running; below 2 GB: the newest resume job requeued; a job pushed twice is barred from pt1; reopened at the third passing check, not before); an admin's own drain is left alone; an urgent job waiting stops closing and reopens; the page's actions as the agent applies them (close, accept, give back, thresholds). Run it alone with `python3 tests/integration/e2e.py --only part_time` on a cluster where `install` has run |
 | `host` | the job wrapper's `foreign_gpu_processes` and `card_is_free` against this machine's real `nvidia-smi` (read-only; nothing is started or changed on the host). It needs a compute process on the GPU to parse a non-empty output; when there is none the run says so in a `NOTE` and checks the empty case only |
 
 ### Decision: how Grafana is reached in the portal

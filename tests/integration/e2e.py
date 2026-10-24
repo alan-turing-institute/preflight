@@ -6,7 +6,7 @@
 
 Runs on the host and drives the container through `run.sh shell`. Every check prints PASS or FAIL with its
 evidence as it happens; the exit status is 1 when any check failed. Stages: install, jobs, urgent, failure,
-recovery, portal, proxy, ssh, lease, host, upgrade (in this order; `--only` takes a subset, later stages need `install` to have run once).
+recovery, portal, proxy, ssh, lease, host, part_time, upgrade (in this order; `--only` takes a subset, later stages need `install` to have run once).
 """
 
 from __future__ import annotations
@@ -39,6 +39,7 @@ GRAFANA_TLS = "https://testnode:3443"
 USERS = ("alice", "bob", "carol")
 # Test-only portal passwords of the throwaway accounts (only their bcrypt hashes go into the container).
 PASSWORDS: dict[str, str] = {u: f"pw-{u}-e2e" for u in (*USERS, "dave")}
+PT_COMPOSE = ["docker", "compose", "-p", "gpujobs-test", "-f", str(HERE / "compose.yml")]
 RESULTS: list[tuple[str, bool, str]] = []
 CHAIN_LENGTH = 3  # jobs in the chain S1 submits
 CPU_CAP = 2  # cores S3 lets the CPU-only partition use on the 4-core harness node
@@ -59,9 +60,7 @@ class Out:
         return (self.out + self.err).strip()
 
 
-def cl(*argv: str, user: str = "root", timeout: int = 300, stdin: str | None = None) -> Out:
-    """One command in the container, as `user`."""
-    cmd = [str(RUN), "shell", *(["-u", user] if user != "root" else []), *argv]
+def _run(cmd: list[str], argv: tuple[str, ...], timeout: int, stdin: str | None) -> Out:
     try:
         done = subprocess.run(
             cmd, capture_output=True, text=True, timeout=timeout, input=stdin, check=False,
@@ -70,6 +69,16 @@ def cl(*argv: str, user: str = "root", timeout: int = 300, stdin: str | None = N
     except subprocess.TimeoutExpired as exc:
         return Out(124, "", f"timed out after {timeout} s: {' '.join(argv)[:200]} {exc.stderr or ''}")
     return Out(done.returncode, done.stdout, done.stderr)
+
+
+def cl(*argv: str, user: str = "root", timeout: int = 300, stdin: str | None = None) -> Out:
+    """One command in the container, as `user`."""
+    return _run([str(RUN), "shell", *(["-u", user] if user != "root" else []), *argv], argv, timeout, stdin)
+
+
+def pt(*argv: str, timeout: int = 300, stdin: str | None = None) -> Out:
+    """One command, as root, in the part-time container (run.sh drives only the first one)."""
+    return _run([*PT_COMPOSE, "exec", "-T", "-u", "root", "-w", "/root", "part-time", *argv], argv, timeout, stdin)
 
 
 def sh(script: str, user: str = "root", timeout: int = 300) -> Out:
@@ -221,9 +230,10 @@ os.write(fd, json.dumps(users).encode())
 """
 
 
-def put(path: str, text: str, mode: str = "0644") -> None:
+def put(path: str, text: str, mode: str = "0644", run: Callable[..., Out] = cl) -> None:
+    """Write `text` to `path` in the container `run` talks to (`cl`, or `pt` for the part-time one)."""
     target = shlex.quote(path)
-    done = cl("bash", "-c", f"mkdir -p \"$(dirname {target})\" && cat > {target} && chmod {mode} {target}", stdin=text, timeout=60)
+    done = run("bash", "-c", f"mkdir -p \"$(dirname {target})\" && cat > {target} && chmod {mode} {target}", stdin=text, timeout=60)
     if done.rc:
         raise SystemExit(f"could not write {path}: {done.text}")
 
@@ -1099,6 +1109,297 @@ def stage_host() -> None:
               found == [] and r["free"] is True, f"raw {r['raw']!r}")
 
 
+# -- stage: part_time ------------------------------------------------------------------------------------------
+
+PT = "pt1"  # the part-time node: the compose service `part-time`, a configless slurmd
+PT_MEMINFO = "/var/tmp/fake-meminfo"  # what the rendered node_check.json's meminfo_path is pointed at on pt1
+PT_LOG = "/var/log/gpujobs/node_check.log"
+NODE_CHECK_JSON = "/etc/gpujobs/node_check.json"
+SITE_COPY = "/etc/gpujobs/site.toml"
+STICKY_DIRS = ("jobs", "events", "footprints", "requests", "logs", "scripts", "manifests")  # components/agent.py STICKY
+CHECK_REASON = "gpujobs-check: "  # slurm/node_check.py REASON_PREFIX; node_check imports gpu_jobs, which needs a site file
+ADMIN_REASON = "gpujobs-admin: "  # slurm/agent.py ADMIN_REASON_PREFIX
+CHECK_EVERY_S = 5  # harness.site.toml [health_check] interval_s
+QUIET_S = 5 * CHECK_EVERY_S  # long enough for four or five health checks to have had their say
+CLOSE_GB, PUSH_GB = 6, 2  # a part-time node's default thresholds (site_config): close below, push back below
+MB_PER_GB = 1000  # decimal, as node_check shows them
+FREE_OK_GB, FREE_CLOSE_GB, FREE_PUSH_GB = 20, 4, 1  # the fake free memory: open, closes, pushes back too
+PAGE_CLOSE_GB, PAGE_PUSH_GB, FREE_BETWEEN_GB = 8, 3, 7  # the page's thresholds, and a value only they close at
+PASSES_TO_REOPEN = 3  # node_check.REOPEN_AFTER
+PUSHES_BEFORE_BAR = 2  # node_check.PUSHES_BEFORE_EXCLUDE
+UNUSABLE = {"DOWN", "INVAL", "FAIL", "UNKNOWN"}
+PT_DROP_IN = (  # the real function behind the slurmd drop-in of `install.py apply --part-time`
+    "import sys; sys.path[:0] = ['/src/slurm/install', '/src/slurm']\n"
+    "import components.part_time as p; print(p.slurmd_drop_in(sys.stdin.read(), 'testnode'), end='')"
+)
+PT_EDIT_SETTINGS = (  # point pt1's entry of the rendered node_check.json at the fake meminfo
+    "import json, sys; path, node, meminfo = sys.argv[1:]\n"
+    "settings = json.load(open(path)); settings[node]['meminfo_path'] = meminfo; json.dump(settings, open(path, 'w'), indent=2)"
+)
+PT_PUSHES = (
+    f"import glob, json; print(json.dumps(sorted((json.load(open(f)) for f in glob.glob('{STATE}/events/*-push_back.json')),"
+    " key=lambda e: e['at'])))"
+)
+
+
+def ptsh(script: str, timeout: int = 300) -> Out:
+    return pt("bash", "-c", script, timeout=timeout)
+
+
+def set_free(gb: float) -> None:
+    """The free memory pt1's health check sees. node_check reads MemAvailable in kB (1024 bytes) and shows decimal MB."""
+    kb = int(gb * 1e9 / 1024)
+    ptsh(f"printf 'MemTotal: 4000000 kB\\nMemAvailable: {kb} kB\\n' > {PT_MEMINFO}.new && mv {PT_MEMINFO}.new {PT_MEMINFO}")
+
+
+def node_json() -> dict:
+    try:
+        return json.loads(sh(f"scontrol show node {PT} --json").out)["nodes"][0]
+    except (ValueError, KeyError, IndexError):
+        return {}
+
+
+def node_reason() -> str:
+    return str(node_json().get("reason") or "")
+
+
+def closed_by(prefix: str) -> bool:
+    info = node_json()
+    return "DRAIN" in (info.get("state") or []) and str(info.get("reason") or "").startswith(prefix)
+
+
+def is_open() -> bool:
+    states = set(node_json().get("state") or [])
+    return bool(states) and "DRAIN" not in states and not states & UNUSABLE
+
+
+def pt_log() -> list[tuple[int, str]]:
+    """(free MB, decisions) of each health check run on pt1, oldest first; a line is `<time> pt1 free=N MB <decisions>`."""
+    found = (re.search(r"free=(\d+) MB (.*)$", line) for line in pt("cat", PT_LOG).out.splitlines())
+    return [(int(m[1]), m[2]) for m in found if m]
+
+
+def pt_pushes(job: str | None = None) -> list[dict]:
+    """The push_back events node_check wrote on pt1 (its own state directory), oldest first."""
+    try:
+        found = json.loads(pt("python3", "-c", PT_PUSHES).out)
+    except ValueError:
+        return []
+    return [e for e in found if job is None or e["job"] == job]
+
+
+def anywhere(name: str) -> str:
+    return submit("alice", name, 600, "--anywhere")
+
+
+def filler(name: str, cpus: int) -> str:
+    """A restart cpu job that takes `cpus` of the full node's 4 cores, so an --anywhere job has to go to pt1."""
+    return submit("alice", name, 600, "--cpus", str(cpus), cls="restart")
+
+
+def runs_on(job: str, host: str, partition: str) -> bool:
+    """RUNNING within 90 s, on `host`, in `partition`."""
+    if not wait_state(job, "RUNNING", 90):
+        return False
+    info = jobinfo(job)
+    return info.get("BatchHost") == host and info.get("Partition") == partition
+
+
+def page_request(action: str, **fields: object) -> bool:
+    """What the page's POST leaves for the agent: `requests/part_time-<node>-<ns>.json`, a file carol (an admin) owns."""
+    path = f"{STATE}/requests/part_time-{PT}-$(date +%s%N).json"
+    return cl("bash", "-c", f"cat > {path}", stdin=json.dumps({"action": action, **fields}), user="carol").rc == 0
+
+
+def request_taken() -> bool:
+    return sh(f"ls {STATE}/requests/part_time-* 2>/dev/null | wc -l").out.strip() == "0"
+
+
+def user_ids(run: Callable[..., Out]) -> list[str]:
+    return sorted(line.split(":")[0] + ":" + line.split(":")[2] for line in run("getent", "passwd", "slurm", "alice", "bob", "carol").out.split())
+
+
+def join_part_time() -> bool:
+    """Bring pt1 up as `install.py apply --part-time pt1` + `part-time add pt1` would leave it. The harness substitutes
+    (README, "What the run does outside the installer"):
+      - `apply --part-time` needs the pinned slurm build (a download and a compile) and the controller runs the distro's
+        slurm: pt1 keeps the image's packages. The tools component is replaced by a symlink to /src/slurm, the slurmd
+        drop-in is made by the installer's own `slurmd_drop_in`, and no firewall is in the container.
+      - `part-time add` needs ssh, which the containers do not have: the harness compares the user ids itself and copies
+        the munge key through `docker exec`.
+      - what a real node install does NOT make, and the health check and the job wrapper need: the site file and the
+        state directories (see Findings in the run's report)."""
+    ptsh("systemctl disable --now slurmctld slurmdbd mariadb gpujobs-db-init gpujobs-accounts-init slurmd; "
+         "rm -f /etc/slurm/slurm.conf /etc/slurm/gres.conf /etc/slurm/cgroup.conf /etc/slurm/slurmdbd.conf "
+         "/etc/systemd/system/slurmd.service.d/10-conf-server.conf")  # the image's bootstrap; a re-run starts clean
+    ptsh("install -d /opt/gpujobs /var/log/gpujobs && ln -sfn /src/slurm /opt/gpujobs/slurm && install -d -m 0755 "
+         f"{STATE} && for d in {' '.join(STICKY_DIRS)}; do install -d -m 1777 {STATE}/$d; done")
+    put(SITE_COPY, cl("cat", SITE_COPY).out, run=pt)
+    put(NODE_CHECK_JSON, cl("cat", NODE_CHECK_JSON).out, run=pt)
+    # The rendered file points at /proc/meminfo, which in the container is the host's: edit pt1's copy to a file the stage writes.
+    edited = pt("python3", "-c", PT_EDIT_SETTINGS, NODE_CHECK_JSON, PT, PT_MEMINFO)
+    set_free(FREE_OK_GB)
+    # The key travels on stdin (base64, as the container helpers carry text), never in an argv.
+    key = cl("base64", "-w0", "/etc/munge/munge.key").out
+    keyed = pt("bash", "-c", "base64 -d | install -m 0400 -o munge -g munge /dev/stdin /etc/munge/munge.key && systemctl restart munge",
+               stdin=key, timeout=60)
+    return edited.rc == 0 and key != "" and keyed.rc == 0
+
+
+def stage_part_time() -> None:
+    section("part_time: a second container as a configless part-time node; the health check, --anywhere and the page's actions")
+    note("part_time: the harness stands in for `install.py apply --part-time pt1` (needs the pinned slurm build) and "
+         "`install.py part-time add pt1` (needs ssh); see README, \"What the run does outside the installer\"")
+    up = pt("true")
+    if not check("the part-time container is running (compose service part-time, hostname pt1)", up.rc == 0, up.text[:200]):
+        return
+    config = sh("scontrol show config | grep -i SlurmctldParameters").out
+    check("the installed slurm.conf turns on configless mode (SlurmctldParameters=enable_configless)", "enable_configless" in config, config.strip())
+    ours, theirs = user_ids(cl), user_ids(pt)
+    check("slurm, alice, bob and carol have the same ids on both machines (the check `part-time add` makes over ssh)",
+          bool(ours) and ours == theirs, f"{ours} vs {theirs}")
+    executable = [sh("test -x /opt/gpujobs/slurm/node_check.py").rc, pt("test", "-x", "/src/slurm/node_check.py").rc]
+    check("node_check.py is executable where slurmd will run it (slurm execs HealthCheckProgram directly)", executable == [0, 0],
+          f"exit statuses of test -x: installed copy on testnode {executable[0]}, repository file on pt1 {executable[1]}")
+    ready = join_part_time()
+    check("pt1 is made ready: bootstrap removed, tools, site file and settings in place, munge key copied", ready)
+
+    drop_in = pt("python3", "-c", PT_DROP_IN, stdin=pt("systemctl", "cat", "slurmd").out)
+    put("/etc/systemd/system/slurmd.service.d/10-conf-server.conf", drop_in.out, run=pt)
+    started = ptsh("systemctl daemon-reload && systemctl enable --now slurmd", timeout=120)
+    check("the installer's slurmd_drop_in adds --conf-server testnode and slurmd starts", "--conf-server testnode" in drop_in.out and started.rc == 0,
+          f"{drop_in.text} | {started.text[-200:]}")
+    registered = wait_for(lambda: sh(f"sinfo -h -N -n {PT} -o %T").out.strip() in ("idle", "mixed", "allocated"), 150, 3)
+    cache = pt("ls", "/var/spool/slurmd/conf-cache").out.split()
+    check("pt1 registers with slurmctld with no slurm.conf of its own (configless: the config is in slurmd's cache)",
+          bool(registered) and "slurm.conf" in cache and pt("test", "-e", "/etc/slurm/slurm.conf").rc != 0,
+          f"state {sh(f'sinfo -h -N -n {PT} -o %T').out.strip()}, cache {cache}")
+    check("slurmd runs node_check.py on pt1 every few seconds: its log has an allow line", bool(wait_for(
+          lambda: any(d == "allow" for _, d in pt_log()), 60, 3)), str(pt_log()[-2:]))
+    clear_queue()
+    check("pt1 starts open (20 GB free, nothing drained it)", bool(wait_for(is_open, 60)), node_reason())
+
+    # an --anywhere job prefers the full node; the part-time one takes it only when the full node is busy
+    a = anywhere("pt-first")
+    check("--anywhere: with both nodes free the job starts on the full node, in partition cpu", runs_on(a, "testnode", "cpu"), str(jobinfo(a)))
+    fill = filler("pt-fill", 3)  # a restart job takes the other cores of the 4-core full node
+    check("a restart cpu job fills the rest of the full node", runs_on(fill, "testnode", "cpu"), str(jobinfo(fill)))
+    b1 = anywhere("pt-b1")
+    if not check("--anywhere: with the full node busy the job starts on pt1, in partition part_time", runs_on(b1, PT, "part_time"), str(jobinfo(b1))):
+        return
+    time.sleep(2)  # slurm records start times in whole seconds: b2 must be strictly newer
+    b2 = anywhere("pt-b2")
+    check("a second --anywhere job also runs on pt1, started after the first", runs_on(b2, PT, "part_time"), str(jobinfo(b2)))
+
+    # rule 3: below the close limit the node is drained and its jobs are left running
+    set_free(FREE_CLOSE_GB)
+    check("4 GB free (below 6): pt1 is drained with a gpujobs-check reason that names the memory",
+          bool(wait_for(lambda: closed_by(CHECK_REASON), 60, 3)) and "4.0 GB free" in node_reason(), node_reason())
+    check("a drain leaves the running jobs alone: both still RUNNING, nothing pushed back",
+          state(b1) == state(b2) == "RUNNING" and not pt_pushes(), f"{state(b1)} {state(b2)} pushes {len(pt_pushes())}")
+
+    # rule 2: below the push-back limit the newest resume job is requeued
+    set_free(FREE_PUSH_GB)
+    check("1 GB free (below 2): the newest resume job is requeued", bool(wait_for(lambda: state(b2) == "PENDING", 90, 2)), f"{b2}: {state(b2)}")
+    pushes = pt_pushes()
+    check("it was the newest (the first push_back event names b2, not b1), with the free memory recorded",
+          bool(pushes) and pushes[0]["job"] == b2 and pushes[0]["node"] == PT and pushes[0]["free_mb"] < PUSH_GB * MB_PER_GB,
+          str(pushes[:1]))
+    clear_queue()
+
+    # rule 4: reopen only after three passing runs in a row
+    set_free(FREE_OK_GB)
+    reopened = wait_for(is_open, 120, 3)
+    log = pt_log()
+    last = max((i for i, (_, d) in enumerate(log) if "reopen" in d), default=-1)
+    streak = 0
+    while last - streak >= 0 and log[last - streak][0] >= CLOSE_GB * MB_PER_GB:
+        streak += 1
+    check("pt1 reopens at the third passing check in a row, not before", bool(reopened) and last >= 0 and streak == PASSES_TO_REOPEN,
+          f"passing runs ending at the reopen line: {streak}; {log[max(last - 3, 0):last + 1]}")
+
+    # rule 2, repeated: a job pushed twice from the same node is barred from it
+    fill = filler("pt-fill4", 4)
+    b3 = anywhere("pt-b3")
+    wait_state(fill, "RUNNING", 60)
+    if check("one job alone on pt1 (the full node is full)", runs_on(b3, PT, "part_time"), str(jobinfo(b3))):
+        set_free(FREE_PUSH_GB)
+        wait_for(lambda: state(b3) == "PENDING", 90, 2)
+        check("first push: requeued, one push_back event, not yet barred", len(pt_pushes(b3)) == 1 and jobinfo(b3).get("ExcNodeList") in ("", "(null)"),
+              f"events {len(pt_pushes(b3))}; ExcNodeList {jobinfo(b3).get('ExcNodeList')}")
+        set_free(FREE_OK_GB)
+        back = wait_for(lambda: is_open() and state(b3) == "RUNNING", REQUEUE_DELAY_S + 150, 3)
+        check("after the node reopens the pushed job runs on pt1 again (one push does not bar it)", bool(back) and jobinfo(b3).get("BatchHost") == PT,
+              str(jobinfo(b3))[:200])
+        set_free(FREE_PUSH_GB)
+        barred = wait_for(lambda: PT in jobinfo(b3).get("ExcNodeList", ""), 90, 2)
+        check("second push: the job is barred from pt1 (ExcNodeList names it) after two push_back events",
+              bool(barred) and len(pt_pushes(b3)) == PUSHES_BEFORE_BAR, f"events {len(pt_pushes(b3))}; ExcNodeList {jobinfo(b3).get('ExcNodeList')}")
+        set_free(FREE_OK_GB)
+        wait_for(is_open, 120, 3)
+        time.sleep(QUIET_S)
+        check("the barred job stays PENDING though pt1 is open again (the full node is full)", state(b3) == "PENDING", f"{b3}: {state(b3)}")
+    clear_queue()
+
+    # an admin's own drain is never touched
+    wait_for(is_open, 120, 3)
+    hand = "maintenance by hand"
+    sh(f"scontrol update NodeName={PT} State=DRAIN Reason='{hand}'")
+    set_free(FREE_PUSH_GB)
+    time.sleep(QUIET_S)
+    check("a drain with another reason is left alone while memory is low", closed_by(hand), node_reason())
+    check("the health check's log says it left it alone", any("left alone" in d for _, d in pt_log()[-8:]), str(pt_log()[-2:]))
+    set_free(FREE_OK_GB)
+    time.sleep(QUIET_S)
+    check("and when memory is fine again it does not resume it either", closed_by(hand), node_reason())
+    sh(f"scontrol update NodeName={PT} State=RESUME")
+    wait_for(is_open, 60, 3)
+
+    # an urgent job waiting stops closing
+    set_free(FREE_CLOSE_GB)
+    closed = wait_for(lambda: closed_by(CHECK_REASON), 60, 3)
+    held = cl("sbatch", "--parsable", "-p", "urgent", "--begin=now+1hour", "-J", "pt-urgent-hold", "--mem", "100M", "--wrap", "true", user="carol")
+    urgent = held.out.strip().split(";")[0]
+    check("an urgent job is waiting (held by --begin) while pt1 is closed for low memory", bool(closed) and urgent.isdigit() and state(urgent) == "PENDING",
+          f"{held.text} {state(urgent)}")
+    check("the health check reopens what it closed once an urgent job waits", bool(wait_for(is_open, 60, 3)), node_reason())
+    time.sleep(QUIET_S)
+    check("and keeps pt1 open at 4 GB free while the urgent job waits", is_open() and any("stay open (urgent" in d for _, d in pt_log()[-8:]),
+          str(pt_log()[-2:]))
+    sh(f"scancel {urgent}")
+    check("with no urgent job waiting it closes again", bool(wait_for(lambda: closed_by(CHECK_REASON), 60, 3)), node_reason())
+    set_free(FREE_OK_GB)
+    wait_for(is_open, 120, 3)
+
+    # the page's actions: request files an admin owns, carried out by the agent
+    check("page: close -> the agent drains pt1 with its own reason and takes the request",
+          page_request("close") and bool(wait_for(lambda: closed_by(ADMIN_REASON), 60, 3)) and bool(wait_for(request_taken, 30, 3)), node_reason())
+    time.sleep(QUIET_S)
+    check("a page closure is not reopened by the health check, though memory is fine", closed_by(ADMIN_REASON), node_reason())
+    check("page: accept -> the agent resumes the node it closed", page_request("accept") and bool(wait_for(is_open, 60, 3)), node_reason())
+    fill = filler("pt-fill4b", 4)
+    b4 = anywhere("pt-b4")
+    wait_state(fill, "RUNNING", 60)
+    if check("a resume job runs on pt1 before 'Give me my machine back'", runs_on(b4, PT, "part_time"), str(jobinfo(b4))):
+        check("page: give_back -> pt1 is closed and its resume job requeued", page_request("give_back")
+              and bool(wait_for(lambda: closed_by(ADMIN_REASON) and state(b4) == "PENDING", 90, 3)),
+              f"{node_reason()}; {b4}: {state(b4)}")
+    page_request("accept")
+    wait_for(is_open, 60, 3)
+    clear_queue()
+    check("page: thresholds -> the agent puts them in the node's Extra", page_request("thresholds", close_below_gb=PAGE_CLOSE_GB, push_back_below_gb=PAGE_PUSH_GB)
+          and bool(wait_for(lambda: json.loads(node_json().get("extra") or "{}") == {"close_below_mb": PAGE_CLOSE_GB * MB_PER_GB, "push_back_below_mb": PAGE_PUSH_GB * MB_PER_GB}, 60, 3)),
+          str(node_json().get("extra")))
+    set_free(FREE_BETWEEN_GB)
+    check("7 GB free closes pt1 under the page's 8 GB (the default 6 GB would not): node_check uses the Extra override",
+          bool(wait_for(lambda: closed_by(CHECK_REASON), 60, 3)), node_reason())
+    set_free(FREE_OK_GB)
+    page_request("thresholds", close_below_gb=CLOSE_GB, push_back_below_gb=PUSH_GB)  # back to the defaults
+    wait_for(is_open, 120, 3)
+    clear_queue()
+
+
+
 # SchedMD's digests (plan notes, "Facts"): the release tarballs the harness builds.
 UPGRADE_STEPS = ("25.05.9", "7be633820df896df819ac2e9f2ebd0824de509515e5fb78ba1c19da2453b39ed")
 UPGRADE_TARGET = ("26.05.5", "4680cafc82b0689865c885eb703441e7ebf764896c40fd03a50f2fcb60664f68")
@@ -1142,6 +1443,7 @@ STAGES: dict[str, Callable[[], None]] = {
     "ssh": stage_ssh,
     "lease": stage_lease,
     "host": stage_host,
+    "part_time": stage_part_time,
     "upgrade": stage_upgrade,
 }
 
