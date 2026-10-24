@@ -130,8 +130,12 @@ def test_site_admin_check_multi_gpu_plan_and_request_file(
     assert "sudo slurm/install/install.py admin add USER" in err
 
     monkeypatch.setattr(urgent.site_config, "is_admin", lambda _site, _user: True)
+    (tmp_path / "jobs" / "m.json").write_text(json.dumps({"name": "u", "last_leg": {
+        "peak_gpu_mib": 2048, "peak_mem_bytes": 0, "ended_at": 1, "exit": 0, "signals": []}}))
     assert urgent.run([*argv, "--dry-run", "--", "true"]) == 0
-    out = capsys.readouterr().out
+    captured = capsys.readouterr()
+    out = captured.out
+    assert "[submit] warning: --mem 1G (1.1 GB) is below the 2.1 GB 'u' peaked at" in captured.err
     assert "service svc: yields in a minute" in out
     assert "PAUSABLE  5 p:x:5" in out  # the running job holding 2 GPUs is a candidate
     assert "--gres=gpu:2" in out

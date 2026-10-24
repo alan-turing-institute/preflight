@@ -94,6 +94,51 @@ def test_mem_auto_uses_the_last_measured_run_plus_a_margin(tmp_path: Path, monke
     assert f"{DIRECTIVE} --mem=14G" in script  # newest run: 10 + 2 GiB, plus 10%, rounded up
 
 
+@pytest.mark.parametrize(
+    ("mem", "name", "expected"),
+    [
+        ("10G", "n", "--mem 10G (10.7 GB) is below the 12.9 GB 'n' peaked at"),  # 12 GiB measured
+        ("0", "n", "--mem 0 asks for the whole box"),
+        ("0", "n", "--mem auto would ask for 15.0 GB"),  # 14G is 14 GiB
+        ("12000M", "n", "below the 12.9 GB"),  # plain slurm notation: M is MiB
+        ("13G", "n", ""),  # enough
+        ("auto", "n", ""),
+        ("1G", "other", ""),  # no measured run under that name
+    ],
+)
+def test_a_hand_set_mem_below_the_measured_peak_or_zero_warns(
+    mem: str, name: str, expected: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(gpu_jobs, "STATE_DIR", tmp_path)
+    (tmp_path / "jobs").mkdir()
+    leg = {"peak_gpu_mib": 10 * 1024, "peak_mem_bytes": 2 * 1024**3, "ended_at": 1, "exit": 0, "signals": []}
+    (tmp_path / "jobs" / "1.json").write_text(json.dumps({"name": "n", "last_leg": leg}))
+    dry("--project", "p", "--what", "w", "--class", "restart", "--gpu", "--mem", mem, "--name", name, "--", "x")
+    err = capsys.readouterr().err
+    assert ("[submit] warning: " in err and expected in err) if expected else err == ""
+
+
+@pytest.mark.parametrize(
+    ("command", "queue", "warns"),
+    [
+        (["--device", "cpu"], [], True),
+        (["--device=cpu"], [], True),
+        (["--device", "cuda"], [], False),
+        (["--device", "cpu"], [gpu_jobs.QueuedJob("1", "normal", "PENDING", "Resources", "p:x:1", gpus=1)], False),
+        (["--device", "cpu"], [gpu_jobs.QueuedJob("1", "normal", "RUNNING", "None", "p:x:1", gpus=1)], False),
+        (["--device", "cpu"], None, False),  # slurm does not answer: say nothing
+    ],
+)
+def test_device_cpu_with_the_gpu_unreserved_warns(
+    command: list[str], queue: list | None, warns: bool, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(gpu_jobs, "read_queue", lambda: queue)
+    dry("--project", "p", "--what", "w", "--class", "restart", "--", "x", *command)
+    assert ("the GPU is free" in capsys.readouterr().err) is warns
+
+
 def test_no_mem_reuses_the_last_measured_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(gpu_jobs, "STATE_DIR", tmp_path)
     (tmp_path / "jobs").mkdir()

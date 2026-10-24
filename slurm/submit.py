@@ -107,6 +107,48 @@ def resolve_mem(mem: str | None, name: str | None, gpu: bool) -> str | None:
     return WHOLE_BOX if gpu else None
 
 
+def warn(text: str) -> None:
+    print(f"[submit] warning: {text}", file=sys.stderr)
+
+
+def _gb(megabytes: float) -> str:
+    return f"{megabytes * 1024**2 / 1e9:.1f} GB"
+
+
+def warn_memory(mem: str | None, name: str | None, gpu: bool) -> None:
+    """C1: a job named `name` with a measured footprint that states `--mem` by hand warns when it is below the peak (the
+    memory floor may kill it) or `0` (the whole box: it waits for every other job). Warnings only, never a refusal."""
+    peak = None if name is None or mem in (None, "auto") else gpu_jobs.measured_peak_bytes(name)
+    if peak is None:
+        return
+    try:
+        asked_mb = gpu_jobs.mem_mb(mem)
+    except (ValueError, IndexError):
+        return  # not slurm notation: sbatch reports it
+    if asked_mb == 0:
+        auto = resolve_mem(None, name, gpu)
+        warn(f"--mem 0 asks for the whole box, so the job waits for every other job; {name!r} peaked at "
+             f"{peak / 1e9:.1f} GB, and --mem auto would ask for {_gb(gpu_jobs.mem_mb(auto))}")
+    elif asked_mb * 1024**2 < peak:
+        warn(f"--mem {mem} ({_gb(asked_mb)}) is below the {peak / 1e9:.1f} GB {name!r} peaked at on its last clean "
+             "run; the memory floor may kill the job")
+
+
+def warn_device(arguments: argparse.Namespace) -> None:
+    """C4: a CPU-only job told `--device cpu` while no GPU job runs or waits: the GPU is free and may finish it far sooner."""
+    command = arguments.command
+    on_cpu = "--device=cpu" in command or any(a == "--device" and b == "cpu" for a, b in zip(command, command[1:]))
+    if arguments.gpus or not on_cpu:
+        return
+    queue = gpu_jobs.read_queue()
+    if queue is None:
+        return
+    reserved = any(j.gpus > 0 and j.state in (gpu_jobs.State.RUNNING, gpu_jobs.State.PENDING) for j in queue)
+    if not reserved:
+        warn("the command says --device cpu but no GPU job is running or waiting: the GPU is free, and the work may "
+             "finish far sooner there (resubmit with --gpu)")
+
+
 def comment(what: str) -> str:
     """The `--what` text as a one-line slurm comment, cut to `COMMENT_MAX` characters."""
     return what.replace("\r", " ").replace("\n", " ")[:COMMENT_MAX]
@@ -294,6 +336,7 @@ def submit(argv: list[str]) -> str:
         raise Refused(msg)
     seconds(arguments.wait_limit)
     mem = resolve_mem(arguments.mem, named, arguments.gpu)
+    warn_memory(arguments.mem, named, arguments.gpu)
     named_cpus = arguments.cpus
     arguments.cpus = resolve_cpus(arguments.cpus, arguments.gpus, site)
     if arguments.anywhere:
@@ -337,6 +380,7 @@ def submit(argv: list[str]) -> str:
     manifest = gpu_jobs.STATE_DIR / "manifests" / f"{arguments.name}-{stamp}.json" if gated else None
     consent = may_suspend(arguments) if arguments.service else None
     script = sbatch_script(arguments, mem=mem, log=log, manifest=manifest)
+    warn_device(arguments)
     if arguments.dry_run:
         if arguments.service:
             print(f"[submit] service room: {json.dumps(service_room(site, arguments.cpus, gpu_jobs.mem_mb(mem), consent))}")

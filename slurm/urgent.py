@@ -172,6 +172,7 @@ def run(argv: list[str]) -> int:
     whole_box = arguments.whole_box or arguments.mem is None
     arguments.gpu = arguments.gpu or arguments.gpus is not None or whole_box
     arguments.gpus = arguments.gpus or int(arguments.gpu)
+    submit.warn_memory(arguments.mem, arguments.name, arguments.gpu)
     arguments.name = arguments.name or Path(arguments.command[0]).name
     arguments.job_class, arguments.after = "urgent", []
     queue = gpu_jobs.read_queue()
