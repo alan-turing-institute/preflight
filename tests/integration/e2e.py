@@ -433,7 +433,7 @@ def stage_jobs() -> None:
           urgent.text[:200])
     direct = cl("sbatch", "--partition=urgent", "--wrap", "true", user="alice")
     dj = (re.search(r"Submitted batch job (\d+)", direct.out) or [None, ""])[1]
-    wait_for(lambda: "not_in_group" in jobinfo(dj).get("Reason", ""), 15)  # slurm's first pass over the job names the reason
+    wait_for(lambda: "not_in_group" in jobinfo(dj).get("Reason", ""), 60)  # slurm's first pass over the job names the reason; slow on a loaded host
     why = jobinfo(dj).get("Reason", "")
     check("S6: alice cannot sidestep the tool: a job she sends straight to the urgent partition never runs (slurm: AllowGroups)",
           bool(dj) and state(dj) == "PENDING" and "not_in_group_permitted_to_use_this_partition" in why, f"job {dj} {state(dj)}: {why}")
@@ -441,15 +441,15 @@ def stage_jobs() -> None:
 
     # S3: CPU-only jobs never take the cores held for GPU jobs. The harness node (4 cores, 4 GPUs) cannot hold a core per
     # GPU and leave CPU jobs one, so the cap a site's cores_per_gpu renders is set on the live partition instead. The CPU
-    # jobs mix both classes: slurm counts MaxCPUsPerNode per partition, so one partition must cap them together.
+    # jobs are `restart` ones: a `resume` CPU job goes to cpu_fill, which has no cap and GPU jobs requeue (D23).
     capped = sh(f"scontrol update PartitionName=cpu MaxCPUsPerNode={CPU_CAP}")
     try:
-        cpu = [submit("alice", f"cpu{i}", 120, cls=cls) for i, cls in enumerate(("resume", "restart", "resume"))]
+        cpu = [submit("alice", f"cpu{i}", 120, cls=cls) for i, cls in enumerate(("restart",) * 3)]
         wait_for(lambda: sum(state(j) == "RUNNING" for j in cpu) == CPU_CAP, 60)
         g = submit("alice", "gpu-beside-cpu", 30, "--gpu", "--cpus", "2", cls="restart")
         started = wait_for(lambda: state(g) == "RUNNING", 90)  # a backfill pass can take up to 30 s
         parts = {jobinfo(j).get("Partition") for j in cpu}
-        check("S3: CPU-only jobs of both classes share one cpu partition capped at 2 cores; the third waits, and a 2-core "
+        check("S3: CPU-only restart jobs share one cpu partition capped at 2 cores; the third waits, and a 2-core "
               "GPU job still starts", capped.rc == 0 and parts == {"cpu"}
               and [state(j) for j in cpu].count("RUNNING") == CPU_CAP and bool(started),
               f"cap rc={capped.rc}; partitions {parts}; cpu {[(j, state(j), jobinfo(j).get('Reason')) for j in cpu]}; "
@@ -1226,7 +1226,7 @@ def request_taken() -> bool:
 
 
 def user_ids(run: Callable[..., Out]) -> list[str]:
-    return sorted(line.split(":")[0] + ":" + line.split(":")[2] for line in run("getent", "passwd", "slurm", "alice", "bob", "carol").out.split())
+    return sorted(line.split(":")[0] + ":" + line.split(":")[2] for line in run("getent", "passwd", "slurm", "alice", "bob", "carol", "dave").out.split())
 
 
 def join_part_time() -> list[tuple[str, bool, str]]:
@@ -1277,8 +1277,9 @@ def stage_part_time() -> None:
     up = pt("true")
     if not check("the part-time container is running (compose service part-time, hostname pt1)", up.rc == 0, up.text[:200]):
         return
+    pt("useradd", "--uid", sh("id -u dave").out.strip(), "--create-home", "--shell", "/bin/bash", "dave")  # the install stage made dave here
     ours, theirs = user_ids(cl), user_ids(pt)
-    check("slurm, alice, bob and carol have the same ids on both machines (the check `part-time add` makes over ssh)",
+    check("slurm, alice, bob, carol and dave have the same ids on both machines (the check `part-time add` makes over ssh)",
           bool(ours) and ours == theirs, f"{ours} vs {theirs}")
     executable = [sh("test -x /opt/gpujobs/slurm/node_check.py").rc, pt("test", "-x", "/src/slurm/node_check.py").rc]
     check("node_check.py is executable where slurmd will run it (slurm execs HealthCheckProgram directly)", executable == [0, 0],
@@ -1441,7 +1442,7 @@ def stage_upgrade() -> None:
                                    f"steps = ['{':'.join(UPGRADE_STEPS)}']\n")
     put(UPGRADE_SITE, site)
     done = sh(f"{INSTALL} upgrade-slurm --site {UPGRADE_SITE}", timeout=UPGRADE_TIMEOUT_S)
-    check("upgrade-slurm exits 0 after both steps", done.rc == 0, done.text[-300:])
+    check("upgrade-slurm exits 0 after both steps", done.rc == 0, done.text[:600] + " ... " + done.text[-1500:])
     after = sh("sinfo -V").text
     check("slurm now reports the site file's release", UPGRADE_TARGET[0] in after and before != after, f"{before} -> {after}")
     backups = sh("ls -d /var/backups/gpujobs/slurm-*/slurm_acct_db.sql /var/backups/gpujobs/slurm-*/state_save.tar.gz "
