@@ -10,8 +10,10 @@ without touching this box's `/etc`, systemd, slurm daemons or queue.
     tests/integration/run.sh down    # remove the container and network (the image stays)
 
 SchedMD's slurm instead of the distro's: `GPUJOBS_TEST_IMAGE=gpujobs-testcluster:slurm-26.05.5 SLURM_VERSION=26.05.5
-SLURM_SHA256=<hex> E2E_SITE=/src/tests/integration/harness.site.slurm.toml tests/integration/run.sh e2e` (the image builds
-the `slurm-smd` debs with `slurm/install/slurm_build.py`, about 6 minutes; `harness.site.slurm.toml` names the same release).
+SLURM_SHA256=<hex> tests/integration/run.sh e2e` (the image builds the `slurm-smd` debs with `slurm/install/slurm_build.py`
+once, about 6 minutes, kept in the `gpujobs-slurm-build-cache` volume; e2e.py writes `harness.site.toml` plus that
+`[slurm]` table into both containers). Several clusters at once: give each run its own `GPUJOBS_TEST_PROJECT` and a
+group of stages (`--only install,...`); `--list` names the stages.
 
 Every command that talks to slurm inside the container belongs in `run.sh`. The image is `gpujobs-testcluster:dev`
 (about 570 MB), the compose project is `gpujobs-test`.

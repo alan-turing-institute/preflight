@@ -31,8 +31,11 @@ from levels import Level, priority_for  # noqa: E402 - stdlib only; the priority
 
 TOP_PRIORITY = 0xFFFF0000  # slurm's job_mgr.c: the most priority/basic gives a job by itself
 RUN = HERE / "run.sh"
-# E2E_SITE: the site file with a [slurm] table, for an image built with SLURM_VERSION (harness.site.slurm.toml).
-SITE = os.environ.get("E2E_SITE", "/src/tests/integration/harness.site.toml")
+# The harness site file. With SLURM_VERSION and SLURM_SHA256 set (an image built with SchedMD's slurm), main() writes
+# it plus that [slurm] table into both containers at SITE, so the two never drift apart; E2E_SITE overrides either.
+BASE_SITE = "/src/tests/integration/harness.site.toml"
+SLURM_PIN = (os.environ.get("SLURM_VERSION", ""), os.environ.get("SLURM_SHA256", ""))
+SITE = os.environ.get("E2E_SITE") or ("/tmp/harness.site.slurm.toml" if all(SLURM_PIN) else BASE_SITE)
 INSTALL = "python3 /src/slurm/install/install.py"
 STATE = "/var/lib/gpujobs"
 PORTAL = "https://testnode"
@@ -1479,6 +1482,10 @@ def main() -> int:
     if unknown := [s for s in chosen if s not in STAGES]:
         parser.error(f"unknown stage(s) {unknown}; stages: {', '.join(STAGES)}")
     took: dict[str, float] = {}
+    if SITE != BASE_SITE and not os.environ.get("E2E_SITE"):
+        pinned = (HERE / "harness.site.toml").read_text() + f"\n[slurm]\nversion = '{SLURM_PIN[0]}'\nsha256 = '{SLURM_PIN[1]}'\n"
+        for run in (cl, pt):
+            put(SITE, pinned, run=run)
     for name, stage in STAGES.items():
         if name in chosen:
             started = time.monotonic()
