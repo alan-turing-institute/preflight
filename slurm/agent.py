@@ -754,18 +754,18 @@ class Agent:
         return self._scontrol_ok(["update", f"NodeName={node}", "State=DRAIN", f"Reason={CLOSED_FROM_PAGE}"], errors)
 
     def _requeue_resume_jobs(self, node: str, errors: list[str]) -> bool:
-        """Requeue every `resume` job running on `node` (never an urgent or service one)."""
-        done = call(self.scontrol, ["squeue", "-h", "-t", "R", "-w", node, "-o", "%i|%j|%P"])
-        if done.returncode != 0:
+        """Requeue every `resume` job running on `node` (never an urgent or service one).
+
+        From the JSON queue, never `squeue -o` text: a job name may hold a newline and forge rows (review R)."""
+        queue = self.read_queue()
+        if queue is None:
             errors.append(f"squeue for {node} failed; will retry")
             return False
         ok = True
-        for line in done.stdout.splitlines():
-            job_id, _, rest = line.partition("|")
-            name, _, partition = rest.rpartition("|")
-            if (gpu_jobs.JOB_ID.fullmatch(job_id) and gpu_jobs.class_of(name) is gpu_jobs.JobClass.RESUME
-                    and partition not in RESUME_PROTECTED):
-                ok = self._scontrol_ok(["requeue", job_id], errors) and ok
+        for job in queue:
+            if (job.state == gpu_jobs.State.RUNNING and job.node == node and job.job_class is gpu_jobs.JobClass.RESUME
+                    and job.partition not in RESUME_PROTECTED):
+                ok = self._scontrol_ok(["requeue", job.job_id], errors) and ok
         return ok
 
     def _set_thresholds(self, node: str, request: dict[str, object], errors: list[str]) -> bool:

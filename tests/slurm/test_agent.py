@@ -528,7 +528,11 @@ def test_part_time_requests_are_an_admins_and_each_does_exactly_its_own_thing(wo
     assert world.writes == [["update", "NodeName=lap", "State=RESUME"]]
     # give back: drain, then requeue the `resume` jobs there and no other
     world.writes.clear()
-    world.running = "11|p:resume:a|part_time\n12|p:steady:b|part_time\n13|p:resume:c|urgent\n"
+    # a forged name (a newline and a fake row) is just a name in the JSON queue, never a job to requeue
+    world.queue = [gpu_jobs.QueuedJob(i, part, "RUNNING", "None", name, node="lap") for i, name, part in (
+        ("11", "p:resume:a", "part_time"), ("12", "p:steady:b", "part_time"), ("13", "p:resume:c", "urgent"),
+        ("14", "p:steady:x\n99|p:resume:z|part_time", "part_time"))] + [
+        gpu_jobs.QueuedJob("15", "cpu", "RUNNING", "None", "p:resume:d", node="n1")]
     world.part_time("4", action="give_back")
     world.step()
     assert world.writes == [

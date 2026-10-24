@@ -1169,7 +1169,8 @@ def _free_mb(value: object) -> int | None:
 
 
 def _part_time_state(names: list[str]) -> dict[str, PartTimeState]:
-    """The nodes' state from `scontrol show node --json`, and each one's running `resume` jobs from `squeue`."""
+    """The nodes' state from `scontrol show node --json`, and each one's running `resume` jobs from the JSON queue."""
+    queue = gpu_jobs.read_queue() or []
     try:
         nodes = json.loads(jobs_view.run_command(["scontrol", "show", "node", ",".join(names), "--json"]))["nodes"]
     except (ValueError, KeyError, TypeError):
@@ -1182,7 +1183,7 @@ def _part_time_state(names: list[str]) -> dict[str, PartTimeState]:
         except ValueError:
             extra = None
         states = node.get("state") or []
-        listed = jobs_view.run_command(["squeue", "-h", "-t", "R", "-w", name, "-o", "%j"]).splitlines()
+        listed = [job.name for job in queue if job.state == gpu_jobs.State.RUNNING and job.node == name]
         out[name] = PartTimeState(
             closed=any(flag in states for flag in ("DRAIN", "DOWN")), reason=str(node.get("reason") or ""),
             free_mb=_free_mb(node.get("free_mem")),
