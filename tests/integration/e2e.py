@@ -610,10 +610,10 @@ def stage_service() -> None:
     counter = ["python3", "-c", "import time\nfor i in range(10**6):\n open('/tmp/e2e-frozen', 'w').write(str(i)); time.sleep(1)"]
     count = lambda: int(sh("cat /tmp/e2e-frozen 2>/dev/null || echo -1").out.strip() or -1)  # noqa: E731
     try:
-        c = submit("alice", "frozen", 0, "--cpus", "2", command=counter)
+        c = submit("alice", "frozen", 0, "--cpus", "2", command=counter, cls="restart")  # a resume job would be in cpu_fill (D23)
         g = submit("alice", "gpu-untouched", 600, "--gpu", "--cpus", "2")
         full = wait_for(lambda: state(c) == "RUNNING" and state(g) == "RUNNING", 90)
-        w = submit("alice", "waits", 600, "--cpus", "2")  # the cpu cap is full: it waits, and must not take the room
+        w = submit("alice", "waits", 600, "--cpus", "2", cls="restart")  # the cpu cap is full: it waits, and must not take the room
         ask = cl("gpujobs-submit", "--project", "e2e", "--what", "e2e ask", "--class", "restart", "--mem", "200M", *flags,
                  "--dry-run", "--", "true", user="bob")
         line = ask.out.splitlines()[0] if ask.out else ""
