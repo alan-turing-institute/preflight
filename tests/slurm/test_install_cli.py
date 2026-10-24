@@ -4,6 +4,7 @@ import os
 import stat
 import subprocess
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -40,12 +41,21 @@ class Fake:
         self.squeue_rc, self.ctld_rc = 0, 0  # squeue's exit status; `systemctl is-active slurmctld`'s (0: running)
         self.policy = "slurm-wlm:\n  Installed: (none)\n  Candidate: 23.11.4-1.2ubuntu5\n"
         self.distro_slurm = ""  # what `dpkg-query -W` reports installed, e.g. "ii slurm-wlm\nii slurmd\n"
+        self.sinfo = ""  # what `sinfo -V` prints ("" = no slurm installed)
+        self.dbd_active = False  # `systemctl is-active slurmdbd`
+        self.held = []  # (argv, whether policy-rc.d stood) for each package install or removal
 
     def __call__(self, argv):
         self.calls.append(argv)
         rc = 0
+        if argv[:1] in (["apt-get"], ["dnf"]) and argv[1] in ("install", "remove"):
+            self.held.append((argv, (components.ROOT / slurm_component.POLICY_RC_D).exists()))
         if argv[:1] == ["squeue"]:
             return subprocess.CompletedProcess(argv, self.squeue_rc, self.queue, "")
+        if argv[:1] == ["sinfo"] and self.sinfo:
+            return subprocess.CompletedProcess(argv, 0, self.sinfo, "")
+        if argv[:3] == ["systemctl", "is-active", "slurmdbd"]:
+            return subprocess.CompletedProcess(argv, 0 if self.dbd_active else 3, "active" if self.dbd_active else "inactive", "")
         if argv[:2] == ["systemctl", "is-active"]:
             return subprocess.CompletedProcess(argv, self.ctld_rc, "", "")
         if argv[:1] == ["dpkg-query"]:
@@ -266,35 +276,60 @@ def test_slurm_table_installs_the_built_packages_in_place_of_the_distros(env, mo
     tmp, site, fake = env
     site.write_text(SITE + "[slurm]\nversion = '26.05.5'\nsha256 = '" + "ab" * 32 + "'\n")
     built = []
-    debs = [tmp / "slurm-smd_26.05.5_arm64.deb", tmp / "slurm-smd-dbgsym_26.05.5_arm64.deb"]
+    names = ["slurm-smd-dbgsym", "slurm-smd-dev", "slurm-smd-slurmdbd", "slurm-smd-doc", "slurm-smd", "slurm-smd-sview"]
+    debs = [tmp / f"{n}_26.05.5_arm64.deb" for n in names]
     monkeypatch.setattr(slurm_component.slurm_build, "build", lambda v, s: built.append((v, s)) or debs)
     fake.distro_slurm = "ii slurm-wlm\nii slurmd\n"
     fake.policy = "  Candidate: 21.08.5-2ubuntu1\n"  # an old distro slurm no longer matters: it is not installed
     root = tmp / "root"
+    policy = root / "usr/sbin/policy-rc.d"
+    policy.parent.mkdir(parents=True)
+    policy.write_text("someone's own\n")  # kept, and put back afterwards
+    fake.sinfo = "slurm-wlm 23.11.4"  # apply never changes the release: that is upgrade-slurm's
+    assert run(site, root, "apply") == 1 and built == []
+    fake.sinfo = "slurm 26.05.5"
     assert run(site, root, "apply") == 0
     assert built == [("26.05.5", "ab" * 32)]
     installs = [c for c in fake.calls if c[:1] == ["apt-get"]]
     assert installs == [["apt-get", "install", "-y", "mariadb-server", "munge"],
                         ["apt-get", "remove", "-y", "slurm-wlm", "slurmd"],  # only what is installed
-                        ["apt-get", "install", "-y", str(debs[0])]]  # not the debug symbols
+                        # only the daemons, the client and the base package, not -dev, -doc, sview or debug symbols
+                        ["apt-get", "install", "-y", str(debs[4]), str(debs[2])]]
+    # no package command ran without policy-rc.d, which keeps the packages' scripts from starting a daemon
+    assert [on for _, on in fake.held] == [True, True, True]
+    assert policy.read_text() == "someone's own\n" and not policy.with_name("policy-rc.d.gpujobs-saved").exists()
     # without apt-get, dnf stands in when the site builds slurm, and is refused when it does not
     monkeypatch.setattr(cli.shutil, "which", lambda name: "/usr/bin/dnf" if name == "dnf" else None)
     modules = components.load(cli.site_config.load(site), ["slurm"])
     assert cli.apt_install_commands(modules, cli.site_config.load(site)) == [["dnf", "install", "-y", "mariadb-server", "munge"]]
     assert cli.platform_refusals(cli.site_config.load(site), modules) == []
     assert cli.platform_refusals(SimpleNamespace(slurm_build=None), modules)
+    fake.calls.clear()  # dnf systems mask the daemons around the install, and unmask them
+    with slurm_component.daemons_held("dnf"):
+        fake.calls.append(["install"])
+    assert fake.calls == [["systemctl", "mask", "--runtime", "slurmdbd", "slurmctld", "slurmd"], ["install"],
+                          ["systemctl", "unmask", "--runtime", "slurmdbd", "slurmctld", "slurmd"]]
+
+
+PARTITIONS = ("PartitionName=gpu AllowGroups=ALL Default=YES MaxTime=UNLIMITED PreemptMode=REQUEUE State=UP TotalCPUs=20\n"
+              "PartitionName=cpu AllowGroups=ALL Default=NO MaxTime=UNLIMITED PreemptMode=OFF State=DRAIN TotalCPUs=20\n")
 
 
 class UpgradeFake(Fake):
-    """A running slurm 23.11.4 with job 7 in its history; `fail` is an argv prefix whose command exits 1."""
+    """A running slurm 23.11.4 with job 7 in its history and two partitions; `fail` is an argv prefix whose command
+    exits 1, `late_job` makes the second `squeue` find a job, `slow_dbd` a slurmdbd that never answers."""
 
     def __init__(self, fail=()):
         super().__init__()
         self.version, self.fail, self.dead_dbd, self.lose_history = "slurm-wlm 23.11.4", list(fail), False, False
+        self.slow_dbd = self.late_job = False
+        self.squeues = 0
 
     def __call__(self, argv):
         installed = any(c[:2] == ["apt-get", "install"] for c in self.calls)
-        out = {"sinfo -V": self.version, "sacct": "" if self.lose_history and installed else "7\n", "scontrol show": "StateSaveLocation = /var/spool/slurmctld\nSlurmUser = slurm(64030)\n"}
+        out = {"sinfo -V": self.version, "sacct": "" if self.lose_history and installed else "7\n",
+               "scontrol show config": "StateSaveLocation = /var/spool/slurmctld\nSlurmUser = slurm(64030)\n",
+               "scontrol show partition": PARTITIONS}
         text = " ".join(argv)
         if self.fail and text.startswith(" ".join(self.fail)):
             self.calls.append(argv)
@@ -302,8 +337,12 @@ class UpgradeFake(Fake):
         for prefix in ("mariadb-dump", "tar"):  # the backup files exist once the command has run
             if argv[0] == prefix:
                 Path(next(a.split("=")[-1] for a in argv if a.startswith("/") or "=/" in a)).write_text("x" * 1_500_000)
-        if argv[:4] == ["sacctmgr", "-n", "show", "cluster"] and self.dead_dbd:
+        if argv[:4] == ["sacctmgr", "-n", "show", "cluster"] and (self.dead_dbd or self.slow_dbd):
             return subprocess.CompletedProcess(argv, 1, "", "Connection refused")
+        if argv[:2] == ["squeue", "-h"]:
+            self.squeues += 1
+            if self.late_job:
+                self.queue = "9 jobs\n" if self.squeues > 1 else ""
         done = super().__call__(argv)
         match = next((v for k, v in out.items() if text.startswith(k)), None)
         return done if match is None else subprocess.CompletedProcess(argv, 0, match, "")
@@ -311,6 +350,8 @@ class UpgradeFake(Fake):
 
 class FakeDbd:
     """slurmdbd in the foreground: runs until terminated, or has already exited with `dead`."""
+
+    pid = 4242
 
     def __init__(self, calls, dead=False):
         self.dead, self.calls = dead, calls
@@ -334,8 +375,8 @@ def upgrade(env, monkeypatch, capsys):
     components.set_runner(fake)
     monkeypatch.setattr(slurm_component, "BACKUP_ROOT", tmp / "backups")
     monkeypatch.setattr(slurm_component, "sleep", lambda _s: None)
-    monkeypatch.setattr(slurm_component.slurm_build, "build", lambda v, s: [tmp / f"slurm-smd_{v}.deb"])
-    monkeypatch.setattr(components, "popen", lambda argv: fake.calls.append(argv) or FakeDbd(fake.calls, fake.dead_dbd))
+    monkeypatch.setattr(slurm_component.slurm_build, "build", lambda v, s: fake.calls.append(["build", v]) or [tmp / f"slurm-smd_{v}.deb"])
+    monkeypatch.setattr(components, "popen", lambda argv, **kw: fake.calls.append(argv) or FakeDbd(fake.calls, fake.dead_dbd))
     monkeypatch.setattr(cli.shutil, "which", lambda name: f"/usr/bin/{name}")
     monkeypatch.setattr(cli, "cmd_apply", lambda *a: fake.calls.append(["apply"]) or 0)
     return tmp, site, fake
@@ -346,39 +387,105 @@ def test_upgrade_slurm_backs_up_then_steps_through_each_release(upgrade, capsys)
     assert run(site, tmp / "root", "upgrade-slurm") == 0
     calls = [" ".join(c) for c in fake.calls]
     saved = str(next((tmp / "backups").iterdir()))
-    assert [c for c in calls if c.startswith(("mariadb-dump", "tar"))] == [
-        f"mariadb-dump --result-file={saved}/slurm_acct_db.sql slurm_acct_db",
-        f"tar -czf {saved}/state_save.tar.gz -C / var/spool/slurmctld", f"tar -czf {saved}/etc_slurm.tar.gz -C / etc/slurm"]
-    after_backup = calls[calls.index(f"tar -czf {saved}/etc_slurm.tar.gz -C / etc/slurm"):]
-    one = ["systemctl stop slurmctld slurmd", "systemctl stop slurmdbd", "apt-get install -y {deb}",
-           "sudo -u slurm slurmdbd -D -vvv", "terminated", "systemctl start slurmdbd", "systemctl start slurmctld",
-           "systemctl start slurmd"]
-    assert [c for c in after_backup if c.startswith(("systemctl", "apt-get", "sudo", "terminated"))] == [
-        c.format(deb=f"{tmp}/slurm-smd_{v}.deb") for v in ("25.05.9", "26.05.5") for c in one]
-    assert calls[-1] == "apply"
+    dump = f"mariadb-dump --result-file={saved}/slurm_acct_db.sql slurm_acct_db"
+    state = f"tar -czf {saved}/state_save.tar.gz -C / var/spool/slurmctld"
+    conf = f"tar -czf {saved}/etc_slurm.tar.gz -C / etc/slurm"
+    close = [f"scontrol update PartitionName={n} State=INACTIVE" for n in ("gpu", "cpu")]
+    reopen = ["scontrol update PartitionName=gpu State=UP", "scontrol update PartitionName=cpu State=DRAIN"]  # as they were
+    step = ["apt-get install -y {deb}", "systemctl is-active slurmdbd", "sudo -u slurm slurmdbd -D -vvv", "terminated",
+            "systemctl start slurmdbd", "systemctl start slurmctld", "systemctl start slurmd"]
+    interesting = ("build", "systemctl", "apt-get", "sudo", "terminated", "scontrol update", "squeue", "mariadb-dump", "tar", "apply")
+    assert [c for c in calls if c.startswith(interesting)] == [
+        "squeue -h",  # the first empty-queue check, then both releases are built, all before anything stops
+        "build 25.05.9", "build 26.05.5",
+        *close, "squeue -h",  # no partition takes a job, then the queue is checked again
+        "systemctl stop slurmctld slurmd", dump, state, conf, "systemctl stop slurmdbd",  # slurmdbd only after the dump
+        *(c.format(deb=f"{tmp}/slurm-smd_25.05.9.deb") for c in step),
+        "systemctl stop slurmctld slurmd", "systemctl stop slurmdbd",
+        *(c.format(deb=f"{tmp}/slurm-smd_26.05.5.deb") for c in step),
+        *reopen, "apply"]
+    # every sacct listing covers the same absolute seven days
+    windows = {tuple(c[c.index("-S") + 1:c.index("-S") + 2] + c[c.index("-E") + 1:c.index("-E") + 2]) for c in fake.calls if c[0] == "sacct"}
+    (start, end), = windows
+    stamp = "%Y-%m-%dT%H:%M:%S"
+    assert datetime.strptime(end, stamp) - datetime.strptime(start, stamp) == timedelta(days=7)
+    # package installs ran under policy-rc.d, which is gone again, and slurmdbd's output has a log beside the backup
+    assert [on for _, on in fake.held] == [True, True] and not (tmp / "root/usr/sbin/policy-rc.d").exists()
+    assert (Path(saved) / "slurmdbd-conversion.log").exists()
     assert "state_save.tar.gz: 1.5 MB" in capsys.readouterr().out  # each backup file's size, decimal
 
 
-def test_upgrade_slurm_refuses_before_touching_anything(upgrade, capsys):
+def test_upgrade_slurm_refuses_before_touching_anything(upgrade, capsys, monkeypatch):
     tmp, site, fake = upgrade
     fake.queue = "12 jobs\n"
     assert run(site, tmp / "root", "upgrade-slurm") == 1 and "slurm has jobs" in capsys.readouterr().err
     fake.queue, fake.version = "", "slurm 26.05.5"
     assert run(site, tmp / "root", "upgrade-slurm") == 1 and "already at or after" in capsys.readouterr().err
-    assert not any(c[0] in ("mariadb-dump", "tar") for c in fake.calls) and not (tmp / "backups").exists()
+    fake.version = "slurm-wlm 23.11.4"
 
+    def build(version, sha256):  # the second release cannot be built: stop before the first is installed
+        if version == "26.05.5":
+            raise slurm_component.slurm_build.SlurmBuildError("no network")
+        return [tmp / f"slurm-smd_{version}.deb"]
 
-# a failed install, a slurmdbd that dies converting, and a conversion that loses job history (data loss)
-@pytest.mark.parametrize("fail, dead, lose", [(("apt-get", "install", "-y", "/"), False, False), ((), True, False), ((), False, True)])
-def test_a_failed_step_prints_the_restore_commands_and_goes_no_further(upgrade, capsys, fail, dead, lose):
-    tmp, site, fake = upgrade
-    fake.fail, fake.dead_dbd, fake.lose_history = list(fail), dead, lose
+    monkeypatch.setattr(slurm_component.slurm_build, "build", build)
     assert run(site, tmp / "root", "upgrade-slurm") == 1
     err = capsys.readouterr().err
-    assert "UPGRADE FAILED at slurm 25.05.9" in err and "slurm_acct_db <" in err and "apt-get install -y --allow-downgrades slurm-wlm" in err
-    assert not any("26.05.5" in " ".join(c) for c in fake.calls) and ["apply"] not in fake.calls
-    assert lose or ["systemctl", "start", "slurmctld"] not in fake.calls  # a dead slurmdbd never reaches the controller
-    assert not lose or "sacct no longer lists 1 job(s)" in err
+    assert "no network" in err and "slurm was not touched" in err
+    touched = ("systemctl", "mariadb-dump", "tar", "apt-get", "sudo")
+    assert not any(c[0] in touched or c[:2] == ["scontrol", "update"] for c in fake.calls) and not (tmp / "backups").exists()
+
+
+# a failed install, a slurmdbd that dies converting, a conversion that loses job history (data loss), and a slurmdbd
+# service already running when the foreground one would start (two on one database)
+@pytest.mark.parametrize("what", [{"fail": ["apt-get", "install", "-y", "/"]}, {"dead_dbd": True}, {"lose_history": True}, {"dbd_active": True}])
+def test_a_failed_step_prints_the_restore_commands_and_goes_no_further(upgrade, capsys, what):
+    tmp, site, fake = upgrade
+    vars(fake).update(what)
+    assert run(site, tmp / "root", "upgrade-slurm") == 1
+    err = capsys.readouterr().err
+    assert "UPGRADE FAILED at slurm 25.05.9" in err and "apt-get install -y --allow-downgrades slurm-wlm" in err
+    assert not any("26.05.5" in " ".join(c) for c in fake.calls if c[0] != "build") and ["apply"] not in fake.calls
+    assert "lose_history" in what or ["systemctl", "start", "slurmctld"] not in fake.calls  # a dead slurmdbd never reaches the controller
+    assert "lose_history" not in what or "sacct no longer lists 1 job(s)" in err
+    assert not (tmp / "root/usr/sbin/policy-rc.d").exists()  # the guard comes off even when the install failed
+    # the restore, in order: stop all; reinstall the old packages with no daemon starting; stop again (a script may have
+    # started one); drop and reload the database, state and settings; restart (not start); reopen the partitions
+    at = -1
+    for needle in ("systemctl stop slurmctld slurmd slurmdbd", "exit 101", "--allow-downgrades slurm-wlm", "rm -f /usr/sbin/policy-rc.d",
+                   "systemctl stop slurmctld slurmd slurmdbd", "DROP DATABASE", "tar -xzf", "systemctl restart slurmdbd slurmctld slurmd",
+                   "scontrol update PartitionName=gpu State=UP"):
+        at = err.index(needle, at + 1)
+    # SchedMD's packages come back from the cache, only the ones the upgrade installs
+    smd = slurm_component.restore_text(Path("/b"), "/s", "slurm 25.05.9", "apt-get", {})
+    assert "/slurm/25.05.9/*/slurm-smd-slurmdbd_*.deb" in smd and "slurm-smd*.deb" not in smd
+    assert "/slurm/25.05.9/*/rpmbuild/RPMS/*/slurm-slurmdbd-[0-9]*.rpm" in slurm_component.restore_text(Path("/b"), "/s", "slurm 25.05.9", "dnf", {})
+
+
+def test_a_slurmdbd_still_converting_is_left_running_and_nothing_is_restored(upgrade, capsys):
+    tmp, site, fake = upgrade
+    fake.slow_dbd = True
+    assert run(site, tmp / "root", "upgrade-slurm") == 1
+    err = capsys.readouterr().err
+    assert "still converting" in err and "pid 4242" in err and "tail -f" in err and "slurmdbd-conversion.log" in err
+    assert ["terminated"] not in fake.calls  # never signalled
+    assert "DROP DATABASE" not in err and "UPGRADE FAILED" not in err and "Do not stop that slurmdbd" in err
+    assert ["systemctl", "start", "slurmctld"] not in fake.calls and ["apply"] not in fake.calls
+
+
+# a job slips in after the first check, and a backup that fails: no package has changed, so slurm is put back
+@pytest.mark.parametrize("what, reopened", [({"late_job": True}, False), ({"fail": ["tar", "-czf"]}, True)])
+def test_a_failure_before_any_package_changes_puts_slurm_back(upgrade, capsys, what, reopened):
+    tmp, site, fake = upgrade
+    vars(fake).update(what)
+    assert run(site, tmp / "root", "upgrade-slurm") == 1
+    err = capsys.readouterr().err
+    assert "UPGRADE REFUSED" in err and "UPGRADE FAILED" not in err and "DROP DATABASE" not in err
+    calls = [" ".join(c) for c in fake.calls]
+    assert not any(c.startswith("apt-get") for c in calls) and "apply" not in calls
+    assert calls.index("scontrol update PartitionName=gpu State=INACTIVE") < calls.index("scontrol update PartitionName=gpu State=UP")
+    assert calls[-2:] == ["scontrol update PartitionName=gpu State=UP", "scontrol update PartitionName=cpu State=DRAIN"]
+    assert ("systemctl start slurmctld" in calls) is reopened  # stopped only when the queue check passed
 
 
 PART_TIME_SITE = SITE + """

@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import os
 import re
+import subprocess
+import sys
 import time
-from datetime import datetime
+from collections.abc import Iterator
+from contextlib import contextmanager
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import render
@@ -52,17 +57,73 @@ def _install_built(site) -> list[list[str]]:
 
 def install_release(version: str, sha256: str) -> list[list[str]]:
     """The commands that put the release's packages (built first when not cached) in place of what is installed."""
-    built = [str(p) for p in slurm_build.build(version, sha256) if "-dbgsym" not in p.name]
-    if not built[0].endswith(".deb"):
-        return [["dnf", "install", "-y", *built]]
+    return install_commands(slurm_build.build(version, sha256))
+
+
+def install_commands(built: list[Path]) -> list[list[str]]:
+    """Install the allowlisted packages among `built` (`slurm_build.installable`), after removing the distribution's
+    slurm packages when installed. Run them under `daemons_held`."""
+    wanted = [str(p) for p in slurm_build.installable(built)]
+    if not wanted:
+        raise slurm_build.SlurmBuildError("the build left none of the packages that get installed (slurm_build.DEB_INSTALL, RPM_INSTALL)")
+    if not wanted[0].endswith(".deb"):
+        return [["dnf", "install", "-y", *wanted]]
     status = components.run(["dpkg-query", "-W", "-f=${db:Status-Abbrev} ${Package}\\n", *DISTRO_SLURM]).stdout or ""
     installed = [line[3:] for line in status.splitlines() if line.startswith("ii ")]
-    return [*([["apt-get", "remove", "-y", *installed]] if installed else []), ["apt-get", "install", "-y", *built]]
+    return [*([["apt-get", "remove", "-y", *installed]] if installed else []), ["apt-get", "install", "-y", *wanted]]
 
 
-def refusals(site) -> list[str]:
-    """A slurm someone else set up is never replaced unasked (its slurm.conf lacks `render.RENDERED_MARK`), and a
-    restart requeues or kills running jobs, so the queue must be empty (an absent `squeue` means no slurm yet)."""
+#: Packages start their daemons when installed (SchedMD's debs, Ubuntu's, and the rpms'): a new slurmdbd started that
+#: way converts the accounting database unattended, and a slurmctld on a half-written config. Debian-like systems ask
+#: `policy-rc.d`, whose exit status 101 means "do not start"; others get the units masked until the install is over.
+POLICY_RC_D = "usr/sbin/policy-rc.d"
+POLICY_RC_D_SAVED = POLICY_RC_D + ".gpujobs-saved"
+NO_START = "#!/bin/sh\nexit 101\n"
+DAEMONS = ["slurmdbd", "slurmctld", "slurmd"]
+EXECUTABLE = 0o755
+
+
+@contextmanager
+def daemons_held(manager: str) -> Iterator[None]:
+    """Package installs and removals inside the block start no slurm daemon (`manager` is `apt-get` or `dnf`)."""
+    with (_policy_rc_d() if manager == "apt-get" else _units_masked()):
+        yield
+
+
+@contextmanager
+def _units_masked() -> Iterator[None]:
+    done = components.run(["systemctl", "mask", "--runtime", *DAEMONS])
+    if done.returncode != 0:
+        raise SystemExit(f"cannot keep the slurm daemons from starting during the install: systemctl mask failed: {done.stderr or ''}".rstrip())
+    try:
+        yield
+    finally:
+        if components.run(["systemctl", "unmask", "--runtime", *DAEMONS]).returncode != 0:
+            print(f"WARNING: run `systemctl unmask --runtime {' '.join(DAEMONS)}` by hand", file=sys.stderr)
+
+
+@contextmanager
+def _policy_rc_d() -> Iterator[None]:
+    path, saved = components.ROOT / POLICY_RC_D, components.ROOT / POLICY_RC_D_SAVED
+    if saved.exists() or saved.is_symlink():
+        raise SystemExit(f"{saved} is left over from an interrupted run: put it back as {path} (or delete it), then run again")
+    if path.exists() or path.is_symlink():
+        os.replace(path, saved)  # someone's own policy (Docker images ship one) comes back afterwards
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(NO_START, encoding="utf-8")
+        path.chmod(EXECUTABLE)
+        yield
+    finally:
+        path.unlink(missing_ok=True)
+        if saved.exists() or saved.is_symlink():
+            os.replace(saved, path)
+
+
+def refusals(site, upgrading: bool = False) -> list[str]:
+    """A slurm someone else set up is never replaced unasked (its slurm.conf lacks `render.RENDERED_MARK`), `apply`
+    never changes the slurm release (`upgrade-slurm` does, with `upgrading`), and a restart requeues or kills running
+    jobs, so the queue must be empty (an absent `squeue` means no slurm yet)."""
     out = []
     conf = components.ROOT / "etc/slurm/slurm.conf"
     try:
@@ -72,6 +133,9 @@ def refusals(site) -> list[str]:
     if render.RENDERED_MARK not in first and not components.REPLACE_EXISTING_SLURM:
         out.append(f"{conf} was not written by this installer: this machine runs a slurm someone else set up, and "
                    "apply would replace its settings. Leave it, or back it up and pass --replace-existing-slurm")
+    if site.slurm_build and not upgrading and (installed := _installed_version()) not in ("", site.slurm_build[0]):
+        out.append(f"slurm {installed} is installed and the site file's [slurm] version is {site.slurm_build[0]}: "
+                   "apply never changes the release; use install.py upgrade-slurm")
     try:
         done = components.run(["squeue", "-h"])
     except FileNotFoundError:
@@ -81,6 +145,16 @@ def refusals(site) -> list[str]:
     if done.returncode != 0 or done.stdout.strip():
         out.append("slurm has jobs (or squeue failed); restarting its daemons now would requeue or kill them")
     return out
+
+
+def _installed_version() -> str:
+    """The installed slurm's release as `sinfo -V` prints it ("slurm 23.11.4"), or "" when there is none."""
+    try:
+        done = components.run(["sinfo", "-V"])
+    except FileNotFoundError:
+        return ""
+    found = re.search(r"\d+\.\d+\.\d+", done.stdout or "")
+    return found[0] if done.returncode == 0 and found else ""
 
 
 def _never_ran() -> bool:
@@ -145,12 +219,17 @@ def steps_after(site, running: tuple[int, ...]) -> list[tuple[str, str]]:
     return [(v, h) for v, h in (*site.slurm_steps, site.slurm_build) if version_tuple(v) > running]
 
 
+def build_all(site, running: tuple[int, ...]) -> dict[str, list[Path]]:
+    """Every release `upgrade-slurm` will install, built (or found built) before anything is stopped."""
+    return {version: slurm_build.build(version, sha256) for version, sha256 in steps_after(site, running)}
+
+
 def upgrade_refusals(site, running: tuple[int, ...]) -> list[str]:
     if not site.slurm_build:
         return ["the site file has no [slurm] table: there is no release to upgrade to"]
     if version_tuple(site.slurm_build[0]) <= running:
         return [f"slurm {'.'.join(map(str, running))} is already at or after the site file's {site.slurm_build[0]}"]
-    return refusals(site)
+    return refusals(site, upgrading=True)
 
 
 def config_value(key: str) -> str:
@@ -180,16 +259,74 @@ def stop_daemons() -> list[list[str]]:
     return [["systemctl", "stop", "slurmctld", "slurmd"], ["systemctl", "stop", "slurmdbd"]]
 
 
-def convert_accounting(user: str) -> None:
+PARTITION = re.compile(r"^PartitionName=(\S+)\s.*?\bState=(\S+)", re.MULTILINE)
+INACTIVE = "INACTIVE"
+
+
+def partition_states() -> dict[str, str]:
+    """Each partition's state (UP, DOWN, DRAIN or INACTIVE), to put back when the upgrade is over."""
+    done = components.run(["scontrol", "show", "partition", "-o"])
+    states = dict(PARTITION.findall(done.stdout or ""))
+    if done.returncode != 0 or not states:
+        raise SystemExit(f"`scontrol show partition` lists no partitions: {done.stdout or ''} {done.stderr or ''}".strip())
+    return states
+
+
+def set_partitions(states: dict[str, str]) -> list[str]:
+    """Give each partition its state; the commands that failed (to be run by hand) come back."""
+    failed = []
+    for name, state in states.items():
+        argv = ["scontrol", "update", f"PartitionName={name}", f"State={state}"]
+        if components.run(argv).returncode != 0:
+            failed.append(" ".join(argv))
+    return failed
+
+
+def queue_busy() -> bool:
+    done = components.run(["squeue", "-h"])
+    return done.returncode != 0 or bool((done.stdout or "").strip())
+
+
+def resume_unchanged(states: dict[str, str], stopped: bool) -> None:
+    """Back from a refusal or a failure before any package changed: start what was stopped (`stopped`), reopen the
+    partitions."""
+    if stopped:
+        for unit in DAEMONS:
+            components.run(["systemctl", "start", unit])
+        await_answers(["sinfo", "-h"])
+    if failed := set_partitions(states):
+        raise SystemExit("could not reopen the partitions; run by hand:\n" + "\n".join(f"  {c}" for c in failed))
+
+
+class ConversionUnfinished(Exception):
+    """The foreground slurmdbd is still running (converting the accounting database) and is left alone."""
+
+    def __init__(self, pid: int, log: Path):
+        super().__init__(f"slurmdbd (pid {pid}) is still converting the accounting database and was left running; "
+                         f"watch it with `tail -f {log}` and `sacctmgr show cluster` (that answers once it is done)")
+        self.pid, self.log = pid, log
+
+
+def convert_accounting(user: str, log: Path) -> None:
     """Run the new slurmdbd in the foreground until it answers (its first start converts the database), then stop it
-    and hand over to the service; a slurmdbd that exits first is a failure."""
-    proc = components.popen(["sudo", "-u", user, "slurmdbd", "-D", "-vvv"])
+    and hand over to the service. A slurmdbd that exits first is a failure; one that is still running when the wait
+    ends or breaks is never signalled (stopping a converting database server risks the database): it raises
+    `ConversionUnfinished`. It runs in its own session, writing `log`, so closing the terminal does not end it."""
+    state = components.run(["systemctl", "is-active", "slurmdbd"])
+    if (state.stdout or "").strip() != "inactive":
+        raise SystemExit(f"the slurmdbd service is {(state.stdout or '').strip() or 'not inactive'} before the conversion: "
+                         "it must be stopped, or two slurmdbd would work on one database")
+    with log.open("ab") as out:
+        proc = components.popen(["sudo", "-u", user, "slurmdbd", "-D", "-vvv"], stdout=out, stderr=subprocess.STDOUT,
+                                start_new_session=True)
     try:
         components.wait_for_accounting(sleep, CONVERSION_WAIT_S, CONVERSION_POLL_S, lambda: proc.poll() is None)
-    finally:
+    except BaseException as error:
         if proc.poll() is None:
-            proc.terminate()
-            proc.wait()
+            raise ConversionUnfinished(proc.pid, log) from error
+        raise
+    proc.terminate()  # it answers, so the conversion is finished
+    proc.wait()
 
 
 def await_answers(command: list[str]) -> None:
@@ -200,30 +337,52 @@ def await_answers(command: list[str]) -> None:
     raise SystemExit(f"{' '.join(command)} did not succeed within {ANSWER_WAIT_S} s")
 
 
-def history() -> set[str]:
-    done = components.run(["sacct", "-X", "-n", "-P", "-S", "now-7days", "-o", "JobID"])
+HISTORY_DAYS = 7
+SACCT_TIME = "%Y-%m-%dT%H:%M:%S"
+
+
+def history_window(now: datetime) -> tuple[str, str]:
+    """The seven days up to `now` as absolute `sacct` times, fixed once so every listing covers the same jobs."""
+    return (now - timedelta(days=HISTORY_DAYS)).strftime(SACCT_TIME), now.strftime(SACCT_TIME)
+
+
+def history(window: tuple[str, str]) -> set[str]:
+    start, end = window
+    done = components.run(["sacct", "-X", "-n", "-P", "-S", start, "-E", end, "-o", "JobID"])
     if done.returncode != 0:
         raise SystemExit(f"sacct failed ({done.returncode}): {done.stderr or ''}".rstrip())
     return set((done.stdout or "").split())
 
 
-def restore_text(folder: Path, state_save: str, previous: str, manager: str) -> str:
+def restore_text(folder: Path, state_save: str, previous: str, manager: str, partitions: dict[str, str]) -> str:
     """The commands that put the machine back as the backup found it, printed when a step fails. `previous` is what
     `sinfo -V` printed before the upgrade: the distribution's slurm is reinstalled from the repositories, SchedMD's
-    from the build cache."""
-    cached = slurm_build.DEFAULT_CACHE / ".".join(map(str, version_tuple(re.search(r"\d+\.\d+\.\d+", previous)[0])))
+    from the build cache. The packages go in under the same no-daemon guard as the upgrade's, and the daemons are
+    stopped again before the files come back; `partitions` are the states they had before the upgrade closed them."""
+    cached = slurm_build.DEFAULT_CACHE / re.search(r"\d+\.\d+\.\d+", previous)[0]  # as printed: the directory is 25.05.9
     apt = manager == "apt-get"
     if previous.startswith("slurm-wlm"):
         reinstall = f"{manager} install -y {'--allow-downgrades ' if apt else ''}slurm-wlm slurmdbd"
     else:
-        reinstall = f"{manager} install -y {cached}/*/slurm-smd*.deb" if apt else f"dnf install -y {cached}/*/rpmbuild/RPMS/*/*.rpm"
-    lines = ["systemctl stop slurmctld slurmd slurmdbd",
+        names = slurm_build.DEB_INSTALL if apt else slurm_build.RPM_INSTALL  # only these, as the upgrade installs
+        files = [f"{cached}/*/{n}_*.deb" if apt else f"{cached}/*/rpmbuild/RPMS/*/{n}-[0-9]*.rpm" for n in names]
+        reinstall = f"{manager} install -y {' '.join(files)}"
+    policy = f"/{POLICY_RC_D}"
+    hold, release = ([f"mv -n {policy} {policy}.gpujobs-saved 2>/dev/null; printf '#!/bin/sh\\nexit 101\\n' > {policy}; chmod 755 {policy}"],
+                     [f"rm -f {policy}; mv {policy}.gpujobs-saved {policy} 2>/dev/null; true"]) if apt else (
+        [f"systemctl mask --runtime {' '.join(DAEMONS)}"], [f"systemctl unmask --runtime {' '.join(DAEMONS)}"])
+    stop = "systemctl stop slurmctld slurmd slurmdbd"
+    lines = [stop,
+             *hold,
              f"{manager} remove -y 'slurm-smd*'" if apt else "dnf remove -y 'slurm*'",
              reinstall,
+             *release,
+             stop,  # the packages' scripts may have started one
              "mariadb -e 'DROP DATABASE IF EXISTS slurm_acct_db; CREATE DATABASE slurm_acct_db'",
              f"mariadb slurm_acct_db < {folder / DB_DUMP}",
              f"rm -rf {state_save}/* /etc/slurm/*",
              f"tar -xzf {folder / STATE_TAR} -C /",
              f"tar -xzf {folder / CONF_TAR} -C /",
-             "systemctl start slurmdbd slurmctld slurmd"]
+             "systemctl restart slurmdbd slurmctld slurmd",
+             *(f"scontrol update PartitionName={name} State={state}" for name, state in partitions.items())]
     return "\n".join(f"  {line}" for line in lines)

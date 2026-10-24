@@ -206,27 +206,41 @@ before. Both fields or neither.
 |---|---|---|
 | `version` | required with `sha256` | The release, e.g. `26.05.5`. |
 | `sha256` | required with `version` | The digest of its tarball (`slurm-VERSION.tar.bz2` from SchedMD's GitHub release); the build refuses a download that differs. |
-| `steps` | `[]` | Releases `install.py upgrade-slurm` installs first, in order, each as `"<version>:<sha256>"`; `version` is the last. |
+| `steps` | `[]` | Releases `install.py upgrade-slurm` installs first, each as `"<version>:<sha256>"`, in strictly ascending order and each older than `version`, which is the last release. |
 
 `apply` then runs `slurm/install/slurm_build.py` (debs on Debian-like systems, rpms on Fedora or RHEL-like ones, built
-once and kept under `/var/cache/gpujobs/slurm`). It installs them with `apt-get install` or `dnf install`, after
-removing the distribution's slurm packages (`slurm-wlm`, `slurmctld`, `slurmd`, `slurmdbd`, `slurm-client`) when they
-are installed; the refusal for a queue with jobs applies first. `munge` and `mariadb-server` still come from the
-distribution. The apt version check is skipped, and a machine without `apt-get` may use `dnf`.
+once and kept under `/var/cache/gpujobs/slurm`; a build counts as finished only when it left its completion marker, so
+an interrupted one is built again). It installs only SchedMD's `slurm-smd`, `slurm-smd-client`, `slurm-smd-slurmctld`,
+`slurm-smd-slurmd` and `slurm-smd-slurmdbd` (rpms: `slurm`, `slurm-perlapi`, `slurm-slurmctld`, `slurm-slurmd`,
+`slurm-slurmdbd`), with `apt-get install` or `dnf install`, after removing the distribution's slurm packages
+(`slurm-wlm`, `slurmctld`, `slurmd`, `slurmdbd`, `slurm-client`) when they are installed; the refusal for a queue with
+jobs applies first. `munge` and `mariadb-server` still come from the distribution. The apt version check is skipped,
+and a machine without `apt-get` may use `dnf`. The packages' own scripts start their daemons when installed, so every
+install and removal here runs under a temporary `/usr/sbin/policy-rc.d` that forbids it (an existing one is put back
+afterwards), or, on `dnf` systems, with `slurmdbd`, `slurmctld` and `slurmd` masked until it is over.
 
-**Upgrading.** Change `version` and `sha256` and run `apply` only for a release inside slurm's compatibility window
-of the running one (23.11 to 25.05 is, 23.11 to 26.05 is not), with the queue empty and the accounting database,
-`StateSaveLocation` and `/etc/slurm` backed up: the first start of a newer `slurmdbd` converts the database, which
-can take tens of minutes, and a downgrade is not supported once a newer daemon has started.
+**Upgrading.** `apply` never changes the slurm release: it refuses when slurm is installed and its version differs from
+`version`. A release is installed with `sudo install.py upgrade-slurm`, which takes it from the running one to `version`
+through `steps` (slurm supports upgrades within a compatibility window: 23.11 to 25.05 is inside it, 23.11 to 26.05 is
+not), and only with the queue empty: the first start of a newer `slurmdbd` converts the accounting database, which can
+take tens of minutes, and a downgrade is not supported once a newer daemon has started.
 
-`sudo install.py upgrade-slurm` does this for a running controller: it refuses unless the queue is empty and the running
-version (`sinfo -V`) is older than `version`, backs up to `/var/backups/gpujobs/slurm-DATE/` (`mariadb-dump` of
-`slurm_acct_db`, tars of `StateSaveLocation` and `/etc/slurm`; each file's size is printed in MB), then for each of
-`steps` and finally `version`: stops `slurmctld`, `slurmd` and `slurmdbd`, installs that release's packages, runs
-`slurmdbd -D` as the slurm user until it answers (up to an hour; it fails if the process exits first), stops it, starts
-`slurmdbd`, `slurmctld` and `slurmd`, and checks that `sinfo` answers and `sacct` still lists the last seven days' jobs.
-Any failure stops everything and prints the commands that restore the backup and the previous packages. It ends with
-`apply`.
+`upgrade-slurm` refuses unless the queue is empty and the running version (`sinfo -V`) is older than `version`. It builds
+every release first, so a build or download that fails leaves slurm untouched. It then sets every partition to
+`State=INACTIVE` (so nothing more can be queued), checks the queue again, stops `slurmctld` and `slurmd`, and backs up to
+`/var/backups/gpujobs/slurm-DATE/` (`mariadb-dump` of `slurm_acct_db`, tars of `StateSaveLocation` and `/etc/slurm`; each
+file's size is printed in MB); only then does it stop `slurmdbd`. For each of `steps` and finally `version` it installs that
+release's packages, runs `slurmdbd -D` as the slurm user until it answers (up to an hour; it fails if the process exits
+first, and refuses to start if the `slurmdbd` service is running), stops it, starts `slurmdbd`, `slurmctld` and `slurmd`,
+and checks that `sinfo` answers and `sacct` still lists the same jobs as before, for one seven-day window fixed at the
+start. At the end it sets the partitions back to the states they had and runs `apply`.
+
+A failure before any package changed (a job that slipped in, a failed backup) starts slurm again and reopens the
+partitions. A later failure stops everything and prints the commands that restore the backup and the previous packages
+(under the same no-daemon guard, with the daemons stopped again before the files come back, then `systemctl restart`, then
+the partitions' states). If the foreground `slurmdbd` is still converting when the wait ends, it is left running (nobody
+signals a converting database server); the command prints its process id and the log it writes, `slurmdbd-conversion.log`
+beside the backup, and stops there without a restore.
 
 ### `[metrics]`
 
