@@ -33,8 +33,9 @@ The pieces are installed by one program, `slurm/install/install.py`, in six comp
   work: no `apt-get`, or apt offering no `slurm-wlm` or one older than 23.11 (Ubuntu 22.04 offers 21.08). They warn
   and go ahead where it is only untested: an operating system other than Ubuntu 24.04, an architecture other than
   aarch64, a site file listing more than one node.
-- **Slurm 23.11 or newer, from the distribution packages.** Ubuntu 24.04 ships 23.11.4. The installer installs
-  `slurm-wlm`, `slurmdbd`, `mariadb-server` and `munge`. That Ubuntu build has no NVML plugin (NVML is NVIDIA's
+- **Slurm 23.11 or newer, from the distribution packages, or built from a SchedMD release.** Ubuntu 24.04 ships
+  23.11.4. The installer installs `slurm-wlm`, `slurmdbd`, `mariadb-server` and `munge`; with the site file's
+  `[slurm]` table it builds and installs that release instead of the first two (section 4). That Ubuntu build has no NVML plugin (NVML is NVIDIA's
   management library), so GPUs are declared by device file in `gres.conf`, and slurm itself records no per-GPU
   use; the metrics component fills that gap.
 - **A machine whose slurm this installer sets up.** The `slurm` component always installs and configures slurm
@@ -123,7 +124,7 @@ and pass `--site` each time.
 
 ## 4. The site file
 
-TOML. Tables: the top level, `[[nodes]]` with `[[nodes.gpus]]`, `[lease]` with `[lease.services]`, `[service]`, `[metrics]`,
+TOML. Tables: the top level, `[[nodes]]` with `[[nodes.gpus]]`, `[lease]` with `[lease.services]`, `[service]`, `[slurm]`, `[metrics]`,
 `[portal]` with `[portal.auth_settings]`. "required" means there is no default. The source of truth is
 `slurm/site_config.py`.
 
@@ -195,6 +196,27 @@ on a site of several.
 |---|---|---|
 | `cores` | required | Cores the partition may use per node (`MaxCPUsPerNode`), 1 up to the cores CPU-only jobs may use. |
 | `group` | `gpujobs-service` | Unix group allowed to submit (`AllowGroups=`, with the admin group). `install.py service add USER` adds one. |
+
+### `[slurm]` (optional)
+
+Build and install a SchedMD slurm release instead of the distribution's. Absent: the distribution's packages, as
+before. Both fields or neither.
+
+| Field | Default | Meaning |
+|---|---|---|
+| `version` | required with `sha256` | The release, e.g. `26.05.5`. |
+| `sha256` | required with `version` | The digest of its tarball (`slurm-VERSION.tar.bz2` from SchedMD's GitHub release); the build refuses a download that differs. |
+
+`apply` then runs `slurm/install/slurm_build.py` (debs on Debian-like systems, rpms on Fedora or RHEL-like ones, built
+once and kept under `/var/cache/gpujobs/slurm`). It installs them with `apt-get install` or `dnf install`, after
+removing the distribution's slurm packages (`slurm-wlm`, `slurmctld`, `slurmd`, `slurmdbd`, `slurm-client`) when they
+are installed; the refusal for a queue with jobs applies first. `munge` and `mariadb-server` still come from the
+distribution. The apt version check is skipped, and a machine without `apt-get` may use `dnf`.
+
+**Upgrading.** Change `version` and `sha256` and run `apply` only for a release inside slurm's compatibility window
+of the running one (23.11 to 25.05 is, 23.11 to 26.05 is not), with the queue empty and the accounting database,
+`StateSaveLocation` and `/etc/slurm` backed up: the first start of a newer `slurmdbd` converts the database, which
+can take tens of minutes, and a downgrade is not supported once a newer daemon has started.
 
 ### `[metrics]`
 

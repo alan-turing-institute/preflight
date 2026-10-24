@@ -21,6 +21,7 @@ name = "n"
 cpus = 2
 real_memory_mb = 1000
 """
+SHA = "ab" * 32
 GPU = "[[nodes.gpus]]\nindex = 0\nuuid = 'u'\ndevice = 'd'\ntype = 't'\n"
 
 
@@ -65,6 +66,9 @@ def test_example_loads_and_minimal_file_gets_every_default(tmp_path: Path) -> No
     assert site.service is None  # no [service] table: no service partition
     service = gpujobs_site.load(write(tmp_path, MINIMAL + "[service]\ncores = 2\n")).service
     assert service == gpujobs_site.Service(2, "gpujobs-service")  # no cores held for GPUs: up to the node's cores
+    assert site.slurm_build is None and gpujobs_site.load(write(tmp_path, MINIMAL + "[slurm]\n")).slurm_build is None
+    built = gpujobs_site.load(write(tmp_path, MINIMAL + f"[slurm]\nversion = '26.05.5'\nsha256 = '{SHA}'\n"))
+    assert built.slurm_build == ("26.05.5", SHA)
 
 
 @pytest.mark.parametrize(
@@ -87,6 +91,10 @@ def test_example_loads_and_minimal_file_gets_every_default(tmp_path: Path) -> No
         (MINIMAL + "[service]\ncores = 0\n", "service.cores = 0"),
         (MINIMAL + "[[nodes]]\nname = 'm'\ncpus = 2\nreal_memory_mb = 1000\n[service]\ncores = 1\n", "a site of one node"),
         (MINIMAL + "[service]\ncores = 1\ngroups = 'g'\n", "unknown key(s) in [service]: groups"),
+        (MINIMAL + "[slurm]\nversion = '26.05.5'\n", "needs both version and sha256"),
+        (MINIMAL + f"[slurm]\nsha256 = '{SHA}'\n", "needs both version and sha256"),
+        (MINIMAL + f"[slurm]\nversion = '26.05'\nsha256 = '{SHA}'\n", "slurm.version = '26.05'"),
+        (MINIMAL + "[slurm]\nversion = '26.05.5'\nsha256 = 'abc'\n", "slurm.sha256 must be 64"),
     ],
 )
 def test_bad_site_files_are_refused(tmp_path: Path, text: str, fragment: str) -> None:

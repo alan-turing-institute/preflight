@@ -1,7 +1,7 @@
 """The site file: every difference between one machine and another, read once and typed.
 
 The TOML layout maps one-to-one onto the dataclasses below (`[[nodes]]`, `[[nodes.gpus]]`, `[lease]`,
-`[lease.services]`, `[metrics]`, `[portal]`, `[portal.auth_settings]`). Unknown keys are an error at every
+`[lease.services]`, `[slurm]`, `[metrics]`, `[portal]`, `[portal.auth_settings]`). Unknown keys are an error at every
 table level, so a typo cannot silently fall back to a default. `site.example.toml` documents each field.
 """
 
@@ -11,6 +11,7 @@ import grp
 import ipaddress
 import os
 import pwd
+import re
 import tomllib
 from dataclasses import dataclass
 from enum import StrEnum
@@ -121,6 +122,7 @@ class Site:
     metrics: Metrics
     portal: Portal
     notify_command: tuple[str, ...]  # argv; empty means no notification
+    slurm_build: tuple[str, str] | None = None  # ([slurm] version, sha256): build that release, not the distro's slurm
 
     @property
     def cpu_job_cap(self) -> int | None:
@@ -207,6 +209,20 @@ def _parse_service(raw: Any, nodes: tuple[Node, ...]) -> Service:
     return Service(cores, t["group"])
 
 
+def _parse_slurm(raw: Any) -> tuple[str, str] | None:
+    t = _table(raw, "slurm", set(), {"version": "", "sha256": ""})
+    version, sha256 = t["version"], t["sha256"]
+    if not version and not sha256:
+        return None
+    if not (version and sha256):
+        raise SiteError("site file: [slurm] needs both version and sha256, or neither")
+    if not isinstance(version, str) or not re.fullmatch(r"\d+\.\d+\.\d+", version):
+        raise SiteError(f"site file: slurm.version = {version!r}; expected a release such as 26.05.5")
+    if not isinstance(sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", sha256):
+        raise SiteError("site file: slurm.sha256 must be 64 lowercase hex digits, the release tarball's digest")
+    return version, sha256
+
+
 def parse(raw: dict[str, Any]) -> Site:
     top = _table(
         raw,
@@ -221,6 +237,7 @@ def parse(raw: dict[str, Any]) -> Site:
             "unified_memory": False,
             "lease": None,
             "service": None,
+            "slurm": None,
             "hostguard": False,
             "dgx_gate": False,
             "metrics": {},
@@ -285,6 +302,7 @@ def parse(raw: dict[str, Any]) -> Site:
             _networks(p["allow_from"], "portal.allow_from"),
         ),
         notify_command=tuple(top["notify_command"]),
+        slurm_build=_parse_slurm(top["slurm"]) if top["slurm"] is not None else None,
     )
 
 

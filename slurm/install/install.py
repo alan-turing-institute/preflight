@@ -167,14 +167,24 @@ def kernel_refusals() -> list[str]:
     return problems
 
 
+def package_manager(site) -> str:
+    """`apt-get`, or `dnf` on a machine that has no apt-get when the site builds its own slurm (`[slurm]`)."""
+    if getattr(site, "slurm_build", None) and shutil.which("apt-get") is None and shutil.which("dnf"):
+        return "dnf"
+    return "apt-get"
+
+
 def platform_refusals(site, modules) -> list[str]:
-    """What would make an apply fail on this machine, found before anything is touched: no apt to install the
-    packages with, or an apt whose slurm is older than this build supports."""
+    """What would make an apply fail on this machine, found before anything is touched: no package manager to install
+    the packages with, or an apt whose slurm is older than this build supports (not asked when the site builds its
+    own slurm: `[slurm]`)."""
     if not apt_install_commands(modules, site):
         return []
-    if shutil.which("apt-get") is None:
-        return ["this installer installs its packages with apt (Debian or Ubuntu); this machine has no apt-get"]
-    if not any(m.NAME == "slurm" for m in modules):
+    built = getattr(site, "slurm_build", None)
+    if shutil.which(package_manager(site)) is None:
+        return ["this installer needs apt-get or dnf to install its packages; this machine has neither"] if built else [
+            "this installer installs its packages with apt (Debian or Ubuntu); this machine has no apt-get"]
+    if built or not any(m.NAME == "slurm" for m in modules):
         return []
     policy = components.run(["apt-cache", "policy", "slurm-wlm"]).stdout or ""
     version = re.search(r"Candidate:\s*(?:\d+:)?(\d+)\.(\d+)", policy)
@@ -232,6 +242,8 @@ def apt_install_commands(modules, site) -> list[list[str]]:
     for m in modules:
         if packages := m.packages(site):
             groups.setdefault(tuple(getattr(m, "apt_flags", lambda _site: [])(site)), []).extend(packages)
+    if package_manager(site) == "dnf":  # apt's flags mean nothing to it
+        return [["dnf", "install", "-y", *dict.fromkeys(p for pkgs in groups.values() for p in pkgs)]] if groups else []
     return [["apt-get", "install", "-y", *flags, *packages] for flags, packages in groups.items()]
 
 
@@ -248,6 +260,7 @@ def cmd_apply(site, args, modules, chown: Chown | None = _chown) -> int:
         write_files(args.root, sources, chown)
         _run_all([["apt-get", "update"]])
     _run_all(apt_install_commands(modules, site))
+    _run_all([step for m in modules for step in getattr(m, "install_steps", lambda _site: [])(site)])
     files = _all(modules, site, "files")
     write_files(args.root, files, chown)
     _run_all([argv for m in modules for argv in m.post_install(site)])

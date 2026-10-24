@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import render
+import slurm_build
 
 import components
 
 NAME = "slurm"
 PACKAGES = ["slurm-wlm", "slurmdbd", "mariadb-server", "munge"]
+#: What the site file's `[slurm]` table replaces: slurm itself comes from `slurm_build`, these two from the distro.
+DISTRO_ONLY = ["mariadb-server", "munge"]
+#: Ubuntu's slurm packages, removed (when installed) before SchedMD's, which conflict with them.
+DISTRO_SLURM = ["slurm-wlm", "slurmctld", "slurmd", "slurmdbd", "slurm-client"]
 RESTARTS = [["mariadb", "munge"], ["slurmdbd"], ["slurmctld", "slurmd"]]
 # slurmctld's StateSaveLocation (templates/slurm/slurm.conf). The packages do not make it, and slurmctld, running as
 # SlurmUser, cannot make it in /var/spool itself (Turing box, 2026-10-21: "mkdir(/var/spool/slurmctld): Permission denied").
@@ -27,7 +32,23 @@ def files(site) -> dict[str, render.FileSpec]:
 
 
 def packages(site) -> list[str]:
-    return list(PACKAGES)
+    return list(DISTRO_ONLY if site.slurm_build else PACKAGES)
+
+
+def install_steps(site) -> list:
+    """With `[slurm]` set, build that release (cached) and install its packages in place of the distro's slurm; the
+    build runs when its turn comes, after the distro packages, so a refused or dry run never builds."""
+    return [lambda: _install_built(site)] if site.slurm_build else []
+
+
+def _install_built(site) -> list[list[str]]:
+    version, sha256 = site.slurm_build
+    built = [str(p) for p in slurm_build.build(version, sha256) if "-dbgsym" not in p.name]
+    if not built[0].endswith(".deb"):
+        return [["dnf", "install", "-y", *built]]
+    status = components.run(["dpkg-query", "-W", "-f=${db:Status-Abbrev} ${Package}\\n", *DISTRO_SLURM]).stdout or ""
+    installed = [line[3:] for line in status.splitlines() if line.startswith("ii ")]
+    return [*([["apt-get", "remove", "-y", *installed]] if installed else []), ["apt-get", "install", "-y", *built]]
 
 
 def refusals(site) -> list[str]:

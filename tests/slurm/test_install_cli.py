@@ -39,6 +39,7 @@ class Fake:
         self.calls, self.queue, self.client_ok, self.known = [], queue, client_ok, set()
         self.squeue_rc, self.ctld_rc = 0, 0  # squeue's exit status; `systemctl is-active slurmctld`'s (0: running)
         self.policy = "slurm-wlm:\n  Installed: (none)\n  Candidate: 23.11.4-1.2ubuntu5\n"
+        self.distro_slurm = ""  # what `dpkg-query -W` reports installed, e.g. "ii slurm-wlm\nii slurmd\n"
 
     def __call__(self, argv):
         self.calls.append(argv)
@@ -47,6 +48,8 @@ class Fake:
             return subprocess.CompletedProcess(argv, self.squeue_rc, self.queue, "")
         if argv[:2] == ["systemctl", "is-active"]:
             return subprocess.CompletedProcess(argv, self.ctld_rc, "", "")
+        if argv[:1] == ["dpkg-query"]:
+            return subprocess.CompletedProcess(argv, 1, self.distro_slurm, "")
         if argv[:2] == ["apt-cache", "policy"]:
             return subprocess.CompletedProcess(argv, 0, self.policy, "")
         if argv[:4] == ["sacctmgr", "-n", "-P", "show"]:
@@ -256,3 +259,26 @@ def test_apt_flags_apply_only_to_the_component_that_asks():
         ["apt-get", "install", "-y", "--no-install-recommends", "prometheus"],
     ]
 
+
+
+def test_slurm_table_installs_the_built_packages_in_place_of_the_distros(env, monkeypatch):
+    tmp, site, fake = env
+    site.write_text(SITE + "[slurm]\nversion = '26.05.5'\nsha256 = '" + "ab" * 32 + "'\n")
+    built = []
+    debs = [tmp / "slurm-smd_26.05.5_arm64.deb", tmp / "slurm-smd-dbgsym_26.05.5_arm64.deb"]
+    monkeypatch.setattr(slurm_component.slurm_build, "build", lambda v, s: built.append((v, s)) or debs)
+    fake.distro_slurm = "ii slurm-wlm\nii slurmd\n"
+    fake.policy = "  Candidate: 21.08.5-2ubuntu1\n"  # an old distro slurm no longer matters: it is not installed
+    root = tmp / "root"
+    assert run(site, root, "apply") == 0
+    assert built == [("26.05.5", "ab" * 32)]
+    installs = [c for c in fake.calls if c[:1] == ["apt-get"]]
+    assert installs == [["apt-get", "install", "-y", "mariadb-server", "munge"],
+                        ["apt-get", "remove", "-y", "slurm-wlm", "slurmd"],  # only what is installed
+                        ["apt-get", "install", "-y", str(debs[0])]]  # not the debug symbols
+    # without apt-get, dnf stands in when the site builds slurm, and is refused when it does not
+    monkeypatch.setattr(cli.shutil, "which", lambda name: "/usr/bin/dnf" if name == "dnf" else None)
+    modules = components.load(cli.site_config.load(site), ["slurm"])
+    assert cli.apt_install_commands(modules, cli.site_config.load(site)) == [["dnf", "install", "-y", "mariadb-server", "munge"]]
+    assert cli.platform_refusals(cli.site_config.load(site), modules) == []
+    assert cli.platform_refusals(SimpleNamespace(slurm_build=None), modules)

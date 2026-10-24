@@ -60,6 +60,12 @@ python = "/opt/gpujobs/venv/bin/python"       # interpreter with localmodels ins
 # cores = 4                    # per node, at most the cores CPU-only jobs may use (required)
 # group = "gpujobs-service"    # Unix group allowed to submit; install.py service add USER. Default: gpujobs-service
 
+# Optional. Build and install this SchedMD slurm release instead of the distribution's. Both fields or neither;
+# leave the table out for the distribution's packages.
+# [slurm]
+# version = "26.05.5"          # the release (required with sha256)
+# sha256 = "4680cafc82b0689865c885eb703441e7ebf764896c40fd03a50f2fcb60664f68"   # its tarball's digest (required with version)
+
 [metrics]
 mode = "off"            # local (install Prometheus and Grafana here), external (use the URLs below), or off. Default: off
 prometheus_url = ""     # used when mode = "external". Default: empty
