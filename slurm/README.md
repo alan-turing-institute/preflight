@@ -551,6 +551,12 @@ as that uid), so check this first, or the controller refuses in step 2.
    `rrsync` of the state directory.
 3. Add the node to the controller's site file if it is not there, and `sudo install.py apply` on the controller.
 
+**A hybrid CPU (Intel Core Ultra and similar).** Slurm cannot describe performance cores of two threads beside efficiency cores of one: `slurmd -C`
+on such a laptop says `CPUs=22 ... CoresPerSocket=16 ThreadsPerCore=1` (and, built with hwloc, only 12 CPUs, so the controller drains the node "Low CPUs").
+Build without hwloc (the rpm build does), give the node `cores_per_socket` as `slurmd -C` prints it, and measure what `keep_cpus` names: slurm's CpuSpecList is
+in its own abstract ids, in an order that is not the operating system's. Reserve each id alone (`CpuSpecList=k` on a copy of the node's conf, `slurmd -D -v`)
+and read the log's "Reserved machine CPU IDs"; then run a job given all its CPUs and check `cpuset.cpus.effective` is the cores you meant to lend.
+
 **Where a part-time job's records go.** The job wrapper runs on the machine, so a job's record (`jobs/<id>.json`, with
 its legs and peaks), its events (a pushed-back job's `push_back`) and its log are written to the machine's own state
 directory. Every minute the controller's agent copies each machine's state directory to
