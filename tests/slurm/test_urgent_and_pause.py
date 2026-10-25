@@ -234,6 +234,61 @@ def test_site_admin_check_multi_gpu_plan_and_request_file(
         assert (["scontrol", "requeue", "3"] in calls) is requeued, held_cores
 
 
+def test_entry_runs_the_gate_before_anything_is_held_and_mem_auto_sizes_the_job(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    (tmp_path / "site.toml").write_text(
+        'name = "t"\nadmin_group = "admins"\ndgx_gate = true\n[[nodes]]\nname = "n1"\ncpus = 20\nreal_memory_mb = 100000\n'
+        'cores_per_gpu = 12\n[[nodes.gpus]]\nindex = 0\nuuid = "GPU-x"\ndevice = "/dev/nvidia0"\ntype = "gb10"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(urgent.site_config, "SITE_FILE", tmp_path / "site.toml")
+    monkeypatch.setattr(urgent.site_config, "is_admin", lambda _site, _user: True)
+    queue = [
+        gpu_jobs.QueuedJob("5", "normal", "RUNNING", "None", "p:x:5", gpus=1),
+        gpu_jobs.QueuedJob("6", "normal", "PENDING", "Resources", "p:x:6", gpus=1),
+    ]
+    monkeypatch.setattr(gpu_jobs, "read_queue", lambda: queue)
+    monkeypatch.setattr(urgent, "other_leases", list)
+    monkeypatch.setattr(urgent.audit, "unregistered", list)
+    monkeypatch.setattr(urgent, "free_on_nodes", lambda: None)
+    peak = {"bytes": 20 * 1024**3}
+    monkeypatch.setattr(gpu_jobs, "measured_peak_bytes", lambda _name, *, clean=True: peak["bytes"])
+    calls: list[list[str]] = []
+    done = type("Done", (), {"returncode": 0, "stdout": "9", "stderr": ""})()
+    monkeypatch.setattr(urgent.subprocess, "run", lambda command, **_k: calls.append(command) or done)
+    gates: list[tuple] = []
+
+    def gate(repo: Path, entry: str, command: list[str], manifest: Path, searches: list[str]) -> None:
+        gates.append((repo, entry, command, manifest.parent, searches))
+        if gates[-1][1] == "refused.py":
+            raise urgent.submit.Refused("the DGX gate refused (exit 1); nothing was queued")
+        manifest.parent.mkdir(parents=True, exist_ok=True)
+        manifest.write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr(urgent.submit, "run_gate", gate)
+    argv = ["--project", "p", "--what", "w", "--time", "0:10:00", "--name", "u", "--mem", "auto", "--gpu", "--repo", str(tmp_path),
+            "--search", "third_party/x"]
+
+    # a gate refusal holds, requeues and submits nothing
+    assert urgent.run([*argv, "--entry", "refused.py", "--", "true"]) == 1
+    assert calls == [] and "the DGX gate refused" in capsys.readouterr().err
+
+    # the gate passes: its manifest copy goes to the job wrapper and the job's record; --mem auto is the measured peak plus 10%
+    assert urgent.run([*argv, "--entry", "scripts/e.py", "--", "true"]) == 0
+    assert gates[-1] == (tmp_path.resolve(), "scripts/e.py", ["true"], tmp_path / "manifests", ["third_party/x"])
+    script = Path(calls[-1][-1]).read_text(encoding="utf-8")
+    manifest = gpu_jobs.read_sidecar("9", gpu_jobs.current_user())["manifest"]
+    assert f"--manifest {manifest} --repo {tmp_path}" in script and "--mem=22G" in script and "--exclusive" not in script
+    assert gpu_jobs.read_sidecar("9", gpu_jobs.current_user())["entry"] == "scripts/e.py"
+    assert ["scontrol", "hold", "6"] in calls  # the other pending GPU job is held only after the gate
+
+    # no measured run: --mem auto is the whole box, exactly as --whole-box
+    peak["bytes"] = None
+    assert urgent.run([*argv, "--", "true"]) == 0
+    assert "--mem=0" in Path(calls[-1][-1]).read_text(encoding="utf-8") and "--exclusive" in Path(calls[-1][-1]).read_text(encoding="utf-8")
+
+
 class FakeSlurm:
     """Stands in for every scontrol/scancel call: records them, fails when told to."""
 

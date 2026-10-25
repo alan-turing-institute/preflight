@@ -3,8 +3,8 @@
 
 Design 3.6 (`design notes`).
 
-    slurm/urgent.py --project P --what '...' --time 2:00:00 [--mem M | --whole-box] [--gpu | --gpus N] \
-        [--wait] [--requeue-steady] [--dry-run] -- <command...>
+    slurm/urgent.py --project P --what '...' --time 2:00:00 [--mem M|auto | --whole-box] [--gpu | --gpus N] \
+        [--entry script.py --repo DIR [--search DIR]...] [--wait] [--requeue-steady] [--dry-run] -- <command...>
 
 1. THE PLAN, printed before acting, classifies everything in the urgent job's way:
    pausable at once (`normal` jobs: they lose at most the time since their last checkpoint; service-a),
@@ -16,6 +16,9 @@ Design 3.6 (`design notes`).
 3. Otherwise it submits to `urgent` with the required `--time`. Default size `--whole-box`: the GPU, all
    memory and all cores. Slurm pre-empts and requeues the `normal` jobs in the way; their dependents wait;
    the services step aside because an urgent job is keeper demand, with or without `--gpu`.
+   `--mem auto` asks for the job name's newest measured run plus margin (`submit.resolve_mem`), the whole box when
+   there is none. `--entry` (with `--repo`, `--search`) runs the DGX gate as `submit.py` does, before anything is held or
+   submitted: a refusal changes nothing, and the job wrapper re-checks the code when the job starts.
 4. ORDER AFTERWARDS: a requeued job cannot start for the requeue wait, so an urgent job shorter than that
    would hand the card to another queued job first. Other pending tier-1 GPU jobs are held and recorded in
    `requests/restore_order-<ns>.json`; the agent releases them once every pre-empted job is running again or has left.
@@ -133,13 +136,19 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--what", required=True)
     p.add_argument("--time", required=True, help="how long the urgent job may run (slurm time, e.g. 2:00:00)")
     size = p.add_mutually_exclusive_group()
-    size.add_argument("--mem", default=None, help="memory it needs; default: the whole box")
+    size.add_argument("--mem", default=None,
+                      help="memory it needs; `auto`: the last measured run of --name plus 10%%, else the whole box; "
+                           "default: the whole box")
     size.add_argument("--whole-box", action="store_true")
     count = p.add_mutually_exclusive_group()
     count.add_argument("--gpu", action="store_true", help="one GPU (same as --gpus 1)")
     count.add_argument("--gpus", type=int, default=None, metavar="N", help="N GPUs, N >= 1")
     p.add_argument("--wait", action="store_true", help="accept waiting behind what cannot be paused")
     p.add_argument("--requeue-steady", action="store_true", help="requeue steady jobs in the way (loses them)")
+    p.add_argument("--entry", default=None, help="the Python entry script, relative to --repo (runs the gate)")
+    p.add_argument("--repo", type=Path, default=None)
+    p.add_argument("--search", action="append", default=[], metavar="DIR",
+                   help="an import root the gate's code-parity leg also walks, relative to --repo (repeatable)")
     p.add_argument("--cpus", type=int, default=4)
     p.add_argument("--name", default=None)
     p.add_argument("--log", type=Path, default=None)
@@ -163,17 +172,24 @@ def run(argv: list[str]) -> int:
     if arguments.gpus is not None and arguments.gpus < 1:
         print("[urgent] REFUSED: --gpus must be an integer >= 1", file=sys.stderr)
         return 1
+    if arguments.entry and arguments.repo is None:
+        print("[urgent] REFUSED: --entry needs --repo (the project checkout)", file=sys.stderr)
+        return 1
     site = gpu_jobs.load_site()
     if not site_config.is_admin(site, pwd.getpwuid(os.getuid()).pw_name):
         print(f"[urgent] REFUSED: only members of {site.admin_group} may submit urgent work; "
               f"an admin adds you with: {ADMIN_REMEDY}", file=sys.stderr)
         return 1
     services = site.lease.services if site.lease else {}
+    named = arguments.name
+    if arguments.mem == "auto":  # a job with no measured run (the whole box) is sized as with no --mem
+        resolved = submit.resolve_mem(arguments.mem, named, arguments.gpu or arguments.gpus is not None)
+        arguments.mem = None if resolved in (None, submit.WHOLE_BOX) else resolved
     whole_box = arguments.whole_box or arguments.mem is None
     arguments.gpu = arguments.gpu or arguments.gpus is not None or whole_box
     arguments.gpus = arguments.gpus or int(arguments.gpu)
-    submit.warn_memory(arguments.mem, arguments.name, arguments.gpu)
-    arguments.name = arguments.name or Path(arguments.command[0]).name
+    submit.warn_memory(arguments.mem, named, arguments.gpu)
+    arguments.name = named or Path(arguments.command[0]).name
     arguments.job_class, arguments.after = "urgent", []
     queue = gpu_jobs.read_queue()
     if queue is None:
@@ -214,8 +230,10 @@ def run(argv: list[str]) -> int:
     log = arguments.log or gpu_jobs.STATE_DIR / "logs" / f"{arguments.name}-{stamp}.log"
     extra = [f"--time={arguments.time}"] + (["--exclusive"] if whole_box else [])
     mem = "0" if whole_box else arguments.mem  # --mem=0: all of the node's memory
+    gated = bool(arguments.entry) and site.dgx_gate
+    manifest = gpu_jobs.STATE_DIR / "manifests" / f"{arguments.name}-{stamp}.json" if gated else None
     script = submit.sbatch_script(
-        arguments, mem=mem, log=log, manifest=None, partition=gpu_jobs.Partition.URGENT, extra=tuple(extra),
+        arguments, mem=mem, log=log, manifest=manifest, partition=gpu_jobs.Partition.URGENT, extra=tuple(extra),
         needs_lease=True,
     )
     if arguments.dry_run:
@@ -223,6 +241,8 @@ def run(argv: list[str]) -> int:
         return 0
     try:
         submit.require_keeper(site)
+        if manifest:  # before anything is held or requeued: a refusal changes nothing
+            submit.run_gate(arguments.repo.resolve(), arguments.entry, arguments.command, manifest, arguments.search)
     except submit.Refused as refused:
         print(f"[urgent] REFUSED: {refused}", file=sys.stderr)
         return 1
@@ -282,8 +302,8 @@ def run(argv: list[str]) -> int:
                 print(f"[urgent] requeued steady job {steady_id} (its run so far is lost)")
     gpu_jobs.record_queued_job(
         job_id, "urgent", project=arguments.project, what=arguments.what, job_class="urgent", name=arguments.name,
-        gpu=arguments.gpu, gpus=arguments.gpus, mem=mem, command=arguments.command, log=str(log), script=str(path), after=[],
-        preempts=victims, submitted_at=int(time.time()),
+        gpu=arguments.gpu, gpus=arguments.gpus, mem=mem, command=arguments.command, log=str(log), script=str(path), entry=arguments.entry,
+        manifest=str(manifest) if manifest else None, after=[], preempts=victims, submitted_at=int(time.time()),
     )
     print(f"[urgent] job {job_id} submitted; log {log}")
     return 0
