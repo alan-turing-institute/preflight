@@ -119,6 +119,12 @@ def test_the_peak_for_mem_auto_comes_from_clean_finished_legs_only(tmp_path: Pat
     legs = [done, preempted, crashed]
     (tmp_path / "jobs" / "1.json").write_text(json.dumps({"name": "n", "legs": legs, "last_leg": crashed}))
     assert gpu_jobs.measured_peak_bytes("n") == 1024 * 1024**2
+    # with no clean run: the LARGEST peak of an unclean leg that ran long enough; a leg that died loading is ignored
+    long_crash = {**crashed, "peak_gpu_mib": 2048, "started_at": 0, "ended_at": gpu_jobs.UNCLEAN_MIN_S}
+    early_crash = {**crashed, "peak_gpu_mib": 4096, "started_at": 0, "ended_at": 5}
+    (tmp_path / "jobs" / "9.json").write_text(json.dumps({"name": "m", "legs": [long_crash, early_crash, preempted]}))
+    assert gpu_jobs.measured_peak_bytes("m") is None
+    assert gpu_jobs.measured_peak_bytes("m", clean=False) == 2048 * 1024**2
     (tmp_path / "jobs" / "2.json").write_text(json.dumps({"name": "n", "legs": 5, "last_leg": {"peak_gpu_mib": "x", "exit": 0}}))
     assert gpu_jobs.measured_peak_bytes("n") == 1024 * 1024**2  # wrong types inside a valid record are skipped
     monkeypatch.setattr(gpu_jobs, "current_user", lambda: "somebody-else")  # the file is not theirs

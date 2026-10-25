@@ -75,6 +75,8 @@ KEEPER_STALE_S = 60
 COMMENT_MAX = 200
 #: --mem auto: the measured peak, plus this share, rounded up to whole GiB.
 AUTO_MARGIN = 0.10
+#: --mem auto with no clean run: the largest peak of the crashed or pre-empted runs (a lower bound), plus this share.
+UNCLEAN_MARGIN = 0.25
 #: --mem with no measured run, for a GPU job: slurm's "all of the memory on each node".
 WHOLE_BOX = "0"
 DEFAULT_CPUS = 4  # a CPU-only job, or any job on a site whose nodes have no GPUs
@@ -97,15 +99,22 @@ def seconds(text: str) -> float:
 def resolve_mem(mem: str | None, name: str | None, gpu: bool) -> str | None:
     """The `--mem` to ask slurm for. A stated figure is used as given; none (or `auto`) is the newest measured run of
     `name` plus `AUTO_MARGIN`, only for a job given `--name` (the default name, the command's first word such as
-    `python`, is shared by unrelated jobs); with no measured run, the whole box for a GPU job (`0`: slurm grants
+    `python`, is shared by unrelated jobs); with no clean run, the largest peak of its crashed or pre-empted runs plus
+    `UNCLEAN_MARGIN`; with no measured run at all, the whole box for a GPU job (`0`: slurm grants
     every byte it hands out) and slurm's own default for a CPU job. The wrapper measures every run, so only a
     named job's first run takes the whole box."""
     if mem not in (None, "auto"):
         return mem
-    peak = None if name is None else gpu_jobs.measured_peak_bytes(name)
-    if peak is not None:
-        return f"{math.ceil(peak * (1 + AUTO_MARGIN) / 1024**3)}G"
-    return WHOLE_BOX if gpu else None
+    if name is None:
+        return WHOLE_BOX if gpu else None
+    for clean, margin in ((True, AUTO_MARGIN), (False, UNCLEAN_MARGIN)):
+        if (peak := gpu_jobs.measured_peak_bytes(name, clean=clean)) is not None:
+            return f"{math.ceil(peak * (1 + margin) / 1024**3)}G"
+    if gpu:
+        warn(f"no measured run called {name!r}: it asks for the whole box and waits for every other job; "
+             "pass --mem from a similar job's footprint (slurm/footprint.py NAME) to let it start beside them")
+        return WHOLE_BOX
+    return None
 
 
 def warn(text: str) -> None:

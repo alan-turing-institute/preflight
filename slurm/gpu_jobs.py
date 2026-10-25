@@ -726,11 +726,19 @@ def completion_records(job_ids: Iterable[str] | None = None) -> dict[str, dict[s
     return records
 
 
-def measured_peak_bytes(name: str) -> int | None:
+#: An unclean leg (crashed or pre-empted) counts towards `measured_peak_bytes(..., clean=False)` only after this long:
+#: one that died while loading has not reached its working size.
+UNCLEAN_MIN_S = 600
+
+
+def measured_peak_bytes(name: str, *, clean: bool = True) -> int | None:
     """The footprint of the newest run called `name` that finished cleanly (exit 0, no signal): GPU plus CPU side.
 
     Only this user's own sidecars count: another user's file with the name could understate the peak, and a crashed
-    or pre-empted leg stopped early, so its peak is too low to size the next run on.
+    or pre-empted leg stopped early, so its peak is too low to size the next run on. With `clean=False` (used only when
+    no clean run exists) it is instead the LARGEST peak of any leg that ran `UNCLEAN_MIN_S` or longer: a lower bound,
+    but far closer than the whole box a re-queued job otherwise asks for (2026-10-25: a re-queue after a crash asked
+    for the whole box and sat idle beside a 27 GB job with 75 GB free).
     """
     best: tuple[int, int] | None = None
     me = current_user()
@@ -742,15 +750,18 @@ def measured_peak_bytes(name: str) -> int | None:
         if path.stem in remote and (copied := read_json(remote[path.stem])):
             record = merge_remote(record, copied)
         for leg in _legs(record):
-            if "peak_gpu_mib" not in leg or leg.get("exit") != 0 or leg.get("signals"):
+            if "peak_gpu_mib" not in leg or (clean and (leg.get("exit") != 0 or leg.get("signals"))):
                 continue
             try:
                 total = int(float(leg["peak_gpu_mib"]) * 1024 * 1024) + int(leg.get("peak_mem_bytes") or 0)
                 ended = int(leg.get("ended_at") or 0)
+                started = leg.get("started_at")
+                ran = ended - (ended if started is None else int(started))
             except (TypeError, ValueError):
                 continue
-            if best is None or ended > best[0]:
-                best = (ended, total)
+            key = ended if clean else total
+            if (clean or ran >= UNCLEAN_MIN_S) and (best is None or key > best[0]):
+                best = (key, total)
     return None if best is None else best[1]
 
 
