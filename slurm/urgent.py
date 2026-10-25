@@ -149,7 +149,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--repo", type=Path, default=None)
     p.add_argument("--search", action="append", default=[], metavar="DIR",
                    help="an import root the gate's code-parity leg also walks, relative to --repo (repeatable)")
-    p.add_argument("--cpus", type=int, default=4)
+    p.add_argument("--cpus", type=int, default=None, help="default: as submit.py (a GPU job gets the site's cores per GPU)")
     p.add_argument("--name", default=None)
     p.add_argument("--log", type=Path, default=None)
     p.add_argument("--workdir", type=Path, default=Path.cwd())
@@ -190,6 +190,7 @@ def run(argv: list[str]) -> int:
     arguments.gpus = arguments.gpus or int(arguments.gpu)
     submit.warn_memory(arguments.mem, named, arguments.gpu)
     arguments.name = named or Path(arguments.command[0]).name
+    arguments.cpus = submit.resolve_cpus(arguments.cpus, arguments.gpus, site)
     arguments.job_class, arguments.after = "urgent", []
     queue = gpu_jobs.read_queue()
     if queue is None:

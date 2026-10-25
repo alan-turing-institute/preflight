@@ -280,6 +280,7 @@ def test_entry_runs_the_gate_before_anything_is_held_and_mem_auto_sizes_the_job(
     script = Path(calls[-1][-1]).read_text(encoding="utf-8")
     manifest = gpu_jobs.read_sidecar("9", gpu_jobs.current_user())["manifest"]
     assert f"--manifest {manifest} --repo {tmp_path}" in script and "--mem=22G" in script and "--exclusive" not in script
+    assert "--cpus-per-task=12" in script  # as submit.py: the site's cores per GPU
     assert gpu_jobs.read_sidecar("9", gpu_jobs.current_user())["entry"] == "scripts/e.py"
     assert ["scontrol", "hold", "6"] in calls  # the other pending GPU job is held only after the gate
 
