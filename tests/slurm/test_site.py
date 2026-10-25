@@ -84,7 +84,7 @@ def test_example_loads_and_minimal_file_gets_every_default(tmp_path: Path) -> No
     full, part = mixed.nodes
     assert (mixed.full_nodes, mixed.part_time_nodes) == ((full,), (part,)) and mixed.health_check == gpujobs_site.HealthCheck(30)
     assert (full.close_below_mb, full.push_back_below_mb, part.close_below_mb, part.push_back_below_mb) == (16000, 10000, 6000, 2000)
-    assert (part.mem_spec_limit_mb, full.mem_spec_limit_mb, part.mains_only) == (3000, None, None)
+    assert (part.mem_spec_limit_mb, full.mem_spec_limit_mb, part.mains_only) == (8000 - 4768, None, None)  # 5 decimal GB is 4768 of slurm's 2^20-byte MB
     assert site.health_check is None
 
 
@@ -93,7 +93,7 @@ def test_example_loads_and_minimal_file_gets_every_default(tmp_path: Path) -> No
     [
         (MINIMAL + PART_TIME, "a part_time node needs address"),
         (MINIMAL + PART_TIME + "address = 'a'\n" + GPU, "a part_time node cannot have GPUs"),
-        (MINIMAL + PART_TIME + "address = 'a'\njobs_memory_gb = 8\n", "jobs_memory_gb = 8"),
+        (MINIMAL + PART_TIME + "address = 'a'\njobs_memory_gb = 9\n", "jobs_memory_gb = 9"),
         (MINIMAL + PART_TIME + "address = 'a'\njobs_memory_gb = nan\n", "jobs_memory_gb = nan"),
         (MINIMAL + PART_TIME + "address = 'a'\njobs_memory_gb = inf\n", "jobs_memory_gb = inf"),
         (MINIMAL + "close_below_gb = nan\n", "close_below_gb = nan"),

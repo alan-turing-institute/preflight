@@ -21,6 +21,7 @@ from typing import Any
 
 SITE_FILE = Path(os.environ.get("GPUJOBS_SITE", "/etc/gpujobs/site.toml"))
 MB_PER_GB = 1000  # site-file sizes are decimal gigabytes
+SLURM_MB_PER_GB = 1e9 / 2**20  # slurm's "MB" (`real_memory_mb`, MemSpecLimit) is 2^20 bytes: a decimal GB is 953.67 of them
 #: Health-check thresholds in GB when a node names none, by `part_time`: (close below, push back below).
 _DEFAULT_THRESHOLDS_GB = {False: (16, 10), True: (6, 2)}
 _CPU_SPEC_LIST = re.compile(r"\d+(-\d+)?(,\d+(-\d+)?)*")
@@ -94,7 +95,7 @@ class Node:
         """MemSpecLimit: memory slurm keeps from jobs; None unless `jobs_memory_gb` is set."""
         if self.jobs_memory_gb is None:
             return None
-        return self.real_memory_mb - round(self.jobs_memory_gb * MB_PER_GB)
+        return self.real_memory_mb - round(self.jobs_memory_gb * SLURM_MB_PER_GB)
 
 
 @dataclass(frozen=True)
@@ -278,9 +279,9 @@ def _check_part_time(node: Node, where: str) -> None:
                         "such as \"0-11\" or \"0,2,4-7\"")
     jobs = node.jobs_memory_gb
     if jobs is not None and (isinstance(jobs, bool) or not isinstance(jobs, int | float) or not math.isfinite(jobs)
-                             or not 0 < round(jobs * MB_PER_GB) < node.real_memory_mb):
+                             or not 0 < round(jobs * SLURM_MB_PER_GB) < node.real_memory_mb):
         raise SiteError(f"site file: [{where}] jobs_memory_gb = {jobs!r}; expected more than 0 and less than the "
-                        f"node's memory ({node.real_memory_mb / MB_PER_GB:g} GB)")
+                        f"node's memory ({node.real_memory_mb / SLURM_MB_PER_GB:.1f} GB)")
 
 
 def _parse_health_check(raw: Any) -> HealthCheck:

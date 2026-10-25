@@ -184,7 +184,7 @@ def test_part_time_node_and_health_check():
     assert (part_time.mode, part_time.owner) == (0o644, "slurm")
     assert [ln for ln in part_time.content.splitlines() if not ln.startswith("#")] == [
         "NodeName=lap NodeAddr=100.64.0.2 CPUs=22 Boards=1 SocketsPerBoard=1 CoresPerSocket=16 ThreadsPerCore=1 "
-        "RealMemory=33000 CpuSpecList=12-21 MemSpecLimit=13000 State=UNKNOWN"]
+        "RealMemory=33000 CpuSpecList=12-21 MemSpecLimit=13927 State=UNKNOWN"]
     assert "NodeName=lap" not in conf and render.PART_TIME_CONF_PATH not in render.render(
         site_config.parse({**raw, "nodes": raw["nodes"][:1]}), "slurm")
     assert "SlurmctldHost=head\n" in conf and "Nodes=lap" not in conf.replace("PartitionName=part_time Nodes=lap", "")

@@ -582,7 +582,7 @@ def test_part_time_resources_rewrite_the_included_file_then_reconfigure(world: W
     world.admins = {gpu_jobs._owner(world.part_time("1", action="resources", jobs_memory_gb=20, keep_cpus="0-3"))}
     world.step()
     conf = (world.dir / "part_time_nodes.conf").read_text()
-    assert "NodeName=lap NodeAddr=10.0.0.2 CPUs=8" in conf and "CpuSpecList=0-3 MemSpecLimit=10000" in conf
+    assert "NodeName=lap NodeAddr=10.0.0.2 CPUs=8" in conf and "CpuSpecList=0-3 MemSpecLimit=10927" in conf
     assert world.writes == [["reconfigure"]]
     world.part_time("2", action="resources", jobs_memory_gb=99)  # more than the machine has
     world.step()
