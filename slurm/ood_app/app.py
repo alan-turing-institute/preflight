@@ -1266,15 +1266,19 @@ def _field(label: str, name: str, value: object, unit: str, kind: str = "number"
             f'aria-describedby="unit-{name}"> <span id="unit-{name}" class="meta">{esc(unit)}</span></label>')
 
 
-def _copied_line(state: PartTimeState, shared: bool) -> str:
+def _fact(label: str, value: str) -> str:
+    return f'<div class="pt-fact"><span class="meta">{esc(label)}</span><b class="num">{esc(value)}</b></div>'
+
+
+def _copied_fact(state: PartTimeState, shared: bool) -> str:
     if shared:
-        return '<p class="meta">Job state: read from the shared state directory.</p>'
+        return '<div class="pt-fact"><span class="meta">Job state</span><b>read from the shared state directory</b></div>'
     when = "never" if state.copied_at is None else datetime.fromtimestamp(state.copied_at).strftime("%a %-d %b %H:%M:%S")  # noqa: DTZ006 - local
-    return f'<p class="meta">Job state last copied from this machine: {esc(when)}</p>'
+    return _fact("Job state last copied from this machine:", when)
 
 
 def _part_time_node(node: site_config.Node, state: PartTimeState | None, shared: bool = False) -> str:
-    """One machine: open or closed and why, its free memory, the switch, the give-back button and its settings."""
+    """One machine: a header with its state and its two buttons, a row of facts, and its settings in two groups."""
     name = esc(node.name)
     if state is None:
         return f'<div class="part-time"><h3>{name}</h3><p class="meta">Slurm does not answer for this machine.</p></div>'
@@ -1285,21 +1289,26 @@ def _part_time_node(node: site_config.Node, state: PartTimeState | None, shared:
     badge = _badge("paused", "Closed") if state.closed else _badge("running", "Open")
     jobs_memory = "" if node.jobs_memory_gb is None else node.jobs_memory_gb
     return (
-        f'<div class="part-time" data-node="{name}"><h3>{name} {badge}<span class="meta">{why}</span></h3>'
-        f'<p>Memory available on the machine: <b class="num">{esc(free)}</b></p>' + _copied_line(state, shared) +
+        f'<div class="part-time" data-node="{name}"><div class="pt-head"><h3>{name} {badge}<span class="meta">{why}</span></h3>'
         '<div class="actions">'
         f'<label class="check"><input type="checkbox" data-part-time="switch" data-node="{name}"'
         f'{"" if state.closed else " checked"}> Accept jobs</label>'
         f'<button type="button" class="danger" data-part-time="give_back" data-node="{name}" '
-        f'data-jobs="{state.resume_jobs}">Give me my machine back</button></div>'
-        f'<form class="actions" data-part-time="thresholds" data-node="{name}">'
-        + _field("Close below", "close_below_gb", _gb(close_mb), "GB free")  # type: ignore[arg-type]
-        + _field("Push jobs back below", "push_back_below_gb", _gb(push_mb), "GB free")  # type: ignore[arg-type]
-        + '<button type="submit">Save limits</button></form>'
-        f'<form class="actions" data-part-time="resources" data-node="{name}">'
+        f'data-jobs="{state.resume_jobs}">Give me my machine back</button></div></div>'
+        '<div class="pt-facts">' + _fact("Memory available", free) + _fact("Jobs running here", str(state.resume_jobs))
+        + _copied_fact(state, shared) + '</div>'
+        '<div class="pt-settings">'
+        f'<form class="pt-group" data-part-time="thresholds" data-node="{name}"><h4>When to step aside</h4>'
+        "<p class=\"meta\">When the machine's available memory falls below the first limit it closes to new jobs; below the "
+        "second, running jobs are sent back to the queue.</p><div class=\"pt-fields\">"
+        + _field("Close below", "close_below_gb", _gb(close_mb), "GB available")  # type: ignore[arg-type]
+        + _field("Push jobs back below", "push_back_below_gb", _gb(push_mb), "GB available")  # type: ignore[arg-type]
+        + '</div><button type="submit">Save limits</button></form>'
+        f'<form class="pt-group" data-part-time="resources" data-node="{name}"><h4>What jobs may use</h4>'
+        '<p class="meta">The memory and cores slurm may give to jobs; the rest stays yours.</p><div class="pt-fields">'
         + _field("Memory for jobs", "jobs_memory_gb", jobs_memory, "GB (empty: all)")
         + _field("Cores kept for you", "keep_cpus", node.keep_cpus or "", "e.g. 0-11", "text")
-        + '<button type="submit">Save resources</button></form></div>'
+        + '</div><button type="submit">Save resources</button></form></div></div>'
     )
 
 

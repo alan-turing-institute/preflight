@@ -284,8 +284,18 @@ dialog .actions { justify-content: flex-end; margin-top: 16px; }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
 
 /* Part-time machines card */
-.part-time + .part-time { margin-top: 18px; padding-top: 18px; border-top: 1px solid var(--border); }
-.part-time h3 { font-size: 14px; font-weight: 650; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+.part-time { display: flex; flex-direction: column; gap: 14px; }
+.part-time + .part-time { margin-top: 20px; padding-top: 20px; border-top: 1px solid var(--border); }
+.part-time h3 { font-size: 15px; font-weight: 650; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 0; }
 .part-time h3 .meta { color: var(--muted); font-size: 12.5px; font-weight: 400; }
-.part-time form.actions { margin-top: 10px; align-items: flex-end; }
+.pt-head { display: flex; justify-content: space-between; align-items: center; gap: 10px 16px; flex-wrap: wrap; }
+.pt-head .actions { align-items: center; gap: 14px; }
+.pt-facts { display: flex; flex-wrap: wrap; gap: 8px 36px; }
+.pt-fact { display: flex; flex-direction: column; gap: 2px; font-size: 12.5px; }
+.pt-fact b { font-size: 15px; font-weight: 650; }
+.pt-settings { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; }
+.pt-group { display: flex; flex-direction: column; align-items: flex-start; gap: 10px; padding: 14px 16px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-2); }
+.pt-group h4 { font-size: 13px; font-weight: 650; margin: 0; }
+.pt-group .meta { margin: 0; font-size: 12.5px; }
+.pt-fields { display: flex; flex-wrap: wrap; gap: 10px 16px; }
 .part-time .field input { width: 7rem; }
