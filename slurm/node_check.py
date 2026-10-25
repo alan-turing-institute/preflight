@@ -21,6 +21,7 @@ import argparse
 import contextlib
 import json
 import os
+import re
 import socket
 import stat
 import subprocess
@@ -37,6 +38,9 @@ import gpu_jobs  # noqa: E402 - path set just above
 SETTINGS_PATH = Path("/etc/gpujobs/node_check.json")
 LOG_PATH = Path("/var/log/gpujobs/node_check.log")  # the settings name it too; this is for a run that cannot read them
 REASON_PREFIX = "gpujobs-check: "
+#: The node's `Comment` carries what the check just read, for the page: `available_mb=N;total_mb=N;cores=N;cores_busy=X`
+#: (`gpu_busy=X`, 0-1, too on a machine with a GPU; no spaces: `scontrol -o` splits on them). A comment that does not start with the prefix is someone else's: left alone.
+COMMENT_PREFIX = "available_mb="
 #: slurm kills a health check after 60 s; every slurm call gets far less.
 CALL_TIMEOUT_S = 10
 #: Consecutive runs that must pass rule 3 before we reopen a node we closed.
@@ -136,6 +140,7 @@ class NodeInfo:
     drained: bool
     reason: str
     extra: str
+    comment: str = ""
 
     @property
     def ours(self) -> bool:
@@ -152,7 +157,8 @@ def read_node(run: Runner, hostname: str) -> NodeInfo:
         raise RuntimeError(f"scontrol show node failed: {done.stderr.strip()}")
     node = json.loads(done.stdout)["nodes"][0]
     states = node.get("state") or []
-    return NodeInfo(str(node["name"]), DRAIN_FLAG in states, str(node.get("reason") or ""), str(node.get("extra") or ""))
+    return NodeInfo(str(node["name"]), DRAIN_FLAG in states, str(node.get("reason") or ""), str(node.get("extra") or ""),
+                    str(node.get("comment") or ""))
 
 
 @dataclass(frozen=True)
@@ -264,6 +270,27 @@ def drain(run: Runner, node: str, why: str) -> None:
         raise RuntimeError(f"drain failed: {done.stderr.strip()}")
 
 
+def read_comment(text: object) -> dict[str, float]:
+    """The reading in a node's comment (`report_free`), {} when it is not one."""
+    found = dict(part.split("=", 1) for part in str(text or "").split(";") if "=" in part)
+    if not str(text or "").startswith(COMMENT_PREFIX) or not all(re.fullmatch(r"\d+(\.\d+)?", v) for v in found.values()):
+        return {}
+    return {k: float(v) for k, v in found.items()}
+
+
+def report_free(run: Runner, info: NodeInfo, free: int, use: dict[str, float], gpu_busy: float | None = None) -> None:
+    """Put what the check judged by, and what the machine is doing, on the node, where the page reads it (slurm's own
+    `FreeMem` leaves out the cache, so it is not the figure the limits are about). Display only: a failure never closes
+    the node."""
+    value = f"{COMMENT_PREFIX}{free}"
+    if use:
+        value += f";total_mb={use['mem_total'] // MB_BYTES};cores={int(use['cores'])};cores_busy={use['cores_busy']:.1f}"
+        if gpu_busy is not None:
+            value += f";gpu_busy={gpu_busy:.2f}"
+    if value != info.comment and (not info.comment or info.comment.startswith(COMMENT_PREFIX)):
+        run(["scontrol", "update", f"NodeName={info.name}", f"Comment={value}"])
+
+
 def reopen(run: Runner, node: str) -> None:
     done = run(["scontrol", "update", f"NodeName={node}", "State=RESUME"])
     if done.returncode != 0:
@@ -287,7 +314,8 @@ def log_line(path: Path, line: str) -> None:
 
 def check(
     settings_path: Path, run: Runner = run_command, record: Recorder = gpu_jobs.write_event,
-    hostname: str | None = None,
+    hostname: str | None = None, gpu_busy: Callable[[], float | None] = gpu_jobs.gpu_busy,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> list[str]:
     """One run of the rules; the decisions taken (empty = allow). Raises on any failure: the caller fails closed."""
     host = (hostname or socket.gethostname()).split(".")[0]
@@ -346,6 +374,7 @@ def check(
         decisions.append(f"reopen ({REOPEN_AFTER} passing runs)")
 
     gpu_jobs.write_json(settings.state_path, state)
+    report_free(run, info, free, gpu_jobs.machine_use(lambda path: (settings.meminfo_path if path == "/proc/meminfo" else Path(path)).read_text(encoding="ascii"), sleep), gpu_busy())
     try:
         if skipped := write_manifest(settings.state_dir):
             log_line(settings.log_path, f"{info.name} {skipped}")

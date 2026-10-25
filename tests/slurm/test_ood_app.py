@@ -65,6 +65,7 @@ class Fake:
             project_order=lambda: ["proj"],
             capacity=lambda: {"cpus": 20, "cpus_used": 8, "mem_mb": 102400, "mem_used_mb": 65536, "gpus": 1, "gpus_used": 1,
                               "nodes": 1, "here": 1},
+            node_capacity=lambda: [],  # one machine: never the live cluster's
             machine=lambda: {"mem_total": 120 * 1024**3, "mem_used": 110 * 1024**3, "cores": 20, "cores_busy": 3.0},
             gpu_busy=lambda: 0.37,
         )
@@ -144,6 +145,22 @@ def test_every_get_route_answers(path: str) -> None:
         elsewhere = app._resource_tiles({"cpus": 1, "cpus_used": 0, "mem_mb": 1024, "mem_used_mb": 0, "gpus": 1, "gpus_used": 1,
                                          "nodes": 1, "here": 0}, [], 0.5, {"mem_total": 1, "mem_used": 1, "cores": 1, "cores_busy": 1})
         assert "Reserved by jobs" in elsewhere and "Busy" not in elsewhere and "In use" not in elsewhere
+        # two machines: a strip for the cluster, then one each; only the page's own machine reads /proc, the other's reading
+        # is the one its health check left in its comment
+        total = {"cpus": 28, "cpus_used": 4, "mem_mb": 112000, "mem_used_mb": 0, "gpus": 1, "gpus_used": 0, "nodes": 2, "here": 1}
+        dgx = {"name": "dgx", "here": 1, "cpus": 20, "cpus_used": 4, "mem_mb": 100000, "mem_used_mb": 0, "gpus": 1, "gpus_used": 0, "comment": ""}
+        lap = {"name": "lap", "here": 0, "cpus": 8, "cpus_used": 0, "mem_mb": 12000, "mem_used_mb": 0, "gpus": 0, "gpus_used": 0,
+               "comment": "available_mb=9000;total_mb=30000;cores=22;cores_busy=1.5"}
+        running = [{"kind": app.Kind.RUNNING, "node": "lap", "cpus": 8, "gpus": 0}]
+        both = app._resource_tiles(total, running, 0.5, {"mem_total": 2 * 10**9, "mem_used": 10**9, "cores": 20, "cores_busy": 3.0}, [dgx, lap])
+        strips = both.split('<section')[1:]
+        assert [x.split("</h2>")[0].rsplit(">", 1)[1] for x in strips] == ["Whole cluster", "dgx", "lap"]
+        assert "3.0 of 20" in strips[1] and "1.5 of 22" in strips[2] and "21.0 of 30.0 GB" in strips[2]
+        assert "4.5 of 42" in strips[0] and "22.0 of 32.0 GB" in strips[0] and "Busy</span><span class=\"num\">50%" in strips[0]  # summed
+        assert ">GPU<" in strips[1] and ">GPU<" not in strips[2] and "not reported" not in both  # the laptop has none
+        lap_silent = {**lap, "comment": ""}  # a machine that has not reported: said so on its strip and the cluster's, left out of the sum
+        silent = app._resource_tiles(total, running, 0.5, {"mem_total": 2 * 10**9, "mem_used": 10**9, "cores": 20, "cores_busy": 3.0}, [dgx, lap_silent])
+        assert silent.count("in use not reported by lap") == 2 and "3.0 of 20" in silent.split("<section")[1]
 
 
 def test_unknown_things_are_not_found_or_bad() -> None:
@@ -203,6 +220,7 @@ def test_part_time_card_is_the_admins_and_its_buttons_leave_requests_the_agent_r
     for fake in (plain, boss):
         fake.backend.site, fake.backend.requests_dir = (lambda: site), tmp_path
         fake.backend.part_time_state = lambda names: {"lap": state}
+    assert (app._available_mb("available_mb=10284"), app._available_mb("a note"), app._available_mb("")) == (10284, None, None)
     assert "Part-time machines" not in call(plain, "/")[1]
     page = call(boss, "/")[1]
     assert "Part-time machines" in page and "3.5 GB" in page and 'data-jobs="2"' in page and 'name="close_below_gb" type="number" step="any" min="0" value="7"' in page

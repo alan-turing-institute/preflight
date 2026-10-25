@@ -950,28 +950,46 @@ def job_pids(cgroup: Path | None, fallback_pids: set[int], job_id: str, gpu_pids
     return pids
 
 
-def capacity(runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run) -> dict[str, int]:
-    """Over every node: the cores, memory (MB) and GPUs slurm has to give, and how much of each it has given to jobs
-    (`scontrol show nodes -o`), with the number of nodes and how many of them are this host. {} when slurm does not
-    answer."""
+def node_capacity(
+    runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> list[dict[str, int | str]] | None:
+    """Each node's cores, memory (MB) and GPUs slurm has to give, and how much of each it has given to jobs
+    (`scontrol show nodes -o`), with `here` = 1 for this host. What a node keeps for its owner (`CPUSpecList`,
+    `MemSpecLimit`: a part-time machine) is not counted as theirs to give. None when slurm does not answer."""
     try:
         done = runner(["scontrol", "show", "nodes", "-o"], capture_output=True, text=True, timeout=30, check=False)
     except (OSError, subprocess.TimeoutExpired):
-        return {}
+        return None
     if done.returncode != 0:
-        return {}
-    total = dict.fromkeys(("cpus", "cpus_used", "mem_mb", "mem_used_mb", "gpus", "gpus_used", "nodes", "here"), 0)
+        return None
     host = os.uname().nodename.split(".")[0]
+    found: list[dict[str, int | str]] = []
     for line in done.stdout.splitlines():
         fields = dict(part.split("=", 1) for part in line.split() if "=" in part)
-        total["nodes"] += 1
-        total["here"] += host in {fields.get("NodeName"), fields.get("NodeHostName")}
         gpus = [re.search(r"gres/gpu=(\d+)", fields.get(key, "")) for key in ("CfgTRES", "AllocTRES")]
-        for key, value in (("cpus", fields.get("CPUTot")), ("cpus_used", fields.get("CPUAlloc")),
+        node: dict[str, int | str] = {"name": fields.get("NodeName", ""), "here": int(host in {fields.get("NodeName"), fields.get("NodeHostName")}),
+                                        "comment": fields.get("Comment", "")}
+        for key, value in (("cpus", fields.get("CPUEfctv") or fields.get("CPUTot")), ("cpus_used", fields.get("CPUAlloc")),
                            ("mem_mb", fields.get("RealMemory")), ("mem_used_mb", fields.get("AllocMem")),
                            ("gpus", gpus[0] and gpus[0][1]), ("gpus_used", gpus[1] and gpus[1][1])):
-            total[key] += int(value) if value and str(value).isdigit() else 0
-    return total
+            node[key] = int(value) if value and str(value).isdigit() else 0
+        held = fields.get("MemSpecLimit", "")
+        node["mem_mb"] = int(node["mem_mb"]) - (int(held) if held.isdigit() else 0)
+        found.append(node)
+    return found
+
+
+def capacity(runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run) -> dict[str, int]:
+    """`node_capacity` summed over every node, with the number of nodes and how many of them are this host. {} when
+    slurm does not answer."""
+    found = node_capacity(runner)
+    if found is None:
+        return {}
+    total = dict.fromkeys(("cpus", "cpus_used", "mem_mb", "mem_used_mb", "gpus", "gpus_used", "here"), 0)
+    for node in found:
+        for key in total:
+            total[key] += int(node[key])
+    return {**total, "nodes": len(found)}
 
 
 def _cpu_ticks(stat_text: str) -> tuple[int, int]:

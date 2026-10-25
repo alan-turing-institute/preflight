@@ -31,6 +31,7 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 import agent
 import gpu_jobs
 import jobs_view
+import node_check
 import site_config
 from gpu_jobs import QueuedJob
 
@@ -223,6 +224,7 @@ class Backend:
     now: Callable[[], datetime] = datetime.now
     project_order: Callable[[], list[str]] = lambda: _project_order()
     capacity: Callable[[], Mapping[str, int]] = gpu_jobs.capacity
+    node_capacity: Callable[[], list[dict[str, int | str]] | None] = gpu_jobs.node_capacity
     machine: Callable[[], Mapping[str, float]] = gpu_jobs.machine_use
     gpu_busy: Callable[[], float | None] = gpu_jobs.gpu_busy
     run: Run = run_tool
@@ -534,46 +536,79 @@ def _running_note(running: int, on_gpu: int) -> str:
 
 
 def _resource_tiles(
-    have: Mapping[str, int], rows: list[dict[str, object]], busy: float | None = None, use: Mapping[str, float] | None = None
+    have: Mapping[str, int], rows: list[dict[str, object]], busy: float | None = None, use: Mapping[str, float] | None = None,
+    per_node: list[dict[str, int | str]] = (),  # type: ignore[assignment]
 ) -> str:
     """Per resource, what slurm jobs have reserved (out of what slurm can give, its own totals) beside what is really in
     use (out of the whole machine: a process outside slurm uses memory no job reserved, and a job may use less than it
-    reserved). The in-use readings (`nvidia-smi`, /proc) are of the host the page runs on, so they show only when that
-    host is slurm's one node."""
+    reserved). The in-use readings (`nvidia-smi`, /proc) are of the host the page runs on, so they show only on that
+    host's strip. One machine: one strip. Several: a strip for the whole cluster, then one for each machine."""
     if not have:
         return ""
-    if not (have.get("nodes") == 1 and have.get("here")):
-        busy, use = None, {}
+    if len(per_node) < 2:
+        return _box("This machine", have, rows, busy, use) if have.get("nodes") == 1 and have.get("here") else _box("This machine", have, rows)
+    # every machine reports through its own health check, so every strip reads the same way; the page's own machine falls
+    # back to its live reading when its check has not reported yet
+    seen = {str(n["name"]): _reading(n.get("comment")) or ({**(use or {}), **({"gpu_busy": busy} if busy is not None else {})} if n["here"] else {})
+            for n in per_node}
+    missing = [name for name, reading in seen.items() if not reading]
+    combined = _combined([(n, seen[str(n["name"])]) for n in per_node if seen[str(n["name"])]])
+    return _box("Whole cluster", have, rows, combined.get("gpu_busy"), combined, missing) + "".join(
+        _box(str(n["name"]), n, [r for r in rows if r["node"] == n["name"]], seen[str(n["name"])].get("gpu_busy"), seen[str(n["name"])],
+             missing if not seen[str(n["name"])] else ())
+        for n in per_node
+    )
+
+
+def _combined(readings: list[tuple[Mapping[str, int | str], Mapping[str, float]]]) -> dict[str, float]:
+    """The cluster's in-use reading: the machines' readings summed, over the machines that report; the GPUs' busy
+    figures weighted by how many GPUs each machine has."""
+    total = {key: sum(r[key] for _, r in readings) for key in ("mem_total", "mem_used", "cores", "cores_busy")}
+    gpus = [(int(n["gpus"]), r["gpu_busy"]) for n, r in readings if n["gpus"] and "gpu_busy" in r]
+    return {**total, **({"gpu_busy": sum(g * b for g, b in gpus) / sum(g for g, _ in gpus)} if gpus else {})}
+
+
+def _box(
+    title: str, have: Mapping[str, int | str], rows: list[dict[str, object]], busy: float | None = None,
+    use: Mapping[str, float] | None = None, unreported: Iterable[str] = (),
+) -> str:
+    """One strip of the three resources for a machine (or the cluster): `have` is its totals, `rows` its jobs, `unreported`
+    the machines whose in-use reading is missing from it."""
     use = use or {}
     running = [r for r in rows if r["kind"] == Kind.RUNNING]
     by_gpu = sum(int(r["cpus"]) for r in running if r["gpus"])  # type: ignore[call-overload]
     by_cpu = sum(int(r["cpus"]) for r in running if not r["gpus"])  # type: ignore[call-overload]
     mib = 1024**2  # slurm's "MB" is 2^20 bytes
-    left_mem = (have["mem_mb"] - have["mem_used_mb"]) * mib
+    cpus, cpus_used, mem, mem_used_mb = (int(have[k]) for k in ("cpus", "cpus_used", "mem_mb", "mem_used_mb"))
+    gpus, gpus_used = int(have["gpus"]), int(have["gpus_used"])
+    left_mem = (mem - mem_used_mb) * mib
     cores, cores_busy = int(use.get("cores", 0)), use.get("cores_busy")
     mem_total, mem_used = use.get("mem_total"), use.get("mem_used")
     meters = [
-        _split_meter(
-            "GPU", (f"{have['gpus_used']} of {have['gpus']}", _share(have["gpus_used"], have["gpus"])),
+        *([_split_meter(
+            "GPU", (f"{gpus_used} of {gpus}", _share(gpus_used, gpus)),
             ("Busy", f"{busy:.0%}", busy) if busy is not None else None,
-            f"{have['gpus'] - have['gpus_used']} left to reserve",
-        ),
+            f"{gpus - gpus_used} left to reserve",
+        )] if gpus else []),
         _split_meter(
-            "Cores", (f"{have['cpus_used']} of {have['cpus']}", _share(have["cpus_used"], have["cpus"])),
+            "Cores", (f"{cpus_used} of {cpus}", _share(cpus_used, cpus)),
             ("Busy", f"{cores_busy:.1f} of {cores}", cores_busy / cores) if cores_busy is not None and cores else None,
-            f"{by_cpu} by CPU jobs · {by_gpu} by GPU jobs · {have['cpus'] - have['cpus_used']} left to reserve",
+            f"{by_cpu} by CPU jobs · {by_gpu} by GPU jobs · {cpus - cpus_used} left to reserve",
         ),
         _split_meter(
-            "Memory", (_of(have["mem_used_mb"] * mib, have["mem_mb"] * mib), _share(have["mem_used_mb"], have["mem_mb"])),
+            "Memory", (_of(mem_used_mb * mib, mem * mib), _share(mem_used_mb, mem)),
             ("In use, whole machine", _of(mem_used, mem_total), mem_used / mem_total) if mem_total and mem_used is not None else None,
             f"{_size(left_mem)} left to reserve"
             + (f" · {_size(mem_total - mem_used)} available" if mem_total and mem_used is not None else ""),
             short=True,
         ),
     ]
+    names = ", ".join(esc(name) for name in unreported)
+    heading = f"h-box-{re.sub(r'[^A-Za-z0-9]', '-', title)}"
     return (
-        '<section class="card box" aria-labelledby="h-box"><div class="card-head"><h2 id="h-box">This machine</h2>'
-        '<span class="meta">reserved by slurm jobs, and really in use now</span></div><div class="box-meters">'
+        f'<section class="card box" aria-labelledby="{heading}"><div class="card-head"><h2 id="{heading}">{esc(title)}</h2>'
+        f'<span class="meta">reserved by slurm jobs{", and really in use now" if use else ""}'
+        f'{f" · in use not reported by {names}" if names else ""}</span></div><div class="box-meters">'
         + "".join(meters) + "</div></section>"
     )
 
@@ -713,7 +748,7 @@ def index_page(backend: Backend, root: str = "") -> str:
         ("Waiting", str(count[Kind.WAITING]), "in the queue" if count[Kind.WAITING] else "queue is empty"),
         ("Paused", str(count[Kind.PAUSED]), _paused_note(rows)),
         ("Finished, last 24 h", str(len(recent)), f"{failed} failed" if failed else "none failed"),
-    ]) + _resource_tiles(backend.capacity(), rows, backend.gpu_busy(), backend.machine())
+    ]) + _resource_tiles(backend.capacity(), rows, backend.gpu_busy(), backend.machine(), backend.node_capacity() or [])
     recent_html = (
         '<div class="card-head"><h2 id="h-recent">Finished in the last 24 hours</h2>'
         f'<a class="meta" href="{root}history">All history →</a></div>'
@@ -1178,11 +1213,20 @@ class PartTimeState:
     copied_at: int | None = None  # when the agent last copied this machine's job state here (epoch s); None: never
 
 
-def _free_mb(value: object) -> int | None:
-    """slurm's `free_mem`: a number, or the {"set", "number"} form of its newer JSON."""
-    if isinstance(value, Mapping):
-        value = value.get("number") if value.get("set") else None
-    return value if isinstance(value, int) and not isinstance(value, bool) else None
+def _available_mb(comment: object) -> int | None:
+    """The memory the node's health check last read (MB available), which it leaves in the node's comment; None for
+    none. Not slurm's `free_mem`, which leaves out the cache the limits count as free."""
+    found = node_check.read_comment(comment).get("available_mb")
+    return None if found is None else int(found)
+
+
+def _reading(comment: object) -> dict[str, float]:
+    """What `machine_use` gives (and `gpu_busy`), from the reading a machine's own health check left in its comment."""
+    found = node_check.read_comment(comment)
+    if not {"available_mb", "total_mb", "cores", "cores_busy"} <= found.keys():
+        return {}
+    return {"mem_total": found["total_mb"] * 1_000_000, "mem_used": (found["total_mb"] - found["available_mb"]) * 1_000_000,
+            "cores": found["cores"], "cores_busy": found["cores_busy"], **({"gpu_busy": found["gpu_busy"]} if "gpu_busy" in found else {})}
 
 
 def _part_time_state(names: list[str]) -> dict[str, PartTimeState]:
@@ -1204,7 +1248,7 @@ def _part_time_state(names: list[str]) -> dict[str, PartTimeState]:
         listed = [job.name for job in queue if job.state == gpu_jobs.State.RUNNING and job.node == name]
         out[name] = PartTimeState(
             closed=any(flag in states for flag in ("DRAIN", "DOWN")), reason=str(node.get("reason") or ""),
-            free_mb=_free_mb(node.get("free_mem")),
+            free_mb=_available_mb(node.get("comment")),
             resume_jobs=sum(gpu_jobs.class_of(job) is gpu_jobs.JobClass.RESUME for job in listed),
             extra=extra if isinstance(extra, dict) else {},
             copied_at=copied.get(name),
@@ -1242,7 +1286,7 @@ def _part_time_node(node: site_config.Node, state: PartTimeState | None, shared:
     jobs_memory = "" if node.jobs_memory_gb is None else node.jobs_memory_gb
     return (
         f'<div class="part-time" data-node="{name}"><h3>{name} {badge}<span class="meta">{why}</span></h3>'
-        f'<p>Free memory on the machine: <b class="num">{esc(free)}</b></p>' + _copied_line(state, shared) +
+        f'<p>Memory available on the machine: <b class="num">{esc(free)}</b></p>' + _copied_line(state, shared) +
         '<div class="actions">'
         f'<label class="check"><input type="checkbox" data-part-time="switch" data-node="{name}"'
         f'{"" if state.closed else " checked"}> Accept jobs</label>'

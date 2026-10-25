@@ -200,6 +200,9 @@ def test_machine_use_reads_this_host_and_capacity_says_whether_this_host_is_the_
     one = gpu_jobs.capacity(lambda *_a, **_k: subprocess.CompletedProcess([], 0, nodes))
     two = gpu_jobs.capacity(lambda *_a, **_k: subprocess.CompletedProcess([], 0, nodes.replace(here, "elsewhere") + nodes))
     assert (one["nodes"], one["here"], one["mem_used_mb"], two["nodes"], two["here"]) == (1, 1, 61440, 2, 1)
+    lent = "NodeName=lap CPUTot=16 CPUEfctv=8 RealMemory=31494 MemSpecLimit=19494 AllocMem=0 CPUAlloc=0\n"
+    both = gpu_jobs.capacity(lambda *_a, **_k: subprocess.CompletedProcess([], 0, nodes + lent))
+    assert (both["cpus"], both["mem_mb"]) == (20 + 8, 100000 + 12000)  # a part-time machine counts only what it lends
 
 
 def test_a_level_always_wins_then_the_earlier_job_and_every_placed_priority_is_above_slurms_own() -> None:

@@ -38,19 +38,23 @@ class FakeSlurm:
     def __init__(self, jobs: list[dict] | None = None, *, drained: str | None = None, extra: str = "",
                  requeue_fails: bool = False) -> None:
         self.jobs, self.drained, self.extra, self.calls, self.fail = jobs or [], drained, extra, [], False
-        self.requeue_fails = requeue_fails
+        self.requeue_fails, self.comment = requeue_fails, ""
 
     def __call__(self, command: list[str]) -> subprocess.CompletedProcess:
         if self.fail:
             raise subprocess.TimeoutExpired(command, 10)
         if command[:3] == ["scontrol", "show", "node"]:
             state = ["IDLE"] + (["DRAIN"] if self.drained is not None else [])
-            node = {"name": NODE, "state": state, "reason": self.drained or "", "extra": self.extra}
+            node = {"name": NODE, "state": state, "reason": self.drained or "", "extra": self.extra,
+                    "comment": self.comment}
             return done(json.dumps({"nodes": [node]}))
         if command[0] == "squeue":
             return done(json.dumps({"jobs": self.jobs}))
         if command[:3] == ["scontrol", "show", "hostnames"]:
             return done(HOSTLISTS[command[3]])
+        if command[:2] == ["scontrol", "update"] and command[-1].startswith("Comment="):
+            self.comment = command[-1].removeprefix("Comment=")
+            return done()
         self.calls.append(command)
         if command[:2] == ["scontrol", "requeue"] and self.requeue_fails:
             return done(code=1)
@@ -102,7 +106,7 @@ def box(tmp_path: Path):
         def run(slurm: FakeSlurm) -> list[str]:
             return node_check.check(
                 path, slurm, lambda *args, **fields: (events.append((*args, fields)), Path("/events") / args[0])[1],
-                hostname=NODE + ".lan"
+                hostname=NODE + ".lan", gpu_busy=lambda: 0.4, sleep=lambda _s: None,
             )
 
     Box.free(20000)
@@ -118,6 +122,7 @@ def test_push_back_takes_the_latest_started_resume_job_only_and_excludes_at_the_
     )
     decisions = box.run(slurm)
     assert [c[:3] for c in slurm.calls] == [["scontrol", "requeue", "2"]]  # one job; not restart/urgent/service
+    assert slurm.comment.startswith("available_mb=1000;total_mb=") and ";cores_busy=" in slurm.comment and slurm.comment.endswith(";gpu_busy=0.40")  # what the page shows
     assert box.pushes == [("2", gpu_jobs.EventAction.PUSH_BACK, {"node": NODE, "free_mb": 1000})]
     assert [d.split(" (")[0] for d in decisions] == ["push back 2", "would close"]  # and the foreign drain left alone
     slurm.jobs[1].update(job_state=["RUNNING"], nodes=NODE)  # it started here again
