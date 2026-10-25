@@ -15,7 +15,7 @@ NODE = "laptop"
 URGENT_NAME = "p:resume:urgent"
 OURS = f"{node_check.REASON_PREFIX}low"
 JOB_UID = 1234
-HOSTLISTS = {"n[1,3],x": "n1\nn3\nx", f"n[1,3],{NODE}": f"n1\nn3\n{NODE}"}  # `scontrol show hostnames`, expanded
+HOSTLISTS = {"n[1,3],x": "n1\nn3\nx", f"n[1,3],{NODE}": f"n1\nn3\n{NODE}", NODE: NODE, "n9": "n9", f"{NODE},n9": f"{NODE}\nn9"}  # `scontrol show hostnames`, expanded
 RESUME_CALL = ["scontrol", "update", f"NodeName={NODE}", "State=RESUME"]
 
 
@@ -39,6 +39,7 @@ class FakeSlurm:
                  requeue_fails: bool = False) -> None:
         self.jobs, self.drained, self.extra, self.calls, self.fail = jobs or [], drained, extra, [], False
         self.requeue_fails, self.comment = requeue_fails, ""
+        self.asked, self.partitions = "cpu", {"cpu": f"{NODE},n9", "part_time": NODE}  # a queued job's partitions; each one's nodes
 
     def __call__(self, command: list[str]) -> subprocess.CompletedProcess:
         if self.fail:
@@ -50,6 +51,10 @@ class FakeSlurm:
             return done(json.dumps({"nodes": [node]}))
         if command[0] == "squeue":
             return done(json.dumps({"jobs": self.jobs}))
+        if command[:3] == ["scontrol", "show", "job"]:
+            return done(f"JobId={command[3]} JobState=PENDING Partition={self.asked}")
+        if command[:3] == ["scontrol", "show", "partition"]:
+            return done(f"PartitionName={command[3]} AllowGroups=ALL Nodes={self.partitions[command[3]]} State=UP")
         if command[:3] == ["scontrol", "show", "hostnames"]:
             return done(HOSTLISTS[command[3]])
         if command[:2] == ["scontrol", "update"] and command[-1].startswith("Comment="):
@@ -129,6 +134,18 @@ def test_push_back_takes_the_latest_started_resume_job_only_and_excludes_at_the_
     box.run(slurm)
     assert slurm.calls[-1] == ["scontrol", "update", "JobId=2", f"ExcNodeList={NODE}"]
     assert slurm.updates() == [slurm.calls[-1]]  # barred only at the second push
+    # ...and only where the job has another node to go to: barred from its only node it would never run again
+    alone = FakeSlurm([job("1", 10)], drained="gpujobs-admin: held by the owner")
+    alone.partitions["cpu"] = NODE  # its only node
+    barred = lambda s: [c for c in s.calls if c[:2] == ["scontrol", "update"] and "ExcNodeList" in c[-1]]  # noqa: E731
+    for _ in range(2):
+        box.run(alone)
+        alone.jobs[0].update(job_state=["RUNNING"], nodes=NODE)
+    assert barred(alone) == []
+    alone.asked = "cpu,part_time"  # --anywhere: the main node is another it may go to, even from the part-time one
+    alone.partitions["cpu"], alone.partitions["part_time"] = "n9", NODE
+    box.run(alone)
+    assert len(barred(alone)) == 1
     # a job that already carries an exclusion list keeps it, joined raw (never split on commas); one already barred is left
     for before, updates in [("n[1,3],x", [f"ExcNodeList=n[1,3],x,{NODE}"]), (f"n[1,3],{NODE}", [])]:
         again = FakeSlurm([job("6", 99, excluded=before)], drained="gpujobs-admin: held")

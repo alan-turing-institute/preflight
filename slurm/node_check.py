@@ -45,7 +45,7 @@ COMMENT_PREFIX = "available_mb="
 CALL_TIMEOUT_S = 10
 #: Consecutive runs that must pass rule 3 before we reopen a node we closed.
 REOPEN_AFTER = 3
-#: A job is pushed back this many times from a node before it is barred from it.
+#: A job is pushed back this many times from a node before it is barred from it (when its partition has another node).
 PUSHES_BEFORE_EXCLUDE = 2
 KB_BYTES = 1024
 MB_BYTES = 1_000_000  # decimal, as everything shown to people
@@ -219,6 +219,25 @@ def exclusion(run: Runner, existing: str, node: str) -> str | None:
     return None if node in done.stdout.split() else f"{existing},{node}"
 
 
+def has_other_node(run: Runner, job_id: str, node: str) -> bool:
+    """Whether the job may run on a node besides `node`, by the partitions it asked for (a queued job lists them all):
+    a job barred from the only node it can run on never runs."""
+    done = run(["scontrol", "show", "job", job_id, "-o"])
+    asked = re.search(r"\bPartition=(\S+)", done.stdout) if done.returncode == 0 else None
+    if not asked:
+        raise RuntimeError(f"show job {job_id} failed: {done.stderr.strip() or 'no Partition'}")
+    for partition in asked[1].split(","):
+        listed = re.search(r"\bNodes=(\S+)", (shown := run(["scontrol", "show", "partition", partition, "-o"])).stdout)
+        if shown.returncode != 0 or not listed:
+            raise RuntimeError(f"show partition {partition!r} failed: {shown.stderr.strip() or 'no Nodes'}")
+        names = run(["scontrol", "show", "hostnames", listed[1]])
+        if names.returncode != 0:
+            raise RuntimeError(f"show hostnames {listed[1]!r} failed: {names.stderr.strip()}")
+        if any(name != node for name in names.stdout.split()):
+            return True
+    return False
+
+
 def end_job(run: Runner, record: Recorder, victim: Running, node: str, reason: str, **fields: object) -> None:
     """Cancel a job here and record the kill, the event owned by the job's submitter (the manifest says so)."""
     job = victim.job.job_id
@@ -343,7 +362,8 @@ def check(
             state["pushes"][key] = state["pushes"].get(key, 0) + 1
             event(record, victim, gpu_jobs.EventAction.PUSH_BACK, node=info.name, free_mb=free)
             decisions.append(f"push back {job} ({free} MB free)")
-            if state["pushes"][key] >= PUSHES_BEFORE_EXCLUDE and (value := exclusion(run, victim.excluded, info.name)):
+            if (state["pushes"][key] >= PUSHES_BEFORE_EXCLUDE and has_other_node(run, job, info.name)
+                    and (value := exclusion(run, victim.excluded, info.name))):
                 done = run(["scontrol", "update", f"JobId={job}", f"ExcNodeList={value}"])
                 if done.returncode != 0:
                     raise RuntimeError(f"exclude on {job} failed: {done.stderr.strip()}")
