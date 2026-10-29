@@ -29,13 +29,25 @@ def project_for(cwd: Path, projects: list[weekly.Project]) -> weekly.Project | N
 
 def notice(record: dict, now: dt.datetime) -> str | None:
     status = record.get("status")
-    changed = ", ".join(f"{c['name']} {c['old']} -> {c['new']}" for c in record.get("changed", [])[:6])
+    changed = ", ".join(
+        f"{c['name']} {c['old']} -> {c['new']}" for c in record.get("changed", [])[:6]
+    )
     more = len(record.get("changed", [])) - 6
     changed += f" and {more} more" if more > 0 else ""
     if status == weekly.Status.HELD:
         return (
             f"Dependency upgrade HELD for {record['name']} ({record['date'][:10]}): {record['reason']}. "
             f"Waiting: {changed}. The upgraded lock is {weekly.CACHE / record['name'] / 'uv.lock.new'}; apply it at the study boundary."
+        )
+    if status == weekly.Status.SKIPPED and "does not describe the venv" in record.get(
+        "reason", ""
+    ):
+        # Drift is the owning project's to fix (only it knows whether a hand-installed package matters),
+        # and until it does the weekly upgrade never reaches it (owner 2026-10-29).
+        return (
+            f"Weekly dependency upgrades SKIP {record['name']} ({record['date'][:10]}): {record['reason']}. "
+            "Make uv.lock describe .venv again: declare in pyproject.toml anything installed by hand that the "
+            "project uses, then `uv lock` and `uv sync --frozen` with the project's extras, and run its tests."
         )
     if status == weekly.Status.APPLIED:
         when = dt.datetime.fromisoformat(record["date"])

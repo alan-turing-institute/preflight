@@ -231,6 +231,28 @@ def test_the_session_notice_names_held_and_recent_applied_only() -> None:
         )
         is None
     )
+    drift = session_notice.notice(
+        {
+            **base,
+            "status": "skipped",
+            "date": "2026-10-31T00:00:00",
+            "reason": "uv.lock does not describe the venv (6 differences, e.g. anyio)",
+        },
+        now,
+    )
+    assert drift and "SKIP" in drift and "uv sync --frozen" in drift
+    assert (
+        session_notice.notice(
+            {
+                **base,
+                "status": "skipped",
+                "date": "2026-10-31T00:00:00",
+                "reason": "a job of this project is queued or running: x",
+            },
+            now,
+        )
+        is None
+    )
     projects = [
         weekly.Project("a", Path("/x/a"), Check.TESTS, "c"),
         weekly.Project("b", Path("/x/a/b"), Check.TESTS, "c"),
