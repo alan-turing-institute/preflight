@@ -1,7 +1,7 @@
 """The site file: every difference between one machine and another, read once and typed.
 
 The TOML layout maps one-to-one onto the dataclasses below (`[[nodes]]`, `[[nodes.gpus]]`, `[lease]`,
-`[lease.services]`, `[slurm]`, `[metrics]`, `[portal]`, `[portal.auth_settings]`). Unknown keys are an error at every
+`[lease.services]`, `[remote.NAME]`, `[slurm]`, `[metrics]`, `[portal]`, `[portal.auth_settings]`). Unknown keys are an error at every
 table level, so a typo cannot silently fall back to a default. `site.example.toml` documents each field.
 """
 
@@ -14,7 +14,7 @@ import os
 import pwd
 import re
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
@@ -144,6 +144,16 @@ class Portal:
 
 
 @dataclass(frozen=True)
+class Remote:
+    """Another site this one can send jobs to (`submit.py --site NAME`): its own slurm, reached over ssh."""
+
+    host: str  # ssh destination (an ~/.ssh/config alias works)
+    root: str  # folder there, relative to the login home or absolute; one subfolder per project holds its code and data
+    submit_command: str = "gpujobs-submit"  # that site's own submit.py
+    status_command: str = "gpujobs-status"
+
+
+@dataclass(frozen=True)
 class Site:
     name: str
     cluster_name: str  # slurm's ClusterName; Open OnDemand names its cluster file after it
@@ -166,6 +176,7 @@ class Site:
     constrain_devices: bool = True  # cgroup.conf ConstrainDevices: a job sees only the GPUs it holds
     shared_state: bool = False  # the part-time nodes see this state_dir (a shared filesystem): nothing is copied back
     node_python: str = "/usr/bin/python3"  # the interpreter a part-time job's wrapper runs with, there
+    remotes: dict[str, Remote] = field(default_factory=dict)  # `[remote.NAME]` tables
     requeue_delay_s: int = 60  # slurm.conf AuthInfo=cred_expire: how long a requeued job waits before it may start again
 
     @property
@@ -297,6 +308,21 @@ def _parse_lease(raw: Any) -> Lease:
     return Lease(Path(t["lease_dir"]), t["keeper_user"], Path(t["python"]), dict(t["services"]))
 
 
+def _parse_remotes(raw: Any) -> dict[str, Remote]:
+    if not isinstance(raw, dict):
+        raise SiteError(f"site file: [remote] must hold one [remote.NAME] table per site; {_HINT}")
+    remotes = {}
+    for name, table in raw.items():
+        t = _table(table, f"remote.{name}", {"host", "root"}, {"submit_command": "gpujobs-submit", "status_command": "gpujobs-status"})
+        for key, value in t.items():
+            if not isinstance(value, str) or not value.strip() or value != value.strip():
+                raise SiteError(f"site file: remote.{name}.{key} = {value!r}; expected a non-empty text")
+        if ".." in Path(t["root"]).parts:
+            raise SiteError(f"site file: remote.{name}.root = {t['root']!r}; no '..' in it")
+        remotes[name] = Remote(t["host"], t["root"], t["submit_command"], t["status_command"])
+    return remotes
+
+
 def _parse_service(raw: Any, nodes: tuple[Node, ...]) -> Service:
     t = _table(raw, "service", {"cores"}, {"group": "gpujobs-service"})
     if len(nodes) != 1:  # the agent frees cores by suspending cpu jobs, and it counts one machine's cores
@@ -355,6 +381,7 @@ def parse(raw: dict[str, Any]) -> Site:
             "unified_memory": False,
             "lease": None,
             "service": None,
+            "remote": {},
             "slurm": None,
             "health_check": None,
             "shared_state": False,
@@ -440,6 +467,7 @@ def parse(raw: dict[str, Any]) -> Site:
         constrain_devices=top["constrain_devices"],
         shared_state=top["shared_state"],
         node_python=top["node_python"],
+        remotes=_parse_remotes(top["remote"]),
         requeue_delay_s=top["requeue_delay_s"],
     )
 

@@ -64,6 +64,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import audit  # noqa: E402 - path set just above
 import gpu_jobs  # noqa: E402
+import remote
 import site_config
 
 HERE = Path(__file__).resolve().parent
@@ -317,6 +318,11 @@ def parser() -> argparse.ArgumentParser:
     consent.add_argument("--no-suspend", action="store_true", help="with --service: suspend nothing; wait instead")
     p.add_argument("--anywhere", action="store_true",
                    help="a CPU-only resume job may also start on a part-time machine (cpu,part_time)")
+    p.add_argument("--site", default=None, metavar="NAME",
+                   help="send the job to another site's slurm ([remote.NAME] in the site file): syncs --entry's import "
+                        "closure and --data by checksum, then submits there with that site's own submit.py")
+    p.add_argument("--data", action="append", default=[], metavar="DIR",
+                   help="with --site: a folder inside --repo to sync by checksum (repeatable)")
     p.add_argument("--dry-run", action="store_true", help="print the sbatch script and submit nothing")
     p.add_argument("command", nargs=argparse.REMAINDER)
     return p
@@ -338,6 +344,15 @@ def submit(argv: list[str]) -> str:
         raise Refused(msg)
     arguments.gpus = 1 if arguments.gpu else arguments.gpus or 0
     arguments.gpu = arguments.gpus > 0
+    if arguments.data and not arguments.site:
+        msg = "--data goes with --site (it names folders to sync to that site)"
+        raise Refused(msg)
+    if arguments.site:
+        arguments.name = arguments.name or Path(arguments.command[0]).name
+        try:
+            return remote.submit(arguments, gpu_jobs.load_site())
+        except remote.RemoteRefused as error:
+            raise Refused(str(error)) from None
     site = gpu_jobs.load_site()
     named = arguments.name
     arguments.name = arguments.name or Path(arguments.command[0]).name

@@ -38,6 +38,7 @@ def test_this_box_site_file_loads() -> None:
     assert (site.nodes[0].real_memory_mb, gpu.device, gpu.type) == (100000, "/dev/nvidia0", "gb10")
     assert set(site.lease.services) == {"service-a", "service-b", "service-c-app"}
     assert site.service == gpujobs_site.Service(4, "gpujobs-service")
+    assert site.remotes == {"turing": gpujobs_site.Remote("site-b", "gpujobs-sync")}
     assert site.lease.lease_dir == Path("/home/user1/.local/state/gpu-lease")
     assert (site.metrics.mode, site.metrics.grafana_port) == (gpujobs_site.MetricsMode.LOCAL, 3001)
     assert site.metrics.allow_from == ("100.64.0.0/10", "fd7a:115c:a1e0::/48", "192.0.2.8/32")  # Tailscale + NAS Caddy
@@ -122,6 +123,9 @@ def test_example_loads_and_minimal_file_gets_every_default(tmp_path: Path) -> No
         ("state_dir = 5\n" + MINIMAL, "has a value of the wrong kind"),
         (MINIMAL + "cores_per_gpu = 1\n" + GPU + "[service]\ncores = 2\n", "service.cores = 2"),  # beyond the CPU pool
         (MINIMAL + "[service]\ncores = 0\n", "service.cores = 0"),
+        (MINIMAL + "[remote.t]\nhost = 'h'\n", "[remote.t] is missing root"),
+        (MINIMAL + "[remote.t]\nhost = 'h'\nroot = '../x'\n", "no '..'"),
+        (MINIMAL + "[remote.t]\nhost = ' '\nroot = 'r'\n", "remote.t.host = ' '"),
         (MINIMAL + "[[nodes]]\nname = 'm'\ncpus = 2\nreal_memory_mb = 1000\n[service]\ncores = 1\n", "a site of one node"),
         (MINIMAL + "[service]\ncores = 1\ngroups = 'g'\n", "unknown key(s) in [service]: groups"),
         (MINIMAL + "[slurm]\nversion = '26.05.5'\n", "needs both version and sha256"),

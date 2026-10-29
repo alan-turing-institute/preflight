@@ -13,6 +13,7 @@ import agent  # noqa: E402 - path set just above
 import audit  # noqa: E402
 import gpu_jobs  # noqa: E402
 import jobs_view  # noqa: E402
+import remote  # noqa: E402
 from wait import all_sidecars
 
 #: How a job in each partition pauses, for the table.
@@ -64,7 +65,16 @@ def lines(queue: list[gpu_jobs.QueuedJob] | None) -> list[str]:
 
 
 def main() -> int:
-    argparse.ArgumentParser(description=__doc__.splitlines()[0]).parse_args()
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--site", default=None, metavar="NAME", help="show another site's queue ([remote.NAME] in the site file)")
+    arguments = parser.parse_args()
+    if arguments.site:
+        try:
+            print(remote.status(gpu_jobs.load_site(), arguments.site))
+        except remote.RemoteRefused as error:
+            print(f"[status] REFUSED: {error}", file=sys.stderr)
+            return 1
+        return 0
     print("\n".join(lines(gpu_jobs.read_queue())))
     return 0
 

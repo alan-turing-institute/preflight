@@ -76,6 +76,15 @@ python = "/opt/gpujobs/venv/bin/python"       # interpreter with localmodels ins
 [lease.services]
 # myservice = "yields within about 1 min"
 
+# Optional. Other sites this one can send jobs to (`submit.py --site NAME --repo R --entry E [--data DIR]`): the job's code
+# (the import closure of the entry script) and --data folders are copied there by checksum under root/<project>/, then that
+# site's own submit command runs over ssh. One table per site; the job is then watched with that site's own tools.
+# [remote.turing]
+# host = "site-b"           # ssh destination
+# root = "gpujobs-sync"     # relative to the login home, or absolute
+# submit_command = "gpujobs-submit"   # optional; these are the defaults
+# status_command = "gpujobs-status"
+
 # Optional. A `service` partition for background services' CPU stand-ins (submit.py --service): started at once by
 # suspending CPU-only jobs, never touching GPU jobs. Leave the table out when no service has one.
 # [service]

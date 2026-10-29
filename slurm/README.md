@@ -450,6 +450,18 @@ Other options: `submit --mem 24G` (otherwise the last measured run of `--name` p
 box for a GPU job), `--after JOBID` to chain, `--gpus N`, `--dry-run` to print the batch script. `gpujobs-footprint NAME`
 prints a job's last measured peak memory. `gpujobs-status` and `gpujobs-audit` take no options and run at once. `gpujobs-audit` reports GPU work running outside slurm and the lease.
 
+### Sending a job to another site
+
+A site file may name other sites it sends jobs to (`[remote.NAME]`: `host`, `root`; see `site.example.toml`).
+`submit.py --site NAME --repo R --entry E [--search DIR] [--data DIR] <the usual options> -- command` then:
+builds the import closure of `E` with `dgx/assert_code_parity.py` (an import in the repo that sits on no search root is
+a refusal); copies the closure and each `--data` folder (inside `R`) to `root/<project>/` there with `rsync --checksum`,
+so what is already there is skipped; reads the closure's checksums back and refuses if they differ; and runs that
+site's own `gpujobs-submit` over ssh from the same relative folder. Nothing is queued unless every step passed.
+`--service`, `--anywhere`, `--suspend` and `--log` belong to the owning site and are refused. `--after` takes ids on
+the other site. The job is watched with that site's own tools; `status.py --site NAME` prints its queue. This site keeps
+no copy of the job, so the local page does not list it (D24).
+
 ## 8. Operations and caveats
 
 - **`render` and `check` need root once portal secrets exist.** They read the portal's root-only files (client
