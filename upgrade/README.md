@@ -23,8 +23,11 @@ in `~/cache/upgrades/<name>/` (the scratch lock stays), a side venv from the new
 
 Pass: commit `uv.lock` alone (`chore(deps): Weekly dependency upgrade`, never pushed), `uv sync --frozen`, hostguard,
 restart the project's active services. Anything else is HELD (numbers moved, tests failed, `uv.lock` has uncommitted
-changes, the lock changed while the check ran) and announced by `session_notice.py`; apply it by hand at the study
-boundary. A `tests` project keeps its PyTorch stack at the locked version, because tests do not measure numbers or speed.
+changes, the lock changed while the check ran) and announced by `session_notice.py`. At the study boundary,
+`weekly.py apply-held NAME` applies the kept lock without its check (the commit body says so, the log records it); it
+refuses a hold whose tests failed (fix the code, then `weekly.py run --project NAME` applies it), an uncommitted lock, a
+lock that moved since the hold, and a venv the lock no longer describes. A `tests` project keeps its PyTorch stack at the
+locked version, because tests do not measure numbers or speed.
 
 State: `~/.local/state/upgrades/<name>.json` and `weekly.log`; a dry run writes `dry-run/<name>.json`.
 

@@ -4,13 +4,15 @@
 Policy: ~/.claude/software-upgrade-policy.md ("RULING 2026-10-29", "A project upgrade").
 
     weekly.py run [--project NAME] [--dry-run]
+    weekly.py apply-held NAME          # apply a held upgrade's kept lock, its check skipped (owner 2026-10-29)
 
 Per project in `projects.toml` (see README.md): skip when a job of the project is queued or running, or when its
 uv.lock does not describe its venv; otherwise `uv lock --upgrade` in a scratch copy; build a side venv from the new lock;
 check it (numbers: the project's probe under the old and the new venv in ONE slurm job, applied only when every value is
 identical; tests: the project's fast test command in the side venv); then APPLY (commit uv.lock alone, `uv sync --frozen`,
-hostguard, restart the project's services) or HOLD (announced by `session_notice.py`, applied by hand at the study
-boundary). Records: ~/.local/state/upgrades/<name>.json and weekly.log (a dry run writes dry-run/<name>.json instead).
+hostguard, restart the project's services) or HOLD (announced by `session_notice.py`; applied at the study boundary
+with `apply-held`, or cleared by the next run once a failing-tests hold is fixed in the project's code). Records:
+~/.local/state/upgrades/<name>.json and weekly.log (a dry run writes dry-run/<name>.json instead).
 
 A project that checks by `tests` keeps its PyTorch stack at the locked version: tests do not measure numbers or speed, so
 PyTorch moves only through a `numbers` check or `torch_upgrade.py`.
@@ -554,6 +556,7 @@ def apply(
     changes: list[Change],
     before: str,
     state: LockState,
+    note: str = "",
 ) -> str:
     """Put the new lock in, sync, commit uv.lock alone (unless git-ignored), restart services; returns the commit sha."""
     lock = project.path / "uv.lock"
@@ -574,7 +577,9 @@ def apply(
         common.install_hostguard(project.path / ".venv")
     commit = ""
     if state is LockState.CLEAN:
-        body = "\n".join(str(change) for change in changes)
+        body = "\n".join(str(change) for change in changes) + (
+            f"\n\n{note}" if note else ""
+        )
         common.run(
             [
                 "git",
@@ -725,14 +730,102 @@ def record(
     print(line, flush=True)
 
 
-def run_all(names: list[str], *, dry_run: bool) -> int:
+def held_refusal(
+    name: str,
+    record: dict | None,
+    *,
+    old_lock: Path,
+    new_lock: Path,
+    current_lock_sha: str,
+    lock: LockState,
+    lock_problems: list[str],
+) -> str | None:
+    """None when a held upgrade may be applied without its check; otherwise why not, naming what to do instead."""
+    rerun = f"run `weekly.py run --project {name}`"
+    if record is None or record.get("status") != Status.HELD:
+        status = record.get("status") if record else "no record"
+        return f"nothing is held (last weekly outcome: {status}); {rerun} to check for an upgrade"
+    check = record.get("check") or {}
+    if check.get("kind") == Check.TESTS and not check.get("passed"):
+        return (
+            f"held because its tests failed ({record['reason']}); fix the project's code against the new versions, "
+            f"then {rerun}: it applies once the tests pass"
+        )
+    if lock is LockState.DIRTY:
+        return "uv.lock has uncommitted changes or is untracked; commit or discard them first"
+    if not (old_lock.exists() and new_lock.exists()):
+        return (
+            f"the kept locks are gone ({old_lock.parent}); {rerun} to make them again"
+        )
+    if sha(old_lock) != current_lock_sha:
+        return f"uv.lock changed since the hold, so the kept upgrade is stale; {rerun}"
+    if lock_problems:
+        return (
+            f"uv.lock does not describe the venv ({len(lock_problems)} differences, e.g. {lock_problems[0]}); "
+            "bring them back in line first"
+        )
+    return None
+
+
+def apply_held(name: str) -> int:
+    """Apply the lock a hold kept, without its check: the owner's call at a study boundary (owner 2026-10-29)."""
+    projects = {p.name: p for p in all_projects()}
+    if name not in projects:
+        sys.exit(f"unknown project: {name}")
+    project = projects[name]
+    scratch = CACHE / name
+    target = STATE / f"{name}.json"
+    held = json.loads(target.read_text()) if target.exists() else None
+    STATE.mkdir(parents=True, exist_ok=True)
+    with (STATE / "weekly.lock").open("w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            sys.exit("another weekly upgrade is running")
+        state = lock_state(project)
+        current = sha(project.path / "uv.lock")
+        refusal = held_refusal(
+            name,
+            held,
+            old_lock=scratch / "uv.lock.old",
+            new_lock=scratch / "uv.lock.new",
+            current_lock_sha=current,
+            lock=state,
+            lock_problems=describes_venv(project),
+        )
+        if refusal:
+            print(f"[apply-held] {name}: not applied: {refusal}", flush=True)
+            return 1
+        changes = changed_packages(scratch / "uv.lock.old", scratch / "uv.lock.new")
+        note = f"Applied by hand from a hold; the check was skipped. Held because: {held['reason']}"
+        print(f"[apply-held] {name}: {note}", flush=True)
+        commit = apply(project, scratch / "uv.lock.new", changes, current, state, note)
+        record(
+            project,
+            Outcome(
+                Status.APPLIED,
+                f"by hand from the hold, check skipped (held: {held['reason']})",
+            ),
+            changes,
+            None,
+            commit,
+            dry_run=False,
+        )
+    return 0
+
+
+def all_projects() -> list[Project]:
     projects = load_registry()
     found = discover(projects)
     for project in found:
         print(
             f"[weekly] found {project.name} ({project.path}), not in projects.toml: check `{project.command}`"
         )
-    projects += found
+    return projects + found
+
+
+def run_all(names: list[str], *, dry_run: bool) -> int:
+    projects = all_projects()
     if names:
         unknown = set(names) - {p.name for p in projects}
         if unknown:
@@ -784,7 +877,13 @@ def main() -> None:
         action="store_true",
         help="check, record under dry-run/, apply nothing",
     )
+    h = sub.add_parser(
+        "apply-held", help="apply a held upgrade's kept lock without its check"
+    )
+    h.add_argument("name")
     args = ap.parse_args()
+    if args.cmd == "apply-held":
+        sys.exit(apply_held(args.name))
     sys.exit(run_all(args.project, dry_run=args.dry_run))
 
 

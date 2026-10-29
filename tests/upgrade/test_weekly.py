@@ -441,3 +441,69 @@ def test_a_new_uv_project_joins_by_itself_and_a_worktree_or_registered_one_does_
     assert "pytest -q -x" in found["app"].command
     assert "timeout -k 5 300" in found["app"].command
     assert found["app"].sync == ("--all-extras",)
+
+
+def test_apply_held_refuses_what_a_check_must_settle_and_applies_a_kept_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    old, new = tmp_path / "uv.lock.old", tmp_path / "uv.lock.new"
+    old.write_text("old")
+    new.write_text("new")
+    held = {
+        "name": "p",
+        "status": "held",
+        "reason": "the numbers moved",
+        "check": {"kind": "numbers", "passed": False},
+    }
+
+    def refusal(record=held, **given):
+        facts = {
+            "old_lock": old,
+            "new_lock": new,
+            "current_lock_sha": weekly.sha(old),
+            "lock": weekly.LockState.CLEAN,
+            "lock_problems": [],
+        }
+        return weekly.held_refusal("p", record, **{**facts, **given})
+
+    assert refusal() is None
+    assert "nothing is held" in refusal(None)
+    assert "nothing is held" in refusal({**held, "status": "applied"})
+    tests_failed = {**held, "check": {"kind": "tests", "passed": False}}
+    assert "fix the project's code" in refusal(tests_failed)
+    assert (
+        refusal({**held, "check": None}) is None
+    )  # e.g. held because the PyTorch stack moved
+    assert "uncommitted" in refusal(lock=weekly.LockState.DIRTY)
+    assert "kept locks are gone" in refusal(new_lock=tmp_path / "missing")
+    assert "stale" in refusal(current_lock_sha="moved")
+    assert "does not describe" in refusal(lock_problems=["x: venv 1, lock 2"])
+
+    project = weekly.Project("p", tmp_path / "repo", Check.NUMBERS, "c")
+    (tmp_path / "repo").mkdir()
+    (tmp_path / "repo/uv.lock").write_text("old")
+    state, cache = tmp_path / "state", tmp_path / "cache"
+    (cache / "p").mkdir(parents=True)
+    old.rename(cache / "p/uv.lock.old")
+    new.rename(cache / "p/uv.lock.new")
+    state.mkdir()
+    (state / "p.json").write_text(json.dumps(held))
+    applied = []
+    monkeypatch.setattr(weekly, "STATE", state)
+    monkeypatch.setattr(weekly, "CACHE", cache)
+    monkeypatch.setattr(weekly, "all_projects", lambda: [project])
+    monkeypatch.setattr(weekly, "lock_state", lambda p: weekly.LockState.CLEAN)
+    monkeypatch.setattr(weekly, "describes_venv", lambda p: [])
+    monkeypatch.setattr(weekly, "changed_packages", lambda a, b: CHANGES)
+    monkeypatch.setattr(weekly, "apply", lambda *a: applied.append(a) or "abc1234")
+    assert weekly.apply_held("p") == 0
+    assert applied[0][3] == weekly.sha(
+        tmp_path / "repo/uv.lock"
+    )  # the lock it found is the one apply guards
+    assert "check was skipped" in applied[0][5]
+    kept = json.loads((state / "p.json").read_text())
+    assert (kept["status"], kept["commit"]) == (
+        "applied",
+        "abc1234",
+    ) and "check skipped" in kept["reason"]
+    assert weekly.apply_held("p") == 1  # applied: nothing is held any more

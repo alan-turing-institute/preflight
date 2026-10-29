@@ -37,7 +37,8 @@ def notice(record: dict, now: dt.datetime) -> str | None:
     if status == weekly.Status.HELD:
         return (
             f"Dependency upgrade HELD for {record['name']} ({record['date'][:10]}): {record['reason']}. "
-            f"Waiting: {changed}. The upgraded lock is {weekly.CACHE / record['name'] / 'uv.lock.new'}; apply it at the study boundary."
+            f"Waiting: {changed}. The upgraded lock is {weekly.CACHE / record['name'] / 'uv.lock.new'}; apply it at the study "
+            f"boundary with `weekly.py apply-held {record['name']}` (a failing-tests hold is fixed in the code instead)."
         )
     if status == weekly.Status.SKIPPED and "does not describe the venv" in record.get(
         "reason", ""
