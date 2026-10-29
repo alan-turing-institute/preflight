@@ -1,0 +1,9 @@
+[Unit]
+Description=Weekly dependency upgrade of every uv project, Sunday 05:00
+
+[Timer]
+OnCalendar=Sun *-*-* 05:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

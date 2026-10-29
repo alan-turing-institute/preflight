@@ -1,0 +1,11 @@
+[Unit]
+Description=Weekly dependency upgrade of every uv project (preflight/upgrade, owner's ruling 2026-10-29)
+
+[Service]
+Type=oneshot
+# Checks go through slurm (submit.py); this process only waits. A tests check is seconds, a numbers check one short GPU job.
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 %h/dev/turing/preflight/upgrade/weekly.py run
+# Idle priority: it never competes with the work it is upgrading.
+Nice=10
+TimeoutStartSec=4h
