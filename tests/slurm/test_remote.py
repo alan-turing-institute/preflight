@@ -11,7 +11,7 @@ import pytest
 import remote
 import site_config
 
-REMOTE = site_config.Remote("box", "sync")
+REMOTE = site_config.Remote("box", "sync", data_root="/data/ds")
 
 
 @pytest.fixture
@@ -29,7 +29,7 @@ def arguments(repo: Path, **given: object) -> argparse.Namespace:
         "max_jobs": 1, "mem": "8G", "gpus": 1, "cpus": None, "after": [], "resume_ok": False, "entry": "run.py",
         "repo": repo, "search": ["src"], "data": ["data/set"], "workdir": repo, "command": ["python", "run.py", "a b"],
         "dry_run": False, "site": "turing", "service": False, "anywhere": False, "suspend": None, "no_suspend": False,
-        "log": None,
+        "log": None, "data_base": None, "data_env": None,
     }
     return argparse.Namespace(**{**base, **given})
 
@@ -71,6 +71,23 @@ def test_sync_then_submit_in_the_same_place_with_the_same_arguments(repo: Path, 
     assert "--gpus 1" in submitted and "--mem 8G" in submitted and submitted.endswith("-- python run.py 'a b'")
 
 
+def test_data_outside_the_repo_lands_under_data_root_and_the_job_is_told_where(
+    repo: Path, tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = tmp_path_factory.mktemp("store")
+    (store / "gpe" / "laser").mkdir(parents=True)
+    box = Box(repo)
+    monkeypatch.setattr(remote.subprocess, "run", box)
+    remote.submit(
+        arguments(repo, data=[str(store / "gpe" / "laser")], data_base=store, data_env="DATASETS"),
+        SimpleNamespace(remotes={"turing": REMOTE}),
+    )
+    data_sync = next(c for c in box.calls if c[0] == "rsync" and c[-2].endswith("/gpe/laser/"))
+    assert data_sync[-2] == f"{store}/./gpe/laser/" and data_sync[-1] == "box:/data/ds/"  # nested name kept, fixed place
+    assert "--no-implied-dirs" in data_sync and "--checksum" in data_sync  # shared parent folders are left alone
+    assert box.calls[-1][-1].endswith("-- env DATASETS=/data/ds python run.py 'a b'")
+
+
 def test_a_mismatch_after_the_copy_queues_nothing(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     box = Box(repo, stale=True)
     monkeypatch.setattr(remote.subprocess, "run", box)
@@ -83,9 +100,13 @@ def test_dry_run_copies_nothing_and_what_cannot_be_shipped_is_refused(repo: Path
     box = Box(repo)
     monkeypatch.setattr(remote.subprocess, "run", box)
     site = SimpleNamespace(remotes={"turing": REMOTE})
+    bare = SimpleNamespace(remotes={"turing": site_config.Remote("box", "sync")})
+    with pytest.raises(remote.RemoteRefused, match="needs data_root"):  # outside data with nowhere to put it
+        remote.submit(arguments(repo, data=[str(repo.parent)]), bare)
     assert "nothing copied" in remote.submit(arguments(repo, dry_run=True), site) and box.calls == []
     for bad, message in (
-        ({"data": [".."]}, "expected a folder inside"),
+        ({"data": ["nope"]}, "not a folder"),
+        ({"data": [str(repo.parent)], "data_base": repo / "data"}, "outside --data-base"),
         ({"service": True}, "belongs to the site that owns the queue"),
         ({"entry": None}, "needs --repo and --entry"),
         ({"site": "nowhere"}, "names no such remote"),

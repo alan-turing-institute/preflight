@@ -84,6 +84,7 @@ python = "/opt/gpujobs/venv/bin/python"       # interpreter with localmodels ins
 # root = "gpujobs-sync"     # relative to the login home, or absolute
 # submit_command = "gpujobs-submit"   # optional; these are the defaults
 # status_command = "gpujobs-status"
+# data_root = "/data/shared/datasets"   # optional, absolute: where --data folders from OUTSIDE the repo land there
 
 # Optional. A `service` partition for background services' CPU stand-ins (submit.py --service): started at once by
 # suspending CPU-only jobs, never touching GPU jobs. Leave the table out when no service has one.

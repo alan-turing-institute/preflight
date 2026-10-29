@@ -151,6 +151,7 @@ class Remote:
     root: str  # folder there, relative to the login home or absolute; one subfolder per project holds its code and data
     submit_command: str = "gpujobs-submit"  # that site's own submit.py
     status_command: str = "gpujobs-status"
+    data_root: str = ""  # absolute folder there for --data folders from outside the repo; empty: those are refused
 
 
 @dataclass(frozen=True)
@@ -313,13 +314,17 @@ def _parse_remotes(raw: Any) -> dict[str, Remote]:
         raise SiteError(f"site file: [remote] must hold one [remote.NAME] table per site; {_HINT}")
     remotes = {}
     for name, table in raw.items():
-        t = _table(table, f"remote.{name}", {"host", "root"}, {"submit_command": "gpujobs-submit", "status_command": "gpujobs-status"})
+        t = _table(table, f"remote.{name}", {"host", "root"}, {"submit_command": "gpujobs-submit", "status_command": "gpujobs-status", "data_root": ""})
         for key, value in t.items():
+            if key == "data_root" and value == "":
+                continue
             if not isinstance(value, str) or not value.strip() or value != value.strip():
                 raise SiteError(f"site file: remote.{name}.{key} = {value!r}; expected a non-empty text")
         if ".." in Path(t["root"]).parts:
             raise SiteError(f"site file: remote.{name}.root = {t['root']!r}; no '..' in it")
-        remotes[name] = Remote(t["host"], t["root"], t["submit_command"], t["status_command"])
+        if t["data_root"] and not t["data_root"].startswith("/"):
+            raise SiteError(f"site file: remote.{name}.data_root = {t['data_root']!r}; expected an absolute path")
+        remotes[name] = Remote(t["host"], t["root"], t["submit_command"], t["status_command"], t["data_root"])
     return remotes
 
 

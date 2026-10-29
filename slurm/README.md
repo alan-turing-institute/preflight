@@ -458,6 +458,11 @@ builds the import closure of `E` with `dgx/assert_code_parity.py` (an import in 
 a refusal); copies the closure and each `--data` folder (inside `R`) to `root/<project>/` there with `rsync --checksum`,
 so what is already there is skipped; reads the closure's checksums back and refuses if they differ; and runs that
 site's own `gpujobs-submit` over ssh from the same relative folder. Nothing is queued unless every step passed.
+A `--data` folder outside `R` (datasets kept elsewhere) needs `data_root` (absolute) in the `[remote.NAME]` table: it is
+synced by the same checksum rule to `data_root/<name>` there, where `<name>` is its path relative to `--data-base DIR`
+(so `DIR/gpe/x` lands at `data_root/gpe/x`; without `--data-base`, its own folder name), and a folder already there
+byte for byte is only read, not sent. `--data-env NAME` runs the command as `env NAME=<data_root> command`, so a job
+that reads its datasets from an environment variable finds them.
 `--service`, `--anywhere`, `--suspend` and `--log` belong to the owning site and are refused. `--after` takes ids on
 the other site. The job is watched with that site's own tools; `status.py --site NAME` prints its queue. This site keeps
 no copy of the job, so the local page does not list it (D24).

@@ -323,6 +323,11 @@ def parser() -> argparse.ArgumentParser:
                         "closure and --data by checksum, then submits there with that site's own submit.py")
     p.add_argument("--data", action="append", default=[], metavar="DIR",
                    help="with --site: a folder inside --repo to sync by checksum (repeatable)")
+    p.add_argument("--data-base", type=Path, default=None, metavar="DIR",
+                   help="with --site: the folder an outside-the-repo --data path is taken relative to, so "
+                        "DIR/gpe/x lands at data_root/gpe/x there (default: its own name)")
+    p.add_argument("--data-env", default=None, metavar="NAME",
+                   help="with --site: run the command with NAME set to the site's data_root (e.g. AUTOCAST_DATASETS)")
     p.add_argument("--dry-run", action="store_true", help="print the sbatch script and submit nothing")
     p.add_argument("command", nargs=argparse.REMAINDER)
     return p
@@ -344,8 +349,8 @@ def submit(argv: list[str]) -> str:
         raise Refused(msg)
     arguments.gpus = 1 if arguments.gpu else arguments.gpus or 0
     arguments.gpu = arguments.gpus > 0
-    if arguments.data and not arguments.site:
-        msg = "--data goes with --site (it names folders to sync to that site)"
+    if (arguments.data or arguments.data_base or arguments.data_env) and not arguments.site:
+        msg = "--data, --data-base and --data-env go with --site (they name data to sync to that site)"
         raise Refused(msg)
     if arguments.site:
         arguments.name = arguments.name or Path(arguments.command[0]).name
