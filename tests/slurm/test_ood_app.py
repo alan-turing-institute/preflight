@@ -309,3 +309,16 @@ def test_the_tables_show_memory_used_of_asked_and_cores_used_of_given() -> None:
                                datetime(2026, 1, 1), 100, 0, 4 * 1024**3, 2 * 1024**3, cpus=4, cpu_s=150.0)
     assert app._cores_used(row) == "1.5 of 4"
     assert app._finished_memory(row) == f"{app._size(2 * 1024**3)} of {app._size(4 * 1024**3)}"
+
+
+def test_a_running_jobs_cores_are_its_cpu_seconds_over_the_time_it_has_run(tmp_path: Path) -> None:
+    assert app._queue_cores({"cpus": 12, "cores_used": 1.44}) == "1.4 of 12"
+    assert app._queue_cores({"cpus": 12, "cores_used": None}) == "12"  # waiting, or not sampled yet
+    (tmp_path / "metrics").mkdir()
+    (tmp_path / "metrics" / "job_7.prom").write_text('gpujobs_job_cpu_seconds_total{jobid="7"} 90.500\n', encoding="utf-8")
+    old = gpu_jobs.STATE_DIR
+    gpu_jobs.STATE_DIR = tmp_path
+    try:
+        assert app._live_memory("7") == {"cpu_ms": 90500}
+    finally:
+        gpu_jobs.STATE_DIR = old

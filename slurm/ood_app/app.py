@@ -258,6 +258,7 @@ def job_rows(backend: Backend) -> list[dict[str, object]]:
     for job in _ordered(queue):
         record = records.get(job.job_id, {})
         kind, label = _queue_state(job)
+        live = backend.live_memory(job.job_id) if kind == Kind.RUNNING else {}
         rows.append(
             {
                 "id": job.job_id,
@@ -278,7 +279,8 @@ def job_rows(backend: Backend) -> list[dict[str, object]]:
                 "gpus": job.gpus,
                 "cpus": job.cpus,
                 "mem_mb": jobs_view.requested_mem_mb(job, record),
-                "mem_used": backend.live_memory(job.job_id).get("cpu") if kind == Kind.RUNNING else None,
+                "mem_used": live.get("cpu"),
+                "cores_used": live["cpu_ms"] / 1000 / max(_seconds(elapsed.get(job.job_id, "")) or 0, 1) if "cpu_ms" in live else None,
                 "node": job.node,
             }
         )
@@ -461,6 +463,9 @@ def _live_memory(job_id: str) -> dict[str, int]:
         match = re.search(rf"^gpujobs_job_{kind}_memory_bytes\{{[^}}]*\}} (\d+)$", text, re.MULTILINE)
         if match:
             found[kind] = int(match[1])
+    seconds = re.search(r"^gpujobs_job_cpu_seconds_total\{[^}]*\} ([0-9.]+)$", text, re.MULTILINE)
+    if seconds:
+        found["cpu_ms"] = round(float(seconds[1]) * 1000)
     return found
 
 
@@ -670,6 +675,12 @@ def _queue_memory(r: dict[str, object]) -> str:
     return f"{_size(used)} of {asked}" if isinstance(used, int) else asked
 
 
+def _queue_cores(r: dict[str, object]) -> str:
+    """Cores a job was given, and for a running one the average it has used since it started ("1.4 of 12")."""
+    used = r.get("cores_used")
+    return f"{used:.1f} of {r['cpus']}" if isinstance(used, float) else str(r["cpus"])
+
+
 def _cores_used(r: jobs_view.HistoryRow) -> str:
     """Cores a finished job used on average, of those it had: CPU seconds over elapsed seconds."""
     if r.cpus is None:
@@ -700,7 +711,7 @@ def _queue_table(rows: list[dict[str, object]], root: str, now: datetime) -> str
             + f'<td class="hide-sm">{_class_pill(r["class"])}</td>'
             f'<td class="num hide-sm">{esc(r["gpus"])}</td>'
             f'<td class="num hide-sm">{esc(_queue_memory(r))}</td>'
-            f'<td class="num hide-sm">{esc(r["cpus"])}</td>'
+            f'<td class="num hide-sm">{esc(_queue_cores(r))}</td>'
             f'<td class="inline" data-k="user">{esc(r["user"])}</td>'
             "</tr>"
         )
@@ -709,7 +720,7 @@ def _queue_table(rows: list[dict[str, object]], root: str, now: datetime) -> str
         head.format(counts)
         + '<div class="table-wrap"><table class="stack"><thead><tr><th scope="col" class="num">#</th><th scope="col">Job</th><th scope="col">Project</th>'
         '<th scope="col">State</th><th scope="col">Level</th><th scope="col">Running for</th><th scope="col">Queued at</th><th scope="col" class="hide-sm">Class</th>'
-        '<th scope="col" class="hide-sm">GPUs</th><th scope="col" class="hide-sm">Memory (used of asked)</th><th scope="col" class="hide-sm">Cores asked</th><th scope="col">User</th></tr></thead>'
+        '<th scope="col" class="hide-sm">GPUs</th><th scope="col" class="hide-sm">Memory (used of asked)</th><th scope="col" class="hide-sm">Cores (used of given)</th><th scope="col">User</th></tr></thead>'
         f"<tbody>{''.join(body)}</tbody></table></div>"
     )
 

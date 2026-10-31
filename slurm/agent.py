@@ -373,8 +373,20 @@ def _label(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
 
 
-def metrics_text(job: gpu_jobs.QueuedJob, gpu_mib: float, mem_bytes: int) -> str:
-    """The job's two gauges in Prometheus text format; project is the first `:` field of the job name."""
+def _cpu_seconds(cgroup: Path) -> float | None:
+    """CPU time the job's cgroup has used so far (`cpu.stat` usage_usec); None when it cannot be read."""
+    try:
+        for line in (cgroup / "cpu.stat").read_text(encoding="utf-8").splitlines():
+            key, _, value = line.partition(" ")
+            if key == "usage_usec":
+                return int(value) / 1e6
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def metrics_text(job: gpu_jobs.QueuedJob, gpu_mib: float, mem_bytes: int, cpu_seconds: float | None = None) -> str:
+    """The job's gauges (and its CPU seconds so far, when the cgroup says) in Prometheus text format; project is the first `:` field of the job name."""
     project = job.name.split(":", 1)[0] if ":" in job.name else "(other)"
     labels = f'jobid="{_label(job.job_id)}",user="{_label(job.user)}",project="{_label(project)}"'
     return (
@@ -382,6 +394,12 @@ def metrics_text(job: gpu_jobs.QueuedJob, gpu_mib: float, mem_bytes: int) -> str
         f"gpujobs_job_gpu_memory_bytes{{{labels}}} {int(gpu_mib * MIB)}\n"
         "# TYPE gpujobs_job_cpu_memory_bytes gauge\n"
         f"gpujobs_job_cpu_memory_bytes{{{labels}}} {mem_bytes}\n"
+        + (
+            "# TYPE gpujobs_job_cpu_seconds_total counter\n"
+            f"gpujobs_job_cpu_seconds_total{{{labels}}} {cpu_seconds:.3f}\n"
+            if cpu_seconds is not None
+            else ""
+        )
     )
 
 
@@ -1182,7 +1200,7 @@ class Agent:
             pids = gpu_jobs.job_pids(cgroup, set(), job.job_id, set(usage))
             mem = gpu_jobs.read_int(cgroup / "memory.current") or 0
             gpu_mib = sum(mib for pid, mib in usage.items() if pid in pids)
-            texts[f"job_{job.job_id}.prom"] = metrics_text(job, gpu_mib, mem)
+            texts[f"job_{job.job_id}.prom"] = metrics_text(job, gpu_mib, mem, _cpu_seconds(cgroup))
         try:
             self.metrics.mkdir(exist_ok=True)
             for name, text in texts.items():
