@@ -96,6 +96,8 @@ class HistoryRow:
     req_mem_bytes: int | None
     max_rss_bytes: int | None = None
     node: str = ""  # where it ran (sacct's `nodes`); "" if it never started
+    cpus: int | None = None  # cores it was given
+    cpu_s: float | None = None  # CPU seconds it used (sacct's TotalCPU)
 
 
 @dataclass(frozen=True)
@@ -280,7 +282,14 @@ def _row(job: Mapping[str, object]) -> HistoryRow:
         req_mem_bytes=_mib(_tres_count(_field(job, "tres", "requested"), "mem")),
         max_rss_bytes=_peak_rss(job),
         node=str(job.get("nodes") or ""),
+        cpus=_tres_count(_field(job, "tres", "allocated"), "cpu"),
+        cpu_s=_cpu_seconds(job),
     )
+
+
+def _cpu_seconds(job: Mapping[str, object]) -> float | None:
+    seconds, micros = _field(job, "time", "total", "seconds"), _field(job, "time", "total", "microseconds")
+    return seconds + (micros if isinstance(micros, int) else 0) / 1e6 if isinstance(seconds, int) else None
 
 
 def _rows(runner: Runner, since: str, until: str | None) -> list[HistoryRow]:

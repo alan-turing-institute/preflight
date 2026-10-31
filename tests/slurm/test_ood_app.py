@@ -298,3 +298,14 @@ def test_buttons_follow_can_act(viewer: str, admin: bool, shown: bool) -> None:
     # links are absolute from the mount: opened without its trailing slash, the page still finds its stylesheet
     # and asks for it by the installed files' version, so a browser holding an older copy fetches the new one
     assert f'href="{MOUNT}/static/app.css?v={app._assets_version()}"' in page
+
+
+def test_the_tables_show_memory_used_of_asked_and_cores_used_of_given() -> None:
+    from datetime import datetime
+
+    assert app._queue_memory({"mem_mb": 38000, "mem_used": 38_650_802_176}).startswith("38.7 GB of ")
+    assert "of" not in app._queue_memory({"mem_mb": 38000, "mem_used": None})  # waiting: only what it asked for
+    row = jobs_view.HistoryRow("5", "p:normal:x", "p", "ann", "normal", "COMPLETED", "0:0", datetime(2026, 1, 1), datetime(2026, 1, 1),
+                               datetime(2026, 1, 1), 100, 0, 4 * 1024**3, 2 * 1024**3, cpus=4, cpu_s=150.0)
+    assert app._cores_used(row) == "1.5 of 4"
+    assert app._finished_memory(row) == f"{app._size(2 * 1024**3)} of {app._size(4 * 1024**3)}"

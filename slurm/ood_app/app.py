@@ -278,6 +278,7 @@ def job_rows(backend: Backend) -> list[dict[str, object]]:
                 "gpus": job.gpus,
                 "cpus": job.cpus,
                 "mem_mb": jobs_view.requested_mem_mb(job, record),
+                "mem_used": backend.live_memory(job.job_id).get("cpu") if kind == Kind.RUNNING else None,
                 "node": job.node,
             }
         )
@@ -662,6 +663,22 @@ def _node_line(node: str) -> str:
     return f'<div class="why">on {esc(node)}</div>' if node else ""
 
 
+def _queue_memory(r: dict[str, object]) -> str:
+    """What a job asked for, and for a running one what it holds now ("38.6 GB of 38.7 GB")."""
+    asked = _asked_memory(r["mem_mb"])  # type: ignore[arg-type]
+    used = r.get("mem_used")
+    return f"{_size(used)} of {asked}" if isinstance(used, int) else asked
+
+
+def _cores_used(r: jobs_view.HistoryRow) -> str:
+    """Cores a finished job used on average, of those it had: CPU seconds over elapsed seconds."""
+    if r.cpus is None:
+        return "—"
+    if r.cpu_s is None or not r.elapsed_s:
+        return f"{r.cpus}"
+    return f"{r.cpu_s / r.elapsed_s:.1f} of {r.cpus}"
+
+
 def _queue_table(rows: list[dict[str, object]], root: str, now: datetime) -> str:
     head = '<div class="card-head"><h2 id="h-queue">Queue</h2><span class="meta">{}</span></div>'
     if not rows:
@@ -682,7 +699,8 @@ def _queue_table(rows: list[dict[str, object]], root: str, now: datetime) -> str
             + _queued_cell(r, now)
             + f'<td class="hide-sm">{_class_pill(r["class"])}</td>'
             f'<td class="num hide-sm">{esc(r["gpus"])}</td>'
-            f'<td class="num hide-sm">{esc(_asked_memory(r["mem_mb"]))}</td>'  # type: ignore[arg-type]
+            f'<td class="num hide-sm">{esc(_queue_memory(r))}</td>'
+            f'<td class="num hide-sm">{esc(r["cpus"])}</td>'
             f'<td class="inline" data-k="user">{esc(r["user"])}</td>'
             "</tr>"
         )
@@ -691,9 +709,14 @@ def _queue_table(rows: list[dict[str, object]], root: str, now: datetime) -> str
         head.format(counts)
         + '<div class="table-wrap"><table class="stack"><thead><tr><th scope="col" class="num">#</th><th scope="col">Job</th><th scope="col">Project</th>'
         '<th scope="col">State</th><th scope="col">Level</th><th scope="col">Running for</th><th scope="col">Queued at</th><th scope="col" class="hide-sm">Class</th>'
-        '<th scope="col" class="hide-sm">GPUs</th><th scope="col" class="hide-sm">Memory asked</th><th scope="col">User</th></tr></thead>'
+        '<th scope="col" class="hide-sm">GPUs</th><th scope="col" class="hide-sm">Memory (used of asked)</th><th scope="col" class="hide-sm">Cores asked</th><th scope="col">User</th></tr></thead>'
         f"<tbody>{''.join(body)}</tbody></table></div>"
     )
+
+
+def _finished_memory(r: jobs_view.HistoryRow) -> str:
+    """Peak memory it held, of what it asked for."""
+    return f"{_size(r.max_rss_bytes)} of {_size(r.req_mem_bytes)}" if r.req_mem_bytes else _size(r.max_rss_bytes)
 
 
 def _finished_rows(rows: list[jobs_view.HistoryRow], root: str, now: datetime) -> str:
@@ -712,7 +735,8 @@ def _finished_rows(rows: list[jobs_view.HistoryRow], root: str, now: datetime) -
             + f'<td class="num inline" data-k="started">{esc(_clock(r.start, now))}</td>'
             f'<td class="num inline" data-k="took">{esc(_duration(r.elapsed_s) if r.start else "—")}</td>'
             f'<td class="num hide-sm">{esc(r.gpus)}</td>'
-            f'<td class="num hide-sm">{esc(_size(r.max_rss_bytes))}</td>'
+            f'<td class="num hide-sm">{esc(_finished_memory(r))}</td>'
+            f'<td class="num hide-sm">{esc(_cores_used(r))}</td>'
             + f'<td class="inline" data-k="user">{esc(r.user)}</td>'
             "</tr>"
         )
@@ -723,7 +747,7 @@ def _finished_table(rows: list[jobs_view.HistoryRow], root: str, now: datetime) 
     return (
         '<div class="table-wrap"><table class="stack"><thead><tr><th scope="col">Job</th><th scope="col">Project</th><th scope="col">Result</th>'
         '<th scope="col">Queued at</th><th scope="col">Started</th><th scope="col">Took</th><th scope="col" class="hide-sm">GPUs</th>'
-        '<th scope="col" class="hide-sm">Peak CPU memory</th><th scope="col">User</th>'
+        '<th scope="col" class="hide-sm">Peak memory (of asked)</th><th scope="col" class="hide-sm">Cores used (average, of given)</th><th scope="col">User</th>'
         f"</tr></thead><tbody>{_finished_rows(rows, root, now)}</tbody></table></div>"
     )
 
