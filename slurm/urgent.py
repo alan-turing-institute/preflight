@@ -85,6 +85,8 @@ def plan(
         in_way = whole_box or memory_short or cores_short or (gpu and job.gpus > 0)
         if not in_way or not (job.active or job.partition == gpu_jobs.Partition.URGENT):
             continue
+        if job.partition == gpu_jobs.Partition.PART_TIME:
+            continue  # on another machine: it holds none of the cores, memory or card this urgent job needs
         what = f"{job.job_id} {job.name} ({record.get('what', 'no sidecar')}), running {elapsed(job.job_id)}"
         if job.partition in {gpu_jobs.Partition.NORMAL, gpu_jobs.Partition.CPU_FILL}:
             victims.append(job.job_id)

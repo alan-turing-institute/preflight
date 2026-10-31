@@ -8,6 +8,9 @@ Rules, in order, each run (plan B2, `plan notes`):
 1. An urgent job is pending: never close the node; reopen it if we closed it.
 2. Free memory below `push_back_below_mb`: requeue the newest-started `resume` job here (one per run; at its second
    push from this node the job is also barred from the node).
+2b. A `launch_refused` event in this machine's `events/` (written by a job's wrapper that found the machine unfit for
+   it and requeued the job): once the job waits again, and only if the event's owner is the job's owner, bar the job from
+   this node (`ExcNodeList`; a running job cannot be changed, measured 2026-10-31) and delete the event.
 3. Free memory below `close_below_mb`, or `mains_only` and on battery: drain, reason `gpujobs-check: ...`.
 4. We closed it and the last 3 runs all passed rule 3: resume.
 A drain whose reason does not start `gpujobs-check:` is never changed. Any exception drains the node (fail closed).
@@ -56,6 +59,11 @@ MANIFEST_DIRS = ("jobs", "events", "logs", "footprints")
 OWNERS_DIR = "owners"
 MANIFEST_NAME = "manifest.json"
 KILL_REASON = "not allowed on a part-time machine"
+LAUNCH_REFUSED_FILE = re.compile(rf"(\d+)-\d+-{gpu_jobs.EventAction.LAUNCH_REFUSED}\.json", re.ASCII)
+PENDING = gpu_jobs.State.PENDING.value
+#: A `launch_refused` event whose job is not yet waiting is kept this long: `scontrol requeue` leaves the job COMPLETING
+#: for a few seconds (measured 2026-10-31, ~6 s) before it waits.
+LAUNCH_EVENT_WAIT_S = 60
 #: The keys the node's `Extra` may override, and the type each must have.
 EXTRA_KEYS: dict[str, type] = {"close_below_mb": int, "push_back_below_mb": int, "mains_only": bool}
 
@@ -238,6 +246,43 @@ def has_other_node(run: Runner, job_id: str, node: str) -> bool:
     return False
 
 
+def bar_refusing_jobs(run: Runner, events_dir: Path, node: str) -> list[str]:
+    """Apply the `launch_refused` events in `events_dir`: bar each pending job from `node`, owner-checked. An event of a
+    job that is gone, not the event owner's, or not waiting a minute after the event, is deleted without effect; a
+    younger one whose job is not waiting yet (the requeue takes seconds to land) waits for the next run."""
+    decisions = []
+    for path in sorted(events_dir.glob(f"*-{gpu_jobs.EventAction.LAUNCH_REFUSED}.json")):
+        try:
+            status = path.lstat()
+        except OSError:
+            continue
+        match = LAUNCH_REFUSED_FILE.fullmatch(path.name)
+        if not match or not stat.S_ISREG(status.st_mode):
+            continue
+        job = match[1]
+        done = run(["scontrol", "show", "job", job, "-o"])
+        shown = done.stdout if done.returncode == 0 else ""
+        state = re.search(r"\bJobState=(\S+)", shown)
+        owner = re.search(r"\bUserId=\S+\((\d+)\)", shown)
+        if state and state[1] != PENDING and time.time() - status.st_mtime < LAUNCH_EVENT_WAIT_S:
+            continue  # the requeue has not taken effect yet
+        if not state or state[1] != PENDING:
+            decisions.append(f"launch event of {job}: job {'is not waiting' if state else 'gone'}, removed")
+        elif not owner or int(owner[1]) != status.st_uid:
+            decisions.append(f"launch event of {job}: not written by the job's owner, removed")
+        else:
+            existing = re.search(r"\bExcNodeList=(\S+)", shown)
+            value = exclusion(run, "" if not existing or existing[1] == "(null)" else existing[1], node)
+            if value:
+                done = run(["scontrol", "update", f"JobId={job}", f"ExcNodeList={value}"])
+                if done.returncode != 0:  # a person's job must never close the node: say so, try again next run
+                    decisions.append(f"bar {job} from {node} failed ({done.stderr.strip()}): event kept")
+                    continue
+            decisions.append(f"{job} barred from {node} (launch check)")
+        gpu_jobs.remove_quietly(path)
+    return decisions
+
+
 def end_job(run: Runner, record: Recorder, victim: Running, node: str, reason: str, **fields: object) -> None:
     """Cancel a job here and record the kill, the event owned by the job's submitter (the manifest says so)."""
     job = victim.job.job_id
@@ -368,6 +413,8 @@ def check(
                 if done.returncode != 0:
                     raise RuntimeError(f"exclude on {job} failed: {done.stderr.strip()}")
                 decisions.append(f"{job} barred from {info.name}")
+
+    decisions += bar_refusing_jobs(run, settings.state_dir / "events", info.name)
 
     mains_only = battery if settings.mains_only is None else settings.mains_only
     why = ""

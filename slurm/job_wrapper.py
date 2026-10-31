@@ -27,6 +27,12 @@ sbatch script whose only line runs this wrapper. In order:
    23.5 h and its afterok chain started). The agent records each such kill (`agent/oom_kills/`); when the command ended
    without slurm having signalled the wrapper and such a record names this leg, the job ends KILLED_FOR_MEMORY, and a
    `resume` job is first requeued (`scontrol requeue`, its owner's right), at most KILLED_LEGS_LIMIT legs in a row.
+7. LAUNCH RE-CHECK on a part-time machine (`--require`, given only to a job `submit.py` found portable; run only when
+   slurm put the job in `part_time`, so never on the main node): the paths and architecture `portability.decide` saw at
+   submission must still hold here. If not, the wrapper says why, records a `launch_refused` event in this machine's
+   state folder and requeues the job. A job cannot bar a node from itself while it runs (slurm: "Job is no longer
+   pending execution", measured 2026-10-31), so `node_check.py` (root) reads the event and, once the job waits again,
+   sets its `ExcNodeList` if the event's owner is the job's owner. LAUNCH_REFUSALS_LIMIT refusals in a row fail the job.
 """
 
 from __future__ import annotations
@@ -36,6 +42,7 @@ import contextlib
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -48,6 +55,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "hostguard"))
 
 import gpu_jobs  # noqa: E402 - path set just above
+import portability  # noqa: E402
 from gpu_jobs import (  # audit.py imports gpu_mib_by_pid from here
     CGROUP_ROOT,
     cgroup_pids,
@@ -67,6 +75,7 @@ class Exit(IntEnum):
     CARD_NOT_READY = 3  # the wait limit passed
     CODE_CHANGED = 4  # the manifest re-check failed
     KILLED_FOR_MEMORY = 5  # the host's OOM guard killed the run, whatever the command's own exit status
+    LAUNCH_CHECK_FAILED = 6  # a part-time machine was unfit for the job: requeued, or failed after LAUNCH_REFUSALS_LIMIT in a row
 
 
 #: After the command ends, how long to wait for the agent's record of an OOM-guard kill. The agent writes it as the
@@ -78,6 +87,9 @@ KILL_WINDOW_S = 180.0
 #: A `resume` job killed this many legs in a row fails instead of being requeued again: slurm's MaxBatchRequeue covers
 #: only failed launches, so a memory shortage that persists would otherwise requeue it for ever.
 KILLED_LEGS_LIMIT = 3
+#: A job whose launch check fails this many times in a row fails instead of being requeued again: the node's exclusion
+#: is applied by `node_check.py` within about a minute, and if it never lands the job would otherwise loop for ever.
+LAUNCH_REFUSALS_LIMIT = 3
 
 
 def foreign_gpu_processes(own_pids: set[int], output: str | None = None) -> list[tuple[int, str]] | None:
@@ -307,6 +319,29 @@ def _requeued(run: Callable[[list[str]], int], job_id: str) -> bool:
         return False
 
 
+def refuse_launch(job_id: str, problems: list[str], run: Callable[[list[str]], int] = gpu_jobs.run_slurm) -> int:
+    """Say why this machine cannot run the job, leave the marker `node_check.py` bars the node by, and requeue; fail the
+    job on the LAUNCH_REFUSALS_LIMIT-th refusal in a row, or when the refusal cannot be counted or the requeue is refused."""
+    print(f"[job] REFUSED at launch on {socket.gethostname().split('.')[0]}: " + "; ".join(problems), file=sys.stderr, flush=True)
+    try:
+        record = gpu_jobs.read_json(gpu_jobs.sidecar_path(job_id), gpu_jobs.current_user()) or {}
+        so_far = record.get("launch_refusals")
+        refusals = (so_far if isinstance(so_far, int) else 0) + 1
+        gpu_jobs.update_sidecar(job_id, launch_refusals=refusals)
+        if refusals >= LAUNCH_REFUSALS_LIMIT:
+            print(f"[job] refused {refusals} times in a row: the job fails instead of being requeued again", file=sys.stderr, flush=True)
+            return Exit.LAUNCH_CHECK_FAILED
+        gpu_jobs.write_event(job_id, gpu_jobs.EventAction.LAUNCH_REFUSED, node=socket.gethostname().split(".")[0], problems=problems)
+    except OSError as error:
+        print(f"[job] the refusal could not be recorded ({error}): the job fails", file=sys.stderr, flush=True)
+        return Exit.LAUNCH_CHECK_FAILED
+    if not _requeued(run, job_id):
+        print("[job] slurm refused the requeue: the job fails", file=sys.stderr, flush=True)
+    else:
+        print("[job] requeued: the node is barred from the job once it waits again", flush=True)
+    return Exit.LAUNCH_CHECK_FAILED
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--needs-lease", action="store_true", help="a GPU or urgent job: wait for slurm's lease")
@@ -319,6 +354,8 @@ def main() -> int:
     parser.add_argument("--sample", type=float, default=5.0)
     parser.add_argument("--manifest", default=None, help="the submission's code manifest, re-checked at launch")
     parser.add_argument("--repo", default=None, help="the project checkout the manifest describes")
+    parser.add_argument("--require", default=None, metavar="JSON",
+                        help="[[role, path, where], ...] that must still hold on a part-time machine (portability.decide)")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     arguments = parser.parse_args()
     command = arguments.command[1:] if arguments.command[:1] == ["--"] else arguments.command
@@ -361,6 +398,13 @@ def main() -> int:
             best_effort("sidecar", lambda: gpu_jobs.update_sidecar(
                 job_id, last_leg={"leg": restart, "refused": "manifest", "ended_at": int(time.time())}))
             return Exit.CODE_CHANGED
+
+    if arguments.require and os.environ.get("SLURM_JOB_PARTITION") == gpu_jobs.Partition.PART_TIME:
+        if problems := portability.launch_problems(json.loads(arguments.require)):
+            return refuse_launch(job_id, problems)
+        if (gpu_jobs.read_json(gpu_jobs.sidecar_path(job_id), gpu_jobs.current_user()) or {}).get("launch_refusals"):
+            best_effort("sidecar", lambda: gpu_jobs.update_sidecar(job_id, launch_refusals=0))  # in a row: this one passed
+        print("[job] part-time launch check passed", flush=True)
 
     footprint = gpu_jobs.STATE_DIR / "footprints" / f"{job_id}.jsonl"
     started = int(time.time())

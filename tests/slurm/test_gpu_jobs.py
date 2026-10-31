@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import itertools
 import json
 import os
 import pwd
@@ -382,3 +383,28 @@ def test_with_nothing_copied_back_the_readers_never_ask_sacct(tmp_path: Path, mo
     (tmp_path / "jobs" / "5.json").write_text(json.dumps({"name": "n"}))
     assert gpu_jobs.read_sidecar("5") == {"name": "n"} and gpu_jobs.events() == []
     assert gpu_jobs.state_dirs("jobs") == [tmp_path / "jobs"]
+
+
+@pytest.mark.parametrize(("label", "gpus", "service", "no_anywhere"),
+                         list(itertools.product(("resume", "restart"), (0, 1), (False, True), (False, True))))
+def test_only_an_eligible_job_is_offered_the_part_time_machines(label, gpus, service, no_anywhere) -> None:
+    job_class = gpu_jobs.JobClass(label)  # by label: an earlier test reloads gpu_jobs, which makes new enum members
+    eligible = label == "resume" and not gpus and not service and not no_anywhere
+    allowed = gpu_jobs.part_time_eligible(job_class, gpus, service=service, no_anywhere=no_anywhere)
+    asked = gpu_jobs.partition_for(job_class, gpus, service=service, part_time=allowed)
+    assert allowed is eligible and (asked == "cpu_fill,part_time") is eligible
+    # whatever the caller claims, an ineligible job (restart, GPU, service) never gets them, and urgent is not a choice here
+    forced = gpu_jobs.partition_for(job_class, gpus, service=service, part_time=True)
+    assert ("part_time" in forced) is (label == "resume" and not gpus and not service)
+    assert "urgent" not in forced
+
+
+def test_a_job_listing_two_partitions_reads_right_and_one_on_a_part_time_machine_is_not_in_urgent_works_way() -> None:
+    waiting = QueuedJob("1", "part_time,cpu_fill", "PENDING", "Resources", "p:resume:n")  # squeue's order differs from submission
+    assert "part-time machine" in status._pauses(waiting) and status._pauses(waiting) != waiting.partition
+    assert status._pauses(QueuedJob("2", "cpu_fill", "RUNNING", "None", "p:resume:n")).startswith("fills idle cores;")
+    running = QueuedJob("3", "part_time", "RUNNING", "None", "p:resume:n", node="laptop")
+    lines, victims, steady, wait_only = urgent.plan(
+        [running], gpu=True, whole_box=True, leases=[], unregistered=[], services={}, memory_short=True, cores_short=True
+    )
+    assert (victims, steady, wait_only) == ([], [], [])  # it holds none of this machine's cores, memory or card

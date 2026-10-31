@@ -74,6 +74,7 @@ class Node:
     close_below_gb: float | None = None  # health check: close the node below this much free memory
     push_back_below_gb: float | None = None  # health check: requeue a resume job below this much free memory
     cores_per_socket: int | None = None  # CoresPerSocket as `slurmd -C` prints it, when that is not `cpus` (hybrid Intel CPUs); None: cpus
+    default_jobs: bool = True  # part-time: false keeps the node opt-in (`submit.py --anywhere`); true lets portable jobs go there unasked
 
     @property
     def gpu_cores(self) -> int:
@@ -96,6 +97,20 @@ class Node:
         if self.jobs_memory_gb is None:
             return None
         return self.real_memory_mb - round(self.jobs_memory_gb * SLURM_MB_PER_GB)
+
+    @property
+    def cores_lent(self) -> int:
+        """Cores slurm hands to jobs: its abstract cores (`cores_per_socket`, else `cpus`) less the ids in `keep_cpus`."""
+        kept = 0
+        for part in (self.keep_cpus or "").split(","):
+            low, _, high = part.partition("-")
+            kept += int(high or low) - int(low) + 1 if part else 0
+        return (self.cores_per_socket or self.cpus) - kept
+
+    @property
+    def jobs_mb(self) -> int:
+        """Memory slurm hands to jobs, in slurm MB: the real memory less `mem_spec_limit_mb`."""
+        return self.real_memory_mb - (self.mem_spec_limit_mb or 0)
 
 
 @dataclass(frozen=True)
@@ -246,7 +261,7 @@ def _parse_node(raw: Any, i: int) -> Node:
     t = _table(raw, where, {"name", "cpus", "real_memory_mb"}, {
         "gpus": [], "cores_per_gpu": None, "part_time": False, "address": None, "keep_cpus": None,
         "jobs_memory_gb": None, "mains_only": None, "close_below_gb": None, "push_back_below_gb": None,
-        "cores_per_socket": None,
+        "cores_per_socket": None, "default_jobs": True,
     })
     gpus = tuple(
         Gpu(**_table(g, f"{where}.gpus[{j}]", {"index", "uuid", "device", "type"}, {}))
@@ -254,7 +269,7 @@ def _parse_node(raw: Any, i: int) -> Node:
     )
     node = Node(t["name"], t["cpus"], t["real_memory_mb"], gpus, t["cores_per_gpu"], t["part_time"], t["address"],
                 t["keep_cpus"], t["jobs_memory_gb"], t["mains_only"], t["close_below_gb"], t["push_back_below_gb"],
-                t["cores_per_socket"])
+                t["cores_per_socket"], t["default_jobs"])
     _check_part_time(node, where)
     if node.cores_per_socket is not None and not (type(node.cores_per_socket) is int and 1 <= node.cores_per_socket <= node.cpus):
         raise SiteError(f"site file: [{where}] cores_per_socket = {node.cores_per_socket!r}; expected a whole number from 1 to cpus ({node.cpus})")
@@ -267,8 +282,8 @@ def _parse_node(raw: Any, i: int) -> Node:
 
 
 def _check_part_time(node: Node, where: str) -> None:
-    if type(node.part_time) is not bool or node.mains_only not in (None, True, False):
-        raise SiteError(f"site file: [{where}] part_time and mains_only must be true or false")
+    if type(node.part_time) is not bool or node.mains_only not in (None, True, False) or type(node.default_jobs) is not bool:
+        raise SiteError(f"site file: [{where}] part_time, mains_only and default_jobs must be true or false")
     for key in ("close_below_gb", "push_back_below_gb"):
         value = getattr(node, key)
         if value is not None and (isinstance(value, bool) or not isinstance(value, int | float) or not 0 < value < math.inf):

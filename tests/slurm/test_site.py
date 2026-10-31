@@ -39,6 +39,8 @@ def test_this_box_site_file_loads() -> None:
     assert set(site.lease.services) == {"service-a", "service-b", "service-c-app"}
     assert site.service == gpujobs_site.Service(4, "gpujobs-service")
     assert site.remotes == {"turing": gpujobs_site.Remote("site-b", "gpujobs-sync", data_root="/data/site/user1/datasets")}
+    fedora = site.part_time_nodes[0]  # what a job may ask of it: 16 abstract cores less keep_cpus "8-15"; 12 GB of 31.5
+    assert (fedora.cores_lent, fedora.jobs_mb, fedora.default_jobs) == (8, 11444, True)
     assert site.lease.lease_dir == Path("/home/user1/.local/state/gpu-lease")
     assert (site.metrics.mode, site.metrics.grafana_port) == (gpujobs_site.MetricsMode.LOCAL, 3001)
     assert site.metrics.allow_from == ("100.64.0.0/10", "fd7a:115c:a1e0::/48", "192.0.2.8/32")  # Tailscale + NAS Caddy
@@ -117,6 +119,7 @@ def test_example_loads_and_minimal_file_gets_every_default(tmp_path: Path) -> No
         (MINIMAL + "[portal]\nsession_days = -1\n", "portal.session_days = -1"),
         (MINIMAL + "[portal]\nallow_from = ['ts']\n", "portal.allow_from entry 'ts'"),
         ('name = "x"\n', "missing nodes"),
+        (MINIMAL + PART_TIME + "address = 'a'\ndefault_jobs = 'no'\n", "default_jobs must be true or false"),
         (MINIMAL + "cores_per_gpu = 1\n", "cores_per_gpu must be"),  # no GPUs: nothing to hold cores for
         (MINIMAL + "cores_per_gpu = 1.5\n" + GPU, "cores_per_gpu must be"),  # would render MaxCPUsPerNode=0.5
         (MINIMAL + "cores_per_gpu = 2\n" + GPU, "must leave CPU-only jobs a core"),  # 2 of 2: CPU jobs could never run

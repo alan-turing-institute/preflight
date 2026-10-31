@@ -25,12 +25,16 @@ PAUSES = {
     gpu_jobs.Partition.SERVICE: "a service's CPU stand-in; requeued for urgent work",
     gpu_jobs.Partition.PART_TIME: "a part-time machine; requeued when its owner needs it, resumes from its checkpoint",
 }
+#: A job waiting in both (`gpu_jobs.ANYWHERE_PARTITIONS`; once running it is shown in the one it got).
+ANYWHERE_PAUSE = "fills idle cores here or on a part-time machine; requeued for GPU or urgent work or when that machine's owner needs it, resumes from its checkpoint"
 
 
 def _pauses(job: gpu_jobs.QueuedJob) -> str:
     """`PAUSES` by partition; a `cpu` job by its class (urgent.py requeues one that resumes, never one that restarts)."""
     if job.partition == gpu_jobs.Partition.CPU:
         return PAUSES[gpu_jobs.Partition.STEADY if job.restarts else gpu_jobs.Partition.NORMAL]
+    if set(job.partition.split(",")) == {gpu_jobs.Partition.CPU_FILL, gpu_jobs.Partition.PART_TIME}:  # waiting: squeue lists both
+        return ANYWHERE_PAUSE
     return PAUSES.get(job.partition, job.partition)
 
 

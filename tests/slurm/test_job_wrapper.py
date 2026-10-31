@@ -10,6 +10,7 @@ import sys
 import time
 from pathlib import Path
 
+import gpu_jobs
 import job_wrapper
 import pytest
 
@@ -267,3 +268,36 @@ def test_a_run_the_oom_guard_killed_fails_or_is_requeued_never_passes(tmp_path: 
     job_wrapper.after_kill("78", kill, [*legs, {"killed_by": kill}], "p:resume:x", lambda argv: ran.append(argv) or 0)
     job_wrapper.after_kill("78", kill, [{"killed_by": kill}], "p:restart:x", lambda argv: ran.append(argv) or 0)
     assert len(ran) == 1
+
+
+def test_a_part_time_launch_that_no_longer_holds_is_requeued_with_a_marker_and_the_third_in_a_row_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(gpu_jobs, "STATE_DIR", tmp_path)
+    ran: list[list[str]] = []
+    again = lambda argv: ran.append(argv) or 0  # noqa: E731
+    for refusals in (1, 2):
+        assert job_wrapper.refuse_launch("90", ["/x does not exist here"], again) == job_wrapper.Exit.LAUNCH_CHECK_FAILED
+        assert json.loads(gpu_jobs.sidecar_path("90").read_text())["launch_refusals"] == refusals
+        assert len(ran) == refusals  # requeued, not failed
+    markers = gpu_jobs.events("90")
+    assert [e.action for e in markers] == ["launch_refused"] * 2  # what node_check.py turns into the node's exclusion
+    assert markers[0].fields["problems"] == ["/x does not exist here"] and markers[0].actor == gpu_jobs.current_user()
+    job_wrapper.refuse_launch("90", ["/x does not exist here"], again)
+    assert len(ran) == 2 and len(gpu_jobs.events("90")) == 2  # the third: failed with the message, nothing requeued
+    (tmp_path / "jobs" / "91.json").mkdir(parents=True)  # a count that cannot be kept must fail the job, not loop it
+    job_wrapper.refuse_launch("91", ["p"], again)
+    assert len(ran) == 2
+
+
+def test_the_launch_check_runs_only_in_the_part_time_partition(tmp_path: Path) -> None:
+    ran = tmp_path / "ran"
+    require = json.dumps([["program", str(tmp_path / "missing"), ""]])
+    results = []
+    for partition in ("part_time", "cpu_fill"):
+        env = dict(os.environ, SLURM_GPU_STATE_DIR=str(tmp_path / partition), SLURM_JOB_ID="92", SLURM_JOB_PARTITION=partition)
+        done = subprocess.run([sys.executable, str(WRAPPER), "--sample", "0.2", "--require", require, "--", "touch", str(ran)],
+                              env=env, check=False, capture_output=True, text=True)
+        results.append((done.returncode, ran.exists(), "REFUSED at launch" in done.stderr))
+        ran.unlink(missing_ok=True)
+    assert results == [(job_wrapper.Exit.LAUNCH_CHECK_FAILED, False, True), (0, True, False)]

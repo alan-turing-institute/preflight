@@ -426,6 +426,14 @@ The commands below are the shims installed in `/usr/local/bin`; from a checkout 
     gpujobs-submit --project myproj --what 'quick check' --class restart --gpu --level high -- python check.py
     scontrol update jobid=123 qos=low
 
+    # shrink a WAITING job's memory request without cancelling it (megabytes: a "G" suffix is refused). Only while
+    # it waits, and only downwards for a normal user; gpujobs-status and the jobs page read the new value. Size it
+    # from the job's own last run (sacct -j <earlier id> -o MaxRSS), not a guess.
+    scontrol update jobid=123 MinMemoryNode=12288
+    # cores: NumCPUs alone is not enough -- slurm keeps waiting for the per-task count (CPUs/Task, MinCPUsNode)
+    # (2026-10-31, job 1551). Change all three, then check with: scontrol show job 123 | grep -E 'CPUs/Task|MinCPUsNode'
+    scontrol update jobid=123 NumCPUs=4 MinCPUsNode=4 CPUsPerTask=4
+
     # see the queue, who holds the GPU and why jobs wait
     gpujobs-status
 
@@ -582,6 +590,40 @@ shows when it last worked. A copied file counts only for a job that slurm's acco
 belongs to the user accounting names for it (copies lose their owner). If the machines mount the controller's `state_dir`
 (one shared filesystem), set `shared_state = true` and nothing is copied. `node_python` (default `/usr/bin/python3`) is
 the interpreter a part-time job's wrapper runs with there, never the submitter's own.
+
+**What goes to a part-time machine (D25).** A CPU-only `resume` job (no GPUs, not `--service`, not `urgent.py`) is submitted
+to `cpu_fill,part_time` when a part-time node passes the checks at submission, so the scheduler uses an idle part-time
+machine instead of leaving the job waiting for the main node. Slurm cannot tell whether a job is portable, so
+`submit.py` asks the node itself (one ssh, `slurm/portability.py`). In order, the first failure leaves that node out:
+
+1. size: `--cpus` and `--mem` must fit what the node lends (cores: its `cores_per_socket` or `cpus` less the ids in
+   `keep_cpus`; memory: `jobs_memory_gb`);
+2. the node answers over ssh (as the submitting user, `BatchMode`, 5 s);
+3. the working folder is on storage both machines see. Shared means that on both machines the path's mount is a network
+   filesystem (nfs, cifs) holding the same export path and the same file (inode); the server's name is ignored, since one NAS has different addresses on different machines. So a checkpoint written there survives a push-back to the main node.
+   `/mnt/shared` itself is each machine's own disk; only the NAS shares mounted under it count, and only if both machines
+   mount that one. Each decision is judged by the mount, never by a declared folder prefix;
+4. the program (`command[0]`) exists on the node and is built for the node's architecture, and is a system file
+   (`/usr`, `/bin`, `/sbin`, `/lib`, `/lib64`) or on shared storage. A project `.venv` or anything under a home folder
+   is on one machine's own disk and is left out;
+5. every other path in the command (absolute, or existing relative to the working folder; `--opt=PATH` too) and `--repo`
+   is shared or a system file, and exists on the node;
+6. the node's copy of the job tools (the folder `job_wrapper.py` runs from) has the same `*.py` files as this machine's.
+   A node with older tools is left out until the tools are reinstalled there.
+
+To make a project's job eligible: run it with a system tool (or one on a shared NAS folder built for both architectures)
+and put its working folder on a NAS share both machines mount. Every decision is printed (`[submit] part_time fedora:
+included` or `excluded: why`, with `--dry-run` too) and stored in the job's record under `part_time`; a node left out is
+named in the job's `--exclude`. `--no-anywhere` keeps one job off the part-time machines. `--anywhere` is the
+submitter's word that the job is fit for them: it skips checks 2 to 5 (not the size check, and it is refused if no node
+can take the job). A node with `default_jobs = false` in the site file takes only such jobs, so a colleague's machine
+joining a shared site is never used unasked.
+
+When the job starts on the part-time machine its wrapper checks paths, architecture and shared sources again (the
+machine may have changed during the wait). If one no longer holds it prints why, requeues the job and leaves a
+`launch_refused` event in the machine's state folder; `node_check.py` (root, every 30 s) then sets the job's
+`ExcNodeList` to include the node once the job waits again (a running job cannot change its own list), only for an event
+written by the job's own user. Three refusals in a row fail the job (exit code 6) rather than loop.
 
 ## 9. Uninstall
 

@@ -46,7 +46,8 @@ real_memory_mb = 64000       # RealMemory in MB slurm may hand out (required)
 # cores_per_gpu = 4
 
 # A part-time node is someone's own machine lent to the cluster when idle (needs a full node to run slurmctld on).
-# It has no GPUs and its jobs run in the `part_time` partition (submit.py --anywhere). Optional keys, only with part_time:
+# It has no GPUs. A CPU-only `resume` job goes to its `part_time` partition when submit.py finds the job portable to it
+# (default_jobs below), or always when the submitter vouches for it (submit.py --anywhere). Optional keys, only with part_time:
 # part_time = true
 # address = "100.64.0.2"   # slurm NodeAddr: where the controller reaches it (required)
 # keep_cpus = "12-21"          # CpuSpecList: OS CPUs slurm never gives jobs, e.g. "0-11" or "0,2,4-7". Default: none kept
@@ -54,6 +55,7 @@ real_memory_mb = 64000       # RealMemory in MB slurm may hand out (required)
 # cores_per_socket = 16        # CoresPerSocket as `slurmd -C` prints it on the machine, when that is not cpus: a hybrid Intel CPU
 #                              # (6 two-thread + 10 one-thread cores) is 22 CPUs but 16 cores, and slurm drains a node whose
 #                              # configured sockets*cores*threads exceeds what it reports ("Low socket*core*thread count"). Default: cpus
+# default_jobs = false         # keep this node opt-in: only submit.py --anywhere sends a job here. Default: true (a portable job may go unasked)
 # Health check keys, any node (see [health_check]):
 # mains_only = true            # close the node while on battery. Default: decided at run time (true when it has a battery)
 # close_below_gb = 6           # close the node below this much free memory (decimal GB). Default: 16 full, 6 part-time

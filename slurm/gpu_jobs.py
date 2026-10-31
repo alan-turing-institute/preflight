@@ -71,7 +71,7 @@ class Partition(StrEnum):
     CPU_FILL = "cpu_fill"  # a `resume` job without GPUs: no core cap, so it fills idle cores; GPU jobs pre-empt it (D23)
     URGENT = "urgent"  # urgent.py only; pre-empts `normal`
     SERVICE = "service"  # submit.py --service only (D20): a service's CPU stand-in; suspends `cpu` jobs to start
-    PART_TIME = "part_time"  # the part-time machines (someone's own, lent when idle); only `--anywhere` jobs reach it
+    PART_TIME = "part_time"  # the part-time machines (someone's own, lent when idle); a portable CPU `resume` job reaches it (any such job with `--anywhere`)
 
 
 class JobClass(StrEnum):
@@ -90,19 +90,27 @@ def class_of(name: str) -> JobClass | None:
     return JobClass(label) if label in set(JobClass) else None
 
 
-#: What `--anywhere` asks slurm for: it starts in whichever of the two has room first. Once running, squeue names the
-#: one it got, so a job is only ever shown in `cpu_fill` or `part_time`.
+#: What a job allowed on a part-time machine asks slurm for: it starts in whichever of the two has room first. Once
+#: running, squeue names the one it got, so a running job is only ever shown in `cpu_fill` or `part_time`; a waiting
+#: one lists both, in an order slurm chooses: compare them as a set.
 ANYWHERE_PARTITIONS = f"{Partition.CPU_FILL},{Partition.PART_TIME}"
 
 
-def partition_for(job_class: JobClass, gpus: int, *, service: bool = False, anywhere: bool = False) -> str:
+def part_time_eligible(job_class: JobClass, gpus: int, *, service: bool = False, no_anywhere: bool = False) -> bool:
+    """Whether a job may go to a part-time machine at all: a `resume` job (only that class survives being pushed back
+    when the owner takes the machine) without GPUs, not a service, not opted out with `--no-anywhere`."""
+    return job_class is JobClass.RESUME and not gpus and not service and not no_anywhere
+
+
+def partition_for(job_class: JobClass, gpus: int, *, service: bool = False, part_time: bool = False) -> str:
     """The partition a job runs in: a service's stand-in in `service`; one without GPUs by its class: `restart` in `cpu`
     (capped by MaxCPUsPerNode, kept off the cores held for GPU jobs), `resume` in `cpu_fill` (no cap; GPU jobs requeue it);
     otherwise `normal` or `steady` by its class.
-    `anywhere` (a CPU-only `resume` job) adds the part-time machines: `ANYWHERE_PARTITIONS`."""
+    `part_time` (the caller found a part-time node the job may use) adds the part-time machines to an eligible job's
+    list: `ANYWHERE_PARTITIONS`. An ineligible job (`part_time_eligible`) never gets them, whatever the caller says."""
     if service:
         return Partition.SERVICE
-    if anywhere:
+    if part_time and part_time_eligible(job_class, gpus):
         return ANYWHERE_PARTITIONS
     if not gpus:
         return Partition.CPU_FILL if job_class is JobClass.RESUME else Partition.CPU
@@ -794,6 +802,7 @@ class EventAction(StrEnum):
     RELEASE = "release"
     FAILED = "failed"
     PUSH_BACK = "push_back"  # node_check.py requeued a job to free memory on a part-time machine
+    LAUNCH_REFUSED = "launch_refused"  # the wrapper found a part-time machine unfit for the job at launch and requeued it
 
 
 @dataclass(frozen=True)

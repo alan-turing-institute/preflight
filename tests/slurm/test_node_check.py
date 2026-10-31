@@ -39,6 +39,7 @@ class FakeSlurm:
                  requeue_fails: bool = False) -> None:
         self.jobs, self.drained, self.extra, self.calls, self.fail = jobs or [], drained, extra, [], False
         self.requeue_fails, self.comment = requeue_fails, ""
+        self.show_state, self.show_uid, self.exc = "PENDING", JOB_UID, "(null)"  # what `scontrol show job` says of any job
         self.asked, self.partitions = "cpu", {"cpu": f"{NODE},n9", "part_time": NODE}  # a queued job's partitions; each one's nodes
 
     def __call__(self, command: list[str]) -> subprocess.CompletedProcess:
@@ -52,7 +53,8 @@ class FakeSlurm:
         if command[0] == "squeue":
             return done(json.dumps({"jobs": self.jobs}))
         if command[:3] == ["scontrol", "show", "job"]:
-            return done(f"JobId={command[3]} JobState=PENDING Partition={self.asked}")
+            return done(f"JobId={command[3]} JobState={self.show_state} UserId=u({self.show_uid}) GroupId=g(1) "
+                        f"Partition={self.asked} ExcNodeList={self.exc}")
         if command[:3] == ["scontrol", "show", "partition"]:
             return done(f"PartitionName={command[3]} AllowGroups=ALL Nodes={self.partitions[command[3]]} State=UP")
         if command[:3] == ["scontrol", "show", "hostnames"]:
@@ -286,3 +288,34 @@ def test_the_owner_manifest_lists_each_regular_state_file_with_its_owner_and_onl
     (state / "owners" / "manifest.json").unlink()
     box.run(FakeSlurm())
     assert not (state / "owners" / "manifest.json").exists() and "manifest not written" in box.log.read_text()
+
+
+def test_a_launch_refusal_bars_the_node_from_the_pending_job_of_the_events_owner_only(box):
+    events = box.state_dir / "events"
+    events.mkdir(parents=True)
+
+    def marker(job: str) -> Path:  # what the job's wrapper writes (as the job's user) before it requeues
+        path = events / f"{job}-123-launch_refused.json"
+        path.write_text("{}")
+        return path
+
+    slurm = FakeSlurm()
+    slurm.show_uid = os.getuid()  # the marker's owner is the job's owner
+    first = marker("5")
+    assert "5 barred from laptop (launch check)" in box.run(slurm)
+    assert slurm.updates() == [["scontrol", "update", "JobId=5", f"ExcNodeList={NODE}"]] and not first.exists()
+    slurm.exc = "n[1,3],x"  # a job's own exclusion list is kept
+    marker("6")
+    box.run(slurm)
+    assert slurm.updates()[-1] == ["scontrol", "update", "JobId=6", f"ExcNodeList=n[1,3],x,{NODE}"]
+    before = len(slurm.updates())
+    slurm.show_uid = JOB_UID  # a marker some other user planted for this job
+    forged = marker("7")
+    assert any("not written by the job's owner" in d for d in box.run(slurm)) and not forged.exists()
+    slurm.show_uid, slurm.show_state = os.getuid(), "COMPLETING"  # the requeue has not landed yet: wait, then give up
+    waiting = marker("8")
+    box.run(slurm)
+    assert waiting.exists()
+    os.utime(waiting, (1, 1))
+    box.run(slurm)
+    assert not waiting.exists() and len(slurm.updates()) == before  # no exclusion for a job that is not waiting

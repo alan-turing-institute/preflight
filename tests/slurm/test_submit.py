@@ -9,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import gpu_jobs
+import portability
 import pytest
 import site_config
 import submit
@@ -73,18 +74,80 @@ def test_refusals(argv: list[str], why: str, tmp_path: Path, monkeypatch: pytest
         dry("--project", "p", "--what", "w", *argv)
 
 
-def test_anywhere_asks_for_the_cpu_fill_and_part_time_partitions(monkeypatch: pytest.MonkeyPatch) -> None:
-    fake_site(monkeypatch, lease=None, dgx_gate=False, part_time_nodes=(object(),))
-    script = dry("--project", "p", "--what", "w", "--class", "resume", "--resume-ok", "--anywhere", "--mem", "4G",
-                 "--", "x")
-    assert f"{DIRECTIVE} --partition=cpu_fill,part_time" in script and f"{DIRECTIVE} --requeue" in script
+def pt_node(name: str = "fedora", *, cores: int = 8, mb: int = 11444, default_jobs: bool = True) -> SimpleNamespace:
+    return SimpleNamespace(name=name, address=f"{name}.lan", cores_lent=cores, jobs_mb=mb, default_jobs=default_jobs)
+
+
+def fake_decide(monkeypatch: pytest.MonkeyPatch, *verdicts: portability.Verdict) -> list[dict]:
+    """Replace the node probe: the calls `decide` gets are returned, its answer is `verdicts` (and one requirement when
+    the paths were checked, as the real one gives)."""
+    calls: list[dict] = []
+
+    def decide(nodes, **kwargs):
+        calls.append({"nodes": [n.name for n in nodes], **kwargs})
+        return portability.Decision(verdicts, (("workdir", "/nas/w", "nas:/w"),) if kwargs["check_paths"] else ())
+
+    monkeypatch.setattr(portability, "decide", decide)
+    return calls
+
+
+JOB = ["--project", "p", "--what", "w", "--resume-ok", "--mem", "4G"]
+RESUME = [*JOB, "--class", "resume"]
+
+
+@pytest.mark.parametrize(
+    ("argv", "nodes", "partition", "checked"),
+    [
+        ([], [pt_node()], "cpu_fill,part_time", True),  # a portable resume job goes unasked
+        (["--no-anywhere"], [pt_node()], "cpu_fill", None),
+        (["--anywhere"], [pt_node()], "cpu_fill,part_time", False),  # vouched: the path checks are skipped
+        ([], [pt_node(default_jobs=False)], "cpu_fill", None),  # a node that is opt-in only is never used unasked
+        (["--anywhere"], [pt_node(default_jobs=False)], "cpu_fill,part_time", False),
+        (["--gpu"], [pt_node()], "normal", None),
+        (["--class", "restart"], [pt_node()], "cpu", None),
+    ],
+    ids=["default", "no-anywhere", "anywhere", "opt-in node", "anywhere on opt-in node", "gpu", "restart"],
+)
+def test_part_time_is_in_the_partition_list_of_an_eligible_job_only(
+    argv: list[str], nodes: list, partition: str, checked: bool | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_site(monkeypatch, lease=None, dgx_gate=False, part_time_nodes=tuple(nodes))
+    calls = fake_decide(monkeypatch, portability.Verdict("fedora", None))
+    script = dry(*JOB, *(argv if "--class" in argv else ["--class", "resume", *argv]), "--", "x")
+    assert f"{DIRECTIVE} --partition={partition}\n" in script
+    assert [c["check_paths"] for c in calls] == ([] if checked is None else [checked])
+    assert ("--require" in script) == (checked is True)  # only a checked job carries what the wrapper re-checks
     # the machine has no copy of the submitter's venv: the wrapper runs with the site's node_python, and only there
-    assert f"exec /usr/bin/python3 {submit.HERE / 'job_wrapper.py'}" in script
-    # without --anywhere: a resume job without GPUs fills idle cores (cpu_fill, GPU jobs pre-empt it), a restart job stays in cpu
-    resume = dry("--project", "p", "--what", "w", "--class", "resume", "--resume-ok", "--mem", "4G", "--", "x")
-    restart = dry("--project", "p", "--what", "w", "--class", "restart", "--mem", "4G", "--", "x")
-    assert f"{DIRECTIVE} --partition=cpu_fill\n" in resume and f"{DIRECTIVE} --partition=cpu\n" in restart
-    assert f"exec {sys.executable} " in resume
+    assert (f"exec /usr/bin/python3 {submit.HERE / 'job_wrapper.py'}" in script) == ("part_time" in partition)
+
+
+def test_a_node_that_fails_is_barred_by_name_and_every_decision_is_printed(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake_site(monkeypatch, lease=None, dgx_gate=False, part_time_nodes=(pt_node(), pt_node("lap")))
+    fake_decide(monkeypatch, portability.Verdict("fedora", None), portability.Verdict("lap", "cannot ask lap"))
+    script = dry(*RESUME, "--", "x")
+    assert f"{DIRECTIVE} --exclude=lap\n" in script and f"{DIRECTIVE} --partition=cpu_fill,part_time\n" in script
+    out = capsys.readouterr().out  # also under --dry-run
+    assert "[submit] part_time fedora: included" in out and "[submit] part_time lap: excluded: cannot ask lap" in out
+    fake_decide(monkeypatch, portability.Verdict("fedora", "x"), portability.Verdict("lap", "y"))
+    none = dry(*RESUME, "--", "x")
+    assert "part_time" not in none and "--exclude" not in none  # nothing passed: plain cpu_fill, nothing to bar
+
+
+def test_size_is_checked_even_for_a_vouched_job_and_the_refusal_does_not_teach_the_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_site(monkeypatch, lease=None, dgx_gate=False, part_time_nodes=(pt_node(),))
+    with pytest.raises(submit.Refused, match="asks 16 cores, it lends 8") as refused:
+        dry(*RESUME, "--anywhere", "--cpus", "16", "--", "x")
+    assert "--anywhere" not in str(refused.value)
+    assert "part_time" not in dry(*RESUME, "--cpus", "16", "--", "x")  # unasked, an oversized job just stays on the main node
+
+
+def test_a_job_for_another_site_makes_no_local_part_time_decision(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_site(monkeypatch, lease=None, dgx_gate=False, part_time_nodes=(pt_node(),))
+    calls = fake_decide(monkeypatch, portability.Verdict("fedora", None))
+    monkeypatch.setattr(submit.remote, "submit", lambda *_a: "remote")
+    assert submit.submit([*RESUME, "--site", "turing", "--no-anywhere", "--", "x"]) == "remote" and calls == []
 
 
 def test_an_unknown_class_is_refused_by_the_parser() -> None:
@@ -313,7 +376,7 @@ def test_comment_is_the_what_on_one_line_cut_to_200(tmp_path: Path, monkeypatch:
     assert len(submit.comment("y" * 300)) == submit.COMMENT_MAX
 
 
-def submit_for_real(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *extra: str) -> dict[str, object]:
+def submit_for_real(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *extra: str, job: list[str] | None = None) -> dict[str, object]:
     """Run a full submission against fakes; return the sidecar record and whether the gate and keeper ran."""
     monkeypatch.setattr(gpu_jobs, "STATE_DIR", tmp_path)
     seen = {"keeper": False, "gate": False}
@@ -325,8 +388,8 @@ def submit_for_real(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *extra: str
         submit.subprocess, "run",
         lambda *_a, **_k: SimpleNamespace(returncode=0, stdout="77\n", stderr=""),
     )
-    submit.submit(["--project", "p", "--what", "w", "--class", "restart", "--mem", "1G", "--gpus", "2",
-                   "--entry", "a.py", "--repo", str(tmp_path), *extra, "--", "x"])
+    submit.submit(job or ["--project", "p", "--what", "w", "--class", "restart", "--mem", "1G", "--gpus", "2",
+                          "--entry", "a.py", "--repo", str(tmp_path), *extra, "--", "x"])
     return {**(gpu_jobs.read_sidecar("77") or {}), **seen}
 
 
@@ -336,6 +399,13 @@ def test_a_record_that_cannot_be_written_after_sbatch_is_a_warning_naming_the_jo
     (tmp_path / "jobs" / "77.json").mkdir(parents=True)  # stands in for another user's file in the sticky directory
     submit_for_real(monkeypatch, tmp_path)
     assert "job 77 is queued but its record was not written" in capsys.readouterr().err
+
+
+def test_the_part_time_decision_is_in_the_job_record(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_site(monkeypatch, lease=None, dgx_gate=False, part_time_nodes=(pt_node(), pt_node("lap")))
+    fake_decide(monkeypatch, portability.Verdict("fedora", None), portability.Verdict("lap", "cannot ask lap"))
+    record = submit_for_real(monkeypatch, tmp_path, job=[*RESUME, "--", "x"])
+    assert record["part_time"] == {"fedora": "included", "lap": "cannot ask lap"}
 
 
 @pytest.mark.parametrize(

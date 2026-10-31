@@ -5,12 +5,19 @@ Design 3.3 (`design notes`).
 
     slurm/submit.py --project P --what 'one line' --class resume|restart [--mem 24G|auto] [--gpu|--gpus N] \
         [--entry script.py --repo DIR] [--after JOBID]... [--cpus N] [--name NAME] [--log FILE] \
-        [--workdir DIR] [--wait-limit 1h] [--resume-ok] [--level low|normal|high] [--service] [--anywhere] -- <command...>
+        [--workdir DIR] [--wait-limit 1h] [--resume-ok] [--level low|normal|high] [--service] [--anywhere|--no-anywhere] -- <command...>
 
-ANYWHERE: `--anywhere` lets a CPU-only `resume` job start on a part-time machine (someone's own, lent to the cluster
-while idle) as well as on the main node: it is submitted to `cpu,part_time`. Only with `--class resume` and no GPUs,
-because the health check requeues such a job whenever the machine's owner needs the memory back, and the job then
-continues from its checkpoint elsewhere. Refused on a site with no part-time node.
+PART-TIME MACHINES (D25): a CPU-only `resume` job (no GPUs, not `--service`) is submitted to `cpu_fill,part_time`, so it
+may start on a part-time machine (someone's own, lent to the cluster while idle) as well as on the main node, when a
+part-time node passes the checks below. Only `resume`, because the health check requeues such a job whenever the
+machine's owner needs the memory back, and the job then continues from its checkpoint elsewhere. Per node, in order:
+size (the cores and memory it lends), ssh reachability, then the named paths (`portability.py`): the working folder on
+storage both machines see, the program built for the node's architecture, every other named path shared or a system
+file. A node that fails is left out with `--exclude`, and each decision is printed (`[submit] part_time NODE: included`
+or `excluded: why`, with `--dry-run` too) and kept in the job's record. At launch the wrapper checks the same things
+again on the node and requeues the job elsewhere if they no longer hold. `--no-anywhere` keeps the job off them.
+`--anywhere` is the submitter's word that the job is fit for them: the path checks are skipped (the size check
+is not), and it is refused if no part-time node can take the job. A node with `default_jobs = false` takes only such jobs.
 
 SERVICE (D20, sites with `[service]`): `--service` runs a background service's CPU stand-in in the `service` partition
 (`--mem` required). When cores are short the agent suspends CPU-only jobs for it within seconds (they keep their memory,
@@ -64,6 +71,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import audit  # noqa: E402 - path set just above
 import gpu_jobs  # noqa: E402
+import portability
 import remote
 import site_config
 
@@ -217,15 +225,16 @@ def sbatch_script(
     extra: tuple[str, ...] = (),
     needs_lease: bool | None = None,
     node_python: str | None = None,
+    requirements: tuple[tuple[str, str, str], ...] = (),
 ) -> str:
     """The job script: directives, then one line running the wrapper. `urgent.py` passes its own partition and no
     level (its partition goes first whatever the level). A job that may land in `part_time` runs the wrapper with
-    `node_python` (the site's interpreter there), never the submitter's own, whose venv path that machine lacks."""
+    `node_python` (the site's interpreter there), never the submitter's own, whose venv path that machine lacks; it is also handed `requirements` (what
+    `portability.decide` checked) to check again when it starts there."""
     label = arguments.job_class
     level = getattr(arguments, "level", None) or gpu_jobs.Level.NORMAL
     partition = partition or gpu_jobs.partition_for(
-        gpu_jobs.JobClass(label), arguments.gpus, service=getattr(arguments, "service", False),
-        anywhere=getattr(arguments, "anywhere", False),
+        gpu_jobs.JobClass(label), arguments.gpus, service=getattr(arguments, "service", False)
     )
     lines = [
         "#!/bin/bash",
@@ -256,10 +265,41 @@ def sbatch_script(
         wrapper.append("--needs-card")
     if arguments.max_jobs != 1:
         wrapper += ["--max-jobs", str(arguments.max_jobs)]
+    if on_part_time and requirements:
+        wrapper += ["--require", json.dumps(requirements)]
     if manifest:
         wrapper += ["--manifest", str(manifest), "--repo", str(arguments.repo)]
     lines.append(f"exec {shlex.join([*wrapper, '--', *arguments.command])}")
     return "\n".join(lines) + "\n"
+
+
+def place_on_part_time(arguments: argparse.Namespace, site: site_config.Site, mem: str | None) -> portability.Decision | None:
+    """The part-time nodes this job may use and why not the others (printed, one line each); None when the job is not
+    offered to any (not an eligible job, or the site has no node that takes unasked jobs, or `--mem` is not slurm's
+    notation, which sbatch reports). `--anywhere` is a vouching: size is still checked, the paths are not."""
+    if not gpu_jobs.part_time_eligible(gpu_jobs.JobClass(arguments.job_class), arguments.gpus, service=arguments.service,
+                                       no_anywhere=arguments.no_anywhere):
+        return None
+    nodes = [n for n in site.part_time_nodes if arguments.anywhere or n.default_jobs]
+    try:
+        memory_mb = None if mem is None else gpu_jobs.mem_mb(mem)
+    except (ValueError, IndexError):
+        return None
+    if not nodes:
+        return None
+    decision = portability.decide(
+        nodes, cpus=arguments.cpus, memory_mb=memory_mb, check_paths=not arguments.anywhere, python=site.node_python,
+        needs=[*portability.named_paths(arguments.command, arguments.workdir, arguments.repo),
+               portability.Need(portability.Role.TOOLS, str(HERE.resolve()))],  # the script runs the wrapper from here
+    )
+    print("\n".join(v.line() for v in decision.verdicts))
+    if arguments.anywhere:
+        print("[submit] part_time: the submitter vouches for this job, so the path checks were skipped (size was checked)")
+        if not decision.included:
+            why = "; ".join(f"{v.node}: {v.reason}" for v in decision.verdicts)
+            msg = f"no part-time machine can take this job ({why}); ask for what the machine lends, or leave the request out"
+            raise Refused(msg)
+    return decision
 
 
 def resolve_cpus(asked: int | None, gpus: int, site: site_config.Site) -> int:
@@ -316,8 +356,11 @@ def parser() -> argparse.ArgumentParser:
     consent.add_argument("--suspend", default=None, metavar="J[,J]",
                          help="with --service: the only jobs it may suspend (their owner's consent, D9)")
     consent.add_argument("--no-suspend", action="store_true", help="with --service: suspend nothing; wait instead")
-    p.add_argument("--anywhere", action="store_true",
-                   help="a CPU-only resume job may also start on a part-time machine (cpu,part_time)")
+    anywhere = p.add_mutually_exclusive_group()
+    anywhere.add_argument("--anywhere", action="store_true",
+                          help="vouch that this CPU-only resume job may run on a part-time machine: skips the path checks")
+    anywhere.add_argument("--no-anywhere", action="store_true",
+                          help="keep this job off the part-time machines, which a portable CPU-only resume job otherwise uses")
     p.add_argument("--site", default=None, metavar="NAME",
                    help="send the job to another site's slurm ([remote.NAME] in the site file): syncs --entry's import "
                         "closure and --data by checksum, then submits there with that site's own submit.py")
@@ -373,7 +416,7 @@ def submit(argv: list[str]) -> str:
     named_cpus = arguments.cpus
     arguments.cpus = resolve_cpus(arguments.cpus, arguments.gpus, site)
     if arguments.anywhere:
-        if arguments.job_class != gpu_jobs.JobClass.RESUME or arguments.gpus or arguments.service:
+        if not gpu_jobs.part_time_eligible(gpu_jobs.JobClass(arguments.job_class), arguments.gpus, service=arguments.service):
             msg = ("--anywhere needs --class resume with no GPUs and no --service: the owner of a part-time machine "
                    "can take it back at any moment, which requeues the job, and only a job that continues from its "
                    "checkpoint loses nothing")
@@ -412,7 +455,16 @@ def submit(argv: list[str]) -> str:
     gated = bool(arguments.entry) and site.dgx_gate
     manifest = gpu_jobs.STATE_DIR / "manifests" / f"{arguments.name}-{stamp}.json" if gated else None
     consent = may_suspend(arguments) if arguments.service else None
-    script = sbatch_script(arguments, mem=mem, log=log, manifest=manifest, node_python=site.node_python)
+    placed = place_on_part_time(arguments, site, mem)
+    included = bool(placed and placed.included)
+    partition = gpu_jobs.partition_for(
+        gpu_jobs.JobClass(arguments.job_class), arguments.gpus, service=arguments.service, part_time=included
+    )
+    barred = (f"--exclude={','.join(placed.excluded)}",) if included and placed.excluded else ()
+    script = sbatch_script(
+        arguments, mem=mem, log=log, manifest=manifest, node_python=site.node_python, partition=partition, extra=barred,
+        requirements=placed.requirements if included else (),
+    )
     warn_device(arguments)
     if arguments.dry_run:
         if arguments.service:
@@ -456,9 +508,7 @@ def submit(argv: list[str]) -> str:
         max_jobs=arguments.max_jobs,
         submitted_at=int(time.time()),
         **({"may_suspend": None if consent is None else sorted(consent)} if arguments.service else {}),
-    )
-    partition = gpu_jobs.partition_for(
-        gpu_jobs.JobClass(arguments.job_class), arguments.gpus, service=arguments.service, anywhere=arguments.anywhere
+        **({"part_time": {v.node: v.reason or "included" for v in placed.verdicts}} if placed else {}),
     )
     pauses = {
         gpu_jobs.ANYWHERE_PARTITIONS: "requeued for urgent work or when a part-time machine's owner needs it back; "
