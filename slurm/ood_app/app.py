@@ -281,6 +281,7 @@ def job_rows(backend: Backend) -> list[dict[str, object]]:
                 "mem_mb": jobs_view.requested_mem_mb(job, record),
                 "mem_used": live.get("cpu"),
                 "mem_peak": live.get("mem_peak"),
+                "mem_avg": live.get("mem_avg"),
                 "cores_peak": live["cores_peak_milli"] / 1000 if "cores_peak_milli" in live else None,
                 "cores_now": live["cores_now_milli"] / 1000 if "cores_now_milli" in live else None,
                 "cores_used": live["cpu_ms"] / 1000 / max(_seconds(elapsed.get(job.job_id, "")) or 0, 1) if "cpu_ms" in live else None,
@@ -469,7 +470,7 @@ def _live_memory(job_id: str) -> dict[str, int]:
     seconds = re.search(r"^gpujobs_job_cpu_seconds_total\{[^}]*\} ([0-9.]+)$", text, re.MULTILINE)
     if seconds:
         found["cpu_ms"] = round(float(seconds[1]) * 1000)
-    for key, name in (("mem_peak", "cpu_memory_peak_bytes"), ("cores_peak_milli", "cpu_cores_peak")):
+    for key, name in (("mem_peak", "cpu_memory_peak_bytes"), ("mem_avg", "cpu_memory_avg_bytes"), ("cores_peak_milli", "cpu_cores_peak")):
         hit = re.search(rf"^gpujobs_job_{name}\{{[^}}]*\}} ([0-9.]+)$", text, re.MULTILINE)
         if hit:
             found[key] = round(float(hit[1]) * (1000 if key == "cores_peak_milli" else 1))
@@ -684,21 +685,18 @@ def _lines(*pairs: tuple[str, str]) -> str:
 
 
 def _queue_memory(r: dict[str, object]) -> str:
-    """What a job asked for; a running one also what it holds now."""
+    """Memory in the order every cell uses: now, avg, peak, asked. A waiting job has only what it asked for."""
     asked = _asked_memory(r["mem_mb"])  # type: ignore[arg-type]
-    used = r.get("mem_used")
-    peak = r.get("mem_peak")
-    return _lines(("now", _size(used)), ("peak", _size(peak) if isinstance(peak, int) else ""), ("asked", asked)) if isinstance(used, int) else esc(asked)
+    used, mean, peak = r.get("mem_used"), r.get("mem_avg"), r.get("mem_peak")
+    figure = lambda v: _size(v) if isinstance(v, int) else ""  # noqa: E731
+    return _lines(("now", figure(used)), ("avg", figure(mean)), ("peak", figure(peak)), ("asked", asked))
 
 
 def _queue_cores(r: dict[str, object]) -> str:
-    """Cores a job was given; a running one also the rate now and the average since it started."""
-    used, now = r.get("cores_used"), r.get("cores_now")
-    if not isinstance(used, float):
-        return esc(r["cpus"])
-    peak = r.get("cores_peak")
-    return _lines(("now", f"{now:.1f}" if isinstance(now, float) else ""), ("avg", f"{used:.1f}"),
-                  ("peak", f"{peak:.1f}" if isinstance(peak, float) else ""), ("given", str(r["cpus"])))
+    """Cores in the same order: now, avg, peak, asked. A waiting job has only what it asked for."""
+    used, now, peak = r.get("cores_used"), r.get("cores_now"), r.get("cores_peak")
+    figure = lambda v: f"{v:.1f}" if isinstance(v, float) else ""  # noqa: E731
+    return _lines(("now", figure(now)), ("avg", figure(used)), ("peak", figure(peak)), ("asked", str(r["cpus"])))
 
 
 def _cores_used(r: jobs_view.HistoryRow) -> str:
@@ -707,7 +705,7 @@ def _cores_used(r: jobs_view.HistoryRow) -> str:
         return "—"
     if r.cpu_s is None or not r.elapsed_s:
         return esc(r.cpus)
-    return _lines(("avg", f"{r.cpu_s / r.elapsed_s:.1f}"), ("given", str(r.cpus)))
+    return _lines(("avg", f"{r.cpu_s / r.elapsed_s:.1f}"), ("asked", str(r.cpus)))
 
 
 def _queue_table(rows: list[dict[str, object]], root: str, now: datetime) -> str:
@@ -747,7 +745,7 @@ def _queue_table(rows: list[dict[str, object]], root: str, now: datetime) -> str
 
 def _finished_memory(r: jobs_view.HistoryRow) -> str:
     """Peak and average memory a finished job held, and what it asked for, each on its own line."""
-    return _lines(("peak", _size(r.max_rss_bytes)), ("avg", _size(r.avg_rss_bytes) if r.avg_rss_bytes else ""),
+    return _lines(("avg", _size(r.avg_rss_bytes) if r.avg_rss_bytes else ""), ("peak", _size(r.max_rss_bytes)),
                   ("asked", _size(r.req_mem_bytes) if r.req_mem_bytes else ""))
 
 

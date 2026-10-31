@@ -122,7 +122,7 @@ def test_every_get_route_answers(path: str) -> None:
         assert "118.1 of 128.8 GB" in body and "10.7 GB available" in body
         assert "GiB" not in body and "MiB" not in body and "memory in use" not in body.split('class="card box"')[0]
         assert body.count("used warn") == 1 and "fill warn" not in body  # only real memory in use warns; a full reservation or a busy GPU does not
-        assert "64.4 GB</td>" in body  # slurm's request now (60 x 2^30 bytes), not the record's 4G
+        assert "asked</span> 64.4 GB</div></td>" in body  # slurm's request now (60 x 2^30 bytes), not the record's 4G
         # where a running job is, as a small line inside the state cell; a pushed-back job's timeline says why it moved
         assert '<div class="why">on gpu-node-1</div>' in body
         assert "Pushed back: 7.3 GB free on laptop" in call(fake, "/job/7")[1]
@@ -300,26 +300,22 @@ def test_buttons_follow_can_act(viewer: str, admin: bool, shown: bool) -> None:
     assert f'href="{MOUNT}/static/app.css?v={app._assets_version()}"' in page
 
 
-def test_the_tables_show_each_measure_on_its_own_line() -> None:
+def test_the_tables_show_each_measure_on_its_own_line_in_one_order() -> None:
     from datetime import datetime
 
     line = lambda label, value: f'<div><span class="muted">{label}</span> {value}</div>'  # noqa: E731
-    assert app._queue_memory({"mem_mb": 38000, "mem_used": 38_650_802_176}) == line("now", "38.7 GB") + line("asked", "39.8 GB")
-    assert "<div" not in app._queue_memory({"mem_mb": 38000, "mem_used": None})  # waiting: only what it asked for
+    run = {"mem_mb": 38000, "mem_used": 3 * 1024**3, "mem_avg": 2 * 1024**3, "mem_peak": 4 * 1024**3,
+           "cpus": 12, "cores_now": 7.26, "cores_used": 1.44, "cores_peak": 9.04}
+    assert app._queue_memory(run) == line("now", app._size(3 * 1024**3)) + line("avg", app._size(2 * 1024**3)) + line("peak", app._size(4 * 1024**3)) + line("asked", app._queue_memory({"mem_mb": 38000}).split("</span> ")[1][:-6])
+    assert app._queue_cores(run) == line("now", "7.3") + line("avg", "1.4") + line("peak", "9.0") + line("asked", "12")  # same order as memory
+    assert app._queue_cores({"cpus": 4}) == line("asked", "4")  # waiting: only what it asked for, labelled the same way
     row = jobs_view.HistoryRow("5", "p:normal:x", "p", "ann", "normal", "COMPLETED", "0:0", datetime(2026, 1, 1), datetime(2026, 1, 1),
                                datetime(2026, 1, 1), 100, 0, 4 * 1024**3, 2 * 1024**3, avg_rss_bytes=1024**3, cpus=4, cpu_s=150.0)
-    assert app._cores_used(row) == line("avg", "1.5") + line("given", "4")
-    assert app._finished_memory(row) == line("peak", app._size(2 * 1024**3)) + line("avg", app._size(1024**3)) + line("asked", app._size(4 * 1024**3))
+    assert app._cores_used(row) == line("avg", "1.5") + line("asked", "4")
+    assert app._finished_memory(row) == line("avg", app._size(1024**3)) + line("peak", app._size(2 * 1024**3)) + line("asked", app._size(4 * 1024**3))
 
 
-def test_a_running_jobs_cores_are_its_cpu_seconds_over_the_time_it_has_run(tmp_path: Path) -> None:
-    line = lambda label, value: f'<div><span class="muted">{label}</span> {value}</div>'  # noqa: E731
-    assert app._queue_cores({"cpus": 12, "cores_used": 1.44}) == line("avg", "1.4") + line("given", "12")
-    assert app._queue_cores({"cpus": 12, "cores_used": 1.44, "cores_now": 7.26}) == line("now", "7.3") + line("avg", "1.4") + line("given", "12")
-    assert app._queue_cores({"cpus": 12, "cores_used": 1.44, "cores_now": 7.26, "cores_peak": 9.04}) == (
-        line("now", "7.3") + line("avg", "1.4") + line("peak", "9.0") + line("given", "12"))
-    assert line("peak", "38.7 GB") in app._queue_memory({"mem_mb": 38000, "mem_used": 1, "mem_peak": 38_650_802_176})
-    assert app._queue_cores({"cpus": 12, "cores_used": None}) == "12"  # waiting, or not sampled yet
+def test_a_running_jobs_cpu_seconds_are_read_from_the_agents_metrics_file(tmp_path: Path) -> None:
     (tmp_path / "metrics").mkdir()
     (tmp_path / "metrics" / "job_7.prom").write_text('gpujobs_job_cpu_seconds_total{jobid="7"} 90.500\n', encoding="utf-8")
     old = gpu_jobs.STATE_DIR

@@ -387,7 +387,7 @@ def _cpu_seconds(cgroup: Path) -> float | None:
 
 def metrics_text(
     job: gpu_jobs.QueuedJob, gpu_mib: float, mem_bytes: int, cpu_seconds: float | None = None, cores_now: float | None = None,
-    mem_peak_bytes: int | None = None, cores_peak: float | None = None,
+    mem_peak_bytes: int | None = None, cores_peak: float | None = None, mem_avg_bytes: int | None = None,
 ) -> str:
     """The job's gauges (and its CPU seconds so far, when the cgroup says) in Prometheus text format; project is the first `:` field of the job name."""
     project = job.name.split(":", 1)[0] if ":" in job.name else "(other)"
@@ -401,6 +401,12 @@ def metrics_text(
             "# TYPE gpujobs_job_cpu_seconds_total counter\n"
             f"gpujobs_job_cpu_seconds_total{{{labels}}} {cpu_seconds:.3f}\n"
             if cpu_seconds is not None
+            else ""
+        )
+        + (
+            "# TYPE gpujobs_job_cpu_memory_avg_bytes gauge\n"
+            f"gpujobs_job_cpu_memory_avg_bytes{{{labels}}} {mem_avg_bytes}\n"
+            if mem_avg_bytes
             else ""
         )
         + (
@@ -535,6 +541,7 @@ class Agent:
         self.gpu_usage, self.cgroup_root = gpu_usage, cgroup_root
         self.dir = state_dir / "agent"
         self.metrics = state_dir / "metrics"
+        self._mem_samples: dict[str, tuple[int, int]] = {}  # job -> (sum of memory samples, how many) since the agent saw it
         self._cores_peak: dict[str, float] = {}  # job -> highest "cores now" this agent has seen for it
         self._cpu_prev: dict[str, tuple[float, float]] = {}  # job -> (wall time, cpu seconds) at the last sample
         self.requests = state_dir / "requests"
@@ -1230,8 +1237,11 @@ class Agent:
                 self._cpu_prev[job.job_id] = (now, cpu_s)
             if cores_now is not None:
                 self._cores_peak[job.job_id] = max(cores_now, self._cores_peak.get(job.job_id, 0.0))
+            total, count = self._mem_samples.get(job.job_id, (0, 0))
+            self._mem_samples[job.job_id] = (total + mem, count + 1)
             texts[f"job_{job.job_id}.prom"] = metrics_text(
-                job, gpu_mib, mem, cpu_s, cores_now, gpu_jobs.read_int(cgroup / "memory.peak"), self._cores_peak.get(job.job_id)
+                job, gpu_mib, mem, cpu_s, cores_now, gpu_jobs.read_int(cgroup / "memory.peak"), self._cores_peak.get(job.job_id),
+                (total + mem) // (count + 1),
             )
         try:
             self.metrics.mkdir(exist_ok=True)
