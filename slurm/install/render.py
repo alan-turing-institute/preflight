@@ -91,10 +91,11 @@ def _health_lines(site: Site) -> str:
             "# Every node runs the health check as root each interval; it closes and reopens the node itself.\n"
             f"HealthCheckProgram={site.install_dir}/slurm/node_check.py\n"
             f"HealthCheckInterval={site.health_check.interval_s}\n"
-            # slurm's default timeout (60 s) must stay below the interval or slurmd logs an error at every start
-            f"HealthCheckTimeout={min(60, site.health_check.interval_s - 5)}\n"
-            "HealthCheckNodeState=ANY\n"
         )
+        if site.slurm_build:  # the distribution's 23.11 does not know the key and refuses to read the file with it
+            # slurm's default timeout (60 s) must stay below the interval or slurmd logs an error at every start
+            lines += f"HealthCheckTimeout={min(60, site.health_check.interval_s - 5)}\n"
+        lines += "HealthCheckNodeState=ANY\n"
     if site.part_time_nodes:
         lines += "# Part-time nodes fetch their settings from slurmctld (slurmd --conf-server).\nSlurmctldParameters=enable_configless\n"
     return lines

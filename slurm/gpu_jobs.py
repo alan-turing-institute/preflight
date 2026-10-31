@@ -1012,10 +1012,14 @@ def capacity(runner: Callable[..., subprocess.CompletedProcess[str]] = subproces
     return {**total, "nodes": len(found)}
 
 
+#: Positions in /proc/stat's first line after the "cpu" label: user nice system idle iowait ...
+_STAT_IDLE, _STAT_IOWAIT = 3, 4
+
+
 def _cpu_ticks(stat_text: str) -> tuple[int, int]:
     """(busy, total) jiffies over all cores, from /proc/stat's first line (idle and iowait are not busy)."""
     values = [int(v) for v in stat_text.splitlines()[0].split()[1:]]
-    idle = values[3] + (values[4] if len(values) > 4 else 0)
+    idle = values[_STAT_IDLE] + (values[_STAT_IOWAIT] if len(values) > _STAT_IOWAIT else 0)
     return sum(values) - idle, sum(values)
 
 

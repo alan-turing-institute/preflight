@@ -1127,7 +1127,7 @@ FAKE_SLURM = "\n[slurm]\nversion = '26.05.5'\nsha256 = '" + "ab" * 32 + "'\n"  #
 COPY_WAIT_S = 90  # the agent copies pt1's state every 60 s (agent.COPY_EVERY_S)
 CHECK_REASON = "gpujobs-check: "  # slurm/node_check.py REASON_PREFIX; node_check imports gpu_jobs, which needs a site file
 ADMIN_REASON = "gpujobs-admin: "  # slurm/agent.py ADMIN_REASON_PREFIX
-CHECK_EVERY_S = 5  # harness.site.toml [health_check] interval_s
+CHECK_EVERY_S = 10  # harness.site.toml [health_check] interval_s
 QUIET_S = 5 * CHECK_EVERY_S  # long enough for four or five health checks to have had their say
 CLOSE_GB, PUSH_GB = 6, 2  # a part-time node's default thresholds (site_config): close below, push back below
 MB_PER_GB = 1000  # decimal, as node_check shows them

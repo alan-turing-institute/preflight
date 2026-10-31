@@ -65,7 +65,7 @@ mains_only = false                # the container has no battery either way; exp
 
 # Every node runs node_check.py each interval_s; short, so the scenarios run in seconds, not minutes.
 [health_check]
-interval_s = 5
+interval_s = 10
 
 # No [lease]: nothing else shares the container's fake GPUs.
 

@@ -173,12 +173,13 @@ def test_part_time_node_and_health_check():
     assert [ln for ln in added if not ln.startswith("#")] == [
         "HealthCheckProgram=/opt/gpujobs/slurm/node_check.py",
         "HealthCheckInterval=45",
-        "HealthCheckTimeout=40",  # below the interval, or slurmd logs an error
-        "HealthCheckNodeState=ANY",
+        "HealthCheckNodeState=ANY",  # no timeout line: the distribution's slurm 23.11 refuses a file that has one
         "SlurmctldParameters=enable_configless",
         "Include part_time_nodes.conf",
         "PartitionName=part_time Nodes=lap PriorityTier=1 PreemptMode=OFF MaxTime=INFINITE State=UP",
     ]
+    pinned = site_config.parse({**raw, "health_check": {"interval_s": 45}, "slurm": {"version": "26.05.5", "sha256": "0" * 64}})
+    assert "HealthCheckTimeout=40" in render.render(pinned, "slurm")["/etc/slurm/slurm.conf"].content  # below the interval
     # the part-time node's line is in its own file, owned by SlurmUser so the agent can rewrite it; slurm.conf has no copy
     part_time = render.render(site, "slurm")[render.PART_TIME_CONF_PATH]
     assert (part_time.mode, part_time.owner) == (0o644, "slurm")
