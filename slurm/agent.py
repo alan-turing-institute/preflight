@@ -385,7 +385,9 @@ def _cpu_seconds(cgroup: Path) -> float | None:
     return None
 
 
-def metrics_text(job: gpu_jobs.QueuedJob, gpu_mib: float, mem_bytes: int, cpu_seconds: float | None = None) -> str:
+def metrics_text(
+    job: gpu_jobs.QueuedJob, gpu_mib: float, mem_bytes: int, cpu_seconds: float | None = None, cores_now: float | None = None
+) -> str:
     """The job's gauges (and its CPU seconds so far, when the cgroup says) in Prometheus text format; project is the first `:` field of the job name."""
     project = job.name.split(":", 1)[0] if ":" in job.name else "(other)"
     labels = f'jobid="{_label(job.job_id)}",user="{_label(job.user)}",project="{_label(project)}"'
@@ -398,6 +400,12 @@ def metrics_text(job: gpu_jobs.QueuedJob, gpu_mib: float, mem_bytes: int, cpu_se
             "# TYPE gpujobs_job_cpu_seconds_total counter\n"
             f"gpujobs_job_cpu_seconds_total{{{labels}}} {cpu_seconds:.3f}\n"
             if cpu_seconds is not None
+            else ""
+        )
+        + (
+            "# TYPE gpujobs_job_cpu_cores gauge\n"
+            f"gpujobs_job_cpu_cores{{{labels}}} {cores_now:.3f}\n"
+            if cores_now is not None
             else ""
         )
     )
@@ -514,6 +522,7 @@ class Agent:
         self.gpu_usage, self.cgroup_root = gpu_usage, cgroup_root
         self.dir = state_dir / "agent"
         self.metrics = state_dir / "metrics"
+        self._cpu_prev: dict[str, tuple[float, float]] = {}  # job -> (wall time, cpu seconds) at the last sample
         self.requests = state_dir / "requests"
         self.read_queue, self.scontrol, self.ctld_active_s = (
             read_queue,
@@ -1200,7 +1209,12 @@ class Agent:
             pids = gpu_jobs.job_pids(cgroup, set(), job.job_id, set(usage))
             mem = gpu_jobs.read_int(cgroup / "memory.current") or 0
             gpu_mib = sum(mib for pid, mib in usage.items() if pid in pids)
-            texts[f"job_{job.job_id}.prom"] = metrics_text(job, gpu_mib, mem, _cpu_seconds(cgroup))
+            cpu_s, now = _cpu_seconds(cgroup), time.time()
+            before = self._cpu_prev.get(job.job_id)
+            cores_now = (cpu_s - before[1]) / (now - before[0]) if cpu_s is not None and before and now > before[0] else None
+            if cpu_s is not None:
+                self._cpu_prev[job.job_id] = (now, cpu_s)
+            texts[f"job_{job.job_id}.prom"] = metrics_text(job, gpu_mib, mem, cpu_s, cores_now)
         try:
             self.metrics.mkdir(exist_ok=True)
             for name, text in texts.items():

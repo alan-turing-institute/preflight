@@ -280,6 +280,7 @@ def job_rows(backend: Backend) -> list[dict[str, object]]:
                 "cpus": job.cpus,
                 "mem_mb": jobs_view.requested_mem_mb(job, record),
                 "mem_used": live.get("cpu"),
+                "cores_now": live["cores_now_milli"] / 1000 if "cores_now_milli" in live else None,
                 "cores_used": live["cpu_ms"] / 1000 / max(_seconds(elapsed.get(job.job_id, "")) or 0, 1) if "cpu_ms" in live else None,
                 "node": job.node,
             }
@@ -466,6 +467,9 @@ def _live_memory(job_id: str) -> dict[str, int]:
     seconds = re.search(r"^gpujobs_job_cpu_seconds_total\{[^}]*\} ([0-9.]+)$", text, re.MULTILINE)
     if seconds:
         found["cpu_ms"] = round(float(seconds[1]) * 1000)
+    now = re.search(r"^gpujobs_job_cpu_cores\{[^}]*\} ([0-9.]+)$", text, re.MULTILINE)
+    if now:
+        found["cores_now_milli"] = round(float(now[1]) * 1000)
     return found
 
 
@@ -677,8 +681,10 @@ def _queue_memory(r: dict[str, object]) -> str:
 
 def _queue_cores(r: dict[str, object]) -> str:
     """Cores a job was given, and for a running one the average it has used since it started ("1.4 of 12")."""
-    used = r.get("cores_used")
-    return f"{used:.1f} of {r['cpus']}" if isinstance(used, float) else str(r["cpus"])
+    used, now = r.get("cores_used"), r.get("cores_now")
+    if not isinstance(used, float):
+        return str(r["cpus"])
+    return f"{now:.1f} now, {used:.1f} average, of {r['cpus']}" if isinstance(now, float) else f"{used:.1f} average, of {r['cpus']}"
 
 
 def _cores_used(r: jobs_view.HistoryRow) -> str:
@@ -720,7 +726,7 @@ def _queue_table(rows: list[dict[str, object]], root: str, now: datetime) -> str
         head.format(counts)
         + '<div class="table-wrap"><table class="stack"><thead><tr><th scope="col" class="num">#</th><th scope="col">Job</th><th scope="col">Project</th>'
         '<th scope="col">State</th><th scope="col">Level</th><th scope="col">Running for</th><th scope="col">Queued at</th><th scope="col" class="hide-sm">Class</th>'
-        '<th scope="col" class="hide-sm">GPUs</th><th scope="col" class="hide-sm">Memory (used of asked)</th><th scope="col" class="hide-sm">Cores (used of given)</th><th scope="col">User</th></tr></thead>'
+        '<th scope="col" class="hide-sm">GPUs</th><th scope="col" class="hide-sm">Memory (used of asked)</th><th scope="col" class="hide-sm">Cores (now, average, of given)</th><th scope="col">User</th></tr></thead>'
         f"<tbody>{''.join(body)}</tbody></table></div>"
     )
 

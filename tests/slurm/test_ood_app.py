@@ -312,7 +312,8 @@ def test_the_tables_show_memory_used_of_asked_and_cores_used_of_given() -> None:
 
 
 def test_a_running_jobs_cores_are_its_cpu_seconds_over_the_time_it_has_run(tmp_path: Path) -> None:
-    assert app._queue_cores({"cpus": 12, "cores_used": 1.44}) == "1.4 of 12"
+    assert app._queue_cores({"cpus": 12, "cores_used": 1.44}) == "1.4 average, of 12"
+    assert app._queue_cores({"cpus": 12, "cores_used": 1.44, "cores_now": 7.26}) == "7.3 now, 1.4 average, of 12"
     assert app._queue_cores({"cpus": 12, "cores_used": None}) == "12"  # waiting, or not sampled yet
     (tmp_path / "metrics").mkdir()
     (tmp_path / "metrics" / "job_7.prom").write_text('gpujobs_job_cpu_seconds_total{jobid="7"} 90.500\n', encoding="utf-8")
