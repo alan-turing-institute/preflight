@@ -681,17 +681,16 @@ def _queue_memory(r: dict[str, object]) -> str:
     """What a job asked for; for a running one what it holds now, with what it asked for under it."""
     asked = _asked_memory(r["mem_mb"])  # type: ignore[arg-type]
     used = r.get("mem_used")
-    return _two_lines(_size(used), f"of {asked} asked") if isinstance(used, int) else esc(asked)
+    return _two_lines(f"{_size(used)} now", f"of {asked} asked") if isinstance(used, int) else esc(asked)
 
 
 def _queue_cores(r: dict[str, object]) -> str:
-    """Cores a job was given; for a running one the rate now and the average since it started, under the given count."""
+    """Cores a job was given; for a running one the rate now and the average since it started, over the given count."""
     used, now = r.get("cores_used"), r.get("cores_now")
     if not isinstance(used, float):
         return esc(r["cpus"])
-    lead = f"{now:.1f} now" if isinstance(now, float) else f"{used:.1f} avg"
-    detail = f"{used:.1f} avg, of {r['cpus']}" if isinstance(now, float) else f"of {r['cpus']} given"
-    return _two_lines(lead, detail)
+    lead = f"{now:.1f} now · {used:.1f} avg" if isinstance(now, float) else f"{used:.1f} avg"
+    return _two_lines(lead, f"of {r['cpus']} given")
 
 
 def _cores_used(r: jobs_view.HistoryRow) -> str:
@@ -739,11 +738,9 @@ def _queue_table(rows: list[dict[str, object]], root: str, now: datetime) -> str
 
 
 def _finished_memory(r: jobs_view.HistoryRow) -> str:
-    """Peak memory it held; under it the average over the run and what it asked for."""
-    parts = [f"avg {_size(r.avg_rss_bytes)}"] if r.avg_rss_bytes else []
-    if r.req_mem_bytes:
-        parts.append(f"of {_size(r.req_mem_bytes)} asked")
-    return _two_lines(f"{_size(r.max_rss_bytes)} peak", ", ".join(parts))
+    """The same two lines as a running job's cell: measured on top (peak and average), what it asked for under it."""
+    lead = [f"{_size(r.max_rss_bytes)} peak"] + ([f"{_size(r.avg_rss_bytes)} avg"] if r.avg_rss_bytes else [])
+    return _two_lines(" · ".join(lead), f"of {_size(r.req_mem_bytes)} asked" if r.req_mem_bytes else "")
 
 
 def _finished_rows(rows: list[jobs_view.HistoryRow], root: str, now: datetime) -> str:
