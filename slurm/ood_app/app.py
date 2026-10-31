@@ -739,8 +739,11 @@ def _queue_table(rows: list[dict[str, object]], root: str, now: datetime) -> str
 
 
 def _finished_memory(r: jobs_view.HistoryRow) -> str:
-    """Peak memory it held, with what it asked for under it."""
-    return _two_lines(_size(r.max_rss_bytes), f"of {_size(r.req_mem_bytes)} asked" if r.req_mem_bytes else "")
+    """Peak memory it held; under it the average over the run and what it asked for."""
+    parts = [f"avg {_size(r.avg_rss_bytes)}"] if r.avg_rss_bytes else []
+    if r.req_mem_bytes:
+        parts.append(f"of {_size(r.req_mem_bytes)} asked")
+    return _two_lines(f"{_size(r.max_rss_bytes)} peak", ", ".join(parts))
 
 
 def _finished_rows(rows: list[jobs_view.HistoryRow], root: str, now: datetime) -> str:
@@ -771,7 +774,7 @@ def _finished_table(rows: list[jobs_view.HistoryRow], root: str, now: datetime) 
     return (
         '<div class="table-wrap"><table class="stack"><thead><tr><th scope="col">Job</th><th scope="col">Project</th><th scope="col">Result</th>'
         '<th scope="col">Queued at</th><th scope="col">Started</th><th scope="col">Took</th><th scope="col" class="hide-sm">GPUs</th>'
-        '<th scope="col" class="hide-sm">Peak memory</th><th scope="col" class="hide-sm">Cores used</th><th scope="col">User</th>'
+        '<th scope="col" class="hide-sm">Memory</th><th scope="col" class="hide-sm">Cores used</th><th scope="col">User</th>'
         f"</tr></thead><tbody>{_finished_rows(rows, root, now)}</tbody></table></div>"
     )
 

@@ -306,9 +306,10 @@ def test_the_tables_show_memory_used_of_asked_and_cores_used_of_given() -> None:
     assert app._queue_memory({"mem_mb": 38000, "mem_used": 38_650_802_176}).startswith("38.7 GB<div")
     assert "<div" not in app._queue_memory({"mem_mb": 38000, "mem_used": None})  # waiting: only what it asked for
     row = jobs_view.HistoryRow("5", "p:normal:x", "p", "ann", "normal", "COMPLETED", "0:0", datetime(2026, 1, 1), datetime(2026, 1, 1),
-                               datetime(2026, 1, 1), 100, 0, 4 * 1024**3, 2 * 1024**3, cpus=4, cpu_s=150.0)
+                               datetime(2026, 1, 1), 100, 0, 4 * 1024**3, 2 * 1024**3, avg_rss_bytes=1024**3, cpus=4, cpu_s=150.0)
     assert app._cores_used(row) == '1.5 avg<div class="why">of 4 given</div>'
-    assert app._finished_memory(row) == f'{app._size(2 * 1024**3)}<div class="why">of {app._size(4 * 1024**3)} asked</div>'
+    assert app._finished_memory(row) == (f'{app._size(2 * 1024**3)} peak<div class="why">avg {app._size(1024**3)}, '
+                                         f'of {app._size(4 * 1024**3)} asked</div>')
 
 
 def test_a_running_jobs_cores_are_its_cpu_seconds_over_the_time_it_has_run(tmp_path: Path) -> None:

@@ -96,6 +96,7 @@ class HistoryRow:
     req_mem_bytes: int | None
     max_rss_bytes: int | None = None
     node: str = ""  # where it ran (sacct's `nodes`); "" if it never started
+    avg_rss_bytes: int | None = None  # average memory over its steps' samples (sacct's AveRSS)
     cpus: int | None = None  # cores it was given
     cpu_s: float | None = None  # CPU seconds it used (sacct's TotalCPU)
 
@@ -257,6 +258,13 @@ def _peak_rss(job: Mapping[str, object]) -> int | None:
     return max((peak for peak in peaks if peak), default=None)
 
 
+def _avg_rss(job: Mapping[str, object]) -> int | None:
+    """Largest average-RSS (bytes) over the job's steps; None when no step reports one."""
+    steps = job.get("steps")
+    means = [_tres_count(_field(step, "tres", "requested", "average"), "mem") for step in steps or () if isinstance(step, dict)]
+    return max((mean for mean in means if mean), default=None)
+
+
 def _mib(mebibytes: int | None) -> int | None:
     return mebibytes * 1024**2 if mebibytes else None
 
@@ -282,6 +290,7 @@ def _row(job: Mapping[str, object]) -> HistoryRow:
         req_mem_bytes=_mib(_tres_count(_field(job, "tres", "requested"), "mem")),
         max_rss_bytes=_peak_rss(job),
         node=str(job.get("nodes") or ""),
+        avg_rss_bytes=_avg_rss(job),
         cpus=_tres_count(_field(job, "tres", "allocated"), "cpu"),
         cpu_s=_cpu_seconds(job),
     )
