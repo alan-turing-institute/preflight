@@ -280,6 +280,8 @@ def job_rows(backend: Backend) -> list[dict[str, object]]:
                 "cpus": job.cpus,
                 "mem_mb": jobs_view.requested_mem_mb(job, record),
                 "mem_used": live.get("cpu"),
+                "mem_peak": live.get("mem_peak"),
+                "cores_peak": live["cores_peak_milli"] / 1000 if "cores_peak_milli" in live else None,
                 "cores_now": live["cores_now_milli"] / 1000 if "cores_now_milli" in live else None,
                 "cores_used": live["cpu_ms"] / 1000 / max(_seconds(elapsed.get(job.job_id, "")) or 0, 1) if "cpu_ms" in live else None,
                 "node": job.node,
@@ -467,6 +469,10 @@ def _live_memory(job_id: str) -> dict[str, int]:
     seconds = re.search(r"^gpujobs_job_cpu_seconds_total\{[^}]*\} ([0-9.]+)$", text, re.MULTILINE)
     if seconds:
         found["cpu_ms"] = round(float(seconds[1]) * 1000)
+    for key, name in (("mem_peak", "cpu_memory_peak_bytes"), ("cores_peak_milli", "cpu_cores_peak")):
+        hit = re.search(rf"^gpujobs_job_{name}\{{[^}}]*\}} ([0-9.]+)$", text, re.MULTILINE)
+        if hit:
+            found[key] = round(float(hit[1]) * (1000 if key == "cores_peak_milli" else 1))
     now = re.search(r"^gpujobs_job_cpu_cores\{[^}]*\} ([0-9.]+)$", text, re.MULTILINE)
     if now:
         found["cores_now_milli"] = round(float(now[1]) * 1000)
@@ -681,7 +687,8 @@ def _queue_memory(r: dict[str, object]) -> str:
     """What a job asked for; a running one also what it holds now."""
     asked = _asked_memory(r["mem_mb"])  # type: ignore[arg-type]
     used = r.get("mem_used")
-    return _lines(("now", _size(used)), ("asked", asked)) if isinstance(used, int) else esc(asked)
+    peak = r.get("mem_peak")
+    return _lines(("now", _size(used)), ("peak", _size(peak) if isinstance(peak, int) else ""), ("asked", asked)) if isinstance(used, int) else esc(asked)
 
 
 def _queue_cores(r: dict[str, object]) -> str:
@@ -689,7 +696,9 @@ def _queue_cores(r: dict[str, object]) -> str:
     used, now = r.get("cores_used"), r.get("cores_now")
     if not isinstance(used, float):
         return esc(r["cpus"])
-    return _lines(("now", f"{now:.1f}" if isinstance(now, float) else ""), ("avg", f"{used:.1f}"), ("given", str(r["cpus"])))
+    peak = r.get("cores_peak")
+    return _lines(("now", f"{now:.1f}" if isinstance(now, float) else ""), ("avg", f"{used:.1f}"),
+                  ("peak", f"{peak:.1f}" if isinstance(peak, float) else ""), ("given", str(r["cpus"])))
 
 
 def _cores_used(r: jobs_view.HistoryRow) -> str:

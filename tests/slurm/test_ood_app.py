@@ -316,6 +316,9 @@ def test_a_running_jobs_cores_are_its_cpu_seconds_over_the_time_it_has_run(tmp_p
     line = lambda label, value: f'<div><span class="muted">{label}</span> {value}</div>'  # noqa: E731
     assert app._queue_cores({"cpus": 12, "cores_used": 1.44}) == line("avg", "1.4") + line("given", "12")
     assert app._queue_cores({"cpus": 12, "cores_used": 1.44, "cores_now": 7.26}) == line("now", "7.3") + line("avg", "1.4") + line("given", "12")
+    assert app._queue_cores({"cpus": 12, "cores_used": 1.44, "cores_now": 7.26, "cores_peak": 9.04}) == (
+        line("now", "7.3") + line("avg", "1.4") + line("peak", "9.0") + line("given", "12"))
+    assert line("peak", "38.7 GB") in app._queue_memory({"mem_mb": 38000, "mem_used": 1, "mem_peak": 38_650_802_176})
     assert app._queue_cores({"cpus": 12, "cores_used": None}) == "12"  # waiting, or not sampled yet
     (tmp_path / "metrics").mkdir()
     (tmp_path / "metrics" / "job_7.prom").write_text('gpujobs_job_cpu_seconds_total{jobid="7"} 90.500\n', encoding="utf-8")

@@ -386,7 +386,8 @@ def _cpu_seconds(cgroup: Path) -> float | None:
 
 
 def metrics_text(
-    job: gpu_jobs.QueuedJob, gpu_mib: float, mem_bytes: int, cpu_seconds: float | None = None, cores_now: float | None = None
+    job: gpu_jobs.QueuedJob, gpu_mib: float, mem_bytes: int, cpu_seconds: float | None = None, cores_now: float | None = None,
+    mem_peak_bytes: int | None = None, cores_peak: float | None = None,
 ) -> str:
     """The job's gauges (and its CPU seconds so far, when the cgroup says) in Prometheus text format; project is the first `:` field of the job name."""
     project = job.name.split(":", 1)[0] if ":" in job.name else "(other)"
@@ -400,6 +401,18 @@ def metrics_text(
             "# TYPE gpujobs_job_cpu_seconds_total counter\n"
             f"gpujobs_job_cpu_seconds_total{{{labels}}} {cpu_seconds:.3f}\n"
             if cpu_seconds is not None
+            else ""
+        )
+        + (
+            "# TYPE gpujobs_job_cpu_memory_peak_bytes gauge\n"
+            f"gpujobs_job_cpu_memory_peak_bytes{{{labels}}} {mem_peak_bytes}\n"
+            if mem_peak_bytes
+            else ""
+        )
+        + (
+            "# TYPE gpujobs_job_cpu_cores_peak gauge\n"
+            f"gpujobs_job_cpu_cores_peak{{{labels}}} {cores_peak:.3f}\n"
+            if cores_peak is not None
             else ""
         )
         + (
@@ -522,6 +535,7 @@ class Agent:
         self.gpu_usage, self.cgroup_root = gpu_usage, cgroup_root
         self.dir = state_dir / "agent"
         self.metrics = state_dir / "metrics"
+        self._cores_peak: dict[str, float] = {}  # job -> highest "cores now" this agent has seen for it
         self._cpu_prev: dict[str, tuple[float, float]] = {}  # job -> (wall time, cpu seconds) at the last sample
         self.requests = state_dir / "requests"
         self.read_queue, self.scontrol, self.ctld_active_s = (
@@ -1214,7 +1228,11 @@ class Agent:
             cores_now = (cpu_s - before[1]) / (now - before[0]) if cpu_s is not None and before and now > before[0] else None
             if cpu_s is not None:
                 self._cpu_prev[job.job_id] = (now, cpu_s)
-            texts[f"job_{job.job_id}.prom"] = metrics_text(job, gpu_mib, mem, cpu_s, cores_now)
+            if cores_now is not None:
+                self._cores_peak[job.job_id] = max(cores_now, self._cores_peak.get(job.job_id, 0.0))
+            texts[f"job_{job.job_id}.prom"] = metrics_text(
+                job, gpu_mib, mem, cpu_s, cores_now, gpu_jobs.read_int(cgroup / "memory.peak"), self._cores_peak.get(job.job_id)
+            )
         try:
             self.metrics.mkdir(exist_ok=True)
             for name, text in texts.items():
