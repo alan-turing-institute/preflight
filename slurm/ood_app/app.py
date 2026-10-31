@@ -672,34 +672,33 @@ def _node_line(node: str) -> str:
     return f'<div class="why">on {esc(node)}</div>' if node else ""
 
 
-def _two_lines(main: str, detail: str) -> str:
-    """A cell's figure, and under it in small muted text what it is measured against."""
-    return f'{esc(main)}<div class="why">{esc(detail)}</div>' if detail else esc(main)
+def _lines(*pairs: tuple[str, str]) -> str:
+    """One measure per line, its name in muted text before the figure ("now 38.6 GB"); pairs with no figure are left out."""
+    return "".join(f'<div><span class="muted">{esc(label)}</span> {esc(value)}</div>' for label, value in pairs if value)
 
 
 def _queue_memory(r: dict[str, object]) -> str:
-    """What a job asked for; for a running one what it holds now, with what it asked for under it."""
+    """What a job asked for; a running one also what it holds now."""
     asked = _asked_memory(r["mem_mb"])  # type: ignore[arg-type]
     used = r.get("mem_used")
-    return _two_lines(f"{_size(used)} now", f"of {asked} asked") if isinstance(used, int) else esc(asked)
+    return _lines(("now", _size(used)), ("asked", asked)) if isinstance(used, int) else esc(asked)
 
 
 def _queue_cores(r: dict[str, object]) -> str:
-    """Cores a job was given; for a running one the rate now and the average since it started, over the given count."""
+    """Cores a job was given; a running one also the rate now and the average since it started."""
     used, now = r.get("cores_used"), r.get("cores_now")
     if not isinstance(used, float):
         return esc(r["cpus"])
-    lead = f"{now:.1f} now · {used:.1f} avg" if isinstance(now, float) else f"{used:.1f} avg"
-    return _two_lines(lead, f"of {r['cpus']} given")
+    return _lines(("now", f"{now:.1f}" if isinstance(now, float) else ""), ("avg", f"{used:.1f}"), ("given", str(r["cpus"])))
 
 
 def _cores_used(r: jobs_view.HistoryRow) -> str:
-    """Cores a finished job used on average, with the count it had under it: CPU seconds over elapsed seconds."""
+    """Cores a finished job used on average (CPU seconds over elapsed seconds), and the count it had."""
     if r.cpus is None:
         return "—"
     if r.cpu_s is None or not r.elapsed_s:
         return esc(r.cpus)
-    return _two_lines(f"{r.cpu_s / r.elapsed_s:.1f} avg", f"of {r.cpus} given")
+    return _lines(("avg", f"{r.cpu_s / r.elapsed_s:.1f}"), ("given", str(r.cpus)))
 
 
 def _queue_table(rows: list[dict[str, object]], root: str, now: datetime) -> str:
@@ -738,9 +737,9 @@ def _queue_table(rows: list[dict[str, object]], root: str, now: datetime) -> str
 
 
 def _finished_memory(r: jobs_view.HistoryRow) -> str:
-    """The same two lines as a running job's cell: measured on top (peak and average), what it asked for under it."""
-    lead = [f"{_size(r.max_rss_bytes)} peak"] + ([f"{_size(r.avg_rss_bytes)} avg"] if r.avg_rss_bytes else [])
-    return _two_lines(" · ".join(lead), f"of {_size(r.req_mem_bytes)} asked" if r.req_mem_bytes else "")
+    """Peak and average memory a finished job held, and what it asked for, each on its own line."""
+    return _lines(("peak", _size(r.max_rss_bytes)), ("avg", _size(r.avg_rss_bytes) if r.avg_rss_bytes else ""),
+                  ("asked", _size(r.req_mem_bytes) if r.req_mem_bytes else ""))
 
 
 def _finished_rows(rows: list[jobs_view.HistoryRow], root: str, now: datetime) -> str:
