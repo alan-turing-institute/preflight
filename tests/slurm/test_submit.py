@@ -19,10 +19,11 @@ DIRECTIVE = "#S" + "BATCH"  # spelled in two halves so a text-matching guard doe
 
 def fake_site(monkeypatch: pytest.MonkeyPatch, *, lease: object, dgx_gate: bool, nodes: tuple = (),
               cpu_job_cap: int | None = None, service: object = None, part_time_nodes: tuple = (),
-              node_python: str = "/usr/bin/python3") -> None:
+              node_python: str = "/usr/bin/python3", sharing_memory_fraction: float | None = None) -> None:
     """`load` returns just the fields submit.py reads."""
     site = SimpleNamespace(lease=lease, dgx_gate=dgx_gate, nodes=nodes, cpu_job_cap=cpu_job_cap, service=service,
-                           part_time_nodes=part_time_nodes, node_python=node_python)
+                           part_time_nodes=part_time_nodes, node_python=node_python,
+                           sharing_memory_fraction=sharing_memory_fraction)
     monkeypatch.setattr(site_config, "load", lambda *_p: site)
 
 
@@ -166,6 +167,38 @@ def test_mem_auto_uses_the_last_measured_run_plus_a_margin(tmp_path: Path, monke
     assert f"{DIRECTIVE} --mem=14G" in script  # newest run: 10 + 2 GiB, plus 10%, rounded up
 
 
+def test_a_named_measured_job_asks_for_shards_and_its_share_of_the_cores(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    gpu = site_config.Gpu(0, "GPU-a", "/dev/nvidia0", "gb10", shards=12)
+    node = site_config.Node("n", 20, 100_000, (gpu,), cores_per_gpu=12)
+    fake_site(monkeypatch, lease=None, dgx_gate=False, nodes=(node,))
+    monkeypatch.setattr(gpu_jobs, "STATE_DIR", tmp_path)
+    (tmp_path / "jobs").mkdir()
+    leg = {"peak_gpu_mib": 1024, "peak_mem_bytes": 0, "ended_at": 5, "exit": 0, "signals": []}
+    sharing = {"level": 4, "gpu_type": "gb10", "node_memory_mb": 100_000, "shards": 12, "peak_bytes": 1024**3}
+    (tmp_path / "jobs" / "1.json").write_text(json.dumps({"name": "n", "legs": [leg], "sharing": sharing}))
+    argv = ["--project", "p", "--what", "w", "--class", "restart", "--gpu"]
+    script = dry(*argv, "--name", "n", "--", "x")
+    assert f"{DIRECTIVE} --gres=shard:3" in script and "--gres=gpu" not in script
+    assert f"{DIRECTIVE} --cpus-per-task=3" in script and f"{DIRECTIVE} --mem=2G" in script  # 1 GiB peak plus 10%
+    assert "--max-jobs" not in script  # the wrapper tells a shard job by slurm's environment
+    assert "[submit] sharing n: level 4 (measured 4;" in capsys.readouterr().out
+    explicit = dry(*argv, "--max-jobs", "6", "--name", "n", "--", "x")  # --max-jobs replaces the measured level
+    assert f"{DIRECTIVE} --gres=shard:2" in explicit and "--max-jobs" not in explicit
+    assert f"{DIRECTIVE} --gres=gpu:1" in dry(*argv, "--name", "unmeasured", "--", "x")  # no record: the whole card
+    capsys.readouterr()
+    for kept in (dry(*argv, "--max-jobs", "3", "--name", "unmeasured", "--", "x"), dry(*argv, "--max-jobs", "3", "--", "x")):
+        assert f"{DIRECTIVE} --gres=gpu:1" in kept and "--max-jobs" not in kept  # asked, not given: never the wrapper's own flag
+    shown = capsys.readouterr()
+    assert "asked 3 copies" in shown.out and "needs --name" in shown.err  # and both say so
+    assert f"{DIRECTIVE} --gres=gpu:2" in dry("--project", "p", "--what", "w", "--class", "restart", "--gpus", "2", "--name", "n", "--", "x")  # never shares
+    leg["peak_gpu_mib"] = 4096  # grew past what the level was measured at
+    (tmp_path / "jobs" / "2.json").write_text(json.dumps({"name": "n", "legs": [{**leg, "ended_at": 9}]}))
+    dry(*argv, "--name", "n", "--", "x")
+    assert "re-measure" in capsys.readouterr().err
+
+
 @pytest.mark.parametrize(
     ("mem", "name", "expected"),
     [
@@ -245,7 +278,7 @@ def test_a_gpu_job_gets_its_gpus_share_of_the_cores(site_cpus: int | None, held:
                                                     tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(gpu_jobs, "STATE_DIR", tmp_path)
     if site_cpus is not None:
-        gpus = (object(),) * (4 if "--gpus" in argv else 1)
+        gpus = (site_config.Gpu(0, "GPU-a", "/dev/nvidia0", "gb10"),) * (4 if "--gpus" in argv else 1)
         node = SimpleNamespace(cpus=site_cpus, gpus=gpus, cores_per_gpu=held)
         fake_site(monkeypatch, lease=None, dgx_gate=False, nodes=(node,))
     script = dry("--project", "p", "--what", "w", "--class", "restart", "--mem", "4G", *argv, "--", "x")

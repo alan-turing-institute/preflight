@@ -65,6 +65,8 @@ from gpu_jobs import (  # audit.py imports gpu_mib_by_pid from here
     read_int,
 )
 
+#: Slurm sets this in the environment of a job that asked for shards of a card.
+SHARDS_ENV = "SLURM_SHARDS_ON_NODE"
 PREFLIGHT = Path(__file__).resolve().parents[1]
 PARITY = PREFLIGHT / "dgx" / "assert_code_parity.py"
 
@@ -121,8 +123,21 @@ def foreign_gpu_processes(own_pids: set[int], output: str | None = None) -> list
     return found
 
 
-def card_is_free(own_pids: set[int], max_jobs: int = 1) -> tuple[bool, str]:
-    """Free when no compute process outside this job's cgroup is on its GPUs; declared sharing skips the check."""
+def card_is_free(own_pids: set[int], max_jobs: int = 1, shard_job: bool = False) -> tuple[bool, str]:
+    """Free when no compute process outside this job's cgroup is on its GPUs; declared sharing skips the check.
+
+    A shard job (slurm sets SLURM_SHARDS_ON_NODE) shares the card with other slurm jobs by design, so it refuses only
+    on a compute process that belongs to no slurm job and no lease (`audit.unregistered`)."""
+    if shard_job:
+        import audit  # lazy: audit imports this module
+
+        usage = gpu_jobs.gpu_usage()
+        if usage is None:
+            return False, "nvidia-smi did not answer, so the card's occupancy is unknown"
+        stray = audit.unregistered(usage)
+        if not stray:
+            return True, ""
+        return False, "compute process(es) outside slurm and the lease protocol: " + ", ".join(f"pid {p}" for p, _, _ in stray)
     if max_jobs > 1:
         return True, ""
     foreign = foreign_gpu_processes(own_pids)
@@ -377,7 +392,8 @@ def main() -> int:
             limit_s=arguments.wait_limit,
             poll_s=arguments.poll,
             card_free=(
-                (lambda: card_is_free(cgroup_pids(cgroup) if cgroup else {os.getpid()}, arguments.max_jobs))
+                (lambda: card_is_free(cgroup_pids(cgroup) if cgroup else {os.getpid()}, arguments.max_jobs,
+                                      shard_job=SHARDS_ENV in os.environ))
                 if arguments.needs_card
                 else lambda: (True, "")
             ),

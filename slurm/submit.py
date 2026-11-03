@@ -162,7 +162,7 @@ def warn_device(arguments: argparse.Namespace) -> None:
     queue = gpu_jobs.read_queue()
     if queue is None:
         return
-    reserved = any(j.gpus > 0 and j.state in (gpu_jobs.State.RUNNING, gpu_jobs.State.PENDING) for j in queue)
+    reserved = any(j.uses_card and j.state in (gpu_jobs.State.RUNNING, gpu_jobs.State.PENDING) for j in queue)
     if not reserved:
         warn("the command says --device cpu but no GPU job is running or waiting: the GPU is free, and the work may "
              "finish far sooner there (resubmit with --gpu)")
@@ -226,8 +226,10 @@ def sbatch_script(
     needs_lease: bool | None = None,
     node_python: str | None = None,
     requirements: tuple[tuple[str, str, str], ...] = (),
+    shards: int = 0,
 ) -> str:
-    """The job script: directives, then one line running the wrapper. `urgent.py` passes its own partition and no
+    """The job script: directives, then one line running the wrapper. `shards` > 0 asks for that many shards of a
+    shared card instead of the GPU (the wrapper then tells it is a shard job from slurm's environment). `urgent.py` passes its own partition and no
     level (its partition goes first whatever the level). A job that may land in `part_time` runs the wrapper with
     `node_python` (the site's interpreter there), never the submitter's own, whose venv path that machine lacks; it is also handed `requirements` (what
     `portability.decide` checked) to check again when it starts there."""
@@ -250,7 +252,9 @@ def sbatch_script(
     if mem:
         lines.append(f"#SBATCH --mem={mem}")
     gpus = arguments.gpus or int(arguments.gpu)
-    if gpus:
+    if shards:
+        lines.append(f"#SBATCH --gres=shard:{shards}")
+    elif gpus:
         lines.append(f"#SBATCH --gres=gpu:{gpus}")
     if getattr(arguments, "what", None):
         lines.append(f"#SBATCH --comment={shlex.quote(comment(arguments.what))}")
@@ -263,7 +267,7 @@ def sbatch_script(
         wrapper.append("--needs-lease")
     if arguments.gpu:
         wrapper.append("--needs-card")
-    if arguments.max_jobs != 1:
+    if arguments.max_jobs != 1 and not shards:
         wrapper += ["--max-jobs", str(arguments.max_jobs)]
     if on_part_time and requirements:
         wrapper += ["--require", json.dumps(requirements)]
@@ -302,7 +306,34 @@ def place_on_part_time(arguments: argparse.Namespace, site: site_config.Site, me
     return decision
 
 
-def resolve_cpus(asked: int | None, gpus: int, site: site_config.Site) -> int:
+def resolve_packing(arguments: argparse.Namespace, named: str | None, site: site_config.Site) -> gpu_jobs.Packing:
+    """Share the card with other copies of a named job, as far as its measurements allow (D27-D30). Only one card of a
+    site whose card has shards is ever shared (`--gpus` above 1 never is), and only a job given `--name`: the default
+    name is shared by unrelated jobs. Prints the decision, and a warning when the job has outgrown its measurement."""
+    node = next((n for n in site.nodes if n.gpus), None)
+    if arguments.gpus != 1 or node is None or not node.gpus[0].shards:
+        return gpu_jobs.Packing()
+    asked, arguments.max_jobs = arguments.max_jobs, 1  # the level is settled here: the wrapper's declared-sharing flag is for sites without shards
+    if named is None:
+        if asked and asked > 1:
+            warn(f"--max-jobs {asked} needs --name (the default name is shared by unrelated jobs): the whole card")
+        return gpu_jobs.Packing()
+    record = gpu_jobs.measured_sharing(named)
+    peak = gpu_jobs.measured_peak_bytes(named) or gpu_jobs.measured_peak_bytes(named, clean=False)
+    packing = gpu_jobs.plan_packing(
+        gpu=node.gpus[0], node=node, record=record, peak_bytes=peak, fraction=site.sharing_memory_fraction,
+        cpus_asked=arguments.cpus, explicit_level=asked, margin=AUTO_MARGIN,
+    )
+    if packing.line:
+        print(f"[submit] sharing {named}: {packing.line}")
+    measured = int((record or {}).get("peak_bytes") or 0)
+    if peak and measured and peak > measured * (1 + AUTO_MARGIN):
+        warn(f"{named!r} peaked at {peak / 1e9:.1f} GB on its last clean run, above the {measured / 1e9:.1f} GB its "
+             "sharing level was measured at: re-measure (slurm/sharing.py measure)")
+    return packing
+
+
+def resolve_cpus(asked: int | None, gpus: int, site: site_config.Site, shared_cores: int = 0) -> int:
     """`--cpus`, else for a GPU job the cores the site holds for its GPUs (`cores_per_gpu`) or, unset, its GPUs'
     share of the GPU node's cores, else DEFAULT_CPUS.
 
@@ -311,6 +342,8 @@ def resolve_cpus(asked: int | None, gpus: int, site: site_config.Site) -> int:
     """
     if asked is not None:
         return asked
+    if shared_cores:
+        return shared_cores  # a shard job: its share of the cores held for the card
     node = next((n for n in site.nodes if n.gpus), None)
     if not gpus or node is None:
         return min(DEFAULT_CPUS, site.cpu_job_cap or DEFAULT_CPUS)  # a CPU-only job's default fits under the cap
@@ -347,8 +380,9 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--max-jobs",
         type=int,
-        default=1,
-        help="GPU jobs allowed on the card, this one included; above 1 only against a measured sharing result",
+        default=None,
+        help="GPU jobs allowed on the card, this one included: the level to share it at. Default: the level "
+             "`sharing.py measure` recorded for --name, else 1 (the whole card)",
     )
     p.add_argument("--service", action="store_true",
                    help="a background service's CPU stand-in: starts at once by suspending CPU-only jobs (D20)")
@@ -414,7 +448,9 @@ def submit(argv: list[str]) -> str:
     mem = resolve_mem(arguments.mem, named, arguments.gpu)
     warn_memory(arguments.mem, named, arguments.gpu)
     named_cpus = arguments.cpus
-    arguments.cpus = resolve_cpus(arguments.cpus, arguments.gpus, site)
+    packing = resolve_packing(arguments, named, site)
+    arguments.max_jobs = arguments.max_jobs or 1  # from here on: the level asked for, 1 when none
+    arguments.cpus = resolve_cpus(arguments.cpus, arguments.gpus, site, packing.cores)
     if arguments.anywhere:
         if not gpu_jobs.part_time_eligible(gpu_jobs.JobClass(arguments.job_class), arguments.gpus, service=arguments.service):
             msg = ("--anywhere needs --class resume with no GPUs and no --service: the owner of a part-time machine "
@@ -463,7 +499,7 @@ def submit(argv: list[str]) -> str:
     barred = (f"--exclude={','.join(placed.excluded)}",) if included and placed.excluded else ()
     script = sbatch_script(
         arguments, mem=mem, log=log, manifest=manifest, node_python=site.node_python, partition=partition, extra=barred,
-        requirements=placed.requirements if included else (),
+        requirements=placed.requirements if included else (), shards=packing.shards,
     )
     warn_device(arguments)
     if arguments.dry_run:

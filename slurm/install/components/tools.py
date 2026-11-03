@@ -14,7 +14,7 @@ NAME = "tools"
 SLURM_DIR = Path(__file__).resolve().parents[2]
 REPO = SLURM_DIR.parent
 SHIM_DIR = "/usr/local/bin"
-TOOLS = ["submit", "status", "pause", "resume", "kill", "urgent", "wait", "footprint", "audit"]
+TOOLS = ["submit", "status", "pause", "resume", "kill", "urgent", "wait", "footprint", "audit", "sharing"]
 NODE_CHECK_JSON = "/etc/gpujobs/node_check.json"
 SHIM = '#!/bin/sh\nexec /usr/bin/python3 {install_dir}/slurm/{tool}.py "$@"\n'
 

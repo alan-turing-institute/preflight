@@ -87,7 +87,7 @@ def plan(
     """
     lines, victims, steady, wait_only = [], [], [], []
     for job in queue:
-        in_way = whole_box or memory_short or cores_short or (gpu and job.gpus > 0)
+        in_way = whole_box or memory_short or cores_short or (gpu and job.uses_card)
         if not in_way or not (job.active or job.partition == gpu_jobs.Partition.URGENT):
             continue
         if job.partition == gpu_jobs.Partition.PART_TIME:
@@ -273,7 +273,7 @@ def run(argv: list[str]) -> int:
     held = [
         job.job_id for job in queue
         if job.waiting and job.partition != gpu_jobs.Partition.URGENT and job.job_id not in victims
-        and job.gpus > 0
+        and job.uses_card
     ]
     if victims and held and gpu_jobs.run_slurm(["scontrol", "hold", ",".join(held)]):
         # slurm holds the ids it can and refuses the rest (one that started meanwhile): release them all

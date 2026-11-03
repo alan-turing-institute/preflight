@@ -26,7 +26,7 @@ def repo(tmp_path: Path) -> Path:
 def arguments(repo: Path, **given: object) -> argparse.Namespace:
     base = {
         "project": "p", "what": "w", "job_class": "restart", "name": "n", "wait_limit": "1h", "level": "normal",
-        "max_jobs": 1, "mem": "8G", "gpus": 1, "cpus": None, "after": [], "resume_ok": False, "entry": "run.py",
+        "max_jobs": None, "mem": "8G", "gpus": 1, "cpus": None, "after": [], "resume_ok": False, "entry": "run.py",
         "repo": repo, "search": ["src"], "data": ["data/set"], "workdir": repo, "command": ["python", "run.py", "a b"],
         "dry_run": False, "site": "turing", "service": False, "anywhere": False, "suspend": None, "no_suspend": False,
         "log": None, "data_base": None, "data_env": None,
@@ -69,6 +69,7 @@ def test_sync_then_submit_in_the_same_place_with_the_same_arguments(repo: Path, 
     submitted = box.calls[-1][-1]
     assert submitted.startswith("cd sync/p/. && gpujobs-submit --project p --what w --class restart --name n")
     assert "--gpus 1" in submitted and "--mem 8G" in submitted and submitted.endswith("-- python run.py 'a b'")
+    assert "--max-jobs" not in submitted  # none asked: the other site decides, never the text "None"
 
 
 def test_data_outside_the_repo_lands_under_data_root_and_the_job_is_told_where(

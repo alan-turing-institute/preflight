@@ -81,6 +81,21 @@ def test_declared_sharing_skips_the_occupancy_check(monkeypatch) -> None:
     monkeypatch.setattr(job_wrapper, "foreign_gpu_processes", lambda own: [(9, "GPU-x")])
     assert job_wrapper.card_is_free({1}) == (False, "compute process(es) outside this job: pid 9 on GPU-x")
     assert job_wrapper.card_is_free({1}, max_jobs=2) == (True, "")
+    # a shard job shares the card with other slurm jobs: only a process outside slurm and the leases refuses it
+    import audit
+
+    monkeypatch.setattr(job_wrapper.gpu_jobs, "gpu_usage", lambda: {10: 300.0, 20: 50.0})
+    monkeypatch.setattr(audit, "cgroup_of", lambda pid, *_a: "/x/slurmstepd.scope/job_5" if pid == 10 else "/user.slice")
+    monkeypatch.setattr(audit, "lease_pids", lambda *_a: {})
+    monkeypatch.setattr(audit, "descends_from", lambda *_a: False)
+    monkeypatch.setattr(audit, "command_of", lambda *_a: "python")
+    monkeypatch.setattr(job_wrapper.gpu_jobs, "container_label", lambda *_a: "")
+    free, why = job_wrapper.card_is_free({1}, shard_job=True)
+    assert not free and "pid 20" in why and "pid 10" not in why  # pid 10 is a neighbouring slurm job's
+    monkeypatch.setattr(job_wrapper.gpu_jobs, "gpu_usage", lambda: {10: 300.0})
+    assert job_wrapper.card_is_free({1}, shard_job=True) == (True, "")
+    monkeypatch.setattr(job_wrapper.gpu_jobs, "gpu_usage", lambda: None)
+    assert job_wrapper.card_is_free({1}, shard_job=True)[0] is False  # occupancy unknown is not free
 
 
 def test_footprint_sums_all_gpus_and_counts_labelled_containers(tmp_path: Path, monkeypatch) -> None:

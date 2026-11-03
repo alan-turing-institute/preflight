@@ -127,8 +127,9 @@ def verify(remote: site_config.Remote, root: str, repo: Path, files: list[str]) 
 def forwarded(arguments: argparse.Namespace) -> list[str]:
     """The options the other site's `submit.py` takes, from the parsed ones (the sync options stay here)."""
     out = ["--project", arguments.project, "--what", arguments.what, "--class", arguments.job_class,
-           "--name", arguments.name, "--wait-limit", arguments.wait_limit, "--level", str(arguments.level),
-           "--max-jobs", str(arguments.max_jobs)]
+           "--name", arguments.name, "--wait-limit", arguments.wait_limit, "--level", str(arguments.level)]
+    if arguments.max_jobs:  # unset: that site picks the level itself (its measured one, else the whole card)
+        out += ["--max-jobs", str(arguments.max_jobs)]
     if arguments.mem:
         out += ["--mem", arguments.mem]
     if arguments.gpus:

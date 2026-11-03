@@ -174,6 +174,7 @@ class QueuedJob:
     user: str = ""
     priority: int = 0
     gpus: int = 0
+    shards: int = 0  # shards of a shared card it holds (`gres/shard`); 0 for a job on a whole card or no card
     cpus: int = 0  # cores slurm gave it (asked, while it waits)
     level: Level = Level.NORMAL
     mem_mb: int | None = None  # slurm's memory request now (MB per node; 0 is the whole node), None when it gave none
@@ -181,6 +182,11 @@ class QueuedJob:
     submitted: int = 0  # epoch seconds it last entered the queue (a requeue resets it, measured); 0 when unknown
     node: str = ""  # the node a running job is on (squeue's `nodes`); "" while it waits
     sluid: str = ""  # 26.05 names the job's cgroup by this (`step_id.sluid`) instead of `job_<id>`; "" on 23.11
+
+    @property
+    def uses_card(self) -> bool:
+        """Holds a GPU or shards of one: shard use is not GPU use in slurm, so both count."""
+        return self.gpus > 0 or self.shards > 0
 
     @property
     def job_class(self) -> JobClass | None:
@@ -218,6 +224,16 @@ def parse_gpus(gres: str) -> int:
     total = 0
     for item in gres.split(","):
         match = re.fullmatch(r"(?:gres/)?gpu(?::[A-Za-z][\w.-]*)?(?::(\d+))?(?:\(.*\))?", item.strip())
+        if match:
+            total += int(match[1] or 1)
+    return total
+
+
+def parse_shards(gres: str) -> int:
+    """Shards in squeue's `%b`: `gres/shard:4`, `shard:gb10:4`; `gres/shard` alone is 1. `parse_gpus` ignores them."""
+    total = 0
+    for item in gres.split(","):
+        match = re.fullmatch(r"(?:gres/)?shard(?::[A-Za-z][\w.-]*)?(?::(\d+))?(?:\(.*\))?", item.strip())
         if match:
             total += int(match[1] or 1)
     return total
@@ -269,6 +285,7 @@ def parse_squeue(text: str) -> list[QueuedJob]:
                 str(raw["job_id"]), raw.get("partition", ""), state, raw.get("state_reason", ""), raw.get("name", ""),
                 raw.get("dependency", ""), raw.get("user_name", ""),
                 int(priority.get("number", 0)) if priority.get("set") else 0, parse_gpus(raw.get("tres_per_node") or ""),
+                parse_shards(raw.get("tres_per_node") or ""),
                 cpus, level_of(str(raw.get("qos") or "")), _memory_mb(raw, cpus), _cores(raw),
                 int(submitted.get("number", 0)) if submitted.get("set") else 0,
                 str(raw.get("nodes") or ""), _sluid(raw),
@@ -640,6 +657,52 @@ def read_sidecar(job_id: str, user: str | None = None) -> dict[str, object] | No
     return record
 
 
+@dataclass(frozen=True)
+class Packing:
+    """What `plan_packing` decides: copies of the job per card, the shards and cores to ask for (0 and 0: the whole
+    card, with the cores the caller would give a whole-card job), and the line to print ("" when nothing is shared)."""
+
+    level: int = 1
+    shards: int = 0
+    cores: int = 0
+    line: str = ""
+
+
+def plan_packing(
+    *, gpu: site_config.Gpu, node: site_config.Node, record: Mapping[str, object] | None, peak_bytes: int | None,
+    fraction: float | None, cpus_asked: int | None, explicit_level: int | None, margin: float,
+) -> Packing:
+    """How many copies of a named job share one card, and the shards and cores each asks for (D27-D30).
+
+    level_compute: the level `sharing.py measure` recorded, when it was measured on this card type, node memory and
+    shard count (else 1); `explicit_level` (`--max-jobs`) replaces it. level_memory: the node's jobs memory (times the
+    site's `sharing_memory_fraction`, else 1) over the job's measured peak plus `margin`; peak unknown: 1.
+    level_cores: the cores held for the card over `cpus_asked`, when given. The level is the smallest, at least 1;
+    shards are `ceil(gpu.shards / level)`, so at most `level` copies fit, and cores follow one to one.
+    """
+    if not gpu.shards:
+        return Packing()
+    matches = record is not None and (
+        record.get("gpu_type"), record.get("node_memory_mb"), record.get("shards")) == (gpu.type, node.real_memory_mb, gpu.shards)
+    measured = int(record.get("level") or 1) if record is not None and matches else 1
+    compute = explicit_level or measured
+    memory = 1 if not peak_bytes else int((fraction or 1) * node.jobs_mb * 1048576 / (peak_bytes * (1 + margin)))
+    held = node.cores_per_gpu or max(1, node.cpus // max(1, len(node.gpus)))
+    cores_level = held // cpus_asked if cpus_asked else compute
+    level = max(1, min(compute, memory, cores_level))
+    if level <= 1:
+        if explicit_level and explicit_level > 1:  # asked for sharing and not given it: say why, never fall back silently
+            return Packing(line=f"asked {explicit_level} copies, but memory allows {memory if peak_bytes else 'unknown'} and "
+                                f"cores allow {cores_level if cpus_asked else 'any'} -> the whole card")
+        return Packing()
+    shards = -(-gpu.shards // level)
+    cores = -(-held * shards // gpu.shards)
+    source = f"asked {explicit_level}" if explicit_level else f"measured {measured}"
+    line = (f"level {level} ({source}; memory allows {memory if peak_bytes else 'unknown'}; "
+            f"cores allow {cores_level if cpus_asked else 'any'}) -> --gres=shard:{shards} of {gpu.shards}, {cores} cores")
+    return Packing(level, shards, cores, line)
+
+
 def update_sidecar(job_id: str, **fields: object) -> None:
     """Merge fields into a job's sidecar (read, update, atomic write). Only this user's own record is merged into."""
     record = read_json(sidecar_path(job_id), current_user()) or {"job_id": job_id}  # not the copied-back legs
@@ -658,11 +721,11 @@ def record_queued_job(job_id: str, tool: str, **fields: object) -> None:
 
 
 def needs_the_card(job: QueuedJob) -> bool:
-    """A job the background services must step aside for: one that holds GPUs, or any urgent job (design 3.2).
+    """A job the background services must step aside for: one that holds GPUs or shards of one, or any urgent job (design 3.2).
 
     Decided from what slurm says (`gres`), never from the job's sidecar: any user can leave a record under an id.
     """
-    return job.partition == Partition.URGENT or job.gpus > 0
+    return job.partition == Partition.URGENT or job.uses_card
 
 
 def pid_alive(pid: object) -> bool:
@@ -739,6 +802,31 @@ def completion_records(job_ids: Iterable[str] | None = None) -> dict[str, dict[s
 UNCLEAN_MIN_S = 600
 
 
+#: A sidecar `kind` for a sharing measurement's own jobs (`sharing.py`): never a real run.
+SHARING_PROBE = "sharing_probe"
+
+
+def own_records(name: str) -> Iterable[dict[str, object]]:
+    """This user's sidecar records of jobs called `name`, legs copied back from part-time machines merged in. Another
+    user's file with the name is ignored (it could understate a peak or forge a sharing level)."""
+    me = current_user()
+    remote = {job_id: path for path, job_id, owner in remote_files("jobs", "*.json") if owner == me}
+    for path in (STATE_DIR / "jobs").glob("*.json"):
+        record = read_json(path, me) or {}
+        if record.get("name") != name:
+            continue
+        if path.stem in remote and (copied := read_json(remote[path.stem])):
+            record = merge_remote(record, copied)
+        yield record
+
+
+def measured_sharing(name: str) -> dict[str, object] | None:
+    """The `sharing` mapping of this user's newest record called `name` that has one (`sharing.py measure`), else None."""
+    found = [r for r in own_records(name) if isinstance(r.get("sharing"), dict)]
+    newest = max(found, key=lambda r: int(r["sharing"].get("measured_at") or r.get("submitted_at") or 0), default=None)
+    return None if newest is None else newest["sharing"]
+
+
 def measured_peak_bytes(name: str, *, clean: bool = True) -> int | None:
     """The footprint of the newest run called `name` that finished cleanly (exit 0, no signal): GPU plus CPU side.
 
@@ -749,14 +837,9 @@ def measured_peak_bytes(name: str, *, clean: bool = True) -> int | None:
     for the whole box and sat idle beside a 27 GB job with 75 GB free).
     """
     best: tuple[int, int] | None = None
-    me = current_user()
-    remote = {job_id: path for path, job_id, owner in remote_files("jobs", "*.json") if owner == me}
-    for path in (STATE_DIR / "jobs").glob("*.json"):
-        record = read_json(path, me) or {}
-        if record.get("name") != name:
-            continue
-        if path.stem in remote and (copied := read_json(remote[path.stem])):
-            record = merge_remote(record, copied)
+    for record in own_records(name):
+        if record.get("kind") == SHARING_PROBE:
+            continue  # a probe's total is over several copies at once: it must never size a real job
         for leg in _legs(record):
             if "peak_gpu_mib" not in leg or (clean and (leg.get("exit") != 0 or leg.get("signals"))):
                 continue
@@ -1006,12 +1089,14 @@ def node_capacity(
     for line in done.stdout.splitlines():
         fields = dict(part.split("=", 1) for part in line.split() if "=" in part)
         gpus = [re.search(r"gres/gpu=(\d+)", fields.get(key, "")) for key in ("CfgTRES", "AllocTRES")]
+        shards = [re.search(r"gres/shard=(\d+)", fields.get(key, "")) for key in ("CfgTRES", "AllocTRES")]
         node: dict[str, int | str] = {"name": fields.get("NodeName", ""), "here": int(host in {fields.get("NodeName"), fields.get("NodeHostName")}),
                                         "comment": fields.get("Comment", ""), "state": fields.get("State", ""),
                                         "partitions": fields.get("Partitions", "")}
         for key, value in (("cpus", fields.get("CPUEfctv") or fields.get("CPUTot")), ("cpus_used", fields.get("CPUAlloc")),
                            ("mem_mb", fields.get("RealMemory")), ("mem_used_mb", fields.get("AllocMem")),
-                           ("gpus", gpus[0] and gpus[0][1]), ("gpus_used", gpus[1] and gpus[1][1])):
+                           ("gpus", gpus[0] and gpus[0][1]), ("gpus_used", gpus[1] and gpus[1][1]),
+                           ("shards", shards[0] and shards[0][1]), ("shards_used", shards[1] and shards[1][1])):
             node[key] = int(value) if value and str(value).isdigit() else 0
         held = fields.get("MemSpecLimit", "")
         node["mem_mb"] = int(node["mem_mb"]) - (int(held) if held.isdigit() else 0)
@@ -1030,7 +1115,7 @@ def capacity(
         return {}
     if partition is not None:
         found = [node for node in found if starts_jobs_in(node, partition)]
-    total = dict.fromkeys(("cpus", "cpus_used", "mem_mb", "mem_used_mb", "gpus", "gpus_used", "here"), 0)
+    total = dict.fromkeys(("cpus", "cpus_used", "mem_mb", "mem_used_mb", "gpus", "gpus_used", "shards", "shards_used", "here"), 0)
     for node in found:
         for key in total:
             total[key] += int(node[key])

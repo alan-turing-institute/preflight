@@ -58,6 +58,13 @@ def test_classes_of_what_is_in_the_way() -> None:
     assert victims_fill == ["6"] and not any("KNOCK-ON" in line for line in only_fill)
 
 
+def test_a_running_shard_job_is_in_the_way_of_an_urgent_gpu_job() -> None:
+    shard = gpu_jobs.QueuedJob("8", "normal", "RUNNING", "None", "p:x:8", shards=4)  # holds shards, no GPU
+    _, victims, _, _ = urgent.plan([shard, job("5", "cpu", gpus=0, cls="resume")], gpu=True, whole_box=False,
+                                   leases=[], unregistered=[], services={})
+    assert victims == ["8"]
+
+
 def test_whole_box_puts_every_running_job_in_the_way() -> None:
     _, victims, steady, _ = urgent.plan(
         [job("1", "normal"), job("3", "cpu", gpus=0, cls="resume"), job("5", "cpu", gpus=0, cls="restart")],

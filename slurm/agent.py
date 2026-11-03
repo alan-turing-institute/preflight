@@ -152,6 +152,7 @@ class IdleRule(StrEnum):
     CORES = "cores"
     CPU_CORE_CAP = "cpu_core_cap"
     GPU = "gpu"
+    SHARDS = "shards"
 
 
 class PartTimeAction(StrEnum):
@@ -286,9 +287,10 @@ def idle_findings(queue: list[gpu_jobs.QueuedJob], total: dict[str, int], cpu_ca
     and GPUs the job asks for more of than is free; its holders are the running jobs holding it, largest first."""
     free_mem, free_cpus = total["mem_mb"] - total["mem_used_mb"], total["cpus"] - total["cpus_used"]
     free_gpus = total["gpus"] - total["gpus_used"]
+    free_shards = total.get("shards", 0) - total.get("shards_used", 0)
     idle = [
         what for what, unused in (
-            ("a GPU unreserved", total["gpus"] and not total["gpus_used"]),
+            ("a GPU unreserved", total["gpus"] and not total["gpus_used"] and not total.get("shards_used", 0)),
             (f"{free_cpus} cores free", free_cpus >= 1),
             (f"{_gb(free_mem):.1f} GB unreserved", _gb(free_mem) >= IDLE_MEMORY_GB),
         ) if unused
@@ -311,6 +313,7 @@ def idle_findings(queue: list[gpu_jobs.QueuedJob], total: dict[str, int], cpu_ca
             (IdleRule.CPU_CORE_CAP, cpu_only and cpu_cap is not None and job.cpus + sum(j.cpus for j in in_cpu) > (cpu_cap or 0),
              f"{job.cpus} cores under the cpu cap of {cpu_cap}", [(j.cpus, f"{j.cpus} cores", j) for j in in_cpu]),
             (IdleRule.GPU, job.gpus > free_gpus, f"{job.gpus} GPU", [(j.gpus, f"{j.gpus} GPU", j) for j in active]),
+            (IdleRule.SHARDS, job.shards > free_shards, f"{job.shards} shards", [(j.shards, f"{j.shards} shards", j) for j in active]),
         )
         for rule, lacking, lacks, held in options:
             if lacking:

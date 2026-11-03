@@ -207,6 +207,9 @@ def test_machine_use_reads_this_host_and_capacity_says_whether_this_host_is_the_
     one = gpu_jobs.capacity(lambda *_a, **_k: subprocess.CompletedProcess([], 0, nodes))
     two = gpu_jobs.capacity(lambda *_a, **_k: subprocess.CompletedProcess([], 0, nodes.replace(here, "elsewhere") + nodes))
     assert (one["nodes"], one["here"], one["mem_used_mb"], two["nodes"], two["here"]) == (1, 1, 61440, 2, 1)
+    shared = nodes.replace("CfgTRES=gres/gpu=1 AllocTRES=gres/gpu=1", "CfgTRES=gres/gpu=1,gres/shard=12 AllocTRES=gres/shard=8")
+    both_shared = gpu_jobs.capacity(lambda *_a, **_k: subprocess.CompletedProcess([], 0, shared))
+    assert (both_shared["shards"], both_shared["shards_used"], both_shared["gpus_used"]) == (12, 8, 0)  # shard use is not GPU use
     lent = "NodeName=lap CPUTot=16 CPUEfctv=8 RealMemory=31494 MemSpecLimit=19494 AllocMem=0 CPUAlloc=0\n"
     both = gpu_jobs.capacity(lambda *_a, **_k: subprocess.CompletedProcess([], 0, nodes + lent))
     assert (both["cpus"], both["mem_mb"]) == (20 + 8, 100000 + 12000)  # a part-time machine counts only what it lends
@@ -243,10 +246,77 @@ def test_a_level_always_wins_then_the_earlier_job_and_every_placed_priority_is_a
 
 @pytest.mark.parametrize(
     ("gres", "count"),
-    [("gres/gpu:2", 2), ("gpu:gb10:2", 2), ("gres/gpu:gb10:2", 2), ("gres/gpu", 1), ("N/A", 0), ("", 0), ("gres/gpu:1", 1)],
+    [("gres/gpu:2", 2), ("gpu:gb10:2", 2), ("gres/gpu:gb10:2", 2), ("gres/gpu", 1), ("N/A", 0), ("", 0), ("gres/gpu:1", 1),
+     ("gres/shard:4", 0), ("shard:gb10:4", 0), ("gres/gpu:1,gres/shard:2", 1)],
 )
 def test_parse_gpus(gres: str, count: int) -> None:
     assert gpu_jobs.parse_gpus(gres) == count
+
+
+@pytest.mark.parametrize(
+    ("gres", "count"),
+    [("gres/shard:4", 4), ("shard:gb10:4", 4), ("gres/shard", 1), ("gres/gpu:1,gres/shard:2", 2), ("gres/gpu:1", 0), ("N/A", 0)],
+)
+def test_parse_shards_and_a_shard_job_holds_the_card(gres: str, count: int) -> None:
+    assert gpu_jobs.parse_shards(gres) == count
+    job = QueuedJob("7", "normal", "PENDING", "None", "n", gpus=gpu_jobs.parse_gpus(gres), shards=count)
+    assert job.uses_card == bool(gpu_jobs.parse_gpus(gres) or count)
+    assert gpu_jobs.needs_the_card(job) == job.uses_card  # the lease keeper yields for a shard job too
+    assert not gpu_jobs.needs_the_card(QueuedJob("8", "cpu", "RUNNING", "None", "n"))  # a CPU job: no demand
+    # slurm 26.05.5's own text for three running `--gres=shard:2` jobs (recorded by the container's `sharing` stage)
+    real = gpu_jobs.parse_squeue((Path(__file__).parent / "fixtures" / "squeue_shard.json").read_text())
+    assert [(j.shards, j.gpus, gpu_jobs.needs_the_card(j)) for j in real] == [(2, 0, True)] * 3
+
+
+def test_measured_sharing_is_this_users_newest_and_a_probe_never_sizes_a_job(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(gpu_jobs, "STATE_DIR", tmp_path)
+    jobs = tmp_path / "jobs"
+    jobs.mkdir()
+    leg = {"peak_gpu_mib": 1024, "peak_mem_bytes": 0, "ended_at": 1, "exit": 0, "signals": []}
+    (jobs / "1.json").write_text(json.dumps({"name": "n", "legs": [leg], "sharing": {"level": 2, "measured_at": 10}}))
+    (jobs / "2.json").write_text(json.dumps({"name": "n", "sharing": {"level": 4, "measured_at": 20}}))
+    (jobs / "3.json").write_text(json.dumps({"name": "n", "sharing": {"level": 3, "measured_at": 15}}))
+    assert gpu_jobs.measured_sharing("n") == {"level": 4, "measured_at": 20}
+    assert gpu_jobs.measured_sharing("other") is None
+    # a probe's peak is the total over its copies: it must never size a real job, however new
+    (jobs / "4.json").write_text(json.dumps({"name": "n", "kind": gpu_jobs.SHARING_PROBE, "legs": [{**leg, "peak_gpu_mib": 9999, "ended_at": 99}]}))
+    assert gpu_jobs.measured_peak_bytes("n") == 1024 * 1024**2
+    monkeypatch.setattr(gpu_jobs, "current_user", lambda: "somebody-else")  # none of these files is theirs
+    assert gpu_jobs.measured_sharing("n") is None
+
+
+def test_plan_packing_takes_the_smallest_of_compute_memory_and_cores() -> None:
+    gpu = site_config.Gpu(0, "GPU-a", "/dev/nvidia0", "gb10", shards=12)
+    node = site_config.Node("n", 20, 100_000, (gpu,), cores_per_gpu=12)
+    record = {"level": 4, "gpu_type": "gb10", "node_memory_mb": 100_000, "shards": 12}
+    gb = 1000**3
+
+    def peak_for(copies: int) -> int:  # a peak at which the node's memory fits exactly this many, margin included
+        return int(100_000 * 1048576 / (copies * 1.1) * 0.999)
+
+    def plan(**given):
+        arguments = {"gpu": gpu, "node": node, "record": record, "peak_bytes": 2 * gb, "fraction": None, "cpus_asked": None,
+                     "explicit_level": None, "margin": 0.1}
+        return gpu_jobs.plan_packing(**{**arguments, **given})
+
+    assert (plan().level, plan().shards, plan().cores) == (4, 3, 3)
+    assert plan(peak_bytes=peak_for(5)).level == 4 and plan(peak_bytes=peak_for(3)).level == 3  # memory binds
+    assert plan(fraction=0.5, peak_bytes=peak_for(5)).level == 2  # the site's fraction tightens memory
+    assert plan(cpus_asked=5).level == 2  # cores: 12 // 5
+    assert plan(cpus_asked=5).shards == 6  # ceil(12 / 2)
+    assert plan(record={**record, "level": 5}).shards == 3 and plan(record={**record, "level": 5}).level == 5  # ceil(12/5) = 3
+    assert plan(record={**record, "level": 5}).cores == 3
+    assert "level 4 (measured 4; memory allows" in plan().line and "--gres=shard:3 of 12, 3 cores" in plan().line
+    # no record, another card type, or an unknown peak: the whole card, today's request
+    for whole in (plan(record=None), plan(record={**record, "gpu_type": "h100"}), plan(record={**record, "shards": 6}),
+                  plan(peak_bytes=None), plan(gpu=site_config.Gpu(0, "GPU-a", "/dev/nvidia0", "gb10"))):
+        assert (whole.level, whole.shards, whole.line) == (1, 0, "")
+    # --max-jobs replaces the measured level only; memory still bounds it
+    assert plan(explicit_level=6).level == 6 and plan(explicit_level=2).level == 2 and plan(record=None, explicit_level=3).level == 3
+    assert plan(explicit_level=50, peak_bytes=peak_for(5)).level == 5
+    # asked for sharing and not given it: the whole card, and the line says why
+    refused = plan(explicit_level=3, peak_bytes=peak_for(1))
+    assert (refused.level, refused.shards) == (1, 0) and refused.line.startswith("asked 3 copies, but memory allows 1")
 
 
 def test_container_label_uses_the_scope_id_and_degrades_to_empty() -> None:

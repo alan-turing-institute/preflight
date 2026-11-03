@@ -672,3 +672,14 @@ def test_a_whole_box_job_waiting_beside_a_restart_cpu_job_is_found_noticed_hourl
     world.totals = world.totals.replace("CPUAlloc=2", "CPUAlloc=4").replace("AllocMem=22888", "AllocMem=99000")
     world.t += agent_module.IDLE_EVERY_S
     assert world.step()["idle"] == []
+    # a shard job waits for shards: the card holds no GPU reservation, yet it is not "a GPU unreserved"
+    world.totals = ("CPUTot=4 CPUAlloc=2 RealMemory=100000 AllocMem=1000 "
+                    "CfgTRES=cpu=4,gres/gpu=1,gres/shard=12 AllocTRES=gres/shard=12")
+    world.queue = [
+        gpu_jobs.QueuedJob("700", "normal", "PENDING", "Resources", "p:resume:wait", user="a", shards=4, cpus=1, mem_mb=1000),
+        gpu_jobs.QueuedJob("701", "normal", "RUNNING", "None", "p:resume:hold", user="b", shards=12, cpus=2, mem_mb=1000),
+    ]
+    world.t += agent_module.IDLE_EVERY_S
+    [shard_finding] = world.step()["idle"]
+    assert shard_finding["rule"] == "shards" and "needs 4 shards" in shard_finding["text"]
+    assert [h["job"] for h in shard_finding["holders"]] == ["701"] and "GPU unreserved" not in shard_finding["idle"]

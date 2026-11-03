@@ -58,7 +58,7 @@ def lines(queue: list[gpu_jobs.QueuedJob] | None) -> list[str]:
         record = records.get(job.job_id, {})
         why = jobs_view.waiting_reason(job, by_id, records, events)
         out.append(gpu_jobs.printable(  # names and descriptions are what their submitters typed
-            f"[status] {job.job_id} {job.state:<10} {job.user or '?':<10} {job.level:<6} {job.gpus} GPU {job.name}"
+            f"[status] {job.job_id} {job.state:<10} {job.user or '?':<10} {job.level:<6} {f'{job.shards} shards' if job.shards else f'{job.gpus} GPU'} {job.name}"
             f"{f' on {job.node}' if job.node else ''}"
             f" | {record.get('mem') or 'default mem'}, {_pauses(job)}"
             f" | {record.get('what', '(no sidecar)')}{f' | {why}' if why else ''}"
