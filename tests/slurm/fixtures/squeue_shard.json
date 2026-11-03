@@ -5,7 +5,7 @@
       "accrue_time": {
         "set": true,
         "infinite": false,
-        "number": 1793709319
+        "number": 1793711827
       },
       "admin_comment": "",
       "allocating_node": "testnode",
@@ -115,12 +115,12 @@
       "eligible_time": {
         "set": true,
         "infinite": false,
-        "number": 1793709319
+        "number": 1793711827
       },
       "end_time": {
         "set": true,
         "infinite": false,
-        "number": 1825245320
+        "number": 1825247828
       },
       "excluded_nodes": "",
       "exit_code": {
@@ -163,7 +163,7 @@
         "infinite": false,
         "number": 0
       },
-      "job_id": 5,
+      "job_id": 53,
       "job_resources": {
         "select_type": [
           "CR_CORE_MEMORY"
@@ -235,7 +235,7 @@
       "last_sched_evaluation": {
         "set": true,
         "infinite": false,
-        "number": 1793709320
+        "number": 1793711828
       },
       "licenses": "",
       "licenses_allocated": "",
@@ -329,7 +329,7 @@
       "preemptable_time": {
         "set": true,
         "infinite": false,
-        "number": 1793709320
+        "number": 1793711828
       },
       "pre_sus_time": {
         "set": true,
@@ -340,7 +340,7 @@
       "priority": {
         "set": true,
         "infinite": false,
-        "number": 4294901758
+        "number": 4294901706
       },
       "priority_by_partition": [],
       "profile": [
@@ -363,11 +363,11 @@
       "selinux_context": "",
       "shared": [],
       "step_id": {
-        "sluid": "s78SM6GPG9GG00",
+        "sluid": "s699M6GRWT2S00",
         "job_id": {
           "set": true,
           "infinite": false,
-          "number": 5
+          "number": 53
         },
         "step_het_component": {
           "set": false,
@@ -385,7 +385,7 @@
       "start_time": {
         "set": true,
         "infinite": false,
-        "number": 1793709320
+        "number": 1793711828
       },
       "state_description": "",
       "state_reason": "None",
@@ -393,12 +393,12 @@
       "standard_output": "slurm-%j.out",
       "standard_error": "",
       "stdin_expanded": "\/dev\/null",
-      "stdout_expanded": "\/home\/alice\/slurm-5.out",
+      "stdout_expanded": "\/home\/alice\/slurm-53.out",
       "stderr_expanded": "",
       "submit_time": {
         "set": true,
         "infinite": false,
-        "number": 1793709319
+        "number": 1793711827
       },
       "submit_line": "sbatch --parsable -J shard0 --gres=shard:2 --mem=200M -c 1 --wrap sleep 600",
       "suspend_time": {
@@ -441,7 +441,7 @@
       "accrue_time": {
         "set": true,
         "infinite": false,
-        "number": 1793709319
+        "number": 1793711827
       },
       "admin_comment": "",
       "allocating_node": "testnode",
@@ -551,12 +551,12 @@
       "eligible_time": {
         "set": true,
         "infinite": false,
-        "number": 1793709319
+        "number": 1793711827
       },
       "end_time": {
         "set": true,
         "infinite": false,
-        "number": 1825245320
+        "number": 1825247828
       },
       "excluded_nodes": "",
       "exit_code": {
@@ -599,7 +599,7 @@
         "infinite": false,
         "number": 0
       },
-      "job_id": 6,
+      "job_id": 54,
       "job_resources": {
         "select_type": [
           "CR_CORE_MEMORY"
@@ -671,7 +671,7 @@
       "last_sched_evaluation": {
         "set": true,
         "infinite": false,
-        "number": 1793709320
+        "number": 1793711828
       },
       "licenses": "",
       "licenses_allocated": "",
@@ -765,7 +765,7 @@
       "preemptable_time": {
         "set": true,
         "infinite": false,
-        "number": 1793709320
+        "number": 1793711828
       },
       "pre_sus_time": {
         "set": true,
@@ -776,7 +776,7 @@
       "priority": {
         "set": true,
         "infinite": false,
-        "number": 4294901757
+        "number": 4294901705
       },
       "priority_by_partition": [],
       "profile": [
@@ -799,11 +799,11 @@
       "selinux_context": "",
       "shared": [],
       "step_id": {
-        "sluid": "s78SM6GPG9KY00",
+        "sluid": "s699M6GRWT7300",
         "job_id": {
           "set": true,
           "infinite": false,
-          "number": 6
+          "number": 54
         },
         "step_het_component": {
           "set": false,
@@ -821,7 +821,7 @@
       "start_time": {
         "set": true,
         "infinite": false,
-        "number": 1793709320
+        "number": 1793711828
       },
       "state_description": "",
       "state_reason": "None",
@@ -829,12 +829,12 @@
       "standard_output": "slurm-%j.out",
       "standard_error": "",
       "stdin_expanded": "\/dev\/null",
-      "stdout_expanded": "\/home\/alice\/slurm-6.out",
+      "stdout_expanded": "\/home\/alice\/slurm-54.out",
       "stderr_expanded": "",
       "submit_time": {
         "set": true,
         "infinite": false,
-        "number": 1793709319
+        "number": 1793711827
       },
       "submit_line": "sbatch --parsable -J shard1 --gres=shard:2 --mem=200M -c 1 --wrap sleep 600",
       "suspend_time": {
@@ -877,7 +877,7 @@
       "accrue_time": {
         "set": true,
         "infinite": false,
-        "number": 1793709319
+        "number": 1793711827
       },
       "admin_comment": "",
       "allocating_node": "testnode",
@@ -987,12 +987,12 @@
       "eligible_time": {
         "set": true,
         "infinite": false,
-        "number": 1793709319
+        "number": 1793711827
       },
       "end_time": {
         "set": true,
         "infinite": false,
-        "number": 1825245320
+        "number": 1825247828
       },
       "excluded_nodes": "",
       "exit_code": {
@@ -1035,7 +1035,7 @@
         "infinite": false,
         "number": 0
       },
-      "job_id": 7,
+      "job_id": 55,
       "job_resources": {
         "select_type": [
           "CR_CORE_MEMORY"
@@ -1107,7 +1107,7 @@
       "last_sched_evaluation": {
         "set": true,
         "infinite": false,
-        "number": 1793709320
+        "number": 1793711828
       },
       "licenses": "",
       "licenses_allocated": "",
@@ -1201,7 +1201,7 @@
       "preemptable_time": {
         "set": true,
         "infinite": false,
-        "number": 1793709320
+        "number": 1793711828
       },
       "pre_sus_time": {
         "set": true,
@@ -1212,7 +1212,7 @@
       "priority": {
         "set": true,
         "infinite": false,
-        "number": 4294901756
+        "number": 4294901704
       },
       "priority_by_partition": [],
       "profile": [
@@ -1235,11 +1235,11 @@
       "selinux_context": "",
       "shared": [],
       "step_id": {
-        "sluid": "s78SM6GPG9PM00",
+        "sluid": "s699M6GRWTB900",
         "job_id": {
           "set": true,
           "infinite": false,
-          "number": 7
+          "number": 55
         },
         "step_het_component": {
           "set": false,
@@ -1257,7 +1257,7 @@
       "start_time": {
         "set": true,
         "infinite": false,
-        "number": 1793709320
+        "number": 1793711828
       },
       "state_description": "",
       "state_reason": "None",
@@ -1265,12 +1265,12 @@
       "standard_output": "slurm-%j.out",
       "standard_error": "",
       "stdin_expanded": "\/dev\/null",
-      "stdout_expanded": "\/home\/alice\/slurm-7.out",
+      "stdout_expanded": "\/home\/alice\/slurm-55.out",
       "stderr_expanded": "",
       "submit_time": {
         "set": true,
         "infinite": false,
-        "number": 1793709319
+        "number": 1793711827
       },
       "submit_line": "sbatch --parsable -J shard2 --gres=shard:2 --mem=200M -c 1 --wrap sleep 600",
       "suspend_time": {
@@ -1317,7 +1317,7 @@
   "last_update": {
     "set": true,
     "infinite": false,
-    "number": 1793709323
+    "number": 1793711832
   },
   "meta": {
     "plugin": {
@@ -1335,7 +1335,7 @@
       "squeue",
       "--json",
       "-j",
-      "5,6,7"
+      "53,54,55"
     ],
     "slurm": {
       "version": {
