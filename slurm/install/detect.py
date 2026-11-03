@@ -9,8 +9,12 @@ import re
 import socket
 import subprocess
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # slurm/, a standalone driver like footprint.py
+
+import cores  # noqa: E402 - path set just above
 
 DEFAULT_RESERVE_MB = 12288  # the host memory guard's 12 GiB
 NO_VALUE = "[N/A]"
@@ -69,7 +73,8 @@ def quote(value: str) -> str:
 
 
 def render(
-    *, hostname: str, cpus: int, real_memory_mb: int, gpus: list[dict], slurm_version: str, os_name: str
+    *, hostname: str, cpus: int, real_memory_mb: int, gpus: list[dict], slurm_version: str, os_name: str,
+    core_groups: Mapping[int, list[int]] | None = None,
 ) -> str:
     lines = [
         f"# Draft site file for {hostname}, from detect.py. Review before installing.",
@@ -89,6 +94,10 @@ def render(
         f"cpus = {cpus}",
         f"real_memory_mb = {real_memory_mb}",
     ]
+    for mhz, group in (core_groups or {}).items():  # only given when the cores differ
+        lines.append(f"# top speed {mhz} MHz: {len(group)} cores ({cores.cpu_list(group)})")
+    if core_groups:
+        lines.append("# slurm hands cores out without telling these apart; `slurm/cores.py` lists them, each run records which it got")
     if not gpus:
         lines.append("# no GPUs detected (nvidia-smi missing or listed none)")
     for gpu in gpus:
@@ -112,7 +121,9 @@ def detect(
     hostname: str | None = None,
     cpus: int | None = None,
     reserve_mb: int = DEFAULT_RESERVE_MB,
+    cpu_root: Path = cores.CPU_ROOT,
 ) -> str:
+    speeds = cores.CoreSpeeds.read(cpu_root)
     os_text = os_release_path.read_text() if os_release_path.exists() else ""
     return render(
         hostname=hostname or socket.gethostname(),
@@ -121,6 +132,7 @@ def detect(
         gpus=probe_gpus(run),
         slurm_version=(run(["sinfo", "-V"]) or "not found").strip(),
         os_name=parse_os_name(os_text),
+        core_groups=speeds.groups() if speeds.mixed else None,
     )
 
 

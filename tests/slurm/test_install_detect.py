@@ -9,8 +9,8 @@ detect = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(detect)
 
 
-def site_from(fixture: str | None, *, reserve_mb: int = detect.DEFAULT_RESERVE_MB) -> dict:
-    """Run detect against a recorded fixture dir; None = a box with no nvidia-smi."""
+def text_from(fixture: str | None, *, reserve_mb: int = detect.DEFAULT_RESERVE_MB, cpu_root: Path = Path("/nonexistent")) -> str:
+    """Run detect against a recorded fixture dir; None = a box with no nvidia-smi. `cpu_root`: no core speeds by default."""
     base = FIXTURES / (fixture or "gb10")
 
     def run(argv):
@@ -18,11 +18,33 @@ def site_from(fixture: str | None, *, reserve_mb: int = detect.DEFAULT_RESERVE_M
             return (base / "nvidia_smi.csv").read_text() if fixture else None
         return (base / "sinfo_version.txt").read_text()
 
-    text = detect.detect(
+    return detect.detect(
         run=run, meminfo_path=base / "meminfo", os_release_path=base / "os_release",
-        hostname="testbox", cpus=20, reserve_mb=reserve_mb,
+        hostname="testbox", cpus=20, reserve_mb=reserve_mb, cpu_root=cpu_root,
     )
-    return tomllib.loads(text)
+
+
+def site_from(fixture: str | None, *, reserve_mb: int = detect.DEFAULT_RESERVE_MB) -> dict:
+    return tomllib.loads(text_from(fixture, reserve_mb=reserve_mb))
+
+
+def fake_cpus(root: Path, speeds: dict[str, str]) -> Path:
+    """A /sys/devices/system/cpu with one cpuN/cpufreq/cpuinfo_max_freq per entry."""
+    for cpu, khz in speeds.items():
+        (root / f"cpu{cpu}" / "cpufreq").mkdir(parents=True)
+        (root / f"cpu{cpu}" / "cpufreq" / "cpuinfo_max_freq").write_text(khz)
+    return root
+
+
+def test_cores_that_differ_are_listed_by_top_speed_and_alike_cores_are_not(tmp_path: Path):
+    mixed = fake_cpus(tmp_path / "mixed", {"0": "3900000\n", "1": "2808000\n", "2": "2808000\n", "3": "garbage"})
+    (mixed / "cpu4").mkdir()  # an offline core has no cpufreq; cpu3 reports nonsense: both are left out, neither fails the draft
+    text = text_from("gb10", cpu_root=mixed)
+    assert "# top speed 2808 MHz: 2 cores (1-2)" in text and "# top speed 3900 MHz: 1 cores (0)" in text
+    assert text.index("2808 MHz") < text.index("3900 MHz")  # slowest first, though cpu0 is the fast one
+    assert "top speed" not in text_from("gb10", cpu_root=fake_cpus(tmp_path / "alike", {"0": "3900000", "1": "3900000"}))
+    assert "top speed" not in text_from("gb10")  # a host that reports no speeds (no cpufreq)
+    assert tomllib.loads(text)["nodes"][0]["name"] == "testbox"  # the note is a comment: the draft still parses
 
 
 def test_gb10_is_unified_with_one_gpu():

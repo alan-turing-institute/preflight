@@ -586,6 +586,15 @@ Build without hwloc (the rpm build does), give the node `cores_per_socket` as `s
 in its own abstract ids, in an order that is not the operating system's. Reserve each id alone (`CpuSpecList=k` on a copy of the node's conf, `slurmd -D -v`)
 and read the log's "Reserved machine CPU IDs"; then run a job given all its CPUs and check `cpuset.cpus.effective` is the cores you meant to lend.
 
+**Fast and slow cores.** On a host whose cores differ (Arm big.LITTLE, Intel performance and efficiency cores) the same job runs several times
+slower on some cores: measured on an Arm host, one thread of a small torch fit took 6 to 8 s on a 3.9 GHz Cortex-X925 core and 27 to 43 s on a
+2.8 GHz Cortex-A725 core. Slurm hands out the lowest free cores and cannot be told to prefer a kind: a node feature belongs to the whole node, and a
+counted resource tied to sockets did not keep a request on the right cores in slurm 26.05.5 (`design notes`,
+section 10). What the tools do instead is report the fact. `python3 slurm/cores.py` prints the cores of each top speed (from cpufreq's
+`cpuinfo_max_freq`, which separates the kinds; `cpu_capacity` does not), `slurm/install/detect.py` puts the same lines in its draft site file, and
+on such a host every run's record (`jobs/<id>.json`, in each leg) has `cores`: the cores that leg was allowed and how many ran at each top speed, e.g.
+`{"cpus": "0-3,8-11", "cores_by_max_mhz": {"2808": 6, "3900": 2}}`. A host whose cores are alike records nothing.
+
 **Where a part-time job's records go.** The job wrapper runs on the machine, so a job's record (`jobs/<id>.json`, with
 its legs and peaks), its events (a pushed-back job's `push_back`) and its log are written to the machine's own state
 directory. Every minute the controller's agent copies each machine's state directory to

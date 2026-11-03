@@ -184,6 +184,20 @@ def test_sigterm_is_passed_to_the_child_which_saves_then_the_leg_is_recorded(
     assert job_wrapper.main() == 0
     assert [leg["leg"] for leg in json.loads((tmp_path / "state" / "jobs" / "81.json").read_text())["legs"]] == [0]
 
+    # A leg records the cores it was allowed, by top speed, on a host whose cores differ and nothing on one whose cores are alike
+    # (2026-11-03: one thread ran 4 to 6 times slower on the slower cores, and no run said which it had been given).
+    monkeypatch.setattr(job_wrapper.gpu_jobs, "read_sidecar", lambda *a, **k: {})
+    monkeypatch.setattr(os, "sched_getaffinity", lambda _pid: {0, 1, 5})
+    slow, fast = 2_808_000, 3_900_000
+    for job_id, khz, expected in (
+        ("82", {0: slow, 1: slow, 5: fast}, {"cpus": "0-1,5", "cores_by_max_mhz": {"2808": 2, "3900": 1}}),
+        ("83", {0: fast, 1: fast, 5: fast}, None),
+    ):
+        monkeypatch.setenv("SLURM_JOB_ID", job_id)
+        monkeypatch.setattr(job_wrapper.cores.CoreSpeeds, "read", classmethod(lambda cls, root=None, khz=khz: cls(khz)))
+        assert job_wrapper.main() == 0
+        assert json.loads((tmp_path / "state" / "jobs" / f"{job_id}.json").read_text())["last_leg"].get("cores") == expected
+
 
 def test_an_unverifiable_manifest_refuses_the_launch(tmp_path: Path) -> None:
     env = dict(os.environ, SLURM_GPU_STATE_DIR=str(tmp_path / "state"), SLURM_JOB_ID="78")
