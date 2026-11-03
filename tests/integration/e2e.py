@@ -6,12 +6,13 @@
 
 Runs on the host and drives the container through `run.sh shell`. Every check prints PASS or FAIL with its
 evidence as it happens; the exit status is 1 when any check failed. Stages: install, jobs, urgent, failure,
-recovery, portal, proxy, ssh, lease, host, part_time, upgrade (in this order; `--only` takes a subset, later stages need `install` to have run once).
+recovery, portal, proxy, ssh, lease, host, part_time, sharing, upgrade (in this order; `--only` takes a subset, later stages need `install` to have run once).
 """
 
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import os
 import re
@@ -1433,6 +1434,110 @@ BACKUP_FILES = 3  # database dump, state tar, /etc/slurm tar
 UPGRADE_TIMEOUT_S = 4 * 3600  # two builds and two database conversions
 
 
+# -- stage: sharing ---------------------------------------------------------------------------------------------
+
+
+SHARD_CARD_SHARDS = 6  # `shards` of the last fake card in harness.site.toml
+SHARD_JOB_SHARDS = SHARD_CARD_SHARDS // 3  # three jobs fill the card
+SHARD_FIXTURE = REPO / "tests" / "slurm" / "fixtures" / "squeue_shard.json"
+
+
+def shard_job(name: str, shards: int) -> str:
+    """A job holding `shards` of the shared card, queued straight with sbatch as alice (the submit tool's own shard flags are
+    exercised by the stages the main session adds below); returns the job id ('' if refused)."""
+    done = cl("sbatch", "--parsable", "-J", name, f"--gres=shard:{shards}", "--mem=200M", "-c", "1", "--wrap", "sleep 600", user="alice")
+    return done.out.strip().split(";")[0] if done.rc == 0 else ""
+
+
+def whole_card_job(name: str, user: str) -> str:
+    """A job asking for all four fake cards, the shared one included, queued straight with sbatch; returns the job id ('' if refused)."""
+    done = cl("sbatch", "--parsable", "-J", name, "--gres=gpu:4", "--mem=200M", "-c", "1", "--wrap", "sleep 600", user=user)
+    return done.out.strip().split(";")[0] if done.rc == 0 else ""
+
+
+SCHEDULER_PASSES_S = 20  # the harness slurm.conf's scheduling interval is a few seconds: this is several passes
+SHARD_PARSE = """
+import sys
+sys.dont_write_bytecode = True
+sys.path.insert(0, %r)
+import gpu_jobs
+print(sorted((j.job_id, j.shards, j.gpus, gpu_jobs.needs_the_card(j)) for j in gpu_jobs.read_queue() or []))
+"""
+
+
+def stage_sharing() -> None:
+    section("sharing: one card cut into shards, several jobs on it at once")
+    clear_queue()
+    # E1: the daemons started with the rendered shard configuration (the install stage applied it from harness.site.toml)
+    conf = sh("grep -h -E '^(GresTypes|AccountingStorageTRES)=|shard' /etc/slurm/slurm.conf /etc/slurm/gres.conf")
+    node = nodes_alloc()
+    check("E1: the rendered config declares shards, and the node is idle with gpu and shard in its Gres",
+          "GresTypes=gpu,shard" in conf.out and "gres/shard" in conf.out and f"Name=shard Count={SHARD_CARD_SHARDS} " in conf.out
+          and "State=IDLE" in node and re.search(rf"Gres=gpu:fake:4,shard:(fake:)?{SHARD_CARD_SHARDS}\b", node) is not None,
+          f"{conf.text[:200]} | {node[:300]}")
+    # E2: three jobs of a third of the card run at once; a fourth waits for the card, not for cores or memory
+    jobs = [shard_job(f"shard{i}", SHARD_JOB_SHARDS) for i in range(3)]
+    running = all(wait_state(j, "RUNNING", 60) for j in jobs if j) and all(jobs)
+    fourth = shard_job("shard-wait", SHARD_JOB_SHARDS)
+    waiting = bool(fourth) and bool(wait_for(lambda: jobinfo(fourth).get("Reason") == "Resources", 30))
+    held = jobinfo(jobs[0]).get("TresPerNode", "") if jobs[0] else ""
+    check(f"E2: three jobs of shard:{SHARD_JOB_SHARDS} run at once on one card and a fourth waits Resources",
+          running and waiting, f"jobs {jobs} running={running}; fourth {fourth}: {state(fourth) if fourth else ''} "
+          f"{jobinfo(fourth).get('Reason') if fourth else ''}; TresPerNode={held}; node: {nodes_alloc()[-300:]}")
+    shown = sh(f"squeue --json -j {','.join(j for j in jobs if j)}")
+    SHARD_FIXTURE.write_text(shown.out)  # the exact text of `tres_per_node` for a shard job, for the unit tests
+    try:  # slurm's JSON escapes the slash (`gres\/shard:2`), so compare the parsed value, not the text
+        requests = {str(j["job_id"]): j.get("tres_per_node") for j in json.loads(shown.out)["jobs"]}
+    except (ValueError, KeyError):
+        requests = {}
+    check("E2: squeue --json shows a shard job's request in tres_per_node (recorded to tests/slurm/fixtures/squeue_shard.json)",
+          shown.rc == 0 and all(requests.get(j) == f"gres/shard:{SHARD_JOB_SHARDS}" for j in jobs), f"{requests}")
+    # E7: the job layer reads slurm's own text for a shard job (the lease keeper yields to whatever `needs_the_card`, so a shard
+    # job must count as card use although it holds no GPU), and the status tool names its shards
+    put("/tmp/shard_parse.py", SHARD_PARSE % "/opt/gpujobs/slurm")
+    parsed = sh("python3 -I -B /tmp/shard_parse.py")
+    try:
+        seen = {job: rest for job, *rest in ast.literal_eval(parsed.out.strip())}
+    except (ValueError, SyntaxError):
+        seen = {}
+    listed = status_text("alice")
+    check("E7: gpu_jobs reads a real shard job as shards held, no GPU, and card demand; gpujobs-status shows its shards",
+          bool(jobs) and all(seen.get(j) == [SHARD_JOB_SHARDS, 0, True] for j in jobs) and f"{SHARD_JOB_SHARDS} shards" in listed,
+          f"{seen} | {parsed.text[-200:]} | {listed[:300]}")
+    # E3 + E4: a whole-card request waits while shards hold its card; shard jobs submitted AFTER it do not take the shards
+    # freed meanwhile; it starts the moment the card is empty, ahead of them. (Four fake cards: asking for all four is what
+    # needs the shared one.)
+    clear_queue()
+    held = [shard_job(f"shard-held{i}", SHARD_JOB_SHARDS) for i in range(3)]
+    all(wait_state(j, "RUNNING", 60) for j in held if j)
+    whole = whole_card_job("whole", "bob")
+    late = shard_job("shard-late", SHARD_JOB_SHARDS)
+    cl("scancel", held[0])
+    wait_for(lambda: state(held[0]) in {"CANCELLED", "GONE"}, 30)  # slurm keeps a cancelled job in `scontrol show job` for a while
+    time.sleep(SCHEDULER_PASSES_S)  # several scheduling passes: long enough for a queue-jumper to have started
+    jumped, why = state(late), jobinfo(late).get("Reason")
+    cl("scancel", held[1], held[2])
+    started = wait_state(whole, "RUNNING", 90)
+    check("E3/E4: the whole-card job waits while shards hold its card, a later shard job does not take the freed shards ahead of it, "
+          "and the whole-card job starts when the card is empty, before that later job",
+          bool(whole) and jumped == "PENDING" and started and state(late) == "PENDING",
+          f"whole {whole} {state(whole)}; late {late} was {jumped} ({why}), now {state(late)} ({jobinfo(late).get('Reason')})")
+    # E5: `urgent.py` against live shard jobs: it names them as in the way and slurm requeues every one of them for it
+    clear_queue()
+    victims = [shard_job(f"shard-victim{i}", SHARD_JOB_SHARDS) for i in range(3)]
+    all(wait_state(j, "RUNNING", 60) for j in victims if j)
+    out = cl("gpujobs-urgent", "--project", "e2e", "--what", "e2e urgent over shards", "--time", "5:00", "--gpus", "4",
+             "--name", "urgent-shards", "--", *sleep_cmd(15), user="carol", timeout=120)
+    urgent = (re.search(r"job (\d+) submitted", out.out) or [None, ""])[1]
+    named = all(f"{v} shard-victim" in out.out for v in victims)  # the plan lines read `<id> <name> (...)`
+    started = bool(urgent) and bool(wait_for(lambda: state(urgent) == "RUNNING", 180, 3))
+    requeued = all(wait_for(lambda v=v: state(v) == "PENDING", 60, 2) for v in victims)
+    check("E5: urgent.py names every running shard job as in the way, the urgent job starts, and each shard job is requeued",
+          bool(urgent) and named and started and requeued,
+          f"urgent {urgent} {state(urgent) if urgent else ''}; victims {[(v, state(v)) for v in victims]}; {out.text[-300:]}")
+    clear_queue()
+
+
 def stage_upgrade() -> None:
     section("upgrade: `install.py upgrade-slurm` from the image's slurm 23.11 to the site file's release (last: it replaces slurm)")
     clear_queue()
@@ -1476,6 +1581,7 @@ STAGES: dict[str, Callable[[], None]] = {
     "lease": stage_lease,
     "host": stage_host,
     "part_time": stage_part_time,
+    "sharing": stage_sharing,
     "upgrade": stage_upgrade,
 }
 

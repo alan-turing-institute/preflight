@@ -143,6 +143,7 @@ TOML. Tables: the top level, `[[nodes]]` with `[[nodes.gpus]]`, `[lease]` with `
 | `hostguard` | `false` | The job wrapper marks every job as the preferred out-of-memory victim (`oom_score_adj` 800, through the host memory guard in `hostguard/hostguard.py`), so a memory shortage ends a job rather than a login session. The `tools` component installs the guard when this is on. |
 | `dgx_gate` | `false` | Require the DGX submission gate for jobs submitted with `--entry` (other jobs are not gated). The `tools` component installs the gate (`dgx/`) and the host memory guard it checks when this is on. |
 | `notify_command` | `[]` | Command (list of arguments, no shell, 30 s limit) the agent runs when a job ends FAILED, OUT_OF_MEMORY, TIMEOUT or NODE_FAIL, with the job in the environment: `GPUJOBS_JOB` (id), `GPUJOBS_STATE`, `GPUJOBS_USER`, `GPUJOBS_NAME`. The name is whatever its submitter typed, with control characters shown as `?`: quote it wherever it goes into a shell command or a mail header. Empty means no notification. |
+| `sharing_memory_fraction` | absent | Only for sites that share a card (`shards`, below). A number above 0 and at most 1: the share of a node's jobs memory that the jobs sharing a card may fill together, counted at their measured peaks. It tightens two gates alike: `sharing.py measure` drops any level whose peak memory in use passes it (of the box's total memory), and `submit.py` caps the copies by it (of the node's jobs memory). Absent: they may fill all of it. |
 | `nodes` | required | One `[[nodes]]` table per compute node; at least one. |
 | `lease` | absent | Optional table; leave it out when no other service shares the GPU through the lease. Without it the `lease` component is not installed. |
 | `metrics` | all defaults below | Table. |
@@ -166,6 +167,7 @@ TOML. Tables: the top level, `[[nodes]]` with `[[nodes.gpus]]`, `[lease]` with `
 | `uuid` | required | From `nvidia-smi --query-gpu=uuid --format=csv,noheader`. |
 | `device` | required | Device file for `gres.conf`, for example `/dev/nvidia0`. |
 | `type` | required | Gres type name. The node's `Gres=gpu:TYPE:COUNT` uses the type of its first GPU and the number of its GPUs. |
+| `shards` | absent | Let several jobs share this card at once (slurm's `gres/shard`). `"cores"` cuts the card into one shard per core the node holds for a card (`cores_per_gpu`, which it then requires), so a job's shards and cores match one to one; a whole number from 1 to 1024 is also accepted. Absent or 0: the card is one token, one job at a time, as before. Adding shards to a running cluster needs slurm restarted or reconfigured; never reduce them while shard jobs run. See "Sharing a card" in section 7. |
 
 ### `[lease]` (optional)
 
@@ -356,7 +358,7 @@ defaults, not set by this installer.
 to `install_dir/slurm/` (plus `hostguard/hostguard.py` to `install_dir/hostguard/` when `hostguard` or `dgx_gate` is
 on, and `dgx/` to `install_dir/dgx/` when `dgx_gate` is on), and installs one small shim per tool in `/usr/local/bin`: `gpujobs-submit`,
 `gpujobs-status`, `gpujobs-pause`, `gpujobs-resume`, `gpujobs-kill`, `gpujobs-urgent`, `gpujobs-wait`,
-`gpujobs-footprint`, `gpujobs-audit`. Each runs the tool with `/usr/bin/python3`.
+`gpujobs-footprint`, `gpujobs-audit`, `gpujobs-sharing`. Each runs the tool with `/usr/bin/python3`.
 
 **`agent`** (always on). A system service `gpujobs-agent.service` run as slurm's `SlurmUser` (`slurm`), plus the
 site file copy `/etc/gpujobs/site.toml`, the group `admin_group`, and the state directories (section 8). Every
@@ -461,6 +463,39 @@ pre-empt `cpu_fill` jobs for their cores, including ones that start meanwhile; t
 Other options: `submit --mem 24G` (otherwise the last measured run of `--name` plus 10 percent, else the whole
 box for a GPU job), `--after JOBID` to chain, `--gpus N`, `--dry-run` to print the batch script. `gpujobs-footprint NAME`
 prints a job's last measured peak memory. `gpujobs-status` and `gpujobs-audit` take no options and run at once. `gpujobs-audit` reports GPU work running outside slurm and the lease.
+
+### Sharing a card
+
+By default a card is one token: one job at a time. A site that gives a card `shards` (section 4) lets several copies of one
+job run on it together, each asking for a few shards (`--gres=shard:N`) and its share of the cores held for the card. Slurm
+does not limit memory by shard, and on a card that shares system memory it cannot see the card's memory, so the bound that
+holds is the sum of the jobs' declared `--mem`, which slurm's accounting enforces.
+
+Measure first, once per named job. The probe is a short finite command that does the same work every time and exits 0
+(a few epochs of the real job):
+
+    gpujobs-sharing measure --project myproj --name train1 -- python train.py --epochs 3
+    gpujobs-sharing show train1
+
+`measure` queues one job that holds the whole card. It runs the probe alone twice (the gap between the two runs is the noise),
+then 2, 3, 4 copies at once, each pinned to its own cores, and records the table. The level it records is the smallest number
+of copies whose throughput is within the noise of the best, or 1 (no sharing) when none beats one job alone by more than the
+noise; a level where a copy failed, or where the box's memory in use passed `sharing_memory_fraction` of its total, is not a
+candidate. The record is kept with the job's other records and is ignored if the card type, the node's memory or the shard
+count has changed since.
+
+After that, `gpujobs-submit ... --gpu --name train1` shares by itself and prints what it decided, for example
+`level 4 (measured 4; memory allows 15; cores allow any) -> --gres=shard:3 of 12, 3 cores`. The level is the smallest of the
+measured level; the node's jobs memory (times `sharing_memory_fraction`) over the job's last measured peak plus 10 percent;
+and the cores held for the card over `--cpus`. The job then asks for `ceil(shards per card / level)` shards and that share
+of the cores. `--max-jobs N` replaces the measured level (memory and cores still bound it, and the line says so when you
+are given fewer); `--max-jobs 1` forces a whole card. A job with no measurement, no `--name`, or `--gpus` above 1 asks for the whole card as
+before. When the job's newest clean peak is above the one at measurement time, `submit` warns: measure again.
+
+Rules that hold at every site that shares a card. Another user's job shares your card only when both asked for shards: a plain
+`--gpu` job always gets a whole card alone. `gpujobs-urgent --gpu` counts every running shard job as in the way, like a
+whole-card job. A shard job starts unless a compute process that belongs to neither a slurm job nor the lease protocol is on
+the card (`gpujobs-audit` lists such processes). `gpujobs-status` shows `N shards` where a whole-card job shows `1 GPU`.
 
 ### Sending a job to another site
 
