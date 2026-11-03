@@ -12,6 +12,9 @@ name = "example-host"
 account = "gpujobs"
 # Where the job layer keeps records and events. Default: /var/lib/gpujobs
 state_dir = "/var/lib/gpujobs"
+# Sharing cards only. The share of a node's job memory (0 to 1) that the jobs sharing one card may fill together, counted at
+# their measured peaks. Default: unset, so they may fill all the memory the node hands to jobs.
+# sharing_memory_fraction = 0.5
 # Where the code is installed. Default: /opt/gpujobs
 install_dir = "/opt/gpujobs"
 # Unix group of admins: they may act on anyone's jobs and submit urgent work. Default: gpujobs-admin
@@ -67,6 +70,12 @@ index = 0                                        # GPU index
 uuid = "GPU-00000000-0000-0000-0000-000000000000"  # nvidia-smi --query-gpu=uuid --format=csv,noheader
 device = "/dev/nvidia0"                          # device file for gres.conf
 type = "gb10"                                    # gres type name
+# Optional. Let several jobs share this card at once (slurm gres/shard): the card is cut into this many shards and a job
+# asks for some of them (submit.py). "cores" gives one shard per core the node holds for a card (cores_per_gpu above, which
+# it then requires); a whole number from 1 to 1024 is also accepted. Absent or 0: the card is one token, one job at a time.
+# Adding shards to a running cluster needs slurmctld and slurmd restarted (23.11) or reconfigured (26.05); never reduce them
+# while shard jobs run.
+# shards = "cores"
 
 # Optional. Leave the whole table out when no other service shares the GPU through the lease.
 [lease]

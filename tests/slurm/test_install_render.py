@@ -155,6 +155,18 @@ def test_eight_gpu_site_and_extra_slot():
                              "AllowGroups=gpujobs-service,ops")
 
 
+def test_sharing_card_renders_shard_lines_and_the_unshared_site_has_none():
+    gpu = {"index": 0, "uuid": "GPU-0", "device": "/dev/nvidia0", "type": "gb10"}
+    raw = {"name": "s", "nodes": [{"name": "n1", "cpus": 20, "real_memory_mb": 100000, "cores_per_gpu": 12, "gpus": [{**gpu, "shards": "cores"}]}]}
+    shared = render.render(site_config.parse(raw), "slurm")
+    conf, gres = shared["/etc/slurm/slurm.conf"].content, shared["/etc/slurm/gres.conf"].content
+    assert "\nGresTypes=gpu,shard\n" in conf and "Gres=gpu:gb10:1,shard:12 " in conf and "\nAccountingStorageTRES=gres/gpu,gres/shard\n" in conf
+    assert "NodeName=n1 Name=shard Count=12 File=/dev/nvidia0\n" in gres
+    raw["nodes"][0]["gpus"] = [gpu]  # the same site, card not shared: no trace of shards
+    plain = render.render(site_config.parse(raw), "slurm")
+    assert "shard" not in plain["/etc/slurm/slurm.conf"].content + plain["/etc/slurm/gres.conf"].content
+
+
 def test_part_time_node_and_health_check():
     raw = {
         "name": "mix",

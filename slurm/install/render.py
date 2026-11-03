@@ -61,6 +61,7 @@ def _template(component: str, name: str) -> Template:
 def _node_line(node: Node) -> str:
     # gres.conf(5) / slurm.conf(5) typed form: Gres=gpu:<type>:<count> (slurm.conf(5) example "Gres=gpu:tesla:1").
     gres = f" Gres=gpu:{node.gpus[0].type}:{len(node.gpus)}" if node.gpus else ""
+    gres += f",shard:{node.shards}" if node.shards else ""  # the node's shards, summed over its sharing cards
     address = f" NodeAddr={node.address}" if node.part_time else ""
     spec = f" CpuSpecList={node.keep_cpus}" if node.keep_cpus else ""
     spec += f" MemSpecLimit={node.mem_spec_limit_mb}" if node.mem_spec_limit_mb is not None else ""
@@ -68,6 +69,18 @@ def _node_line(node: Node) -> str:
         f"NodeName={node.name}{address} CPUs={node.cpus} Boards=1 SocketsPerBoard=1 CoresPerSocket={node.cores_per_socket or node.cpus} "
         f"ThreadsPerCore=1 RealMemory={node.real_memory_mb}{spec}{gres} State=UNKNOWN\n"
     )
+
+
+def _gres_lines(site: Site) -> str:
+    """gres.conf lines: one per GPU with its Type (gres.conf(5) example: "Name=gpu Type=tesla File=/dev/nvidia1 COREs=2,3"),
+    and for a sharing card a `Name=shard Count=<its shards>` line on the same device file (slurm copies Type and Cores)."""
+    lines = ""
+    for n in site.nodes:
+        for g in n.gpus:
+            lines += f"NodeName={n.name} Name=gpu Type={g.type} File={g.device}\n"
+            if g.shards:
+                lines += f"NodeName={n.name} Name=shard Count={g.shards} File={g.device}\n"
+    return lines
 
 
 def part_time_nodes_conf(site: Site) -> str:
@@ -142,10 +155,6 @@ def _service_partition(site: Site, names: list[str]) -> str:
 
 def _slurm(site: Site, extra: dict[str, str]) -> dict[str, FileSpec]:
     names = [n.name for n in site.full_nodes]  # slurmctld and the partitions' Nodes: full nodes; part-time ones have theirs
-    # One line per GPU with its Type (gres.conf(5) example: "Name=gpu Type=tesla File=/dev/nvidia1 COREs=2,3").
-    gres_lines = "".join(
-        f"NodeName={n.name} Name=gpu Type={g.type} File={g.device}\n" for n in site.nodes for g in n.gpus
-    )
     extra_conf = extra.get("slurm_conf", "")
     values = {
         "site_name": site.name,
@@ -156,7 +165,9 @@ def _slurm(site: Site, extra: dict[str, str]) -> dict[str, FileSpec]:
         "cpu_job_limit": f" MaxCPUsPerNode={site.cpu_job_cap}" if site.cpu_job_cap else "",
         "node_lines": "".join(_node_line(n) for n in site.full_nodes),
         "part_time_include": _part_time_include(site),
-        "gres_lines": gres_lines,
+        "gres_lines": _gres_lines(site),
+        "gres_types": "gpu,shard" if site.sharing else "gpu",
+        "accounting_tres": "gres/gpu,gres/shard" if site.sharing else "gres/gpu",
         "admin_group": site.admin_group,
         "constrain_devices": "yes" if site.constrain_devices else "no",
         "requeue_delay_s": site.requeue_delay_s,

@@ -23,6 +23,7 @@ real_memory_mb = 1000
 """
 SHA = "ab" * 32
 GPU = "[[nodes.gpus]]\nindex = 0\nuuid = 'u'\ndevice = 'd'\ntype = 't'\n"
+SHARING_NODE = MINIMAL.replace("cpus = 2", "cpus = 8") + "cores_per_gpu = 6\n" + GPU  # a node holding 6 cores for its one card
 
 
 def write(tmp_path: Path, text: str) -> Path:
@@ -89,6 +90,15 @@ def test_example_loads_and_minimal_file_gets_every_default(tmp_path: Path) -> No
     assert (full.close_below_mb, full.push_back_below_mb, part.close_below_mb, part.push_back_below_mb) == (16000, 10000, 6000, 2000)
     assert (part.mem_spec_limit_mb, full.mem_spec_limit_mb, part.mains_only) == (8000 - 4768, None, None)  # 5 decimal GB is 4768 of slurm's 2^20-byte MB
     assert site.health_check is None
+    # card sharing (D28): absent = the card is one token; "cores" = one shard per core held for the card; a number as given
+    def shared(extra: str, head: str = "") -> gpujobs_site.Site:
+        return gpujobs_site.load(write(tmp_path, head + SHARING_NODE + extra))
+
+    cores = shared("").nodes[0].cores_per_gpu
+    assert (shared("").sharing, shared("").nodes[0].shards, site.sharing_memory_fraction) == (False, 0, None)
+    assert (shared("shards = 'cores'\n").nodes[0].shards, shared("shards = 'cores'\n").sharing) == (cores, True)
+    assert (shared("shards = 4\n").nodes[0].gpus[0].shards, shared("shards = 0\n").sharing) == (4, False)
+    assert shared("", "sharing_memory_fraction = 0.5\n").sharing_memory_fraction == pytest.approx(0.5)
 
 
 @pytest.mark.parametrize(
@@ -125,6 +135,14 @@ def test_example_loads_and_minimal_file_gets_every_default(tmp_path: Path) -> No
         (MINIMAL + "cores_per_gpu = 2\n" + GPU, "must leave CPU-only jobs a core"),  # 2 of 2: CPU jobs could never run
         ("state_dir = 5\n" + MINIMAL, "has a value of the wrong kind"),
         (MINIMAL + "cores_per_gpu = 1\n" + GPU + "[service]\ncores = 2\n", "service.cores = 2"),  # beyond the CPU pool
+        (SHARING_NODE + "shards = 'all'\n", "shards = 'all'; expected \"cores\""),
+        (SHARING_NODE + "shards = 1025\n", "shards = 1025"),  # slurm's limit on a shard Count
+        (SHARING_NODE + "shards = -1\n", "shards = -1"),
+        (SHARING_NODE + "shards = true\n", "shards = True"),  # a flag is not a count
+        (MINIMAL + GPU + "shards = 'cores'\n", "needs the node's cores_per_gpu"),  # nothing says how many cores the card holds
+        ("sharing_memory_fraction = 1.5\n" + MINIMAL, "sharing_memory_fraction = 1.5"),
+        ("sharing_memory_fraction = 0\n" + MINIMAL, "sharing_memory_fraction = 0"),
+        ("sharing_memory_fraction = true\n" + MINIMAL, "sharing_memory_fraction = True"),
         (MINIMAL + "[service]\ncores = 0\n", "service.cores = 0"),
         (MINIMAL + "[remote.t]\nhost = 'h'\n", "[remote.t] is missing root"),
         (MINIMAL + "[remote.t]\nhost = 'h'\nroot = '../x'\n", "no '..'"),

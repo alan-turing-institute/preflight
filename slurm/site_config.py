@@ -47,6 +47,10 @@ class AuthMode(StrEnum):
     SSH = "ssh"  # no sign-in page: each person's own ssh forward to the relay names them (D19, see portal.py)
 
 
+SHARDS_FROM_CORES = "cores"  # `shards = "cores"`: one shard per core the node holds for the card
+MAX_SHARDS = 1024  # slurm gres.conf(5): a shard Count is limited in size (currently 1024)
+
+
 class SiteError(Exception):
     """The site file is missing or wrong; the message says what to do."""
 
@@ -57,6 +61,7 @@ class Gpu:
     uuid: str
     device: str  # e.g. "/dev/nvidia0"
     type: str
+    shards: int = 0  # slices of the card slurm may give to different jobs at once (gres/shard); 0: the card is one token
 
 
 @dataclass(frozen=True)
@@ -80,6 +85,11 @@ class Node:
     def gpu_cores(self) -> int:
         """Cores held for GPU jobs on this node: 0 when `cores_per_gpu` is unset."""
         return (self.cores_per_gpu or 0) * len(self.gpus)
+
+    @property
+    def shards(self) -> int:
+        """Shards of all this node's cards together (slurm's `gres/shard` count for the node); 0: no card is shared."""
+        return sum(gpu.shards for gpu in self.gpus)
 
     @property
     def close_below_mb(self) -> int:
@@ -194,10 +204,16 @@ class Site:
     node_python: str = "/usr/bin/python3"  # the interpreter a part-time job's wrapper runs with, there
     remotes: dict[str, Remote] = field(default_factory=dict)  # `[remote.NAME]` tables
     requeue_delay_s: int = 60  # slurm.conf AuthInfo=cred_expire: how long a requeued job waits before it may start again
+    sharing_memory_fraction: float | None = None  # a site's own tightening of the share of a node's jobs memory that co-running shard jobs may fill
 
     @property
     def cpu_job_cap(self) -> int | None:
         return _cpu_job_cap(self.nodes)
+
+    @property
+    def sharing(self) -> bool:
+        """Whether any card is shared (declares shards)."""
+        return any(node.shards for node in self.nodes)
 
     @property
     def part_time_nodes(self) -> tuple[Node, ...]:
@@ -256,6 +272,20 @@ def _opt_path(value: str) -> Path | None:
     return Path(value) if value else None
 
 
+def _parse_gpu(raw: Any, where: str, cores_per_gpu: Any) -> Gpu:
+    """One `[[nodes.gpus]]` table; `shards` is a whole number of shards, or "cores" for one per core held for the card."""
+    t = _table(raw, where, {"index", "uuid", "device", "type"}, {"shards": 0})
+    shards = t["shards"]
+    if shards == SHARDS_FROM_CORES:
+        if type(cores_per_gpu) is not int:
+            raise SiteError(f"site file: [{where}] shards = \"{SHARDS_FROM_CORES}\" needs the node's cores_per_gpu: one shard per core held for the card")
+        shards = cores_per_gpu
+    if type(shards) is not int or not 0 <= shards <= MAX_SHARDS:
+        raise SiteError(f"site file: [{where}] shards = {t['shards']!r}; expected \"{SHARDS_FROM_CORES}\" or a whole number from 0 (not shared) "
+                        f"to {MAX_SHARDS}")
+    return Gpu(**{**t, "shards": shards})
+
+
 def _parse_node(raw: Any, i: int) -> Node:
     where = f"nodes[{i}]"
     t = _table(raw, where, {"name", "cpus", "real_memory_mb"}, {
@@ -263,10 +293,7 @@ def _parse_node(raw: Any, i: int) -> Node:
         "jobs_memory_gb": None, "mains_only": None, "close_below_gb": None, "push_back_below_gb": None,
         "cores_per_socket": None, "default_jobs": True,
     })
-    gpus = tuple(
-        Gpu(**_table(g, f"{where}.gpus[{j}]", {"index", "uuid", "device", "type"}, {}))
-        for j, g in enumerate(t["gpus"])
-    )
+    gpus = tuple(_parse_gpu(g, f"{where}.gpus[{j}]", t["cores_per_gpu"]) for j, g in enumerate(t["gpus"]))
     node = Node(t["name"], t["cpus"], t["real_memory_mb"], gpus, t["cores_per_gpu"], t["part_time"], t["address"],
                 t["keep_cpus"], t["jobs_memory_gb"], t["mains_only"], t["close_below_gb"], t["push_back_below_gb"],
                 t["cores_per_socket"], t["default_jobs"])
@@ -407,6 +434,7 @@ def parse(raw: dict[str, Any]) -> Site:
             "shared_state": False,
             "node_python": "/usr/bin/python3",
             "requeue_delay_s": 60,
+            "sharing_memory_fraction": None,
             "hostguard": False,
             "dgx_gate": False,
             "constrain_devices": True,
@@ -445,6 +473,9 @@ def parse(raw: dict[str, Any]) -> Site:
         raise SiteError(f"site file: node_python = {top['node_python']!r}; expected an absolute path")
     if type(top["requeue_delay_s"]) is not int or top["requeue_delay_s"] < 1:
         raise SiteError(f"site file: requeue_delay_s = {top['requeue_delay_s']!r}; expected a whole number of seconds, 1 or more")
+    fraction = top["sharing_memory_fraction"]
+    if fraction is not None and (isinstance(fraction, bool) or not isinstance(fraction, int | float) or not 0 < fraction <= 1):
+        raise SiteError(f"site file: sharing_memory_fraction = {fraction!r}; expected a number above 0 and at most 1")
     nodes = tuple(_parse_node(n, i) for i, n in enumerate(top["nodes"]))
     if nodes and not any(not n.part_time for n in nodes):
         raise SiteError("site file: every node is part_time; slurmctld runs on a full node, so list at least one")
@@ -489,6 +520,7 @@ def parse(raw: dict[str, Any]) -> Site:
         node_python=top["node_python"],
         remotes=_parse_remotes(top["remote"]),
         requeue_delay_s=top["requeue_delay_s"],
+        sharing_memory_fraction=None if fraction is None else float(fraction),
     )
 
 

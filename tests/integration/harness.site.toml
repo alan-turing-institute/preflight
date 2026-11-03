@@ -50,6 +50,10 @@ index = 3
 uuid = "GPU-00000000-0000-0000-0000-000000000003"
 device = "/opt/fakegpu/gpu3"
 type = "fake"
+# The `sharing` stage's card: six shards, three jobs of two. The number form, not shards = "cores": that needs the node's
+# cores_per_gpu, and the 4-core node cannot hold a core for each of 4 cards and still leave CPU-only jobs one (site_config
+# refuses it). Every other stage still gets whole-card jobs; only a job that asks for shards uses this one.
+shards = 6
 
 # The part-time machine: the second container (compose.yml, service part-time), a configless slurmd the `part_time` stage
 # brings up. Default thresholds for a part-time node (close below 6 GB free, push back below 2 GB); the stage fakes the
