@@ -54,8 +54,9 @@ def elapsed(job_id: str) -> str:
 
 
 def free_on_nodes() -> tuple[int, int] | None:
-    """(memory MB, cores) slurm has not allocated across every node, or None if slurm does not answer."""
-    total = gpu_jobs.capacity()
+    """(memory MB, cores) slurm has not allocated on the nodes an urgent job can start on (in the `urgent` partition and
+    not down or draining: a lent machine that is off is not room), or None if slurm does not answer or none can."""
+    total = gpu_jobs.capacity(partition=gpu_jobs.Partition.URGENT)
     if not total.get("nodes"):
         return None
     return total["mem_mb"] - total["mem_used_mb"], total["cpus"] - total["cpus_used"]
@@ -65,6 +66,11 @@ def _asked_mb(job: gpu_jobs.QueuedJob) -> int:
     """The memory a job holds (slurm's request, else its sidecar's); 0 when unknown, the whole box or unreadable, which
     counts as freeing nothing, so a CPU job is requeued rather than the urgent job left waiting."""
     return jobs_view.requested_mem_mb(job, gpu_jobs.read_sidecar(job.job_id, job.user) or {}) or 0
+
+
+def _describe(job: gpu_jobs.QueuedJob) -> str:
+    record = gpu_jobs.read_sidecar(job.job_id, job.user) or {}
+    return f"{job.job_id} {job.name} ({record.get('what', 'no sidecar')}), running {elapsed(job.job_id)}"
 
 
 def plan(
@@ -81,13 +87,12 @@ def plan(
     """
     lines, victims, steady, wait_only = [], [], [], []
     for job in queue:
-        record = gpu_jobs.read_sidecar(job.job_id, job.user) or {}
         in_way = whole_box or memory_short or cores_short or (gpu and job.gpus > 0)
         if not in_way or not (job.active or job.partition == gpu_jobs.Partition.URGENT):
             continue
         if job.partition == gpu_jobs.Partition.PART_TIME:
             continue  # on another machine: it holds none of the cores, memory or card this urgent job needs
-        what = f"{job.job_id} {job.name} ({record.get('what', 'no sidecar')}), running {elapsed(job.job_id)}"
+        what = _describe(job)
         if job.partition in {gpu_jobs.Partition.NORMAL, gpu_jobs.Partition.CPU_FILL}:
             victims.append(job.job_id)
             lines.append(f"[urgent] PAUSABLE  {what}: may be pre-empted (slurm picks as many as the urgent job needs); "
@@ -106,6 +111,14 @@ def plan(
         else:
             wait_only.append(job.job_id)
             lines.append(f"[urgent] WAIT-ONLY {what}: another urgent job; this one waits behind it")
+    requeued = [job.job_id for job in queue if job.job_id in victims and job.partition == gpu_jobs.Partition.NORMAL]
+    if requeued:  # a requeued `normal` job restarts at a higher tier than `cpu_fill`, so it takes cores back from its jobs,
+        # including one that starts in the gap, which no plan made now can see: the warning does not depend on what runs now
+        running = [job.job_id for job in queue
+                   if job.active and job.partition == gpu_jobs.Partition.CPU_FILL and job.job_id not in victims]
+        lines.append(f"[urgent] KNOCK-ON  normal job(s) {','.join(requeued)} it pre-empts restart later at a higher tier than "
+                     "cpu_fill and may pre-empt cpu_fill jobs for their cores, including ones that start meanwhile"
+                     + (f" (running now, not otherwise touched: {','.join(running)})" if running else ""))
     for project, waiting in leases:
         if project == gpu_jobs.LEASE_PROJECT:
             continue

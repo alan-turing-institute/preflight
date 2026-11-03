@@ -210,6 +210,19 @@ def test_machine_use_reads_this_host_and_capacity_says_whether_this_host_is_the_
     lent = "NodeName=lap CPUTot=16 CPUEfctv=8 RealMemory=31494 MemSpecLimit=19494 AllocMem=0 CPUAlloc=0\n"
     both = gpu_jobs.capacity(lambda *_a, **_k: subprocess.CompletedProcess([], 0, nodes + lent))
     assert (both["cpus"], both["mem_mb"]) == (20 + 8, 100000 + 12000)  # a part-time machine counts only what it lends
+    # for one partition only the nodes in it that can start a job count: the lent machine is down and in part_time (2026-11-03:
+    # its 8 cores made urgent.py think 10 were free when the box had 2, so a cpu_fill job it would pre-empt went unlisted)
+    up = nodes.rstrip("\n") + " State=MIXED+PLANNED Partitions=normal,cpu_fill,urgent\n"
+    down = lent.rstrip("\n") + " State=DOWN+NOT_RESPONDING Partitions=part_time\n"
+    draining = up.replace(here, "other").replace("MIXED+PLANNED", "IDLE+DRAIN")
+    run = lambda text: (lambda *_a, **_k: subprocess.CompletedProcess([], 0, text))  # noqa: E731
+    mine, lent_cpus = gpu_jobs.capacity(run(up))["cpus"], gpu_jobs.capacity(run(down))["cpus"]
+    assert gpu_jobs.capacity(run(up + down))["cpus"] == mine + lent_cpus  # no partition: every node, as before
+    assert gpu_jobs.capacity(run(up + down), partition="urgent")["cpus"] == mine  # down, and in another partition
+    awake = down.replace("DOWN+NOT_RESPONDING", "IDLE").replace("part_time", "urgent")
+    assert gpu_jobs.capacity(run(up + awake), partition="urgent")["cpus"] == mine + lent_cpus  # up and in it: counted
+    assert gpu_jobs.capacity(run(up + draining), partition="urgent")["nodes"] == 1  # a draining node starts nothing new
+    assert gpu_jobs.capacity(run(down), partition="urgent")["nodes"] == 0
 
 
 def test_a_level_always_wins_then_the_earlier_job_and_every_placed_priority_is_above_slurms_own() -> None:

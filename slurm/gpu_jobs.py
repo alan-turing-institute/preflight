@@ -970,12 +970,31 @@ def job_pids(cgroup: Path | None, fallback_pids: set[int], job_id: str, gpu_pids
     return pids
 
 
+class NodeFlag(StrEnum):
+    """The parts of a node's `State=` (`scontrol show nodes -o`, joined by "+", e.g. `DOWN+NOT_RESPONDING`) that stop it
+    starting a new job (slurm 26.05.5 `node_state_string_complete`, `src/common/slurm_protocol_defs.c`)."""
+
+    DOWN = "DOWN"
+    FUTURE = "FUTURE"
+    DRAIN = "DRAIN"
+    FAIL = "FAIL"
+    NOT_RESPONDING = "NOT_RESPONDING"
+    INVALID_REG = "INVALID_REG"
+
+
+def starts_jobs_in(node: Mapping[str, int | str], partition: str) -> bool:
+    """Whether a `node_capacity` row is in `partition` and can start a new job: a down or draining node, or one only
+    another partition reaches, has no room to give it however many cores it lists."""
+    return partition in str(node["partitions"]).split(",") and not set(str(node["state"]).split("+")) & set(NodeFlag)
+
+
 def node_capacity(
     runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
 ) -> list[dict[str, int | str]] | None:
     """Each node's cores, memory (MB) and GPUs slurm has to give, and how much of each it has given to jobs
-    (`scontrol show nodes -o`), with `here` = 1 for this host. What a node keeps for its owner (`CPUSpecList`,
-    `MemSpecLimit`: a part-time machine) is not counted as theirs to give. None when slurm does not answer."""
+    (`scontrol show nodes -o`), with `here` = 1 for this host, its `state` and its `partitions` (comma-separated).
+    What a node keeps for its owner (`CPUSpecList`, `MemSpecLimit`: a part-time machine) is not counted as theirs to
+    give. None when slurm does not answer."""
     try:
         done = runner(["scontrol", "show", "nodes", "-o"], capture_output=True, text=True, timeout=30, check=False)
     except (OSError, subprocess.TimeoutExpired):
@@ -988,7 +1007,8 @@ def node_capacity(
         fields = dict(part.split("=", 1) for part in line.split() if "=" in part)
         gpus = [re.search(r"gres/gpu=(\d+)", fields.get(key, "")) for key in ("CfgTRES", "AllocTRES")]
         node: dict[str, int | str] = {"name": fields.get("NodeName", ""), "here": int(host in {fields.get("NodeName"), fields.get("NodeHostName")}),
-                                        "comment": fields.get("Comment", "")}
+                                        "comment": fields.get("Comment", ""), "state": fields.get("State", ""),
+                                        "partitions": fields.get("Partitions", "")}
         for key, value in (("cpus", fields.get("CPUEfctv") or fields.get("CPUTot")), ("cpus_used", fields.get("CPUAlloc")),
                            ("mem_mb", fields.get("RealMemory")), ("mem_used_mb", fields.get("AllocMem")),
                            ("gpus", gpus[0] and gpus[0][1]), ("gpus_used", gpus[1] and gpus[1][1])):
@@ -999,12 +1019,17 @@ def node_capacity(
     return found
 
 
-def capacity(runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run) -> dict[str, int]:
-    """`node_capacity` summed over every node, with the number of nodes and how many of them are this host. {} when
-    slurm does not answer."""
+def capacity(
+    runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run, partition: str | None = None,
+) -> dict[str, int]:
+    """`node_capacity` summed over every node (with `partition`: over the nodes that can start a job in it, see
+    `starts_jobs_in`), with the number of nodes counted and how many of them are this host. {} when slurm does not
+    answer."""
     found = node_capacity(runner)
     if found is None:
         return {}
+    if partition is not None:
+        found = [node for node in found if starts_jobs_in(node, partition)]
     total = dict.fromkeys(("cpus", "cpus_used", "mem_mb", "mem_used_mb", "gpus", "gpus_used", "here"), 0)
     for node in found:
         for key in total:

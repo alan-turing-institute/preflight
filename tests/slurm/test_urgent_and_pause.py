@@ -26,7 +26,8 @@ def sidecars(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_classes_of_what_is_in_the_way() -> None:
-    queue = [job("1", "normal"), job("2", "steady"), job("3", "cpu", gpus=0, cls="resume"), job("4", "urgent", "PENDING")]
+    queue = [job("1", "normal"), job("2", "steady"), job("3", "cpu", gpus=0, cls="resume"), job("4", "urgent", "PENDING"),
+             job("6", "cpu_fill", gpus=0, cls="resume")]
     lines, victims, steady, wait_only = urgent.plan(
         queue, gpu=True, whole_box=False,
         leases=[("service-a", False), ("service-b", False), ("service-c", False), ("slurm", False)],
@@ -40,6 +41,21 @@ def test_classes_of_what_is_in_the_way() -> None:
     assert "PAUSABLE  service service-a" in text
     assert "PAUSABLE  service service-b" in text
     assert "loses all of that run" in text
+    # job 6 is not in the way, but the normal job 1 it pre-empts restarts above it and may take its cores (2026-11-03: 1739 and 1687)
+    assert "normal job(s) 1 " in text and "running now, not otherwise touched: 6" in text and "6" not in victims
+    # the warning does not depend on a cpu_fill job running now: one that starts in the gap is hit too (automl, same day)
+    alone, _, _, _ = urgent.plan([job("1", "normal")], gpu=True, whole_box=False, leases=[], unregistered=[], services={})
+    assert any("KNOCK-ON  normal job(s) 1 " in line and "running now" not in line for line in alone)
+    # no normal job pre-empted, no knock-on; a cpu_fill job already in the way (cores short) is not named twice
+    quiet, _, _, _ = urgent.plan([job("6", "cpu_fill", gpus=0, cls="resume")], gpu=True, whole_box=False, leases=[], unregistered=[], services={})
+    assert quiet == ["[urgent] nothing in the way"]
+    short, victims_short, _, _ = urgent.plan([job("1", "normal"), job("6", "cpu_fill", gpus=0, cls="resume")], gpu=False, whole_box=False,
+                                             leases=[], unregistered=[], services={}, cores_short=True)
+    assert victims_short == ["1", "6"] and not any("running now" in line for line in short)
+    # only a normal job's restart outranks cpu_fill: a cpu_fill job pre-empted alone brings no knock-on
+    only_fill, victims_fill, _, _ = urgent.plan([job("6", "cpu_fill", gpus=0, cls="resume")], gpu=False, whole_box=False, leases=[],
+                                                unregistered=[], services={}, cores_short=True)
+    assert victims_fill == ["6"] and not any("KNOCK-ON" in line for line in only_fill)
 
 
 def test_whole_box_puts_every_running_job_in_the_way() -> None:
@@ -87,6 +103,15 @@ def test_a_job_without_gpus_whose_memory_or_cores_do_not_fit_puts_running_jobs_i
     lines, victims, _, wait_only = urgent.plan([job("3", "service", gpus=0)], gpu=False, whole_box=False, leases=[],
                                                unregistered=[], services={}, cores_short=True)
     assert (victims, wait_only) == (["3"], []) and "a service's CPU stand-in" in "\n".join(lines)
+
+
+def test_free_room_is_counted_only_on_nodes_the_urgent_partition_can_start_a_job_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    asked: list[object] = []
+    monkeypatch.setattr(gpu_jobs, "capacity", lambda *_a, **kw: asked.append(kw.get("partition")) or
+                        {"nodes": 1, "mem_mb": 10, "mem_used_mb": 4, "cpus": 8, "cpus_used": 3})
+    assert urgent.free_on_nodes() == (6, 5) and asked == [gpu_jobs.Partition.URGENT]
+    monkeypatch.setattr(gpu_jobs, "capacity", lambda *_a, **_k: {"nodes": 0})  # every node down: unknown, never "plenty"
+    assert urgent.free_on_nodes() is None
 
 
 def test_memory_notation() -> None:

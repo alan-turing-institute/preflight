@@ -454,6 +454,10 @@ The commands below are the shims installed in `/usr/local/bin`; from a checkout 
     # wait until a job and everything chained after it has finished
     gpujobs-wait 123
 
+The urgent plan counts free cores and memory only on nodes in the `urgent` partition that can start a job (not down, drained or
+failed), so a lent machine that is off adds no room. When it pre-empts a `normal` job it also prints one `KNOCK-ON` line: the requeued `normal` job restarts above `cpu_fill` and may
+pre-empt `cpu_fill` jobs for their cores, including ones that start meanwhile; the line names the `cpu_fill` jobs running now that the plan does not touch.
+
 Other options: `submit --mem 24G` (otherwise the last measured run of `--name` plus 10 percent, else the whole
 box for a GPU job), `--after JOBID` to chain, `--gpus N`, `--dry-run` to print the batch script. `gpujobs-footprint NAME`
 prints a job's last measured peak memory. `gpujobs-status` and `gpujobs-audit` take no options and run at once. `gpujobs-audit` reports GPU work running outside slurm and the lease.
