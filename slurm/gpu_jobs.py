@@ -1115,11 +1115,27 @@ def capacity(
         return {}
     if partition is not None:
         found = [node for node in found if starts_jobs_in(node, partition)]
+    return _sum_nodes(found)
+
+
+def _sum_nodes(found: list[dict[str, int | str]]) -> dict[str, int]:
     total = dict.fromkeys(("cpus", "cpus_used", "mem_mb", "mem_used_mb", "gpus", "gpus_used", "shards", "shards_used", "here"), 0)
     for node in found:
         for key in total:
             total[key] += int(node[key])
     return {**total, "nodes": len(found)}
+
+
+def usable_capacity(found: list[dict[str, int | str]], partitions: str | None = None) -> dict[str, int]:
+    """`node_capacity` rows summed over the nodes that can start a job in one of `partitions` (comma-separated, as a job's
+    partition field reads; None: in any partition). A down or draining node, or one only another partition reaches, has
+    room no waiting job can use, so it is not counted."""
+    wanted = [name for name in (partitions or "").split(",") if name]
+    return _sum_nodes([
+        node for node in found
+        if (any(starts_jobs_in(node, name) for name in wanted) if wanted
+            else not set(str(node["state"]).split("+")) & set(NodeFlag))
+    ])
 
 
 #: Positions in /proc/stat's first line after the "cpu" label: user nice system idle iowait ...

@@ -52,6 +52,7 @@ class World:
         self.nodes = {"n1": "IDLE", "n2": "IDLE+DRAIN"}
         self.writes: list[list[str]] = []  # every scontrol update / release, failed ones included
         self.totals = ""  # CPUTot=.. fields of node n1 in `scontrol show nodes -o`, for the idle check
+        self.lent = ""  # the same for node n2, a drained part-time machine
         self.fail: set[str] = set()  # scontrol subcommands that answer with an error
         self.records: dict[str, dict[str, str]] = {}
         self.notify_command: tuple[str, ...] = ()
@@ -76,7 +77,7 @@ class World:
                 return done(argv, out=self.running)
             case ["show", "nodes"]:
                 return done(
-                    argv, out="".join(f"NodeName={n} Arch=x {self.totals if n == 'n1' else ''}\n" for n in self.nodes)
+                    argv, out="".join(f"NodeName={n} Arch=x {self.totals if n == 'n1' else self.lent}\n" for n in self.nodes)
                 )
             case ["show", "node"]:
                 return done(
@@ -633,7 +634,7 @@ def test_a_part_times_job_state_is_copied_back_each_minute_and_a_failure_is_logg
 
 def idle_world(world: World, *, gpus_used: int = 0, mem_used: int = 22888) -> World:
     """The 596/611 case: a whole-box GPU job waits, a 24 GB `restart` CPU job runs, the GPU is unreserved."""
-    world.totals = (f"CPUTot=4 CPUAlloc=2 RealMemory=100000 AllocMem={mem_used} "
+    world.totals = (f"CPUTot=4 CPUAlloc=2 RealMemory=100000 AllocMem={mem_used} State=MIXED Partitions=normal,cpu "
                     f"CfgTRES=cpu=4,gres/gpu=1 AllocTRES=gres/gpu={gpus_used}")
     waiting = gpu_jobs.QueuedJob("596", "normal", "PENDING", "Resources", "wait:resume:big", user="a", gpus=1, cpus=4, mem_mb=0)
     holder = gpu_jobs.QueuedJob("611", "cpu", "RUNNING", "None", "crypto-quant-research:restart:scan", user="b", cpus=2, mem_mb=22888)
@@ -673,7 +674,7 @@ def test_a_whole_box_job_waiting_beside_a_restart_cpu_job_is_found_noticed_hourl
     world.t += agent_module.IDLE_EVERY_S
     assert world.step()["idle"] == []
     # a shard job waits for shards: the card holds no GPU reservation, yet it is not "a GPU unreserved"
-    world.totals = ("CPUTot=4 CPUAlloc=2 RealMemory=100000 AllocMem=1000 "
+    world.totals = ("CPUTot=4 CPUAlloc=2 RealMemory=100000 AllocMem=1000 State=MIXED Partitions=normal,cpu "
                     "CfgTRES=cpu=4,gres/gpu=1,gres/shard=12 AllocTRES=gres/shard=12")
     world.queue = [
         gpu_jobs.QueuedJob("700", "normal", "PENDING", "Resources", "p:resume:wait", user="a", shards=4, cpus=1, mem_mb=1000),
@@ -683,3 +684,16 @@ def test_a_whole_box_job_waiting_beside_a_restart_cpu_job_is_found_noticed_hourl
     [shard_finding] = world.step()["idle"]
     assert shard_finding["rule"] == "shards" and "needs 4 shards" in shard_finding["text"]
     assert [h["job"] for h in shard_finding["holders"]] == ["701"] and "GPU unreserved" not in shard_finding["idle"]
+    # 2026-11-04 (job 1902): a drained part-time machine's idle cores are no room for a cpu job, so its 8-core wait is still named
+    world.totals = "CPUTot=20 CPUAlloc=20 RealMemory=100000 AllocMem=1000 State=MIXED Partitions=normal,cpu"
+    world.lent = "CPUTot=16 CPUEfctv=8 RealMemory=31494 AllocMem=0 CPUAlloc=0 State=IDLE+DRAIN Partitions=part_time"
+    world.queue = [gpu_jobs.QueuedJob("9", "cpu", "PENDING", "Resources", "p:restart:x", user="a", cpus=8, mem_mb=1000)]
+    world.t += agent_module.IDLE_EVERY_S
+    assert [f["rule"] for f in world.step()["idle"]] == ["cores"]
+    # and an awake part-time machine is room only for jobs of its own partition: a cpu job does not count its cores either
+    world.lent = world.lent.replace("IDLE+DRAIN", "IDLE")
+    world.t += agent_module.IDLE_EVERY_S
+    assert [f["rule"] for f in world.step()["idle"]] == ["cores"]
+    world.queue = [dataclasses.replace(world.queue[0], partition="cpu_fill,part_time")]
+    world.t += agent_module.IDLE_EVERY_S
+    assert world.step()["idle"] == []  # a cpu_fill job may run there: the 8 lent cores are its room

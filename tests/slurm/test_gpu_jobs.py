@@ -226,6 +226,10 @@ def test_machine_use_reads_this_host_and_capacity_says_whether_this_host_is_the_
     assert gpu_jobs.capacity(run(up + awake), partition="urgent")["cpus"] == mine + lent_cpus  # up and in it: counted
     assert gpu_jobs.capacity(run(up + draining), partition="urgent")["nodes"] == 1  # a draining node starts nothing new
     assert gpu_jobs.capacity(run(down), partition="urgent")["nodes"] == 0
+    rows = gpu_jobs.node_capacity(run(up + down + draining))
+    assert gpu_jobs.usable_capacity(rows)["nodes"] == 1  # any partition: the down and the draining node are no room at all
+    assert gpu_jobs.usable_capacity(rows, "cpu_fill,part_time")["cpus"] == mine  # a job's partition list: part_time's node is down
+    assert gpu_jobs.usable_capacity(rows, "part_time")["nodes"] == 0
 
 
 def test_a_level_always_wins_then_the_earlier_job_and_every_placed_priority_is_above_slurms_own() -> None:

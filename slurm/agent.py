@@ -280,10 +280,12 @@ def _holder(job: gpu_jobs.QueuedJob, amount: str) -> Holder:
     return Holder(job.job_id, jobs_view.project_of(job.name), amount, cls.value if cls else "unknown class", movable)
 
 
-def idle_findings(queue: list[gpu_jobs.QueuedJob], total: dict[str, int], cpu_cap: int | None) -> list[IdleFinding]:
+def idle_findings(queue: list[gpu_jobs.QueuedJob], total: dict[str, int], cpu_cap: int | None,
+                  total_for: Callable[[str], dict[str, int]] | None = None) -> list[IdleFinding]:
     """One finding per job waiting for room while the machine has a GPU unreserved, a core free or memory unreserved.
 
-    `total` is `gpu_jobs.capacity()`. The lacking resource is the first of memory, cores, the cpu partition's core cap
+    `total` is the capacity of the nodes that can start jobs; `total_for(partitions)`, when given, is the capacity a job
+    in those partitions can use (a drained node, or one only another partition reaches, is no room for it). The lacking resource is the first of memory, cores, the cpu partition's core cap
     and GPUs the job asks for more of than is free; its holders are the running jobs holding it, largest first."""
     free_mem, free_cpus = total["mem_mb"] - total["mem_used_mb"], total["cpus"] - total["cpus_used"]
     free_gpus = total["gpus"] - total["gpus_used"]
@@ -303,9 +305,13 @@ def idle_findings(queue: list[gpu_jobs.QueuedJob], total: dict[str, int], cpu_ca
     for job in queue:
         if job.state != gpu_jobs.State.PENDING or job.reason not in IDLE_WAITING_REASONS:
             continue
-        need_mem = total["mem_mb"] if job.mem_mb == 0 else job.mem_mb or 0
+        mine = total_for(job.partition) if total_for else total
+        free_mem, free_cpus = mine["mem_mb"] - mine["mem_used_mb"], mine["cpus"] - mine["cpus_used"]
+        free_gpus = mine["gpus"] - mine["gpus_used"]
+        free_shards = mine.get("shards", 0) - mine.get("shards_used", 0)
+        need_mem = mine["mem_mb"] if job.mem_mb == 0 else job.mem_mb or 0
         cpu_only = not job.gpus and gpu_jobs.Partition.CPU in job.partition.split(",")
-        held_mem = lambda j: total["mem_mb"] if j.mem_mb == 0 else j.mem_mb or 0  # noqa: E731
+        held_mem = lambda j: mine["mem_mb"] if j.mem_mb == 0 else j.mem_mb or 0  # noqa: E731
         options = (
             (IdleRule.MEMORY, need_mem > free_mem, "all memory" if job.mem_mb == 0 else f"{_gb(need_mem):.1f} GB memory",
              [(held_mem(j), f"{_gb(held_mem(j)):.1f} GB", j) for j in active]),
@@ -1154,11 +1160,12 @@ class Agent:
         """Record who waits while the machine has something unused, log each new finding, and tell the holders' and the
         waiting job's projects (once an hour per waiting job and holder, through the site's notify command)."""
         s = self.state
-        total = gpu_jobs.capacity(self.scontrol)
-        if not total:
+        rows = gpu_jobs.node_capacity(self.scontrol)
+        if not rows:
             errors.append("scontrol did not answer; the idle check waits")
             return
-        found = idle_findings(queue, total, self.site.cpu_job_cap)
+        found = idle_findings(queue, gpu_jobs.usable_capacity(rows), self.site.cpu_job_cap,
+                              lambda partitions: gpu_jobs.usable_capacity(rows, partitions))
         seen = {f"{f.waiting}:{f.rule}" for f in found}
         s.idle_since = {k: v for k, v in s.idle_since.items() if k in seen}
         for finding in found:
