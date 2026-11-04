@@ -11,6 +11,9 @@ import site_config
 ROOT = Path(__file__).resolve().parents[2]
 MACHINE = ROOT / "machine" / "slurm"
 GOLDEN = Path(__file__).parent / "fixtures" / "render" / "golden"
+INSTALL = str(ROOT / "slurm" / "install")
+if INSTALL not in sys.path:
+    sys.path.append(INSTALL)  # `components` is imported by name below; another test file used to put it there by luck
 spec = importlib.util.spec_from_file_location("render", ROOT / "slurm" / "install" / "render.py")
 render = importlib.util.module_from_spec(spec)
 sys.modules["render"] = render  # dataclasses looks its module up here
@@ -36,12 +39,16 @@ EXPECTED_DIFF = {
         "+# No multifactor priority: it recomputes every pending job's priority from age, and after a reboot that wiped the",
         "+# priority a hold had restored.",
         "+PriorityType=priority/basic",
+        "-GresTypes=gpu",
+        "+GresTypes=gpu,shard",
         "-# Pre-emption by partition priority, no accounting database: an `urgent` job takes resources from `normal` jobs,",
         "-# which are requeued (SIGTERM to every process of the job, then SIGKILL after KillWait) and start again when resources free.",
         "+# Pre-emption by partition priority, strictly lower tiers only (accounting is through slurmdbd, below): an `urgent` job (tier 3) takes",
         "+# resources from `normal` and `cpu_fill` jobs, and a `normal` GPU job (tier 2) from `cpu_fill` jobs; they are requeued (SIGTERM to every process of the job, then SIGKILL after KillWait) and start again when resources free.",
         "-# (stage C, 2026-10-16). It also records each job's GPU use (`sacct`), which this box's ledger never had.",
         "+# (stage C, 2026-10-16). It also keeps the finished-job history that `sacct` reads.",
+        "-AccountingStorageTRES=gres/gpu",
+        "+AccountingStorageTRES=gres/gpu,gres/shard",
         "+# Keep each job's --comment in the accounting record.",
         "+AccountingStoreFlags=job_comment",
         "-# RealMemory: what slurm hands out once the background services have stepped aside: physical 124,610 MB minus",
@@ -51,7 +58,7 @@ EXPECTED_DIFF = {
         "-# normal: resumes from its checkpoint, pre-emptable. steady: cannot resume, never pre-empted. urgent:",
         "+# RealMemory is what slurm hands out: the node's real_memory_mb in the site file (its memory minus the background",
         "+# services' base use minus the host memory guard's reserve).",
-        "+NodeName=gpu-node-1 CPUs=20 Boards=1 SocketsPerBoard=1 CoresPerSocket=20 ThreadsPerCore=1 RealMemory=100000 Gres=gpu:gb10:1 State=UNKNOWN",
+        "+NodeName=gpu-node-1 CPUs=20 Boards=1 SocketsPerBoard=1 CoresPerSocket=20 ThreadsPerCore=1 RealMemory=100000 Gres=gpu:gb10:1,shard:12 State=UNKNOWN",
         "+# normal: resumes from its checkpoint, pre-emptable. steady: cannot resume, never pre-empted. Both tier 2. urgent (tier 3):",
         "-PartitionName=normal Nodes=gpu-node-1 Default=YES PriorityTier=1 PreemptMode=REQUEUE MaxTime=INFINITE State=UP",
         "-PartitionName=steady Nodes=gpu-node-1 PriorityTier=1 PreemptMode=OFF MaxTime=INFINITE State=UP",
@@ -75,6 +82,7 @@ EXPECTED_DIFF = {
         "+# Each GPU as a schedulable token, typed to match the node's Gres= in slurm.conf. No NVML autodetect: Ubuntu's slurm",
         "+# ships no NVML plugin. On a unified-memory machine (one whose GPU shares system RAM, such as the GB10) the GPU's memory is system RAM, so none is declared.",
         "+NodeName=gpu-node-1 Name=gpu Type=gb10 File=/dev/nvidia0",
+        "+NodeName=gpu-node-1 Name=shard Count=12 File=/dev/nvidia0",
     ],
     "slurmdbd.conf": [
         "-# kill_invalid_depend never cancelled a failed chain (stage C test 7). Source of truth; /etc/slurm/slurmdbd.conf",
