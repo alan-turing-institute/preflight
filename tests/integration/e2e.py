@@ -1455,6 +1455,7 @@ def whole_card_job(name: str, user: str) -> str:
     return done.out.strip().split(";")[0] if done.rc == 0 else ""
 
 
+BACKFILL_WAIT_S = 75  # a backfill pass can take 30 s and a started job shows a pass later
 SCHEDULER_PASSES_S = 20  # the harness slurm.conf's scheduling interval is a few seconds: this is several passes
 SHARD_PARSE = """
 import sys
@@ -1538,6 +1539,83 @@ def stage_sharing() -> None:
     clear_queue()
 
 
+def late_shard_job_jumps(wait_s: int) -> tuple[bool, str]:
+    """Whether a shard job queued AFTER a whole-card job starts in the shards freed under it (the D31 starvation), within `wait_s`."""
+    clear_queue()
+    held = [shard_job(f"shard-held{i}", SHARD_JOB_SHARDS) for i in range(3)]
+    all(wait_state(j, "RUNNING", 60) for j in held if j)
+    whole = whole_card_job("whole", "bob")
+    late = shard_job("shard-late", SHARD_JOB_SHARDS)
+    cl("scancel", held[0])
+    jumped = bool(wait_for(lambda: state(late) == "RUNNING", wait_s, 3))
+    seen = f"whole {whole} {state(whole)}; late {late} {state(late)} ({jobinfo(late).get('Reason')})"
+    clear_queue()
+    return jumped, seen
+
+
+def plain_running_job(name: str) -> tuple[str, str]:
+    """A job holding no card, running; returns (id, its start time) to compare after a `scontrol reconfigure`."""
+    done = cl("sbatch", "--parsable", "-J", name, "--mem=50M", "-c", "1", "--wrap", "sleep 900", user="alice")
+    job = done.out.strip().split(";")[0] if done.rc == 0 else ""
+    return job, (jobinfo(job).get("StartTime", "") if job and wait_state(job, "RUNNING", 60) else "")
+
+
+def untouched(job: str, started: str) -> bool:
+    """The job is still the same run: running, same start time, never requeued."""
+    info = jobinfo(job)
+    return bool(job and started) and state(job) == "RUNNING" and info.get("StartTime") == started and info.get("Restarts") == "0"
+
+
+def switch_scheduler(kind: str) -> str:
+    """Change SchedulerType in the live slurm.conf and `scontrol reconfigure` (no restart); returns what slurm then reports."""
+    sh(f"sed -i 's#^SchedulerType=.*#SchedulerType=sched/{kind}#' /etc/slurm/slurm.conf && scontrol reconfigure")
+    time.sleep(SCHEDULER_PASSES_S)
+    return sh("scontrol show config | grep -E '^SchedulerType'").out.strip()
+
+
+def stage_sched_switch() -> None:
+    section("sched_switch: does `scontrol reconfigure` alone change the scheduler between backfill and builtin (D31, no restart)?")
+    clear_queue()
+    survivor, started = plain_running_job("survivor")
+    reported = switch_scheduler("backfill")
+    kept = untouched(survivor, started)
+    backfill_jumped, backfill_seen = late_shard_job_jumps(BACKFILL_WAIT_S)
+    reported_back = switch_scheduler("builtin")
+    builtin_jumped, builtin_seen = late_shard_job_jumps(BACKFILL_WAIT_S)
+    check("backfill, set by reconfigure only: the later shard job takes the freed shards (the starvation D31 found)",
+          backfill_jumped, f"{reported}: {backfill_seen}")
+    check("builtin, set back by reconfigure only: the later shard job waits behind the whole-card job",
+          not builtin_jumped, f"{reported_back}: {builtin_seen}")
+    check("a job running across the first reconfigure is untouched: still running, same start time, never requeued",
+          kept, f"job {survivor} started {started}: {jobinfo(survivor)}")
+
+
+def stage_shards_reconfigure() -> None:
+    section("shards_reconfigure: a cluster running WITHOUT shards gets them by `scontrol reconfigure` alone (the live rollout path)")
+    clear_queue()
+    sh("mkdir -p /root/with-shards && cp -a /etc/slurm/slurm.conf /etc/slurm/gres.conf /root/with-shards/")
+    # take the shard lines out and restart, so the daemons run as they do on a box that never had sharing
+    sh(r"sed -i -e 's/^GresTypes=gpu,shard/GresTypes=gpu/' -e 's#^AccountingStorageTRES=gres/gpu,gres/shard#AccountingStorageTRES=gres/gpu#' "
+       r"-e 's/,shard:[0-9]*//' /etc/slurm/slurm.conf && sed -i '/Name=shard/d' /etc/slurm/gres.conf && systemctl restart slurmctld slurmd")
+    wait_for(lambda: "State=IDLE" in nodes_alloc(), 90, 3)
+    before = nodes_alloc()
+    check("without shards: the node lists no shard resource", "shard" not in before and "State=IDLE" in before, before[:300])
+    refused = shard_job("shard-before", SHARD_JOB_SHARDS)
+    check("without shards: a shard request is refused", refused == "", f"job id {refused!r}")
+    survivor, started = plain_running_job("survivor")
+    sh("cp -a /root/with-shards/slurm.conf /root/with-shards/gres.conf /etc/slurm/ && scontrol reconfigure")
+    time.sleep(SCHEDULER_PASSES_S)
+    after = nodes_alloc()
+    jobs = [shard_job(f"shard-new{i}", SHARD_JOB_SHARDS) for i in range(2)]
+    running = all(jobs) and all(wait_state(j, "RUNNING", 60) for j in jobs)
+    check("reconfigure only: the node now lists shards and two shard jobs run on the card at once",
+          re.search(rf"Gres=gpu:fake:4,shard:(fake:)?{SHARD_CARD_SHARDS}\b", after) is not None and running,
+          f"{after[:300]} | jobs {jobs}")
+    check("reconfigure only: a job running across it is untouched (same run, never requeued)",
+          untouched(survivor, started), f"job {survivor} started {started}")
+    clear_queue()
+
+
 def stage_upgrade() -> None:
     section("upgrade: `install.py upgrade-slurm` from the image's slurm 23.11 to the site file's release (last: it replaces slurm)")
     clear_queue()
@@ -1582,6 +1660,8 @@ STAGES: dict[str, Callable[[], None]] = {
     "host": stage_host,
     "part_time": stage_part_time,
     "sharing": stage_sharing,
+    "sched_switch": stage_sched_switch,
+    "shards_reconfigure": stage_shards_reconfigure,
     "upgrade": stage_upgrade,
 }
 
