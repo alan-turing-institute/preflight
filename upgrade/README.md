@@ -31,6 +31,13 @@ locked version, because tests do not measure numbers or speed.
 
 State: `~/.local/state/upgrades/<name>.json` and `weekly.log`; a dry run writes `dry-run/<name>.json`.
 
+## Probe contract (`check = "numbers"`)
+
+The probe writes `{"seconds_per_step": float, "values": [float, ...]}` to `--out`. Only `values` is compared, old venv
+against new, and the project is applied only when the two lists are identical (relative difference exactly 0, same
+length). A probe whose JSON has no `values` list is HELD with "probe output not comparable". A probe that is not
+bit-reproducible across a PyTorch move (differences near 1e-7) is held every time torch changes; choose `tests` for it.
+
 ## Registry fields
 
 `name`, `path`, `check` (`numbers` | `tests`), `command` (numbers: the probe script and arguments, run as
