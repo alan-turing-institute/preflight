@@ -630,6 +630,13 @@ section 10). What the tools do instead is report the fact. `python3 slurm/cores.
 on such a host every run's record (`jobs/<id>.json`, in each leg) has `cores`: the cores that leg was allowed and how many ran at each top speed, e.g.
 `{"cpus": "0-3,8-11", "cores_by_max_mhz": {"2808": 6, "3900": 2}}`. A host whose cores are alike records nothing.
 
+**The one rule that follows: a GPU job always holds a fast core.** A GPU job's host threads (launching kernels, feeding data) decide how busy the card is. Slurm may
+give a job only slow cores, but if the job holds more cores than the host has slow ones, any set it is given contains a fast core and Linux moves the busy threads onto
+it by itself. Measured 2026-11-04 on this host (10 slow, 10 fast cores): an LSTM job on 4 slow cores kept the GPU about 45% busy; the same job on 12 cores (two of them
+fast) kept it 86 to 92% busy. So `submit.py` and `urgent.py` raise a whole-card GPU job below `slow cores + 1` to that number and print a warning saying so; the number comes from
+`slurm/cores.py` on the host the job runs on (11 here and on the Turing box, 0 on a host whose cores are alike), never from a figure written in a site file. It is not
+applied to a shard job (its share of the cores held for the card is fixed by sharing), to a CPU-only job, or when the detected cores are not the GPU node's own.
+
 **Where a part-time job's records go.** The job wrapper runs on the machine, so a job's record (`jobs/<id>.json`, with
 its legs and peaks), its events (a pushed-back job's `push_back`) and its log are written to the machine's own state
 directory. Every minute the controller's agent copies each machine's state directory to

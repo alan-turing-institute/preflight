@@ -37,6 +37,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import audit  # noqa: E402 - path set just above
+import cores  # noqa: E402
 import gpu_jobs  # noqa: E402
 import jobs_view  # noqa: E402
 import site_config  # noqa: E402
@@ -205,7 +206,7 @@ def run(argv: list[str]) -> int:
     arguments.gpus = arguments.gpus or int(arguments.gpu)
     submit.warn_memory(arguments.mem, named, arguments.gpu)
     arguments.name = named or Path(arguments.command[0]).name
-    arguments.cpus = submit.resolve_cpus(arguments.cpus, arguments.gpus, site)
+    arguments.cpus = submit.resolve_cpus(arguments.cpus, arguments.gpus, site, speeds=cores.CoreSpeeds.read())
     arguments.job_class, arguments.after = "urgent", []
     queue = gpu_jobs.read_queue()
     if queue is None:

@@ -70,6 +70,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import audit  # noqa: E402 - path set just above
+import cores
 import gpu_jobs  # noqa: E402
 import portability
 import remote
@@ -333,15 +334,29 @@ def resolve_packing(arguments: argparse.Namespace, named: str | None, site: site
     return packing
 
 
-def resolve_cpus(asked: int | None, gpus: int, site: site_config.Site, shared_cores: int = 0) -> int:
+def resolve_cpus(asked: int | None, gpus: int, site: site_config.Site, shared_cores: int = 0,
+                 speeds: cores.CoreSpeeds | None = None) -> int:
     """`--cpus`, else for a GPU job the cores the site holds for its GPUs (`cores_per_gpu`) or, unset, its GPUs'
-    share of the GPU node's cores, else DEFAULT_CPUS.
+    share of the GPU node's cores, else DEFAULT_CPUS. On a host whose cores differ (`speeds`), a whole-card GPU job
+    is raised to the fewest cores that always include a fast one.
 
     A GPU job given the old flat 4 cores was CPU-bound: the same inference timing ran 2-14x slower than with all 20
     (slurm jobs 254 and 258, 2026-10-19), while the other cores sat idle behind the one GPU.
     """
-    if asked is not None:
-        return asked
+    cpus = asked if asked is not None else _default_cpus(gpus, site, shared_cores)
+    node = next((n for n in site.nodes if n.gpus), None)
+    if not gpus or shared_cores or node is None or speeds is None or len(speeds.khz) != node.cpus:
+        return cpus  # no GPU, a shard job (its share of the held cores is fixed), or speeds that are not this node's
+    floor = min(speeds.fast_core_floor(), node.cpus)
+    if cpus < floor:
+        warn(f"a GPU job with {cpus} cores can run every one of them on this host's {node.cpus - floor + 1} slower cores, "
+             f"which starves the GPU (measured 2026-11-04: 4 slow cores kept it 45% busy, 12 cores 86-92%); using {floor}, "
+             "the fewest that always include a fast core")
+        return floor
+    return cpus
+
+
+def _default_cpus(gpus: int, site: site_config.Site, shared_cores: int) -> int:
     if shared_cores:
         return shared_cores  # a shard job: its share of the cores held for the card
     node = next((n for n in site.nodes if n.gpus), None)
@@ -450,7 +465,7 @@ def submit(argv: list[str]) -> str:
     named_cpus = arguments.cpus
     packing = resolve_packing(arguments, named, site)
     arguments.max_jobs = arguments.max_jobs or 1  # from here on: the level asked for, 1 when none
-    arguments.cpus = resolve_cpus(arguments.cpus, arguments.gpus, site, packing.cores)
+    arguments.cpus = resolve_cpus(arguments.cpus, arguments.gpus, site, packing.cores, cores.CoreSpeeds.read())
     if arguments.anywhere:
         if not gpu_jobs.part_time_eligible(gpu_jobs.JobClass(arguments.job_class), arguments.gpus, service=arguments.service):
             msg = ("--anywhere needs --class resume with no GPUs and no --service: the owner of a part-time machine "

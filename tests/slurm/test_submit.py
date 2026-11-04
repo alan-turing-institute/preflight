@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import cores
 import gpu_jobs
 import portability
 import pytest
@@ -31,6 +32,8 @@ def fake_site(monkeypatch: pytest.MonkeyPatch, *, lease: object, dgx_gate: bool,
 def default_site(monkeypatch: pytest.MonkeyPatch) -> None:
     """Default: a site with a lease and the DGX gate, so a submission checks both."""
     fake_site(monkeypatch, lease=object(), dgx_gate=True)
+    alike = cores.CoreSpeeds({})  # these tests do not depend on the machine they run on having fast and slow cores
+    monkeypatch.setattr(cores.CoreSpeeds, "read", classmethod(lambda cls, root=None: alike))
 
 
 def dry(*argv: str) -> str:
@@ -285,6 +288,27 @@ def test_a_gpu_job_gets_its_gpus_share_of_the_cores(site_cpus: int | None, held:
     assert f"{DIRECTIVE} --cpus-per-task={cpus}" in script
     # a job without GPUs runs in the CPU-only twin, kept off the cores held for GPU jobs
     assert f"{DIRECTIVE} --partition={'steady' if '--gpu' in argv or '--gpus' in argv else 'cpu'}" in script
+
+
+@pytest.mark.parametrize(
+    ("khz", "node_cpus", "argv", "cpus"),
+    [
+        ({**dict.fromkeys(range(10), 2_800_000), **dict.fromkeys(range(10, 20), 3_900_000)}, 20, ["--cpus", "4"], 11),
+        ({**dict.fromkeys(range(10), 2_800_000), **dict.fromkeys(range(10, 20), 3_900_000)}, 20, ["--cpus", "11"], 11),
+        ({**dict.fromkeys(range(10), 2_800_000), **dict.fromkeys(range(10, 20), 3_900_000)}, 20, ["--cpus", "15"], 15),
+        ({**dict.fromkeys(range(10), 2_800_000), **dict.fromkeys(range(10, 20), 3_900_000)}, 20, [], 11),  # site holds 6
+        ({**dict.fromkeys(range(10), 2_800_000), **dict.fromkeys(range(10, 20), 3_900_000)}, 12, ["--cpus", "4"], 4),  # not this node
+        (dict.fromkeys(range(20), 2_800_000), 20, ["--cpus", "4"], 4),  # alike: nothing to avoid
+    ],
+)
+def test_a_gpu_job_on_mixed_cores_always_holds_a_fast_core(khz: dict[int, int], node_cpus: int, argv: list[str], cpus: int,
+                                                           tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(gpu_jobs, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(cores.CoreSpeeds, "read", classmethod(lambda cls, root=None: cls(khz)))
+    node = SimpleNamespace(cpus=node_cpus, gpus=(site_config.Gpu(0, "GPU-a", "/dev/nvidia0", "gb10"),), cores_per_gpu=6)
+    fake_site(monkeypatch, lease=None, dgx_gate=False, nodes=(node,))
+    script = dry("--project", "p", "--what", "w", "--class", "restart", "--mem", "4G", "--gpu", *argv, "--", "x")
+    assert f"{DIRECTIVE} --cpus-per-task={cpus}" in script
 
 
 def test_a_cpu_job_over_the_cpu_cap_is_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

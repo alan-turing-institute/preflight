@@ -59,6 +59,13 @@ class CoreSpeeds:
             out.setdefault(self.khz[cpu] // KHZ_PER_MHZ, []).append(cpu)
         return dict(sorted(out.items()))
 
+    def fast_core_floor(self) -> int:
+        """The fewest cores that cannot all be slow: one more than the cores that are not of the fastest kind, so any
+        allocation of this size or more holds a fast core whichever cores slurm hands out. 0 when the cores are alike."""
+        if not self.mixed:
+            return 0
+        return len(self.khz) - len(next(reversed(self.groups().values()))) + 1
+
     def received(self, cpus: Iterable[int]) -> dict[str, object] | None:
         """What a run allowed `cpus` was given, for its record: {"cpus": "0-3,8-11", "cores_by_max_mhz": {"2808": 6, "3900": 2}}.
         None on a host whose cores are all alike (or report no speed): there is nothing to tell apart."""
