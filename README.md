@@ -77,6 +77,21 @@ time, never in one move.
 
 ## Use
 
+### site-b Spark
+
+Submit GPU workloads through the host's `gpujobs-submit` queue. The current
+queue guide is `/data/site/GPU_JOBS.md` on Spark.
+
+Use the [DGX Spark skill](.agents/skills/dgx-spark/SKILL.md) for agent-assisted
+work. To install it in another project, run this from that project with the
+path to your Preflight checkout.
+
+```sh
+npx skills add /path/to/preflight --skill dgx-spark --agent codex
+```
+
+### Legacy DGX gate
+
     dgx/dgx_submit.sh --entry <script.py> [--search <import root>]... \
                       [--also <file>]... [--allow-diff 'path=reason']... \
                       [-- <launch command>]
