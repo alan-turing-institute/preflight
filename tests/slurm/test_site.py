@@ -32,6 +32,16 @@ def write(tmp_path: Path, text: str) -> Path:
     return path
 
 
+LOCAL_SITE_FILES = sorted((ROOT / "machine" / "slurm").glob("site*.toml"))  # this machine's own, untracked
+
+
+@pytest.mark.skipif(not LOCAL_SITE_FILES, reason="no machine-local site files in this checkout")
+@pytest.mark.parametrize("path", LOCAL_SITE_FILES, ids=lambda p: p.name)
+def test_each_local_site_file_still_loads(path: Path) -> None:
+    """The machine's real site files are git-ignored now; a typo in one must still fail here, not at install."""
+    assert gpujobs_site.load(path).nodes
+
+
 def test_fixture_site_file_loads() -> None:
     site = gpujobs_site.load(ROOT / "tests/slurm/fixtures/site.toml")
     assert (site.name, site.cluster_name, site.account) == ("gpu-node-1", "spark", "local") and site.unified_memory and site.hostguard and site.dgx_gate
