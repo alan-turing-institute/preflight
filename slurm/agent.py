@@ -87,6 +87,7 @@ import render  # noqa: E402 - path set just above
 
 BOOT_ID_FILE = Path("/proc/sys/kernel/random/boot_id")
 #: slurmctld must have been up this long before the nodes are re-registered (it needs time to read its state).
+KILL_TASK_FAILED = "Kill task failed"  # slurm's own drain reason (slurmctld log, 2026-11-07: "Kill task failed (JobId=2187 StepId=batch)")
 CTLD_SETTLE_S = 30.0
 #: How long a service job may take to start once room is made for it; then the room is given back (step 3b).
 ROOM_WAIT_S = 60.0
@@ -670,12 +671,22 @@ class Agent:
     # -- 1. boot re-registration ----------------------------------------------------------------------------
 
     def _node_drained(self, node: str) -> bool | None:
-        """Whether `node` is drained or draining; None when slurm does not say."""
+        """Whether `node` is drained or draining for a reason a reboot does not clear; None when slurm does not say.
+
+        slurm drains a node with KILL_TASK_FAILED when a job's process will not die (2026-11-07: one stuck in the GPU driver);
+        a reboot ended that process, so at boot that drain is not kept, and the release is logged.
+        """
         done = call(self.scontrol, ["scontrol", "show", "node", node, "-o"])
         match = (
             re.search(r"\bState=(\S+)", done.stdout) if done.returncode == 0 else None
         )
-        return None if match is None else "DRAIN" in match[1]
+        if match is None:
+            return None
+        reason = re.search(r"\bReason=(.*?)(?: \S+=|$)", done.stdout)
+        if "DRAIN" in match[1] and reason and reason[1].startswith(KILL_TASK_FAILED):
+            print(f"[agent] boot: releasing {node}, drained for '{reason[1]}' before the reboot ended that process", flush=True)
+            return False
+        return "DRAIN" in match[1]
 
     def _reconcile_boot(self, now: float, errors: list[str]) -> None:
         boot = self.boot_id()

@@ -50,6 +50,7 @@ class World:
         self.copy_answer: tuple[int, str] = (0, "")
         self.running = ""  # squeue's "%i|%j|%P" lines for the jobs running on it
         self.nodes = {"n1": "IDLE", "n2": "IDLE+DRAIN"}
+        self.reasons: dict[str, str] = {}  # a node's drain reason in `scontrol show node`; default "x"
         self.writes: list[list[str]] = []  # every scontrol update / release, failed ones included
         self.totals = ""  # CPUTot=.. fields of node n1 in `scontrol show nodes -o`, for the idle check
         self.lent = ""  # the same for node n2, a drained part-time machine
@@ -82,7 +83,7 @@ class World:
             case ["show", "node"]:
                 return done(
                     argv,
-                    out=f"NodeName={argv[3]} State={self.nodes[argv[3]]} Reason=x\n",
+                    out=f"NodeName={argv[3]} State={self.nodes[argv[3]]} Reason={self.reasons.get(argv[3], 'x')} Comment=y\n",
                 )
         self.writes.append(argv if argv[0] == "scancel" else argv[1:])
         return done(argv, int(argv[1] in self.fail))
@@ -255,6 +256,10 @@ def test_nodes_are_undrained_once_per_boot_after_slurmctld_settles_and_drained_o
     assert (
         world.writes == [["update", "nodename=n1", "state=undrain"]] * 2
     )  # once more for the new boot
+    world.nodes["n2"], world.reasons["n2"] = "DOWN+DRAIN", "Kill task failed (JobId=2187 StepId=batch)"
+    world.boot = "boot-4"
+    world.step()  # a process slurm could not kill drained n2; the reboot ended it, so n2 is released too
+    assert world.writes[-2:] == [["update", "nodename=n1", "state=undrain"], ["update", "nodename=n2", "state=undrain"]]
 
 
 def test_waiting_jobs_get_the_place_their_level_and_id_give_them_and_nothing_else_is_touched(world: World) -> None:
