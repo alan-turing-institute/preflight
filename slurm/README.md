@@ -172,6 +172,7 @@ TOML. Tables: the top level, `[[nodes]]` with `[[nodes.gpus]]`, `[lease]` with `
 | `dgx_gate` | `false` | Require the DGX submission gate for jobs submitted with `--entry` (other jobs are not gated). The `tools` component installs the gate (`dgx/`) and the host memory guard it checks when this is on. |
 | `notify_command` | `[]` | Command (list of arguments, no shell, 30 s limit) the agent runs when a job ends FAILED, OUT_OF_MEMORY, TIMEOUT or NODE_FAIL, with the job in the environment: `GPUJOBS_JOB` (id), `GPUJOBS_STATE`, `GPUJOBS_USER`, `GPUJOBS_NAME`. The name is whatever its submitter typed, with control characters shown as `?`: quote it wherever it goes into a shell command or a mail header. Empty means no notification. |
 | `sharing_memory_fraction` | absent | Only for sites that share a card (`shards`, below). A number above 0 and at most 1: the share of a node's jobs memory that the jobs sharing a card may fill together, counted at their measured peaks. It tightens two gates alike: `sharing.py measure` drops any level whose peak memory in use passes it (of the box's total memory), and `submit.py` caps the copies by it (of the node's jobs memory). Absent: they may fill all of it. |
+| `cpus_from_history` | `recommend` | Cores for a CPU-only job given `--name` and no `--cpus` (section 7). `off`: nothing. `recommend`: `submit` prints the cores the job's 3 newest completed runs of the same `project:class:name` justify and asks as before. `enforce`: it asks for them. The figure is their highest average cores in use (core time over wall time, from `sacct`) times 1.25, rounded up, from 1 to the cores the job may have. |
 | `nodes` | required | One `[[nodes]]` table per compute node; at least one. |
 | `lease` | absent | Optional table; leave it out when no other service shares the GPU through the lease. Without it the `lease` component is not installed. |
 | `metrics` | all defaults below | Table. |
@@ -488,9 +489,24 @@ The urgent plan counts free cores and memory only on nodes in the `urgent` parti
 failed), so a lent machine that is off adds no room. When it pre-empts a `normal` job it also prints one `KNOCK-ON` line: the requeued `normal` job restarts above `cpu_fill` and may
 pre-empt `cpu_fill` jobs for their cores, including ones that start meanwhile; the line names the `cpu_fill` jobs running now that the plan does not touch.
 
-Other options: `submit --mem 24G` (otherwise the last measured run of `--name` plus 10 percent, else the whole
-box for a GPU job), `--after JOBID` to chain, `--gpus N`, `--dry-run` to print the batch script. `gpujobs-footprint NAME`
-prints a job's last measured peak memory. `gpujobs-status` and `gpujobs-audit` take no options and run at once. `gpujobs-audit` reports GPU work running outside slurm and the lease.
+Other options: `submit --mem 24G`, `--after JOBID` to chain, `--gpus N`, `--dry-run` to print the batch script.
+`gpujobs-footprint NAME` prints the peak memory a job is sized from. `gpujobs-status` and `gpujobs-audit` take no options and run at once. `gpujobs-audit` reports GPU work running outside slurm and the lease.
+
+Sizing from a job's own history. Give a job `--name` and the same name on every run; the job wrapper measures each run.
+
+- Memory, without `--mem`: the highest peak (card plus host side) of the name's 3 newest clean runs (exit 0, no signal),
+  plus 10 percent, rounded up to a whole slurm `G` (1.07 GB), the way Kubernetes' Vertical Pod Autoscaler sizes from history rather
+  than from the newest sample. With no clean run, the largest peak of its crashed or pre-empted runs that ran 10 minutes
+  or more, plus 25 percent; with no run at all, the whole box for a GPU job and slurm's default for a CPU job.
+- After a run was killed for memory (slurm's `OUT_OF_MEMORY`, or the host's OOM guard) and no clean run has ended
+  since, the next ask is at least 1.2 times what that run was given and at least 105 MB more (the autoscaler's rule), never
+  below the history's ask, and the whole box when that is more than any node gives jobs. `submit` prints
+  `[submit] memory: run J of 'NAME' was killed by ... ; asking NG`.
+- A hand-set `--mem` below the history's peak, or `--mem 0` for a measured job, warns; it is never refused.
+- Cores, for a CPU-only job without `--cpus`: `[submit] cores: measured A avg over N completed runs; would ask K (asking D now)`,
+  from `sacct` (site field `cpus_from_history`, section 4). Under `recommend` (the default) the job still asks for D;
+  under `enforce` it asks for K. A hand-set `--cpus` more than twice K warns. The figure is kept in the job's record
+  (`cores_from_history`) so proposals can be compared with what the jobs then used. GPU jobs keep the cores held for the card.
 
 ### Sharing a card
 
@@ -514,11 +530,11 @@ count has changed since.
 
 After that, `gpujobs-submit ... --gpu --name train1` shares by itself and prints what it decided, for example
 `level 4 (measured 4; memory allows 15; cores allow any) -> --gres=shard:3 of 12, 3 cores`. The level is the smallest of the
-measured level; the node's jobs memory (times `sharing_memory_fraction`) over the job's last measured peak plus 10 percent;
+measured level; the node's jobs memory (times `sharing_memory_fraction`) over the job's measured peak (section 7) plus 10 percent;
 and the cores held for the card over `--cpus`. The job then asks for `ceil(shards per card / level)` shards and that share
 of the cores. `--max-jobs N` replaces the measured level (memory and cores still bound it, and the line says so when you
 are given fewer); `--max-jobs 1` forces a whole card. A job with no measurement, no `--name`, or `--gpus` above 1 asks for the whole card as
-before. When the job's newest clean peak is above the one at measurement time, `submit` warns: measure again.
+before. When the job's measured peak is above the one at measurement time, `submit` warns: measure again.
 
 Rules that hold at every site that shares a card. Another user's job shares your card only when both asked for shards: a plain
 `--gpu` job always gets a whole card alone. `gpujobs-urgent --gpu` counts every running shard job as in the way, like a

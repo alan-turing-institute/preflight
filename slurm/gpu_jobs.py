@@ -760,9 +760,14 @@ def remove_quietly(path: Path) -> None:
         path.unlink(missing_ok=True)
 
 
-def _sacct_jobs(*selection: str) -> list[dict[str, object]] | None:
+#: How long `submit.py` waits for accounting before it sizes without history: a submission must not stall on slurmdbd.
+SUBMIT_SACCT_S = 10
+
+
+def _sacct_jobs(*selection: str, flags: tuple[str, ...] = ("-X", "-a"), timeout: float = 60) -> list[dict[str, object]] | None:
+    """`sacct --json` records; `flags` default to one allocation record per job, every user's. None when sacct fails."""
     try:
-        done = subprocess.run(["sacct", "--json", "-X", "-a", *selection], capture_output=True, text=True, timeout=60,
+        done = subprocess.run(["sacct", "--json", *flags, *selection], capture_output=True, text=True, timeout=timeout,
                               check=False)
         return json.loads(done.stdout)["jobs"] if done.returncode == 0 else None
     except (OSError, subprocess.TimeoutExpired, ValueError, KeyError, TypeError):
@@ -827,8 +832,18 @@ def measured_sharing(name: str) -> dict[str, object] | None:
     return None if newest is None else newest["sharing"]
 
 
+#: Memory and cores from history (D35): the highest of this many newest clean runs, so one light run cannot shrink the next.
+HISTORY_RUNS = 3
+
+
+def _clean(leg: Mapping[str, object]) -> bool:
+    return leg.get("exit") == 0 and not leg.get("signals")
+
+
 def measured_peak_bytes(name: str, *, clean: bool = True) -> int | None:
-    """The footprint of the newest run called `name` that finished cleanly (exit 0, no signal): GPU plus CPU side.
+    """The HIGHEST footprint (GPU plus CPU side) of the `HISTORY_RUNS` newest runs called `name` that finished cleanly
+    (exit 0, no signal), as Kubernetes' Vertical Pod Autoscaler sizes from a high percentile of history, not the
+    latest sample (D35): with the newest run alone, a light run (a short test, an easy input) sized the next full one.
 
     Only this user's own sidecars count: another user's file with the name could understate the peak, and a crashed
     or pre-empted leg stopped early, so its peak is too low to size the next run on. With `clean=False` (used only when
@@ -836,12 +851,13 @@ def measured_peak_bytes(name: str, *, clean: bool = True) -> int | None:
     but far closer than the whole box a re-queued job otherwise asks for (2026-10-25: a re-queue after a crash asked
     for the whole box and sat idle beside a 27 GB job with 75 GB free).
     """
-    best: tuple[int, int] | None = None
+    found: list[tuple[int, int]] = []  # (ended, total): one per run when clean, one per leg otherwise
     for record in own_records(name):
         if record.get("kind") == SHARING_PROBE:
             continue  # a probe's total is over several copies at once: it must never size a real job
+        legs: list[tuple[int, int]] = []
         for leg in _legs(record):
-            if "peak_gpu_mib" not in leg or (clean and (leg.get("exit") != 0 or leg.get("signals"))):
+            if "peak_gpu_mib" not in leg or (clean and not _clean(leg)):
                 continue
             try:
                 total = int(float(leg["peak_gpu_mib"]) * 1024 * 1024) + int(leg.get("peak_mem_bytes") or 0)
@@ -850,10 +866,94 @@ def measured_peak_bytes(name: str, *, clean: bool = True) -> int | None:
                 ran = ended - (ended if started is None else int(started))
             except (TypeError, ValueError):
                 continue
-            key = ended if clean else total
-            if (clean or ran >= UNCLEAN_MIN_S) and (best is None or key > best[0]):
-                best = (key, total)
-    return None if best is None else best[1]
+            if clean or ran >= UNCLEAN_MIN_S:
+                legs.append((ended, total))
+        if clean and legs:  # a job whose clean legs are several (requeued after one) is still one run of the window
+            legs = [(max(e for e, _ in legs), max(total for _, total in legs))]
+        found += legs
+    newest = sorted(found, reverse=True)[:HISTORY_RUNS] if clean else found
+    return max((total for _, total in newest), default=None)
+
+
+@dataclass(frozen=True)
+class MemoryKill:
+    """A run killed for memory: slurm's OUT_OF_MEMORY, or the host's OOM guard (`killed_by` in its leg)."""
+
+    job_id: str
+    asked_mb: int | None  # the memory it was given, in slurm MB (2^20 bytes); 0: the whole box (`--mem 0`); None: unknown
+    by: str  # what killed it, for the line `submit.py` prints
+
+
+def memory_kill(name: str) -> MemoryKill | None:
+    """The newest run called `name` killed for memory, when no clean run of the name ended after it (D35: the next ask
+    is then bumped above what it was given); None otherwise. Only this user's own records count, as for
+    `measured_peak_bytes`. The newest kill decides, whatever it was given: an older kill with less never stands in.
+
+    The guard's kills are in the job's legs; slurm's own (the job's memory limit) only in accounting, asked once for
+    the runs that ended after the newest clean one and did not finish cleanly. What it was given is the record's
+    `--mem`, else what accounting says slurm allocated (no `--mem`: slurm's default)."""
+    records = [r for r in own_records(name) if r.get("kind") != SHARING_PROBE and r.get("job_id")]
+
+    def ended(record: Mapping[str, object]) -> int:
+        times = [leg.get("ended_at") for leg in _legs(record)] + [record.get("submitted_at")]
+        return max((int(t) for t in times if isinstance(t, int | float)), default=0)
+
+    newest_clean = max((ended(r) for r in records if any(_clean(leg) for leg in _legs(r))), default=0)
+    unclean = {str(r["job_id"]): r for r in records if ended(r) > newest_clean and not any(_clean(leg) for leg in _legs(r))}
+    if not unclean:
+        return None
+    accounting = {str(job.get("job_id")): job
+                  for job in _sacct_jobs("-j", ",".join(sorted(unclean)), timeout=SUBMIT_SACCT_S) or []}
+    kills: list[tuple[int, str, str]] = []  # (ended, job id, by)
+    for job_id, record in unclean.items():
+        job = accounting.get(job_id, {})
+        guard = next((leg["killed_by"] for leg in _legs(record) if isinstance(leg.get("killed_by"), dict)), None)
+        if guard is not None:
+            by = f"the host's OOM guard ({guard.get('guard') or 'earlyoom'})"
+        elif "OUT_OF_MEMORY" in (job.get("state", {}).get("current") or []):
+            by = "slurm (OUT_OF_MEMORY: it passed its memory limit)"
+        else:
+            continue
+        kills.append((ended(record), job_id, by))
+    if not kills:
+        return None
+    _, job_id, by = max(kills)
+    asked, job = unclean[job_id].get("mem"), accounting.get(job_id, {})
+    try:
+        asked_mb = mem_mb(str(asked)) if asked is not None else next(
+            int(t["count"]) for t in job.get("tres", {}).get("allocated", []) if t.get("type") == "mem")
+    except (ValueError, IndexError, KeyError, TypeError, StopIteration):
+        asked_mb = None  # not slurm notation, or accounting does not say
+    return MemoryKill(job_id, asked_mb, by)
+
+
+#: The earliest start time sacct accepts: its window bounds which jobs are searched, and history is wanted whole.
+_SACCT_EPOCH = "1970-01-01T00:00:00"
+
+
+def measured_cores(job_name: str) -> tuple[float, int] | None:
+    """(the HIGHEST average cores in use, how many runs) over this user's `HISTORY_RUNS` newest COMPLETED jobs called
+    `job_name` (slurm's whole name, `project:class:name`); None when accounting does not answer or none completed with
+    a wall time. Average cores = core time over wall time.
+
+    Asked of sacct WITHOUT `-X`: the allocation-only record reports no core time at all (TotalCPU 0 for job 1717 with
+    `-X`, 6,775 s without; slurm 26.05.5, 2026-11-07); the job's record then sums its steps'. With `-s` sacct needs both
+    ends of the window, or it reports nothing."""
+    jobs = _sacct_jobs("-u", current_user(), "--name", job_name, "-s", "CD", "-S", _SACCT_EPOCH, "-E", "now", flags=(),
+                       timeout=SUBMIT_SACCT_S)
+    runs: list[tuple[int, float]] = []
+    for job in jobs or []:
+        try:
+            times = job["time"]
+            elapsed, total = int(times["elapsed"]), times["total"]
+            core_s = int(total["seconds"]) + int(total["microseconds"]) / 1e6
+            end = int(times["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if job.get("name") == job_name and elapsed > 0:
+            runs.append((end, core_s / elapsed))
+    newest = sorted(runs, reverse=True)[:HISTORY_RUNS]
+    return (max(average for _, average in newest), len(newest)) if newest else None
 
 
 def run_slurm(command: list[str]) -> int:

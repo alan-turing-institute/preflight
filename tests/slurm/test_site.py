@@ -109,6 +109,9 @@ def test_example_loads_and_minimal_file_gets_every_default(tmp_path: Path) -> No
     assert (shared("shards = 'cores'\n").nodes[0].shards, shared("shards = 'cores'\n").sharing) == (cores, True)
     assert (shared("shards = 4\n").nodes[0].gpus[0].shards, shared("shards = 0\n").sharing) == (4, False)
     assert shared("", "sharing_memory_fraction = 0.5\n").sharing_memory_fraction == pytest.approx(0.5)
+    # cores from history (D35): recommend unless the site says otherwise
+    assert (site.cpus_from_history, shared("", "cpus_from_history = 'enforce'\n").cpus_from_history) == (
+        gpujobs_site.CoresFromHistory.RECOMMEND, gpujobs_site.CoresFromHistory.ENFORCE)
 
 
 @pytest.mark.parametrize(
@@ -153,6 +156,7 @@ def test_example_loads_and_minimal_file_gets_every_default(tmp_path: Path) -> No
         ("sharing_memory_fraction = 1.5\n" + MINIMAL, "sharing_memory_fraction = 1.5"),
         ("sharing_memory_fraction = 0\n" + MINIMAL, "sharing_memory_fraction = 0"),
         ("sharing_memory_fraction = true\n" + MINIMAL, "sharing_memory_fraction = True"),
+        ("cpus_from_history = 'always'\n" + MINIMAL, "cpus_from_history"),
         (MINIMAL + "[service]\ncores = 0\n", "service.cores = 0"),
         (MINIMAL + "[remote.t]\nhost = 'h'\n", "[remote.t] is missing root"),
         (MINIMAL + "[remote.t]\nhost = 'h'\nroot = '../x'\n", "no '..'"),

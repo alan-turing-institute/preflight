@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A job's last measured footprint, for `submit.py --mem auto` and for an urgent job's stated needs (design 3.5).
+"""A job's measured footprint, for `submit.py --mem auto` and for an urgent job's stated needs (design 3.5).
 
     slurm/footprint.py NAME
 """
@@ -23,7 +23,8 @@ def main() -> int:
     if peak is None:
         print(f"[footprint] no measured run called {name!r}")
         return 1
-    print(f"[footprint] {name}: {peak / 1024**3:.1f} GiB at its peak (GPU plus CPU side, newest finished run)")
+    print(f"[footprint] {name}: {peak / 1e9:.1f} GB at its peak (GPU plus CPU side, the highest of its "
+          f"{gpu_jobs.HISTORY_RUNS} newest clean runs)")
     return 0
 
 

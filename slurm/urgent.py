@@ -16,8 +16,8 @@ Design 3.6 (`design notes`).
 3. Otherwise it submits to `urgent` with the required `--time`. Default size `--whole-box`: the GPU, all
    memory and all cores. Slurm pre-empts and requeues the `normal` jobs in the way; their dependents wait;
    the services step aside because an urgent job is keeper demand, with or without `--gpu`.
-   `--mem auto` asks for the job name's newest measured run plus margin (`submit.resolve_mem`), the whole box when
-   there is none. `--entry` (with `--repo`, `--search`) runs the DGX gate as `submit.py` does, before anything is held or
+   `--mem auto` asks for the highest peak of the job name's 3 newest clean runs plus margin, raised after a run killed
+   for memory (`submit.resolve_mem`), the whole box when there is none. `--entry` (with `--repo`, `--search`) runs the DGX gate as `submit.py` does, before anything is held or
    submitted: a refusal changes nothing, and the job wrapper re-checks the code when the job starts.
 4. ORDER AFTERWARDS: a requeued job cannot start for the requeue wait, so an urgent job shorter than that
    would hand the card to another queued job first. Other pending tier-1 GPU jobs are held and recorded in

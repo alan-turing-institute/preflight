@@ -158,6 +158,23 @@ def test_completion_records_take_each_jobs_latest_record_and_a_name_forges_nothi
     assert gpu_jobs.completion_records(["8"])["8"]["UserId"] == "bob" and asked[-1] == ("-j", "8")
 
 
+def test_cores_from_history_are_the_highest_average_of_the_three_newest_completed_runs(monkeypatch: pytest.MonkeyPatch) -> None:
+    def job(end: int, core_s: int, elapsed: int, name: str = "p:restart:n", micro: int = 0) -> dict[str, object]:
+        return {"name": name, "time": {"end": end, "elapsed": elapsed, "total": {"seconds": core_s, "microseconds": micro}}}
+
+    jobs = [job(1, 900, 100), job(2, 300, 100), job(3, 100, 100), job(4, 249, 100, micro=500_000),
+            job(5, 0, 0), job(6, 999, 1, name="p:restart:n2"), {"name": "p:restart:n", "time": "x"}]
+    asked: list[tuple[tuple[str, ...], tuple[str, ...]]] = []
+    monkeypatch.setattr(gpu_jobs, "_sacct_jobs", lambda *sel, flags, timeout: asked.append((sel, flags, timeout)) or jobs)
+    # 9.0 from run 1 is older than the newest three; no wall time, another name, a bad record: skipped
+    assert gpu_jobs.measured_cores("p:restart:n") == (3.0, 3)
+    selection, flags, timeout = asked[-1]
+    assert timeout == gpu_jobs.SUBMIT_SACCT_S and flags == () and selection[:4] == ("-u", gpu_jobs.current_user(), "--name", "p:restart:n")  # with steps: -X has no core time
+    assert ("-S", gpu_jobs._SACCT_EPOCH) == selection[6:8] and selection[-2:] == ("-E", "now")  # with -s both ends, or nothing
+    monkeypatch.setattr(gpu_jobs, "_sacct_jobs", lambda *_sel, flags, timeout: None)
+    assert gpu_jobs.measured_cores("p:restart:n") is None  # accounting does not answer: nothing proposed
+
+
 def test_parse_squeue_reads_json_so_a_name_cannot_forge_a_row() -> None:
     # Slurm keeps a newline in a job name and lets the owner rename the job (measured, 23.11.4): in a text row this
     # name was a second, forged job 999 with priority 9999.

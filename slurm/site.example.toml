@@ -15,6 +15,9 @@ state_dir = "/var/lib/gpujobs"
 # Sharing cards only. The share of a node's job memory (0 to 1) that the jobs sharing one card may fill together, counted at
 # their measured peaks. Default: unset, so they may fill all the memory the node hands to jobs.
 # sharing_memory_fraction = 0.5
+# Cores for a CPU-only job given --name and no --cpus, from its last 3 completed runs (their highest average cores in use
+# x 1.25, rounded up): "off", "recommend" (print the figure, ask as before) or "enforce" (ask for it). Default: recommend
+# cpus_from_history = "recommend"
 # Where the code is installed. Default: /opt/gpujobs
 install_dir = "/opt/gpujobs"
 # Unix group of admins: they may act on anyone's jobs and submit urgent work. Default: gpujobs-admin

@@ -27,8 +27,16 @@ none, neither any. With `--dry-run` the first line is `[submit] service room: {j
 `after_suspending` or `waits`), `suspends` ([{job, user, name, what}]) and `why`. Only the site's service group and
 admins may use it.
 
-MEMORY: `--mem` is optional. Without it (or with `auto`) a job given `--name` asks for that name's newest measured
-run plus 10%; with no measured run (or no `--name`) a GPU job asks for the whole box, a CPU job for slurm's default.
+MEMORY: `--mem` is optional. Without it (or with `auto`) a job given `--name` asks for the highest peak of that name's
+3 newest clean runs plus 10%; with no measured run (or no `--name`) a GPU job asks for the whole box, a CPU job for
+slurm's default. After a run of the name was killed for memory (slurm's OUT_OF_MEMORY or the host's OOM guard) and no
+clean run has ended since, it asks for at least 1.2 times what that run was given, and 105 MB more at least (D35, the
+Vertical Pod Autoscaler's rule), and prints `[submit] memory: ...` saying so.
+
+CORES (D35, site field `cpus_from_history`): a CPU-only job given `--name` and no `--cpus` is offered the cores its
+3 newest completed runs of the same `project:class:name` used: the highest average (core time over wall time) times
+1.25, rounded up, within the cores the job may have. The line `[submit] cores: ...` shows it; `recommend` (the
+default) only prints it, `enforce` asks for it. A `--cpus` above twice it warns.
 
 LEVEL (D18): where the job waits among the others, `normal` by default; `high` goes ahead of normal and low, `low`
 behind them. Open to everyone. It orders the waiting line only: a running job is never stopped for a higher level.
@@ -87,9 +95,17 @@ COMMENT_MAX = 200
 AUTO_MARGIN = 0.10
 #: --mem auto with no clean run: the largest peak of the crashed or pre-empted runs (a lower bound), plus this share.
 UNCLEAN_MARGIN = 0.25
+#: After a run killed for memory (D35): the next ask is at least this many times what it was given ...
+OOM_BUMP_RATIO = 1.2
+#: ... and at least this many slurm MB (2^20 bytes) more: the Vertical Pod Autoscaler's OOMBumpUpRatio and OOMMinBumpUp.
+OOM_MIN_BUMP_MB = 100
 #: --mem with no measured run, for a GPU job: slurm's "all of the memory on each node".
 WHOLE_BOX = "0"
 DEFAULT_CPUS = 4  # a CPU-only job, or any job on a site whose nodes have no GPUs
+#: Cores from history (D35): the highest average in use over the newest completed runs, times this, rounded up.
+CORES_MARGIN = 1.25
+#: A hand-set --cpus more than this many times the cores from history warns (never a refusal, as for memory).
+CORES_OVER_ASK = 2
 _DURATION = re.compile(r"^(\d+(?:\.\d+)?)([smh]?)$")
 _UNIT_S = {"": 1, "s": 1, "m": 60, "h": 3600}
 
@@ -107,19 +123,45 @@ def seconds(text: str) -> float:
 
 
 def resolve_mem(mem: str | None, name: str | None, gpu: bool) -> str | None:
-    """The `--mem` to ask slurm for. A stated figure is used as given; none (or `auto`) is the newest measured run of
-    `name` plus `AUTO_MARGIN`, only for a job given `--name` (the default name, the command's first word such as
-    `python`, is shared by unrelated jobs); with no clean run, the largest peak of its crashed or pre-empted runs plus
-    `UNCLEAN_MARGIN`; with no measured run at all, the whole box for a GPU job (`0`: slurm grants
+    """The `--mem` to ask slurm for. A stated figure is used as given; none (or `auto`) is the highest peak of the 3
+    newest clean runs of `name` plus `AUTO_MARGIN`, only for a job given `--name` (the default name, the command's
+    first word such as `python`, is shared by unrelated jobs); with no clean run, the largest peak of its crashed or
+    pre-empted runs plus `UNCLEAN_MARGIN`; with no measured run at all, the whole box for a GPU job (`0`: slurm grants
     every byte it hands out) and slurm's own default for a CPU job. The wrapper measures every run, so only a
-    named job's first run takes the whole box."""
+    named job's first run takes the whole box.
+
+    After a run of the name was killed for memory, with no clean run since (`gpu_jobs.memory_kill`), the ask is at
+    least `OOM_BUMP_RATIO` times what that run was given and `OOM_MIN_BUMP_MB` more, never below the history's ask,
+    and the whole box when that is more than any node gives jobs (D35)."""
     if mem not in (None, "auto"):
         return mem
     if name is None:
         return WHOLE_BOX if gpu else None
+    history = None  # GiB
     for clean, margin in ((True, AUTO_MARGIN), (False, UNCLEAN_MARGIN)):
         if (peak := gpu_jobs.measured_peak_bytes(name, clean=clean)) is not None:
-            return f"{math.ceil(peak * (1 + margin) / 1024**3)}G"
+            history = math.ceil(peak * (1 + margin) / 1024**3)
+            break
+    if (kill := gpu_jobs.memory_kill(name)) is not None:
+        said = f"run {kill.job_id} of {name!r} was killed by {kill.by}"
+        if kill.asked_mb is None:
+            warn(f"{said}, but what it was given is unknown (no --mem, and accounting does not say); sized from its "
+                 "history instead")
+        elif kill.asked_mb == 0:
+            warn(f"{said} with the whole box given; it asks for the whole box again")
+            return WHOLE_BOX
+        else:
+            bumped_mb = max(kill.asked_mb + OOM_MIN_BUMP_MB, kill.asked_mb * OOM_BUMP_RATIO)
+            ask = max(math.ceil(bumped_mb / 1024), history or 0)
+            most_mb = max((node.jobs_mb for node in gpu_jobs.load_site().nodes), default=None)
+            said += f" with {_gb(kill.asked_mb)} given"
+            if most_mb is not None and ask * 1024 > most_mb:
+                warn(f"{said}; {OOM_BUMP_RATIO} times that is more than any node gives jobs, so it asks for the whole box")
+                return WHOLE_BOX
+            print(f"[submit] memory: {said}; asking {ask}G, at least {OOM_BUMP_RATIO} times that (D35)")
+            return f"{ask}G"
+    if history is not None:
+        return f"{history}G"
     if gpu:
         warn(f"no measured run called {name!r}: it asks for the whole box and waits for every other job; "
              "pass --mem from a similar job's footprint (slurm/footprint.py NAME) to let it start beside them")
@@ -150,8 +192,8 @@ def warn_memory(mem: str | None, name: str | None, gpu: bool) -> None:
         warn(f"--mem 0 asks for the whole box, so the job waits for every other job; {name!r} peaked at "
              f"{peak / 1e9:.1f} GB, and --mem auto would ask for {_gb(gpu_jobs.mem_mb(auto))}")
     elif asked_mb * 1024**2 < peak:
-        warn(f"--mem {mem} ({_gb(asked_mb)}) is below the {peak / 1e9:.1f} GB {name!r} peaked at on its last clean "
-             "run; the memory floor may kill the job")
+        warn(f"--mem {mem} ({_gb(asked_mb)}) is below the {peak / 1e9:.1f} GB {name!r} peaked at on one of its last "
+             f"{gpu_jobs.HISTORY_RUNS} clean runs; the memory floor may kill the job")
 
 
 def warn_device(arguments: argparse.Namespace) -> None:
@@ -367,13 +409,44 @@ def _default_cpus(gpus: int, site: site_config.Site, shared_cores: int) -> int:
     return max(1, node.cpus * min(gpus, len(node.gpus)) // len(node.gpus))
 
 
+def cores_from_history(arguments: argparse.Namespace, named: str | None, hand_set: bool,
+                       site: site_config.Site) -> dict[str, object] | None:
+    """D35: the cores a CPU-only job given `--name` would ask for from its own completed runs (`gpu_jobs.measured_cores`
+    of `project:class:name`): the highest average in use times `CORES_MARGIN`, rounded up, from 1 to the cores the job
+    may have. Prints the line; under `enforce` a job without `--cpus` asks for them; a `--cpus` more than
+    `CORES_OVER_ASK` times them warns. Returns what is kept in the job's record (for comparing proposals with use
+    before `enforce`), None when nothing was proposed (`off`, a GPU job, no `--name`, no completed run)."""
+    mode = site.cpus_from_history
+    if mode is site_config.CoresFromHistory.OFF or arguments.gpus or named is None:
+        return None
+    measured = gpu_jobs.measured_cores(f"{arguments.project}:{arguments.job_class}:{named}")
+    if measured is None:
+        return None
+    average, runs = measured
+    cap = site.service.cores if arguments.service else site.cpu_job_cap or max((n.cpus for n in site.nodes), default=None)
+    proposal = max(1, math.ceil(average * CORES_MARGIN))
+    proposal = min(proposal, cap) if cap else proposal
+    asking = arguments.cpus
+    applied = mode is site_config.CoresFromHistory.ENFORCE and not hand_set
+    if applied:
+        arguments.cpus = proposal
+    said = f"[submit] cores: measured {average:.1f} avg over {runs} completed runs; "
+    print(said + (f"asking {proposal} (was {asking})" if applied else
+                  f"would ask {proposal} (asking {asking} now{', set by --cpus' if hand_set else ''})"))
+    if hand_set and asking > CORES_OVER_ASK * proposal:
+        warn(f"--cpus {asking} is more than {CORES_OVER_ASK} times the {proposal} cores {named!r} would ask for from its "
+             f"last {runs} completed runs ({average:.1f} in use on average at most); the idle cores are held from other jobs")
+    return {"mode": str(mode), "average": round(average, 2), "runs": runs, "proposal": proposal, "asked": arguments.cpus}
+
+
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--project", required=True)
     p.add_argument("--what", required=True, help="one line: what the job is")
     p.add_argument("--class", dest="job_class", required=True, choices=[c.value for c in gpu_jobs.JobClass])
     p.add_argument("--mem", default=None,
-                   help="e.g. 24G; default auto: the last measured run of --name plus 10%%, else the whole box (GPU)")
+                   help="e.g. 24G; default auto: the highest peak of the 3 newest clean runs of --name plus 10%%, "
+                        "else the whole box (GPU)")
     gpu = p.add_mutually_exclusive_group()
     gpu.add_argument("--gpu", action="store_true", help="one GPU (same as --gpus 1)")
     gpu.add_argument("--gpus", type=int, default=None, metavar="N", help="N GPUs, N >= 1")
@@ -501,6 +574,7 @@ def submit(argv: list[str]) -> str:
         msg = (f"--cpus {arguments.cpus}: a job without GPUs may use at most {site.cpu_job_cap} cores here; the rest "
                "are held for GPU jobs (cores_per_gpu in the site file)")
         raise Refused(msg)
+    history_cores = cores_from_history(arguments, named, named_cpus is not None, site)
     stamp = time.strftime("%Y%m%d-%H%M%S")
     log = arguments.log or gpu_jobs.STATE_DIR / "logs" / f"{arguments.name}-{stamp}.log"
     gated = bool(arguments.entry) and site.dgx_gate
@@ -560,6 +634,7 @@ def submit(argv: list[str]) -> str:
         submitted_at=int(time.time()),
         **({"may_suspend": None if consent is None else sorted(consent)} if arguments.service else {}),
         **({"part_time": {v.node: v.reason or "included" for v in placed.verdicts}} if placed else {}),
+        **({"cores_from_history": history_cores} if history_cores else {}),
     )
     pauses = {
         gpu_jobs.ANYWHERE_PARTITIONS: "requeued for urgent work or when a part-time machine's owner needs it back; "

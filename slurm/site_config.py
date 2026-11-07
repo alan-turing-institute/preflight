@@ -47,6 +47,14 @@ class AuthMode(StrEnum):
     SSH = "ssh"  # no sign-in page: each person's own ssh forward to the relay names them (D19, see portal.py)
 
 
+class CoresFromHistory(StrEnum):
+    """`cpus_from_history` (D35): what `submit.py` does with the cores a CPU-only job used on its last completed runs."""
+
+    OFF = "off"  # nothing: no accounting query, no line
+    RECOMMEND = "recommend"  # print the cores it would ask for; ask as before
+    ENFORCE = "enforce"  # ask for them when --cpus is not given
+
+
 SHARDS_FROM_CORES = "cores"  # `shards = "cores"`: one shard per core the node holds for the card
 MAX_SHARDS = 1024  # slurm gres.conf(5): a shard Count is limited in size (currently 1024)
 
@@ -205,6 +213,7 @@ class Site:
     remotes: dict[str, Remote] = field(default_factory=dict)  # `[remote.NAME]` tables
     requeue_delay_s: int = 60  # slurm.conf AuthInfo=cred_expire: how long a requeued job waits before it may start again
     sharing_memory_fraction: float | None = None  # a site's own tightening of the share of a node's jobs memory that co-running shard jobs may fill
+    cpus_from_history: CoresFromHistory = CoresFromHistory.RECOMMEND  # cores for a named CPU-only job without --cpus (D35)
 
     @property
     def cpu_job_cap(self) -> int | None:
@@ -338,10 +347,14 @@ def _check_part_time(node: Node, where: str) -> None:
                         f"node's memory ({node.real_memory_mb / SLURM_MB_PER_GB:.1f} GB)")
 
 
+#: The shortest `[health_check] interval_s`: slurm's HealthCheckTimeout must stay below it.
+MIN_HEALTH_CHECK_S = 10
+
+
 def _parse_health_check(raw: Any) -> HealthCheck:
     t = _table(raw, "health_check", set(), {"interval_s": 30})
-    if type(t["interval_s"]) is not int or t["interval_s"] < 10:
-        raise SiteError(f"site file: health_check.interval_s = {t['interval_s']!r}; expected a whole number of seconds, 10 or more "
+    if type(t["interval_s"]) is not int or t["interval_s"] < MIN_HEALTH_CHECK_S:
+        raise SiteError(f"site file: health_check.interval_s = {t['interval_s']!r}; expected a whole number of seconds, {MIN_HEALTH_CHECK_S} or more "
                         "(slurm's HealthCheckTimeout must stay below it)")
     return HealthCheck(t["interval_s"])
 
@@ -435,6 +448,7 @@ def parse(raw: dict[str, Any]) -> Site:
             "node_python": "/usr/bin/python3",
             "requeue_delay_s": 60,
             "sharing_memory_fraction": None,
+            "cpus_from_history": CoresFromHistory.RECOMMEND.value,
             "hostguard": False,
             "dgx_gate": False,
             "constrain_devices": True,
@@ -521,6 +535,7 @@ def parse(raw: dict[str, Any]) -> Site:
         remotes=_parse_remotes(top["remote"]),
         requeue_delay_s=top["requeue_delay_s"],
         sharing_memory_fraction=None if fraction is None else float(fraction),
+        cpus_from_history=_enum(CoresFromHistory, top["cpus_from_history"], "cpus_from_history"),
     )
 
 

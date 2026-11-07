@@ -20,18 +20,20 @@ DIRECTIVE = "#S" + "BATCH"  # spelled in two halves so a text-matching guard doe
 
 def fake_site(monkeypatch: pytest.MonkeyPatch, *, lease: object, dgx_gate: bool, nodes: tuple = (),
               cpu_job_cap: int | None = None, service: object = None, part_time_nodes: tuple = (),
-              node_python: str = "/usr/bin/python3", sharing_memory_fraction: float | None = None) -> None:
+              node_python: str = "/usr/bin/python3", sharing_memory_fraction: float | None = None,
+              cpus_from_history: site_config.CoresFromHistory = site_config.CoresFromHistory.OFF) -> None:
     """`load` returns just the fields submit.py reads."""
     site = SimpleNamespace(lease=lease, dgx_gate=dgx_gate, nodes=nodes, cpu_job_cap=cpu_job_cap, service=service,
                            part_time_nodes=part_time_nodes, node_python=node_python,
-                           sharing_memory_fraction=sharing_memory_fraction)
+                           sharing_memory_fraction=sharing_memory_fraction, cpus_from_history=cpus_from_history)
     monkeypatch.setattr(site_config, "load", lambda *_p: site)
 
 
 @pytest.fixture(autouse=True)
 def default_site(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Default: a site with a lease and the DGX gate, so a submission checks both."""
+    """Default: a site with a lease and the DGX gate, so a submission checks both; accounting knows no job."""
     fake_site(monkeypatch, lease=object(), dgx_gate=True)
+    monkeypatch.setattr(gpu_jobs, "_sacct_jobs", lambda *_selection, **_flags: [])
     alike = cores.CoreSpeeds({})  # these tests do not depend on the machine they run on having fast and slow cores
     monkeypatch.setattr(cores.CoreSpeeds, "read", classmethod(lambda cls, root=None: alike))
 
@@ -159,15 +161,49 @@ def test_an_unknown_class_is_refused_by_the_parser() -> None:
         dry("--project", "p", "--what", "w", "--class", "service", "--mem", "1G", "--", "x")
 
 
-def test_mem_auto_uses_the_last_measured_run_plus_a_margin(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_mem_auto_is_the_highest_of_the_three_newest_clean_runs_and_a_memory_kill_bumps_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
     monkeypatch.setattr(gpu_jobs, "STATE_DIR", tmp_path)
     (tmp_path / "jobs").mkdir()
-    for job_id, ended, gpu_mib in [("1", 100, 30 * 1024), ("2", 200, 10 * 1024)]:
-        leg = {"peak_gpu_mib": gpu_mib, "peak_mem_bytes": 2 * 1024**3, "ended_at": ended, "exit": 0, "signals": []}
-        (tmp_path / "jobs" / f"{job_id}.json").write_text(json.dumps({"name": "n", "last_leg": leg}))
-    script = dry("--project", "p", "--what", "w", "--class", "restart", "--gpu", "--mem", "auto", "--name", "n",
-                 "--", "x")
-    assert f"{DIRECTIVE} --mem=14G" in script  # newest run: 10 + 2 GiB, plus 10%, rounded up
+
+    def run(job_id: str, ended: int, mem: str | None = None, *more: dict, **leg: object) -> None:
+        leg = {"peak_gpu_mib": 10 * 1024, "peak_mem_bytes": 2 * 1024**3, "ended_at": ended, "exit": 0, "signals": [], **leg}
+        record = {"job_id": job_id, "name": "n", "mem": mem, "legs": [leg, *more]}
+        (tmp_path / "jobs" / f"{job_id}.json").write_text(json.dumps(record))
+
+    def ask() -> str:
+        script = dry("--project", "p", "--what", "w", "--class", "restart", "--gpu", "--mem", "auto", "--name", "n", "--", "x")
+        return next(line.split("=")[1] for line in script.splitlines() if line.startswith(f"{DIRECTIVE} --mem="))
+
+    for job_id, ended, gpu_gib in [("1", 100, 40), ("2", 200, 30), ("3", 300, 10)]:
+        run(job_id, ended, None, peak_gpu_mib=gpu_gib * 1024)
+    second = {"peak_gpu_mib": 1024, "peak_mem_bytes": 0, "ended_at": 410, "exit": 0, "signals": []}
+    run("4", 400, None, second)  # two clean legs (requeued after the first): still one run of the three
+    assert ask() == "36G"  # 30 + 2 GiB from run 2, the highest of the newest three (run 1 is older), plus 10%, rounded up
+    sacct: list[dict] = []
+    monkeypatch.setattr(gpu_jobs, "_sacct_jobs", lambda *_selection, **_flags: sacct)
+    run("5", 500, "40G", exit=-9)  # slurm's memory limit killed it: only accounting says so
+    assert ask() == "36G"  # a crash is not a kill
+    sacct.append({"job_id": 5, "state": {"current": ["OUT_OF_MEMORY"]}})
+    capsys.readouterr()
+    assert ask() == "48G"  # 1.2 x 40 GiB
+    assert "[submit] memory: run 5 of 'n' was killed by slurm (OUT_OF_MEMORY" in capsys.readouterr().out
+    run("5", 500, "10G", exit=-9)
+    assert ask() == "36G"  # 1.2 x 10 GiB is below what the clean runs need: never lower than history
+    run("6", 600, None, exit=-9, killed_by={"guard": "earlyoom", "job": "6"})  # the host's guard; no --mem given ...
+    sacct.append({"job_id": 6, "tres": {"allocated": [{"type": "mem", "count": 50 * 1024}]}})  # ... so slurm's default
+    assert ask() == "60G"
+    node = site_config.Node("n", 20, 55 * 1024, ())  # no node gives jobs 60 GiB: the whole box instead, and it says so
+    fake_site(monkeypatch, lease=None, dgx_gate=False, nodes=(node,))
+    assert ask() == "0" and "more than any node gives jobs" in capsys.readouterr().err
+    fake_site(monkeypatch, lease=None, dgx_gate=False)
+    run("7", 700, "0", exit=-9, killed_by={"guard": "earlyoom"})  # killed even with the whole box: never less after it
+    assert ask() == "0" and "whole box given" in capsys.readouterr().err
+    run("7", 700, "lots", exit=-9, killed_by={"guard": "earlyoom"})  # what it was given is unknown: history, and it says so
+    assert ask() == "36G" and "is unknown" in capsys.readouterr().err
+    run("8", 800)  # a clean run since the kills: history alone again (runs 8, 4, 3), and no kill is mentioned
+    assert ask() == "14G" and "killed" not in "".join(capsys.readouterr())
 
 
 def test_a_named_measured_job_asks_for_shards_and_its_share_of_the_cores(
@@ -345,6 +381,42 @@ def test_a_cpu_job_over_the_cpu_cap_is_refused(tmp_path: Path, monkeypatch: pyte
         dry("--project", "p", "--what", "w", "--class", "restart", "--mem", "1G", "--no-suspend", "--", "x")
     with pytest.raises(submit.Refused, match="job ids"):
         dry(*service, "--suspend", "5,x", "--", "x")
+
+
+def test_a_named_cpu_job_is_offered_the_cores_its_completed_runs_used(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    measured: dict[str, tuple[float, int] | None] = {}
+    monkeypatch.setattr(gpu_jobs, "measured_cores", lambda job_name: measured.setdefault(job_name, (1.7, 3)))
+    mode = site_config.CoresFromHistory
+
+    def cpus(history: site_config.CoresFromHistory, *argv: str) -> str:
+        fake_site(monkeypatch, lease=None, dgx_gate=False, cpu_job_cap=8, cpus_from_history=history)
+        capsys.readouterr()
+        script = dry("--project", "p", "--what", "w", "--class", "restart", "--mem", "4G", *argv, "--", "x")
+        return next(line.split("=")[1] for line in script.splitlines() if "--cpus-per-task=" in line)
+
+    assert cpus(mode.RECOMMEND, "--name", "n") == "4"  # printed, not applied
+    assert "[submit] cores: measured 1.7 avg over 3 completed runs; would ask 3 (asking 4 now)" in capsys.readouterr().out
+    assert list(measured) == ["p:restart:n"]  # slurm's whole name: another project's or class's runs are not this job's
+    assert cpus(mode.ENFORCE, "--name", "n") == "3"  # ceil(1.7 x 1.25)
+    assert "asking 3 (was 4)" in capsys.readouterr().out
+    measured["p:restart:big"] = (20.0, 2)
+    assert cpus(mode.ENFORCE, "--name", "big") == "8"  # never past the cores a CPU job may have
+    assert cpus(mode.ENFORCE, "--name", "n", "--cpus", "7") == "7"  # a hand-set count is kept ...
+    shown = capsys.readouterr()
+    assert "set by --cpus" in shown.out and "more than 2 times the 3 cores" in shown.err  # ... and warns above 2x
+    assert cpus(mode.ENFORCE, "--name", "n", "--cpus", "6") == "6" and capsys.readouterr().err == ""
+    measured["p:restart:new"] = None  # no completed run: nothing to say
+    for history, argv in [(mode.ENFORCE, ("--name", "new")), (mode.ENFORCE, ()), (mode.OFF, ("--name", "n"))]:
+        assert cpus(history, *argv) == "4" and "[submit] cores:" not in capsys.readouterr().out
+    fake_site(monkeypatch, lease=None, dgx_gate=False, cpu_job_cap=8, cpus_from_history=mode.ENFORCE)
+    assert "[submit] cores:" not in (dry("--project", "p", "--what", "w", "--class", "restart", "--mem", "4G", "--gpu",
+                                         "--name", "n", "--", "x") + capsys.readouterr().out)  # GPU jobs: untouched
+    fake_site(monkeypatch, lease=None, dgx_gate=False, cpu_job_cap=8, cpus_from_history=mode.RECOMMEND)
+    record = submit_for_real(monkeypatch, tmp_path, job=["--project", "p", "--what", "w", "--class", "restart", "--mem",
+                                                         "4G", "--name", "n", "--", "x"])
+    assert record["cores_from_history"] == {"mode": "recommend", "average": 1.7, "runs": 3, "proposal": 3, "asked": 4}
 
 
 def room(capsys: pytest.CaptureFixture[str], *flags: str) -> dict:
