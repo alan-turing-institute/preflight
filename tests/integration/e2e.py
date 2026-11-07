@@ -1513,16 +1513,19 @@ def stage_sharing() -> None:
     all(wait_state(j, "RUNNING", 60) for j in held if j)
     whole = whole_card_job("whole", "bob")
     late = shard_job("shard-late", SHARD_JOB_SHARDS)
+    whole_while_held = state(whole)
     cl("scancel", held[0])
     wait_for(lambda: state(held[0]) in {"CANCELLED", "GONE"}, 30)  # slurm keeps a cancelled job in `scontrol show job` for a while
     time.sleep(SCHEDULER_PASSES_S)  # several scheduling passes: long enough for a queue-jumper to have started
     jumped, why = state(late), jobinfo(late).get("Reason")
     cl("scancel", held[1], held[2])
     started = wait_state(whole, "RUNNING", 90)
-    check("E3/E4: the whole-card job waits while shards hold its card, a later shard job does not take the freed shards ahead of it, "
-          "and the whole-card job starts when the card is empty, before that later job",
-          bool(whole) and jumped == "PENDING" and started and state(late) == "PENDING",
-          f"whole {whole} {state(whole)}; late {late} was {jumped} ({why}), now {state(late)} ({jobinfo(late).get('Reason')})")
+    # Under backfill (D38) the later shard job MAY take the freed shards ahead of the whole-card job: the accepted gap while no
+    # job has a time limit (D4). Recorded, not asserted; sched_switch proves both schedulers' behaviour explicitly.
+    check("E3: the whole-card job waits while shards hold its card", bool(whole) and whole_while_held == "PENDING",
+          f"whole {whole} was {whole_while_held}")
+    note(f"E4 (known gap, D38): later shard job {late} was {jumped} ({why}) after one shard freed; whole-card job "
+         f"{'started' if started else 'not started'} once the earlier shards ended; late now {state(late)}")
     # E5: `urgent.py` against live shard jobs: it names them as in the way and slurm requeues every one of them for it
     clear_queue()
     victims = [shard_job(f"shard-victim{i}", SHARD_JOB_SHARDS) for i in range(3)]
