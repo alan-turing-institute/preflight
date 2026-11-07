@@ -1,7 +1,6 @@
 # upgrade
 
-Dependency upgrades for the uv projects on this machine. Policy: `~/.claude/software-upgrade-policy.md`
-("RULING 2026-10-29", "A project upgrade"). Build notes and measurements: `the upgrade build report`.
+Dependency upgrades for the uv projects on this machine.
 
 | File | What it does |
 |---|---|
@@ -9,7 +8,7 @@ Dependency upgrades for the uv projects on this machine. Policy: `~/.claude/soft
 | `session_notice.py` | one line at session start when the project under the working directory has an upgrade held or just applied |
 | `torch_upgrade.py` | by hand: `build` a side venv with a new PyTorch stack, `check` it on the GPU (one project, one PyTorch move) |
 | `upgrade_common.py` | what the two share: `run`, `freeze`, hostguard, one slurm job for a check, probe comparison |
-| `projects.toml` | the registry |
+| `projects.example.toml` | the registry format; copy it to `projects.toml` (local to the machine, not tracked) and list your projects |
 | `install/` | the systemd user service and timer (Sunday 05:00, `Persistent=true`) |
 
 ## The weekly rule

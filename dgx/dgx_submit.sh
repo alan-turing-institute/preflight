@@ -65,9 +65,16 @@
 # Running with no command runs the legs and reports, launching nothing.
 set -euo pipefail
 
-HOST="${AUTOCAST_DGX_HOST:-site-b}"
-REMOTE_ROOT="${AUTOCAST_DGX_ROOT:-/data/site/user1/project-a}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# This machine's box and its checkout root come from the environment, else from dgx/dgx.local.env (KEY=VALUE lines,
+# not tracked by git): no machine-specific default is tracked. The environment wins over the file.
+if [[ -f "$HERE/dgx.local.env" ]]; then
+    while IFS='=' read -r key value; do
+        if [[ "$key" =~ ^AUTOCAST_DGX_[A-Z_]+$ && -z "${!key:-}" ]]; then export "$key=$value"; fi
+    done < "$HERE/dgx.local.env"
+fi
+HOST="${AUTOCAST_DGX_HOST:?set AUTOCAST_DGX_HOST (the ssh destination of the box) or put it in $HERE/dgx.local.env}"
+REMOTE_ROOT="${AUTOCAST_DGX_ROOT:?set AUTOCAST_DGX_ROOT (the repository root on the box) or put it in $HERE/dgx.local.env}"
 
 # When the box IS this machine (AUTOCAST_DGX_HOST=localhost) every leg runs here
 # directly. It used to `ssh localhost`, which only worked while a forwarded agent was

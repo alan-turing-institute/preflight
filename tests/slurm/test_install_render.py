@@ -9,7 +9,6 @@ from pathlib import Path
 import site_config
 
 ROOT = Path(__file__).resolve().parents[2]
-MACHINE = ROOT / "machine" / "slurm"
 GOLDEN = Path(__file__).parent / "fixtures" / "render" / "golden"
 INSTALL = str(ROOT / "slurm" / "install")
 if INSTALL not in sys.path:
@@ -113,7 +112,7 @@ def _changed_lines(tracked: str, rendered: str) -> list[str]:
 
 
 def test_golden_matches_tracked_files_except_the_planned_lines():
-    site = site_config.load(MACHINE / "site.toml")
+    site = site_config.load(ROOT / "tests/slurm/fixtures/site.toml")
     site = dataclasses.replace(site, nodes=site.full_nodes, health_check=None)  # the golden files predate part-time machines
     files = render.render(site, "slurm")
     assert set(files) == set(TRACKED)

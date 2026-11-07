@@ -1,3 +1,10 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+
+# Local to a machine, never committed: its own site files, notes and plans, the DGX gate's host and root,
+# and the names the commit guard refuses.
+/machine/slurm/
+/upgrade/projects.toml
+/dgx/dgx.local.env
+/.private-patterns

@@ -1,0 +1,26 @@
+# The uv projects the weekly upgrade covers (weekly.py; fields in README.md). Copy this file to `projects.toml` in this
+# folder and list your own projects: `projects.toml` is local to the machine and is not tracked by git.
+# A project joins when it has a .venv and a uv.lock; worktrees do not. `sync` is the uv flags that rebuild the project's
+# real venv (checked against it every week: a lock that does not describe the venv skips the project). A `tests` command
+# must pass on the CURRENT venv: it is a fast selection (target under 30 s), never the whole suite, and leaves out tests
+# already red or flaky on the old venv.
+
+[[project]]
+name = "myproject"
+path = "/home/you/dev/myproject"
+check = "tests"
+command = "python -m pytest -q -p no:cacheprovider tests"
+gpu = false
+services = []
+sync = ["--extra", "dev"]
+mem = "4G"
+
+[[project]]
+name = "my-gpu-project"
+path = "/home/you/dev/my-gpu-project"
+check = "tests"
+command = "python -m pytest -q -p no:cacheprovider tests/fast"
+gpu = true  # its check runs as one slurm job on the GPU
+services = ["my-gpu-project.service"]  # user services stopped for the upgrade and started again after
+sync = ["--extra", "dev"]
+mem = "24G"

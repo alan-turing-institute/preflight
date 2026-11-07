@@ -1,0 +1,94 @@
+# Test fixture: a complete site file for one single-GPU node. Every field is documented in slurm/site.example.toml.
+
+name = "gpu-node-1"
+cluster_name = "spark"  # as installed since 2026-10-16; it cannot change
+account = "local"  # as in this box's slurm accounting, made by hand before the installer existed
+unified_memory = true
+hostguard = true
+dgx_gate = true
+notify_command = []
+# card sharing, one shard per core held for the card (cores_per_gpu = 12); jobs sharing a card may fill half the jobs
+# memory, counted at measured peaks, until a long run's growth over its probe is measured.
+sharing_memory_fraction = 0.5
+
+[[nodes]]
+name = "gpu-node-1"
+cpus = 20
+real_memory_mb = 100000
+cores_per_gpu = 12  # measured 2026-10-20: SWE32 inference stops getting faster at 12 cores (core sweep, jobs 310-315)
+# Health check (D22): this node takes the full-machine default, close below 16 GB and push back below 10 GB available;
+# earlyoom acts at 8.6 GB, so a job is sent back to its checkpoint a little before it would be killed.
+
+[[nodes.gpus]]
+index = 0
+uuid = "GPU-d58339d6-8445-9785-5864-0815072c0f9a"
+device = "/dev/nvidia0"
+type = "gb10"
+shards = "cores"  # 12 shards, matching the 12 cores held for the card
+
+# The owner's Fedora laptop, lent to the cluster when idle (D22): CPU only, portable CPU resume jobs (and any with `submit.py --anywhere`) run in partition part_time.
+# Hybrid Intel CPU (6 performance cores of 2 threads = OS CPUs 0-11, 8 efficiency cores = 12-19, 2 low-power = 20-21). Slurm
+# cannot describe it as such: `slurmd -C` says CPUs=22 CoresPerSocket=16 ThreadsPerCore=1, and numbers its 16 "cores" in its
+# own order. Measured 2026-10-24 by reserving each abstract id alone (CpuSpecList=k, slurmd's "Reserved machine CPU IDs"):
+# abstract 0-7 = OS CPUs 12-19 (the efficiency cores), 8-11 = 1-4, 12-15 = 0,5,6,7 (performance cores, each with its sibling
+# thread). keep_cpus is in those abstract ids: 8-15 stay the owner's, jobs get abstract 0-7 = the 8 efficiency cores. The OS CPUs
+# 8-11 and 20-21 have no abstract id and are never given to jobs. Redo the measurement if the CPU, kernel topology or slurm changes.
+# Jobs may use 12 of its 31.5 GB; the health check closes it below 6 GB free or on battery, and pushes back a resume job below 2 GB.
+[[nodes]]
+name = "fedora"
+cpus = 22
+real_memory_mb = 31494
+part_time = true
+address = "100.64.0.2"  # Tailscale; the controller reaches slurmd on 6818 there
+keep_cpus = "8-15"
+jobs_memory_gb = 12
+cores_per_socket = 16  # `slurmd -C` (built without hwloc, which sees only 12 CPUs): CPUs=22 CoresPerSocket=16 ThreadsPerCore=1
+
+[health_check]
+interval_s = 30
+
+[lease]
+lease_dir = "/home/user1/.local/state/gpu-lease"
+keeper_user = "user1"
+python = "/home/user1/dev/localmodels/.venv/bin/python"
+
+[lease.services]
+service-a = "yields within about 1 min (30-s poll, then its stop)"
+service-b = "yields at its next job boundary, up to ~15 min (an inference runs up to 900 s)"
+service-c-app = "yields between checks, within about 1 s (1-s lease poll; a check takes ~0.05 s on the GPU)"
+
+# Background services' CPU stand-ins (D20; first: service-c's CPU backup, 12G / 4 cores): started at once by suspending
+# `cpu` jobs, never GPU jobs. 4 cores: the backup's measured size (slurm 537, 4 cores).
+[service]
+cores = 4
+
+# Another site this one sends jobs to: `submit.py --site turing` syncs the job's code and data there by checksum, then submits
+# with that site's own gpujobs-submit; `status.py --site turing` shows its queue (project-a's request, 2026-10-29).
+[remote.turing]
+host = "site-b"
+root = "gpujobs-sync"
+data_root = "/data/site/user1/datasets"  # datasets already copied there by hand are reused (rsync --checksum skips them)
+
+# SchedMD's supported slurm, built by the installer from the pinned tarball. `install.py upgrade-slurm` passes through 25.05.9
+# first (a release accepts state from the three before it: 23.11 -> 25.05 -> 26.05).
+[slurm]
+version = "26.05.5"
+sha256 = "4680cafc82b0689865c885eb703441e7ebf764896c40fd03a50f2fcb60664f68"
+steps = ["25.05.9:7be633820df896df819ac2e9f2ebd0824de509515e5fb78ba1c19da2453b39ed"]
+
+[metrics]
+mode = "local"
+grafana_port = 3001
+retention_days = 365
+grafana_url = "https://jobs-grafana.home.example.com"  # through the NAS Caddy, like every *.home service
+allow_from = ["100.64.0.0/10", "fd7a:115c:a1e0::/48", "192.0.2.8/32"]  # Tailscale, and the NAS Caddy (it reaches the box from the NAS's own address)
+
+[portal]
+mode = "install"
+auth = "proxy"  # no sign-in page (owner, 2026-10-19): only the NAS Caddy, which adds the key, can reach it (D15, D16)
+server_name = "jobs.home.example.com"  # served by the NAS Caddy (workspace-sync monitoring/nas/caddy/Caddyfile), Tailscale only
+allow_from = ["192.0.2.8/32"]  # only the NAS Caddy, like service-a and service-b: the address it reaches the box from
+
+[portal.auth_settings]
+user = "user1"  # every request is served as this user
+key_file = "/etc/gpujobs/portal/proxy_key"  # root-only; the NAS Caddy sends the same value as X-Frontdoor-Key (its env JOBS_FRONTDOOR_KEY)

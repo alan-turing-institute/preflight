@@ -49,6 +49,7 @@ import argparse
 import ast
 import hashlib
 import json
+import os
 import subprocess
 import sys
 from datetime import UTC, datetime
@@ -484,6 +485,21 @@ def compare_against_box(arguments: argparse.Namespace, local_root: Path) -> int:
     return 0
 
 
+LOCAL_DEFAULTS = Path(__file__).with_name("dgx.local.env")
+
+
+def local_default(key: str, path: Path = LOCAL_DEFAULTS) -> str | None:
+    """The caller's environment, else this checkout's untracked dgx/dgx.local.env (KEY=VALUE lines), else None."""
+    if os.environ.get(key):
+        return os.environ[key]
+    if path.is_file():
+        for line in path.read_text().splitlines():
+            name, sep, value = line.partition("=")
+            if sep and name.strip() == key:
+                return value.strip()
+    return None
+
+
 def main() -> int:
     """Build the closure, checksum both sides, and report a verdict."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -493,11 +509,11 @@ def main() -> int:
         nargs="?",
         help="the script the job runs (not needed with --check-manifest)",
     )
-    parser.add_argument("--host", default="site-b", help="ssh destination")
+    parser.add_argument("--host", default=local_default("AUTOCAST_DGX_HOST"), help="ssh destination (default: $AUTOCAST_DGX_HOST, else dgx/dgx.local.env)")
     parser.add_argument(
         "--remote-root",
-        default="/data/site/user1/project-a",
-        help="repository root on the box",
+        default=local_default("AUTOCAST_DGX_ROOT"),
+        help="repository root on the box (default: $AUTOCAST_DGX_ROOT, else dgx/dgx.local.env)",
     )
     parser.add_argument(
         "--local-root",
@@ -550,6 +566,9 @@ def main() -> int:
 
     if arguments.check_manifest is not None:
         return check_manifest(arguments.check_manifest, local_root)
+    if not (arguments.host and arguments.remote_root):
+        print("[parity] --host and --remote-root are required (or AUTOCAST_DGX_HOST and AUTOCAST_DGX_ROOT, or dgx/dgx.local.env)", file=sys.stderr)
+        return 2
     if arguments.entry is None:
         print(
             "[parity] an entrypoint is required without --check-manifest",

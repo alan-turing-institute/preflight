@@ -43,7 +43,7 @@ def decide(**given):
     return weekly.decide(**{**facts, **given}).status
 
 
-def test_registry_parses_validates_and_the_real_one_loads(tmp_path: Path) -> None:
+def test_registry_parses_validates_and_the_example_and_the_local_one_load(tmp_path: Path) -> None:
     good = tmp_path / "p.toml"
     good.write_text(
         '[[project]]\nname="a"\npath="/x"\ncheck="tests"\ncommand="python -m pytest"\n'
@@ -68,11 +68,13 @@ def test_registry_parses_validates_and_the_real_one_loads(tmp_path: Path) -> Non
     )
     with pytest.raises(ValueError, match="duplicate"):
         weekly.load_registry(good)
-    real = weekly.load_registry()
-    assert real and all(
-        (p.path / "uv.lock").exists() and (p.path / ".venv/bin/python").exists()
-        for p in real
-    )
+    assert weekly.load_registry(weekly.REGISTRY.with_name("projects.example.toml"))
+    if weekly.REGISTRY.exists():  # this machine's own list (untracked): every project in it must be upgradable
+        real = weekly.load_registry()
+        assert real and all(
+            (p.path / "uv.lock").exists() and (p.path / ".venv/bin/python").exists()
+            for p in real
+        )
 
 
 def test_the_lock_describes_the_venv_only_when_every_installed_package_matches() -> (

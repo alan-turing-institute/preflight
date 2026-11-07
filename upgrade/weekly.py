@@ -108,6 +108,8 @@ class Outcome:
 
 
 def load_registry(path: Path = REGISTRY) -> list[Project]:
+    if not path.exists():
+        raise FileNotFoundError(f"no project registry at {path}: copy projects.example.toml to projects.toml and list your projects")
     entries = tomllib.loads(path.read_text()).get("project", [])
     known = {
         "name",

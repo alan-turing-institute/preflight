@@ -33,6 +33,20 @@ did **not** move: four of its five assert scripts import `autocast`/`hydra`, and
 31 files reference it by path. Its generic legs can be pulled across one at a
 time, never in one move.
 
+## Keeping a machine's own details out of git
+
+Site files, plans and notes that name a particular machine, network or person stay local. `machine/slurm/`,
+`upgrade/projects.toml` and `dgx/dgx.local.env` are ignored by git for that reason (`.gitignore`); start from
+`slurm/site.example.toml` and `upgrade/projects.example.toml`, and give the DGX gate your box through
+`AUTOCAST_DGX_HOST` and `AUTOCAST_DGX_ROOT` (environment, or `KEY=VALUE` lines in `dgx/dgx.local.env`). To make a
+commit refuse private-looking lines, put your own names one regular expression per line in `.private-patterns`
+(ignored by git) and install the hook:
+
+    printf '#!/bin/sh\nexec python3 tools/check_private.py --staged\n' > .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
+
+`python3 tools/check_private.py` checks every tracked file; with no pattern file it still refuses private network
+addresses, tailnet host names and secret-shaped strings.
+
 ## Layout
 
     slurm/                      GPU jobs through slurm, with pause/resume, urgent work, a web page and

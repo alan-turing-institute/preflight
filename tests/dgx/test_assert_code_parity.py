@@ -22,6 +22,13 @@ from assert_code_parity import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _box(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The gate has no tracked default box: the tests name one, as a caller's environment would."""
+    monkeypatch.setenv("AUTOCAST_DGX_HOST", "site-b")
+    monkeypatch.setenv("AUTOCAST_DGX_ROOT", "/data/site/user1/project-a")
+
+
 def write(path: Path, body: str) -> Path:
     """Write a module, trimming the fixture's own indentation."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -352,3 +359,21 @@ def test_an_installed_package_sharing_a_repo_file_name_is_not_stranded(study: Pa
     _, unresolved = mod.closure(study / "scripts" / "entry.py", [study / "scripts"])
     stranded = mod.unreachable_first_party(unresolved, study)
     assert ("llama_cpp" in stranded) is not installed
+
+
+def test_host_and_root_come_from_the_environment_then_the_local_file_never_a_tracked_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Mutation caught: a tracked default host or root silently returning (the box of whoever wrote it)."""
+    local = tmp_path / "dgx.local.env"
+    local.write_text("AUTOCAST_DGX_HOST=filehost\nAUTOCAST_DGX_ROOT=/file/root\n")
+    monkeypatch.delenv("AUTOCAST_DGX_HOST", raising=False)
+    monkeypatch.delenv("AUTOCAST_DGX_ROOT", raising=False)
+    assert mod.local_default("AUTOCAST_DGX_HOST", local) == "filehost"
+    monkeypatch.setenv("AUTOCAST_DGX_HOST", "envhost")  # the environment wins over the file
+    assert mod.local_default("AUTOCAST_DGX_HOST", local) == "envhost"
+    assert mod.local_default("AUTOCAST_DGX_ROOT", tmp_path / "absent.env") is None
+    monkeypatch.delenv("AUTOCAST_DGX_HOST")
+    monkeypatch.setattr(mod, "LOCAL_DEFAULTS", tmp_path / "absent.env")
+    monkeypatch.setattr("sys.argv", ["assert_code_parity.py", "some_entry.py"])
+    assert main() == 2 and "--host and --remote-root are required" in capsys.readouterr().err

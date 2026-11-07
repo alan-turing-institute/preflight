@@ -32,8 +32,8 @@ def write(tmp_path: Path, text: str) -> Path:
     return path
 
 
-def test_this_box_site_file_loads() -> None:
-    site = gpujobs_site.load(ROOT / "machine/slurm/site.toml")
+def test_fixture_site_file_loads() -> None:
+    site = gpujobs_site.load(ROOT / "tests/slurm/fixtures/site.toml")
     assert (site.name, site.cluster_name, site.account) == ("gpu-node-1", "spark", "local") and site.unified_memory and site.hostguard and site.dgx_gate
     gpu = site.nodes[0].gpus[0]
     assert (site.nodes[0].real_memory_mb, gpu.device, gpu.type) == (100000, "/dev/nvidia0", "gb10")
