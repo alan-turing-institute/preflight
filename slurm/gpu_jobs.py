@@ -14,6 +14,7 @@ from __future__ import annotations
 import contextlib
 import errno
 import json
+import math
 import os
 import pwd
 import re
@@ -540,7 +541,7 @@ def remote_files(sub: str, pattern: str = "*") -> list[tuple[Path, str, str]]:
     return out
 
 
-def _legs(record: Mapping[str, object]) -> list[dict[str, object]]:
+def record_legs(record: Mapping[str, object]) -> list[dict[str, object]]:
     legs = record.get("legs")
     return [leg for leg in (legs if isinstance(legs, list) else [record.get("last_leg")]) if isinstance(leg, dict)]
 
@@ -549,7 +550,7 @@ def merge_remote(record: dict[str, object] | None, remote: Mapping[str, object])
     """`record` with a part-time machine's legs added (its `legs`/`last_leg`, oldest first, none twice)."""
     out = dict(record or {})
     legs = list({(leg.get("leg"), leg.get("started_at"), leg.get("ended_at")): leg
-                 for leg in (*_legs(out), *_legs(remote))}.values())
+                 for leg in (*record_legs(out), *record_legs(remote))}.values())
     if legs:
         legs.sort(key=lambda leg: leg.get("ended_at") if isinstance(leg.get("ended_at"), int) else 0)
         out.update(legs=legs, last_leg=legs[-1])
@@ -856,7 +857,7 @@ def measured_peak_bytes(name: str, *, clean: bool = True) -> int | None:
         if record.get("kind") == SHARING_PROBE:
             continue  # a probe's total is over several copies at once: it must never size a real job
         legs: list[tuple[int, int]] = []
-        for leg in _legs(record):
+        for leg in record_legs(record):
             if "peak_gpu_mib" not in leg or (clean and not _clean(leg)):
                 continue
             try:
@@ -895,11 +896,11 @@ def memory_kill(name: str) -> MemoryKill | None:
     records = [r for r in own_records(name) if r.get("kind") != SHARING_PROBE and r.get("job_id")]
 
     def ended(record: Mapping[str, object]) -> int:
-        times = [leg.get("ended_at") for leg in _legs(record)] + [record.get("submitted_at")]
+        times = [leg.get("ended_at") for leg in record_legs(record)] + [record.get("submitted_at")]
         return max((int(t) for t in times if isinstance(t, int | float)), default=0)
 
-    newest_clean = max((ended(r) for r in records if any(_clean(leg) for leg in _legs(r))), default=0)
-    unclean = {str(r["job_id"]): r for r in records if ended(r) > newest_clean and not any(_clean(leg) for leg in _legs(r))}
+    newest_clean = max((ended(r) for r in records if any(_clean(leg) for leg in record_legs(r))), default=0)
+    unclean = {str(r["job_id"]): r for r in records if ended(r) > newest_clean and not any(_clean(leg) for leg in record_legs(r))}
     if not unclean:
         return None
     accounting = {str(job.get("job_id")): job
@@ -907,7 +908,7 @@ def memory_kill(name: str) -> MemoryKill | None:
     kills: list[tuple[int, str, str]] = []  # (ended, job id, by)
     for job_id, record in unclean.items():
         job = accounting.get(job_id, {})
-        guard = next((leg["killed_by"] for leg in _legs(record) if isinstance(leg.get("killed_by"), dict)), None)
+        guard = next((leg["killed_by"] for leg in record_legs(record) if isinstance(leg.get("killed_by"), dict)), None)
         if guard is not None:
             by = f"the host's OOM guard ({guard.get('guard') or 'earlyoom'})"
         elif "OUT_OF_MEMORY" in (job.get("state", {}).get("current") or []):
@@ -1097,6 +1098,46 @@ def read_int(path: Path) -> int | None:
         return int(path.read_text(encoding="utf-8").strip())
     except (OSError, ValueError):
         return None
+
+
+def flat_key(path: Path, key: str) -> int | None:
+    """One value of a flat-keyed cgroup file (`cpu.stat` usage_usec, `memory.events` oom_kill); None when unreadable."""
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            name, _, value = line.partition(" ")
+            if name == key:
+                return int(value)
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+# Sizing arithmetic shared by `submit.py` (--mem auto, cores from history) and the job wrapper's end-of-run advice
+# (D37), so the two cannot drift apart. Here, not in submit.py: the wrapper must not import submit (submit imports
+# audit, which imports the wrapper).
+
+#: --mem auto: the measured peak, plus this share, rounded up to whole G.
+AUTO_MARGIN = 0.10
+#: After a run killed for memory (D35): the next ask is at least this many times what it was given ...
+OOM_BUMP_RATIO = 1.2
+#: ... and at least this many slurm MB (2^20 bytes) more: the Vertical Pod Autoscaler's OOMBumpUpRatio and OOMMinBumpUp.
+OOM_MIN_BUMP_MB = 100
+#: Cores from a job's use (D35, D37): the average in use, times this, rounded up.
+CORES_MARGIN = 1.25
+#: Slurm's G is 1024 of its MB.
+MB_PER_G = 1024
+
+
+def bumped_mem_mb(asked_mb: float) -> float:
+    """The least a run killed for memory with `asked_mb` slurm MB given should ask for next time (D35)."""
+    return max(asked_mb + OOM_MIN_BUMP_MB, asked_mb * OOM_BUMP_RATIO)
+
+
+def mem_option(mb: float, most_mb: int | None) -> str:
+    """`--mem` for `mb` slurm MB, rounded up to whole G; "0" (the whole box) when that is more than any node gives jobs
+    (`most_mb`, None when unknown), which slurm would refuse."""
+    whole_g = max(1, math.ceil(mb / MB_PER_G))  # never "0G": slurm reads --mem 0 as the whole box
+    return "0" if most_mb is not None and whole_g * MB_PER_G > most_mb else f"{whole_g}G"
 
 
 def gpu_usage() -> dict[int, float] | None:

@@ -83,6 +83,12 @@ import gpu_jobs  # noqa: E402
 import portability
 import remote
 import site_config
+from gpu_jobs import (  # shared with the job wrapper's advice (D37)
+    AUTO_MARGIN,
+    CORES_MARGIN,
+    MB_PER_G,
+    OOM_BUMP_RATIO,
+)
 
 HERE = Path(__file__).resolve().parent
 GATE = HERE.parent / "dgx" / "dgx_submit.sh"
@@ -91,19 +97,11 @@ KEEPER_UNIT = "slurm-gpu-lease-keeper"
 KEEPER_STALE_S = 60
 #: Longest `--comment` we write: our choice (it keeps `squeue` output readable), not a slurm limit.
 COMMENT_MAX = 200
-#: --mem auto: the measured peak, plus this share, rounded up to whole GiB.
-AUTO_MARGIN = 0.10
 #: --mem auto with no clean run: the largest peak of the crashed or pre-empted runs (a lower bound), plus this share.
 UNCLEAN_MARGIN = 0.25
-#: After a run killed for memory (D35): the next ask is at least this many times what it was given ...
-OOM_BUMP_RATIO = 1.2
-#: ... and at least this many slurm MB (2^20 bytes) more: the Vertical Pod Autoscaler's OOMBumpUpRatio and OOMMinBumpUp.
-OOM_MIN_BUMP_MB = 100
 #: --mem with no measured run, for a GPU job: slurm's "all of the memory on each node".
 WHOLE_BOX = "0"
 DEFAULT_CPUS = 4  # a CPU-only job, or any job on a site whose nodes have no GPUs
-#: Cores from history (D35): the highest average in use over the newest completed runs, times this, rounded up.
-CORES_MARGIN = 1.25
 #: A hand-set --cpus more than this many times the cores from history warns (never a refusal, as for memory).
 CORES_OVER_ASK = 2
 _DURATION = re.compile(r"^(\d+(?:\.\d+)?)([smh]?)$")
@@ -131,7 +129,7 @@ def resolve_mem(mem: str | None, name: str | None, gpu: bool) -> str | None:
     named job's first run takes the whole box.
 
     After a run of the name was killed for memory, with no clean run since (`gpu_jobs.memory_kill`), the ask is at
-    least `OOM_BUMP_RATIO` times what that run was given and `OOM_MIN_BUMP_MB` more, never below the history's ask,
+    least `gpu_jobs.bumped_mem_mb` of what that run was given, never below the history's ask,
     and the whole box when that is more than any node gives jobs (D35)."""
     if mem not in (None, "auto"):
         return mem
@@ -151,11 +149,10 @@ def resolve_mem(mem: str | None, name: str | None, gpu: bool) -> str | None:
             warn(f"{said} with the whole box given; it asks for the whole box again")
             return WHOLE_BOX
         else:
-            bumped_mb = max(kill.asked_mb + OOM_MIN_BUMP_MB, kill.asked_mb * OOM_BUMP_RATIO)
-            ask = max(math.ceil(bumped_mb / 1024), history or 0)
+            ask = max(math.ceil(gpu_jobs.bumped_mem_mb(kill.asked_mb) / MB_PER_G), history or 0)
             most_mb = max((node.jobs_mb for node in gpu_jobs.load_site().nodes), default=None)
             said += f" with {_gb(kill.asked_mb)} given"
-            if most_mb is not None and ask * 1024 > most_mb:
+            if most_mb is not None and ask * MB_PER_G > most_mb:
                 warn(f"{said}; {OOM_BUMP_RATIO} times that is more than any node gives jobs, so it asks for the whole box")
                 return WHOLE_BOX
             print(f"[submit] memory: {said}; asking {ask}G, at least {OOM_BUMP_RATIO} times that (D35)")

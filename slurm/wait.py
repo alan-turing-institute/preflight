@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Wait until a slurm job and every job chained after it have finished; print their final states.
+"""Wait until a slurm job and every job chained after it have finished; print their final states, each with the
+usage report its last run left (D37: what it used, what to ask for next time; see `job_wrapper.usage_lines`).
 
 Design 3.8-3.9: watchers wait on slurm, not on systemd units. A pre-empted job is pending again, so it
 never reads as done; a job cancelled because its dependency failed (`kill_invalid_depend`) leaves the
@@ -46,6 +47,26 @@ def all_sidecars(users: dict[str, str] | None = None) -> dict[str, dict[str, obj
     }
 
 
+#: Longest report line `usage_lines` prints: the wrapper's are about 120 characters.
+LINE_MAX = 300
+#: Report lines per run (`job_wrapper.usage_lines`: what it used, what to ask for next time).
+REPORT_LINES = 2
+
+
+def usage_lines(job_id: str, user: str) -> list[str]:
+    """The end-of-run report the job wrapper kept for the job's last leg (D37), [] when there is none. Untrusted input:
+    only a record its slurm `user` wrote counts (no user from accounting: nothing, since the owner check would be
+    skipped), and only a list of at most `REPORT_LINES` strings that each start with "[job] ", each made printable."""
+    if not user:
+        return []
+    legs = gpu_jobs.record_legs(gpu_jobs.read_sidecar(job_id, user) or {})
+    usage = legs[-1].get("usage") if legs else None
+    lines = usage.get("lines") if isinstance(usage, dict) else None
+    if not isinstance(lines, list) or len(lines) > REPORT_LINES or not all(isinstance(x, str) and x.startswith("[job] ") for x in lines):
+        return []
+    return [gpu_jobs.printable(line)[:LINE_MAX] for line in lines]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("job_id")
@@ -67,6 +88,8 @@ def main() -> int:
     states = {job: records.get(job, {}).get("JobState", "UNKNOWN") for job in jobs}
     for job, state in states.items():
         print(f"[wait] {job}: {state}")
+        for line in usage_lines(job, records.get(job, {}).get("UserId", "")):
+            print(line)
     return 0 if all(state == COMPLETED for state in states.values()) else 1
 
 

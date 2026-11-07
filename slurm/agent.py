@@ -384,14 +384,8 @@ def _label(value: str) -> str:
 
 def _cpu_seconds(cgroup: Path) -> float | None:
     """CPU time the job's cgroup has used so far (`cpu.stat` usage_usec); None when it cannot be read."""
-    try:
-        for line in (cgroup / "cpu.stat").read_text(encoding="utf-8").splitlines():
-            key, _, value = line.partition(" ")
-            if key == "usage_usec":
-                return int(value) / 1e6
-    except (OSError, ValueError):
-        pass
-    return None
+    usec = gpu_jobs.flat_key(cgroup / "cpu.stat", "usage_usec")
+    return None if usec is None else usec / 1e6
 
 
 def metrics_text(

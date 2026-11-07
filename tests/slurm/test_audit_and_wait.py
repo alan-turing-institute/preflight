@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
 
 import audit
@@ -51,3 +52,34 @@ def test_chain_follows_dependents_transitively(tmp_path: Path, monkeypatch: pyte
         (tmp_path / "jobs" / f"{name}.json").write_text(json.dumps({"after": ["1"]}))
     assert wait.chain("1", wait.all_sidecars()) == ["1", "5"]  # so a name that is no job id never reaches the terminal
     assert wait.chain("1", {"1": {}, "2": {"after": "1"}, "3": {"after": 1}}) == ["1"]  # only a list names dependencies
+
+
+def test_wait_repeats_the_last_runs_usage_report_from_the_jobs_own_record_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(wait.gpu_jobs, "STATE_DIR", tmp_path)
+    (tmp_path / "jobs").mkdir()
+    me = wait.gpu_jobs.current_user()
+    report = ["[job] used: memory peak 9.4 GB of 42.9 GB asked (22%)", "[job] for the same work next time: --mem 10G"]
+
+    def record(lines: object) -> None:
+        legs = [{"usage": {"lines": ["[job] used: an earlier run"]}}, {"usage": {"lines": lines}}]
+        (tmp_path / "jobs" / "5.json").write_text(json.dumps({"legs": legs}))
+
+    record(report)
+    assert wait.usage_lines("5", me) == report  # the LAST run's
+    assert wait.usage_lines("5", "") == []  # accounting names no user: the owner check would be skipped, so nothing
+    assert wait.usage_lines("5", "somebody-else") == []  # a file the job's own user did not write
+    assert wait.usage_lines("6", me) == []  # no record
+    for junk in (["[job] a", "[job] b", "[job] c"], ["not ours"], [5], "[job] x"):
+        record(junk)
+        assert wait.usage_lines("5", me) == []
+    record(["[job] \x1b]0;forged\x07" + "x" * 400])
+    assert wait.usage_lines("5", me)[0].isprintable() and len(wait.usage_lines("5", me)[0]) == wait.LINE_MAX
+    # the command itself prints them under the job's final state
+    record(report)
+    monkeypatch.setattr(wait.gpu_jobs, "read_queue", list)  # nothing unfinished
+    monkeypatch.setattr(wait.gpu_jobs, "completion_records", lambda _jobs: {"5": {"JobState": "COMPLETED", "UserId": me}})
+    monkeypatch.setattr(sys, "argv", ["wait.py", "5"])
+    assert wait.main() == 0
+    assert capsys.readouterr().out.splitlines() == ["[wait] 5: COMPLETED", *report]

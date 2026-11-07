@@ -21,7 +21,10 @@ sbatch script whose only line runs this wrapper. In order:
    GB10, trial B2), appended to `footprints/<job id>.jsonl`. The per-job node-exporter textfile
    (`metrics/job_<id>.prom`) is not written here: the wrapper runs as the job's user, and only the agent may write
    that directory, so the agent measures the same numbers itself.
-5. RECORD the leg's outcome in the job's sidecar (exit status, signal, restart count, peaks).
+5. RECORD the leg's outcome in the job's sidecar (exit status, signal, restart count, peaks), and REPORT what the run
+   used (D37): two lines after the exit line, `[job] used: memory peak ... of ... asked; cores ... on average of ...
+   held` and `[job] for the same work next time: --mem ... --cpus ...` (`usage_lines`), kept in the leg's `usage` so
+   `wait.py` can repeat them. Never per user; the project decides its next request.
 6. A KILL BY THE HOST'S OOM GUARD is not a finished run. The guard signals a process of the job directly, not through
    slurm, and a training loop that catches SIGTERM exits 0 (2026-10-22: job 428 was recorded COMPLETED at 14.6 of
    23.5 h and its afterok chain started). The agent records each such kill (`agent/oom_kills/`); when the command ended
@@ -40,6 +43,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import math
 import os
 import signal
 import socket
@@ -47,6 +51,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from enum import IntEnum
 from pathlib import Path
 from typing import IO
@@ -279,6 +284,101 @@ def run_and_measure(
     }
 
 
+#: Bytes in one of slurm's MB.
+SLURM_MB = 2**20
+#: Decimal units for the report (the owner's rule: GB and MB, never GiB labels).
+GB, MB = 10**9, 10**6
+
+
+def cgroup_counters(cgroup: Path | None) -> tuple[int | None, int | None]:
+    """(core time in microseconds, processes the memory cap has killed) of the job's cgroup now, None when unreadable.
+    `memory.events` is hierarchical, so a kill in the batch step or a task below the job's cgroup counts."""
+    if cgroup is None:
+        return None, None
+    return gpu_jobs.flat_key(cgroup / "cpu.stat", "usage_usec"), gpu_jobs.flat_key(cgroup / "memory.events", "oom_kill")
+
+
+@dataclass(frozen=True)
+class Usage:
+    """What one run asked for and used (D37); None for a figure that could not be read."""
+
+    mem_asked_bytes: int | None
+    mem_peak_bytes: int | None  # host side, plus the card's on a site whose card shares system memory
+    cores_held: int | None
+    cores_avg: float | None
+    cap_killed: bool = False  # the job's memory cap killed one of its processes during the run
+    guard_killed: bool = False  # the host's OOM guard killed it
+
+
+def measure_usage(cgroup: Path | None, outcome: dict[str, object], before: tuple[int | None, int | None],
+                  after: tuple[int | None, int | None], wall_s: float, *, guard_killed: bool, unified: bool) -> Usage:
+    """The run's `Usage` from its cgroup and the peaks `run_and_measure` kept. Asked = the cgroup's memory cap (slurm's
+    --mem); "max" (no cap) or no cgroup is unknown, and so is the host peak without a cgroup."""
+    asked = gpu_jobs.read_int(cgroup / "memory.max") if cgroup else None
+    host = int(outcome.get("peak_mem_bytes") or 0) if cgroup else None
+    card = int(float(outcome.get("peak_gpu_mib") or 0) * SLURM_MB)
+    try:
+        held = len(os.sched_getaffinity(0))
+    except OSError:
+        held = None
+    used_usec = None if None in (before[0], after[0]) else after[0] - before[0]  # type: ignore[operator]
+    return Usage(
+        mem_asked_bytes=asked,
+        mem_peak_bytes=None if host is None else host + (card if unified else 0),
+        cores_held=held,
+        cores_avg=used_usec / 1e6 / wall_s if used_usec is not None and wall_s > 0 else None,
+        cap_killed=None not in (before[1], after[1]) and after[1] > before[1],  # type: ignore[operator]
+        guard_killed=guard_killed,
+    )
+
+
+def _size(n_bytes: float) -> str:
+    return f"{n_bytes / GB:.1f} GB" if n_bytes >= GB else f"{n_bytes / MB:.0f} MB"
+
+
+def usage_lines(u: Usage, *, gpu_job: bool, cores_cap: int | None, most_mb: int | None) -> list[str]:
+    """The run's report (D37): what it used against what it asked for and, when anything is known, the request for the
+    same work next time: memory at its peak plus `AUTO_MARGIN`, or after a memory kill at least `bumped_mem_mb` of what
+    it was given (the whole box, `0`, when no node gives that much, as for a run that had the whole box); cores, for a job without GPUs
+    only (a GPU job's are held for the card, D17/D33), its average times `CORES_MARGIN` within `cores_cap`."""
+    if u.mem_peak_bytes is None:
+        memory = "memory peak unknown"
+    elif u.mem_asked_bytes:
+        memory = (f"memory peak {_size(u.mem_peak_bytes)} of {_size(u.mem_asked_bytes)} asked "
+                  f"({round(100 * u.mem_peak_bytes / u.mem_asked_bytes)}%)")
+    else:
+        memory = f"memory peak {_size(u.mem_peak_bytes)} (asked unknown)"
+    if u.cores_avg is None:
+        cores = "cores in use unknown" + (f" of {u.cores_held} held" if u.cores_held else "")
+    elif u.cores_held:
+        cores = f"cores {u.cores_avg:.1f} on average of {u.cores_held} held ({round(100 * u.cores_avg / u.cores_held)}%)"
+    else:
+        cores = f"cores {u.cores_avg:.1f} on average"
+    note = ("; the memory cap killed a process" if u.cap_killed else "") + ("; killed by the host's OOM guard" if u.guard_killed else "")
+    lines = [f"[job] used: {memory}; {cores}{note}"]
+    flags = []
+    asked_mb = u.mem_asked_bytes / SLURM_MB if u.mem_asked_bytes else None
+    if u.cap_killed or u.guard_killed:
+        if asked_mb is not None:  # a run that had the whole box already gets `0` again: 1.2 times it fits no node
+            option = gpu_jobs.mem_option(gpu_jobs.bumped_mem_mb(asked_mb), most_mb)
+            flags.append(f"--mem {option}" + (" or more" if option != "0" else ""))
+    elif u.mem_peak_bytes is not None:
+        flags.append(f"--mem {gpu_jobs.mem_option(u.mem_peak_bytes * (1 + gpu_jobs.AUTO_MARGIN) / SLURM_MB, most_mb)}")
+    if not gpu_job and u.cores_avg is not None:
+        cpus = max(1, math.ceil(u.cores_avg * gpu_jobs.CORES_MARGIN))
+        flags.append(f"--cpus {min(cpus, cores_cap) if cores_cap else cpus}")
+    if flags:
+        lines.append(f"[job] for the same work next time: {' '.join(flags)}")
+    return lines
+
+
+def usage_record(u: Usage, lines: list[str]) -> dict[str, object]:
+    """The leg's `usage`: the known figures, whether the cap killed a process, and the printed lines (`wait.py` repeats them)."""
+    figures = {"mem_asked_bytes": u.mem_asked_bytes, "mem_peak_bytes": u.mem_peak_bytes, "cores_held": u.cores_held,
+               "cores_avg": None if u.cores_avg is None else round(u.cores_avg, 3)}
+    return {**{k: v for k, v in figures.items() if v is not None}, "memory_cap_killed": u.cap_killed, "lines": lines}
+
+
 def guard_kill(
     job_id: str,
     started: float,
@@ -438,12 +538,22 @@ def main() -> int:
     # The cores this leg was allowed (the cgroup's cpuset reaches this process), by top speed: a run's speed depends on them on a
     # host whose cores differ, and slurm does not choose among them. Read before the command starts; None on a host of alike cores.
     received = best_effort("cores", lambda: cores.CoreSpeeds.read().received(os.sched_getaffinity(0)))
+    # core time and memory-cap kills are read right around the command, on a monotonic clock (D37's report)
+    before, clock_start = cgroup_counters(cgroup), time.monotonic()
     outcome = run_and_measure(command, footprint, cgroup, arguments.sample, job_id)
+    after, wall_s = cgroup_counters(cgroup), time.monotonic() - clock_start
     ended = int(time.time())
     # slurm's own SIGTERM (pre-emption, cancel, time limit) ends the job its own way; only an unforwarded one is a kill
     killed = None if outcome["signals"] else guard_kill(job_id, started, ended, int(outcome["pid"]))  # type: ignore[call-overload]
+    usage = measure_usage(cgroup, outcome, before, after, wall_s, guard_killed=killed is not None, unified=site.unified_memory)
+    in_service = os.environ.get("SLURM_JOB_PARTITION") == gpu_jobs.Partition.SERVICE and site.service is not None
+    report = usage_lines(
+        usage, gpu_job=arguments.needs_card or SHARDS_ENV in os.environ,
+        cores_cap=site.service.cores if in_service else site.cpu_job_cap or max((n.cpus for n in site.nodes), default=None),
+        most_mb=max((n.jobs_mb for n in site.nodes), default=None),
+    )
     outcome.update(leg=restart, started_at=started, ended_at=ended, **({"killed_by": killed} if killed else {}),
-                   **({"cores": received} if received else {}))
+                   **({"cores": received} if received else {}), usage=usage_record(usage, report))
     # the local record only: legs copied back from a part-time machine must never be written into a user's own sidecar
     record = gpu_jobs.read_json(gpu_jobs.sidecar_path(job_id), gpu_jobs.current_user()) or {}
     earlier = record.get("legs")
@@ -451,6 +561,7 @@ def main() -> int:
     best_effort("sidecar", lambda: gpu_jobs.update_sidecar(job_id, legs=legs, last_leg=outcome))
     print(f"[job] exit {outcome['exit']}; signals {outcome['signals']}; peak GPU {outcome['peak_gpu_mib']:.0f} MiB",
           flush=True)
+    print("\n".join(report), flush=True)  # what the run used, and what to ask for next time (D37)
     if killed:
         return after_kill(job_id, killed, legs, os.environ.get("SLURM_JOB_NAME", ""))
     status = int(outcome["exit"])

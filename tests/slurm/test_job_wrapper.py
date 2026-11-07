@@ -154,7 +154,7 @@ time.sleep(30)
 
 
 def test_sigterm_is_passed_to_the_child_which_saves_then_the_leg_is_recorded(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, capsys
 ) -> None:
     saved, up = tmp_path / "saved", tmp_path / "up"
     env = dict(os.environ, SLURM_GPU_STATE_DIR=str(tmp_path / "state"), SLURM_JOB_ID="77")
@@ -196,8 +196,12 @@ def test_sigterm_is_passed_to_the_child_which_saves_then_the_leg_is_recorded(
     monkeypatch.setattr(job_wrapper.gpu_jobs, "read_sidecar", lambda *a, **k: {"legs": [{"leg": "copied"}]})
     monkeypatch.setenv("SLURM_JOB_ID", "81")
     monkeypatch.setattr(sys, "argv", ["job_wrapper.py", "--sample", "0.2", "--", "true"])
+    capsys.readouterr()
     assert job_wrapper.main() == 0
     assert [leg["leg"] for leg in json.loads((tmp_path / "state" / "jobs" / "81.json").read_text())["legs"]] == [0]
+    printed = capsys.readouterr().out.splitlines()  # the usage report follows the exit line, and is kept in the leg (D37)
+    assert printed[-2].startswith("[job] exit 0;") and printed[-1].startswith("[job] used:")
+    assert json.loads((tmp_path / "state" / "jobs" / "81.json").read_text())["last_leg"]["usage"]["lines"] == printed[-1:]
 
     # A leg records the cores it was allowed, by top speed, on a host whose cores differ and nothing on one whose cores are alike
     # (2026-11-03: one thread ran 4 to 6 times slower on the slower cores, and no run said which it had been given).
@@ -330,3 +334,48 @@ def test_the_launch_check_runs_only_in_the_part_time_partition(tmp_path: Path) -
         results.append((done.returncode, ran.exists(), "REFUSED at launch" in done.stderr))
         ran.unlink(missing_ok=True)
     assert results == [(job_wrapper.Exit.LAUNCH_CHECK_FAILED, False, True), (0, True, False)]
+
+
+def test_the_end_of_run_report_measures_from_the_cgroup_and_advises_the_next_request(tmp_path: Path) -> None:
+    gib, most_mb = 2**30, 100 * 1024
+    cg = tmp_path / "job"
+    cg.mkdir()
+    (cg / "memory.max").write_text(f"{40 * gib}\n")
+    (cg / "cpu.stat").write_text("usage_usec 3000000\nuser_usec 1\n")
+    (cg / "memory.events").write_text("low 0\noom 2\noom_kill 1\n")
+    assert job_wrapper.cgroup_counters(cg) == (3_000_000, 1) and job_wrapper.cgroup_counters(None) == (None, None)
+    outcome = {"peak_mem_bytes": 4 * 10**9, "peak_gpu_mib": 1024}
+
+    def measured(**kw: object) -> job_wrapper.Usage:
+        args = {"cgroup": cg, "before": (1_000_000, 1), "after": (3_000_000, 1), "wall_s": 2.0, "unified": True, **kw}
+        return job_wrapper.measure_usage(args.pop("cgroup"), outcome, args.pop("before"), args.pop("after"), args.pop("wall_s"),
+                                         guard_killed=False, unified=args.pop("unified"))
+
+    u = measured()
+    assert (u.mem_asked_bytes, u.mem_peak_bytes, u.cores_avg, u.cap_killed) == (40 * gib, 4 * 10**9 + gib, 1.0, False)  # 2 core-seconds in 2 s
+    assert measured(unified=False).mem_peak_bytes == 4 * 10**9  # the card's memory counts only where it shares the pool
+    assert measured(after=(3_000_000, 2)).cap_killed  # the cap killed a process during this run
+    (cg / "memory.max").write_text("max\n")
+    assert measured().mem_asked_bytes is None  # no cap: unknown
+    assert measured(cgroup=None, before=(None, None), after=(None, None)) == job_wrapper.Usage(None, None, u.cores_held, None)
+
+    def lines(peak: float | None = 9.4e9, *, asked: int | None = 40 * gib, avg: float | None = 1.7, gpu: bool = False,
+              cap: bool = False, guard: bool = False, cores_cap: int | None = 8) -> list[str]:
+        return job_wrapper.usage_lines(job_wrapper.Usage(asked, None if peak is None else int(peak), 8, avg, cap, guard),
+                                       gpu_job=gpu, cores_cap=cores_cap, most_mb=most_mb)
+
+    assert lines() == ["[job] used: memory peak 9.4 GB of 42.9 GB asked (22%); cores 1.7 on average of 8 held (21%)",
+                       "[job] for the same work next time: --mem 10G --cpus 3"]  # peak + 10%; ceil(1.7 x 1.25)
+    assert lines(gpu=True)[1].endswith("--mem 10G")  # a GPU job's cores are held for the card: no --cpus advice
+    assert lines(avg=20.0)[1].endswith("--cpus 8")  # within the cores the job may have
+    assert lines(peak=5e6)[0].startswith("[job] used: memory peak 5 MB") and "--mem 1G" in lines(peak=5e6)[1]
+    assert "--mem 1G" in lines(peak=0)[1]  # never 0G: slurm reads --mem 0 as the whole box
+    assert "--mem 0" in lines(peak=95 * gib)[1]  # more than any node gives jobs: the whole box, not a figure slurm refuses
+    killed = lines(asked=32 * gib, cap=True)
+    assert killed[0].endswith("; the memory cap killed a process") and "--mem 39G or more" in killed[1]  # 1.2 x 32 GiB
+    assert "--mem 0 " in lines(asked=most_mb * 2**20, guard=True)[1] + " "  # killed with the whole box: no more to give
+    assert lines(guard=True, asked=None)[0].endswith("killed by the host's OOM guard")
+    assert lines(peak=None, asked=None, avg=None) == ["[job] used: memory peak unknown; cores in use unknown of 8 held"]
+    record = job_wrapper.usage_record(u, ["[job] x"])
+    assert record == {"mem_asked_bytes": 40 * gib, "mem_peak_bytes": 4 * 10**9 + gib, "cores_held": u.cores_held,
+                      "cores_avg": 1.0, "memory_cap_killed": False, "lines": ["[job] x"]}

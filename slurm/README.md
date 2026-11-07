@@ -508,6 +508,20 @@ Sizing from a job's own history. Give a job `--name` and the same name on every 
   under `enforce` it asks for K. A hand-set `--cpus` more than twice K warns. The figure is kept in the job's record
   (`cores_from_history`) so proposals can be compared with what the jobs then used. GPU jobs keep the cores held for the card.
 
+What a run used. At the end of every run (each leg of a requeued job) the job's log gets two lines after the exit line,
+and `gpujobs-wait` repeats the last run's under each job's final state:
+
+    [job] used: memory peak 9.4 GB of 42.9 GB asked (22%); cores 1.7 on average of 8 held (21%)
+    [job] for the same work next time: --mem 10G --cpus 3
+
+Memory asked is the job's cgroup cap (its `--mem`); the peak is the host side plus, where the card shares system memory
+(`unified_memory`), the card's, so it can pass 100% there. Cores held are slurm's cpuset; the average is the cgroup's core
+time over the run's wall time. The advice is this run's peak plus 10 percent and its average times 1.25 (within the cores
+the job may have); after a memory kill (the job's cap killed a process, or the host's OOM guard killed it) it is at least
+1.2 times what the run was given; `--mem 0` (the whole box) when that is more than any node gives jobs. GPU jobs get no
+`--cpus` advice. The report is per job, never per user, and changes nothing by itself: the project decides its next
+request. A figure that cannot be read shows as unknown.
+
 ### Sharing a card
 
 By default a card is one token: one job at a time. A site that gives a card `shards` (section 4) lets several copies of one
