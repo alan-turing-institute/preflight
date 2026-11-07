@@ -488,8 +488,9 @@ def compare_against_box(arguments: argparse.Namespace, local_root: Path) -> int:
 LOCAL_DEFAULTS = Path(__file__).with_name("dgx.local.env")
 
 
-def local_default(key: str, path: Path = LOCAL_DEFAULTS) -> str | None:
+def local_default(key: str, path: Path | None = None) -> str | None:
     """The caller's environment, else this checkout's untracked dgx/dgx.local.env (KEY=VALUE lines), else None."""
+    path = path or LOCAL_DEFAULTS  # looked up per call, so a test (or a caller) can point it elsewhere
     if os.environ.get(key):
         return os.environ[key]
     if path.is_file():
