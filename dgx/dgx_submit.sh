@@ -69,7 +69,12 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # This machine's box and its checkout root come from the environment, else from dgx/dgx.local.env (KEY=VALUE lines,
 # not tracked by git): no machine-specific default is tracked. The environment wins over the file.
 if [[ -f "$HERE/dgx.local.env" ]]; then
-    while IFS='=' read -r key value; do
+    # `|| [[ -n $key ]]` keeps a last line with no newline; spaces around the key and value are dropped, as in
+    # assert_code_parity.local_default, so both readers see the same values
+    while IFS='=' read -r key value || [[ -n "$key" ]]; do
+        key="${key//[[:space:]]/}"
+        value="${value#"${value%%[![:space:]]*}"}"
+        value="${value%"${value##*[![:space:]]}"}"
         if [[ "$key" =~ ^AUTOCAST_DGX_[A-Z_]+$ && -z "${!key:-}" ]]; then export "$key=$value"; fi
     done < "$HERE/dgx.local.env"
 fi

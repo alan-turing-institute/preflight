@@ -8,6 +8,8 @@ and still died four seconds after winning the card.
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import textwrap
 from pathlib import Path
 
@@ -21,6 +23,8 @@ from assert_code_parity import (
     resolve_module,
 )
 
+
+CANNOT_RUN = 2  # the gate's exit code when it could not check at all (bad input, missing manifest, no box named)
 
 @pytest.fixture(autouse=True)
 def _box(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -199,7 +203,7 @@ def test_an_unparseable_file_refuses_rather_than_passing(
         "sys.argv",
         ["p", str(study / "scripts" / "entry.py"), "--local-root", str(study)],
     )
-    assert main() == 2
+    assert main() == CANNOT_RUN
 
 
 def test_manifest_round_trip_passes(
@@ -261,10 +265,10 @@ def test_an_empty_or_unreadable_manifest_refuses(tmp_path: Path, study: Path) ->
 
     A check that cannot run must not report that it did.
     """
-    assert mod.check_manifest(tmp_path / "nope.json", study) == 2
+    assert mod.check_manifest(tmp_path / "nope.json", study) == CANNOT_RUN
     empty = tmp_path / "empty.json"
     empty.write_text(json.dumps({"digests": {}}))
-    assert mod.check_manifest(empty, study) == 2
+    assert mod.check_manifest(empty, study) == CANNOT_RUN
 
 
 def test_also_covers_a_non_python_file(study: Path) -> None:
@@ -316,7 +320,7 @@ def test_a_first_party_import_off_the_search_path_is_refused(
         "sys.argv",
         ["p", str(study / "scripts" / "entry.py"), "--local-root", str(study)],
     )
-    assert main() == 2
+    assert main() == CANNOT_RUN
     assert "add --search elsewhere" in capsys.readouterr().err
 
 
@@ -373,7 +377,18 @@ def test_host_and_root_come_from_the_environment_then_the_local_file_never_a_tra
     monkeypatch.setenv("AUTOCAST_DGX_HOST", "envhost")  # the environment wins over the file
     assert mod.local_default("AUTOCAST_DGX_HOST", local) == "envhost"
     assert mod.local_default("AUTOCAST_DGX_ROOT", tmp_path / "absent.env") is None
+    # dgx_submit.sh's own reader agrees with local_default on a hand-edited file: spaces, no final newline
+    local.write_text("AUTOCAST_DGX_HOST = filehost\nAUTOCAST_DGX_ROOT= /file/root")
+    script = (Path(mod.__file__).with_name("dgx_submit.sh")).read_text().splitlines()
+    start = next(i for i, line in enumerate(script) if line.startswith("HERE="))
+    stop = next(i for i, line in enumerate(script) if line.startswith("REMOTE_ROOT="))
+    probe = tmp_path / "probe.sh"
+    probe.write_text("set -euo pipefail\n" + "\n".join(script[start : stop + 1]) + '\necho "$HOST|$REMOTE_ROOT"\n')
+    env = {k: v for k, v in os.environ.items() if not k.startswith("AUTOCAST_DGX_")}
+    shell = subprocess.run(["bash", str(probe)], env=env, capture_output=True, text=True, check=True).stdout.strip()
     monkeypatch.delenv("AUTOCAST_DGX_HOST")
+    python = f'{mod.local_default("AUTOCAST_DGX_HOST", local)}|{mod.local_default("AUTOCAST_DGX_ROOT", local)}'
+    assert shell == python == "filehost|/file/root"
     monkeypatch.setattr(mod, "LOCAL_DEFAULTS", tmp_path / "absent.env")
     monkeypatch.setattr("sys.argv", ["assert_code_parity.py", "some_entry.py"])
-    assert main() == 2 and "--host and --remote-root are required" in capsys.readouterr().err
+    assert main() == CANNOT_RUN and "--host and --remote-root are required" in capsys.readouterr().err

@@ -33,7 +33,8 @@ def _tree(site) -> list[Path]:
     if site.hostguard or site.dgx_gate:
         found.append(REPO / "hostguard" / "hostguard.py")
     if site.dgx_gate:
-        found += sorted(p for p in (REPO / "dgx").iterdir() if p.is_file())
+        # never a machine's own untracked settings (dgx.local.env): the installed tree is what git holds
+        found += sorted(p for p in (REPO / "dgx").iterdir() if p.is_file() and not p.name.endswith(".local.env"))
     return found
 
 

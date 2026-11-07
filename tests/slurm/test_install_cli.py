@@ -93,9 +93,9 @@ def test_apply_then_check_against_a_temp_root(env):
     assert run(site, root, "check") == 1  # nothing installed yet
     assert run(site, root, "apply", chown=lambda p, o: owned.append((p, o))) == 0
     assert run(site, root, "check") == 0
-    assert stat.S_IMODE((root / "etc/slurm/slurmdbd.conf").stat().st_mode) == 0o600
-    assert stat.S_IMODE((root / "usr/local/bin/gpujobs-submit").stat().st_mode) == 0o755
-    assert stat.S_IMODE((root / "opt/gpujobs/slurm/ood_app/bin/python").stat().st_mode) == 0o755  # OOD runs it
+    assert stat.S_IMODE((root / "etc/slurm/slurmdbd.conf").stat().st_mode) == cli.render.SECRET_MODE
+    assert stat.S_IMODE((root / "usr/local/bin/gpujobs-submit").stat().st_mode) == cli.render.EXEC_MODE
+    assert stat.S_IMODE((root / "opt/gpujobs/slurm/ood_app/bin/python").stat().st_mode) == cli.render.EXEC_MODE  # OOD runs it
     # The installed wrapper runs a job with only what the install put there (this site leaves hostguard off).
     assert not (root / "opt/gpujobs/hostguard").exists()
     job = dict(os.environ, GPUJOBS_SITE=str(site), SLURM_GPU_STATE_DIR=str(tmp / "state"), SLURM_JOB_ID="1")
@@ -104,6 +104,7 @@ def test_apply_then_check_against_a_temp_root(env):
     gated = SimpleNamespace(install_dir=Path("/opt/gpujobs"), hostguard=False, dgx_gate=True, health_check=None)
     shipped = components.load(gated, ["tools"])[0].files(gated)
     assert {"/opt/gpujobs/hostguard/hostguard.py", "/opt/gpujobs/dgx/dgx_submit.sh"} <= shipped.keys()
+    assert not any(k.endswith(".local.env") for k in shipped)  # a checkout's own dgx.local.env is never installed
     assert ((root / "etc/slurm/slurmdbd.conf"), "slurm") in owned
     assert (root / "etc/gpujobs/site.toml", "root") in owned
     (root / "etc/slurm/slurmdbd.conf").chmod(0o644)  # same content, but readable by everyone
