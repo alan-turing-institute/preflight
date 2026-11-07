@@ -23,6 +23,34 @@ machines is a field in one site file (section 4); nothing is hard-coded to a mac
 The pieces are installed by one program, `slurm/install/install.py`, in six components: `slurm`, `tools`, `agent`,
 `lease`, `metrics`, `portal` (section 5).
 
+## Quick start
+
+**If you only submit jobs** (the machine is already set up): the tools are on your path as `gpujobs-*`. Section 7 has
+every option; this is the short version.
+
+    # run a command on the GPU. --class resume: running it again continues from its checkpoint; restart: it starts over.
+    gpujobs-submit --project myproj --what 'train the model' --class resume --resume-ok --gpu --name train1 -- python train.py
+    gpujobs-submit ... --dry-run -- python train.py     # print the batch script and submit nothing
+    gpujobs-status                                      # the queue, who holds the GPU, and why jobs wait
+    gpujobs-pause 123 ;  gpujobs-resume 123 ;  gpujobs-kill 123      # your own jobs only
+    gpujobs-submit ... --level high -- ...              # wait ahead of normal jobs (levels: low, normal, high)
+
+What else the same command can do, each set out in section 7:
+
+| You want | Add to `gpujobs-submit` |
+|---|---|
+| Several copies of one job to share a card (the site must enable `shards`) | measure once with `gpujobs-sharing measure`, then submit as usual; `--max-jobs N` sets the number |
+| A CPU-only job to run on a spare machine as well (a "part-time" machine, if the site lists one) | nothing for a `resume` job the machine can run; `--anywhere` if you vouch for it |
+| A small CPU stand-in for a background service | `--service` |
+| A job on another site's slurm | `--site NAME` (the site file's `[remote.NAME]`) |
+| Urgent work (administrators only) | use `gpujobs-urgent` instead |
+
+**If you are setting up a machine:** `python3 slurm/install/install.py detect > site.toml`, edit it against the commented
+example `slurm/site.example.toml` (every field is explained in section 4; unknown keys are an error), then `render`,
+`check`, `apply` (section 3). The example shows each table: one `[[nodes]]` entry per machine with its `[[nodes.gpus]]`
+(add `shards` there to let jobs share a card), an optional part-time machine, `[lease]`, `[metrics]` and `[portal]`.
+Add each user with `install.py ... user add USER`, and administrators with `admin add USER` (section 6).
+
 ## 2. Requirements
 
 - **Operating system: Ubuntu 24.04.** What was tested: Ubuntu 24.04 on aarch64 (64-bit Arm), for the unit tests

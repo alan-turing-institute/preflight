@@ -562,7 +562,7 @@ def _resource_tiles(
     host's strip. One machine: one strip. Several: a strip for the whole cluster, then one for each machine."""
     if not have:
         return ""
-    if len(per_node) < 2:
+    if len(per_node) <= 1:  # one machine or none: no per-machine strips
         return _box("This machine", have, rows, busy, use) if have.get("nodes") == 1 and have.get("here") else _box("This machine", have, rows)
     # every machine reports through its own health check, so every strip reads the same way; the page's own machine falls
     # back to its live reading when its check has not reported yet
@@ -763,6 +763,7 @@ def _finished_rows(rows: list[jobs_view.HistoryRow], root: str, now: datetime) -
             # how long it waited to start; one that never started, until it ended
             + (_queued_html(r.submit, r.start or r.end, now) if r.submit else '<td class="num hide-sm">—</td>')
             + f'<td class="num inline" data-k="started">{esc(_clock(r.start, now))}</td>'
+            f'<td class="num inline" data-k="ended">{esc(_clock(r.end, now))}</td>'
             f'<td class="num inline" data-k="took">{esc(_duration(r.elapsed_s) if r.start else "—")}</td>'
             f'<td class="num hide-sm">{esc(r.gpus)}</td>'
             f'<td class="num hide-sm">{_finished_memory(r)}</td>'
@@ -776,7 +777,7 @@ def _finished_rows(rows: list[jobs_view.HistoryRow], root: str, now: datetime) -
 def _finished_table(rows: list[jobs_view.HistoryRow], root: str, now: datetime) -> str:
     return (
         '<div class="table-wrap"><table class="stack"><thead><tr><th scope="col">Job</th><th scope="col">Project</th><th scope="col">Result</th>'
-        '<th scope="col">Queued at</th><th scope="col">Started</th><th scope="col">Took</th><th scope="col" class="hide-sm">GPUs</th>'
+        '<th scope="col">Queued at</th><th scope="col">Started</th><th scope="col">Ended</th><th scope="col">Took</th><th scope="col" class="hide-sm">GPUs</th>'
         '<th scope="col" class="hide-sm">Memory</th><th scope="col" class="hide-sm">Cores used</th><th scope="col">User</th>'
         f"</tr></thead><tbody>{_finished_rows(rows, root, now)}</tbody></table></div>"
     )

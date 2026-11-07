@@ -23,6 +23,7 @@ import app
 
 HOST = "ood.example:8080"
 MOUNT = "/pun/sys/gpujobs"  # where OOD serves the app (Passenger's SCRIPT_NAME)
+SILENT_NOTES = 2  # a silent machine is said so on its own strip and on the cluster's
 
 
 def queued(job_id: str, user: str, name: str = "proj:normal:train", partition: str = "normal") -> gpu_jobs.QueuedJob:
@@ -138,6 +139,7 @@ def test_every_get_route_answers(path: str) -> None:
         at = lambda h, m: datetime(2026, 10, 19, h, m)  # noqa: DTZ001, E731 - local, like the times sacct prints
         row = jobs_view.HistoryRow("5", "p:normal:x", "p", "ann", "normal", "COMPLETED", "0:0", at(9, 0), at(10, 30), at(11, 0), 1800, 1, None)
         assert "Today 09:00<div class=\"why\">(queued for 1 h 30 min)</div>" in app._finished_rows([row], "/", noon)
+        assert 'data-k="ended">Today 11:00</td>' in app._finished_rows([row], "/", noon)  # when it finished, beside Started
         never = dataclasses.replace(row, state="CANCELLED", start=None, elapsed_s=0)
         assert "(queued for 2 h 00 min)" in app._finished_rows([never], "/", noon)
         assert "<th scope=\"col\">Running for</th><th scope=\"col\">Queued at</th>" in body
@@ -160,7 +162,7 @@ def test_every_get_route_answers(path: str) -> None:
         assert ">GPU<" in strips[1] and ">GPU<" not in strips[2] and "not reported" not in both  # the laptop has none
         lap_silent = {**lap, "comment": ""}  # a machine that has not reported: said so on its strip and the cluster's, left out of the sum
         silent = app._resource_tiles(total, running, 0.5, {"mem_total": 2 * 10**9, "mem_used": 10**9, "cores": 20, "cores_busy": 3.0}, [dgx, lap_silent])
-        assert silent.count("in use not reported by lap") == 2 and "3.0 of 20" in silent.split("<section")[1]
+        assert silent.count("in use not reported by lap") == SILENT_NOTES and "3.0 of 20" in silent.split("<section")[1]
 
 
 def test_unknown_things_are_not_found_or_bad() -> None:

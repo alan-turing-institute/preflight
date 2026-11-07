@@ -37,6 +37,7 @@ time, never in one move.
 
     slurm/                      GPU jobs through slurm, with pause/resume, urgent work, a web page and
                                 per-job metrics: see slurm/README.md
+                                (start with its Quick start; AMD machines: slurm/PORTING_AMD.md)
     dgx/assert_code_parity.py   leg 1 — the box runs the same code as this clone
     dgx/assert_gpu_free.py      leg 3 — query health; optional strict occupancy policy
     dgx/assert_hostguard.py     leg 4 — the box venv loads the current memory guard at startup
