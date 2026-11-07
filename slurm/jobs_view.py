@@ -269,6 +269,10 @@ def _mib(mebibytes: int | None) -> int | None:
     return mebibytes * 1024**2 if mebibytes else None
 
 
+#: What sacct gives as the node list of a job that never ran; it is no node, so nothing is shown for it.
+NO_NODE = "None assigned"
+
+
 def _row(job: Mapping[str, object]) -> HistoryRow:
     name = str(job.get("name", ""))
     states = _field(job, "state", "current")
@@ -289,7 +293,7 @@ def _row(job: Mapping[str, object]) -> HistoryRow:
         gpus=_tres_count(_field(job, "tres", "allocated"), "gres", "gpu") or 0,
         req_mem_bytes=_mib(_tres_count(_field(job, "tres", "requested"), "mem")),
         max_rss_bytes=_peak_rss(job),
-        node=str(job.get("nodes") or ""),
+        node="" if str(job.get("nodes") or "") == NO_NODE else str(job.get("nodes") or ""),
         avg_rss_bytes=_avg_rss(job),
         cpus=_tres_count(_field(job, "tres", "allocated"), "cpu"),
         cpu_s=_cpu_seconds(job),

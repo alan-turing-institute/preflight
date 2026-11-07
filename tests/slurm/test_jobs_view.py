@@ -133,13 +133,14 @@ def test_chain_walks_both_ways_and_stays_finite() -> None:
         "2": queued("Dependency", job_id="2", dependency="afterok:1"),
     }
     assert jobs_view.chain("1", loop, {}).before[0].before == ()
-    layers = {  # 40 layers of two jobs, each depending on both jobs below it: 2**40 paths, 80 jobs
+    depth = 40  # layers of two jobs, each depending on both jobs below it: 2**40 paths, 80 jobs
+    layers = {
         str(2 * layer + side): queued(
             "Dependency",
             job_id=str(2 * layer + side),
-            dependency=f"afterok:{2 * layer + 2}:{2 * layer + 3}" if layer < 39 else "",
+            dependency=f"afterok:{2 * layer + 2}:{2 * layer + 3}" if layer < depth - 1 else "",
         )
-        for layer in range(40)
+        for layer in range(depth)
         for side in (1, 2)
     }
     top = jobs_view.chain("1", layers, {})
@@ -147,7 +148,7 @@ def test_chain_walks_both_ways_and_stays_finite() -> None:
     def count(n: jobs_view.ChainNode) -> int:
         return 1 + sum(count(c) for c in n.before)
 
-    assert count(top) <= 80
+    assert count(top) <= 2 * depth  # each job once, never once per path
     deep = {str(i): queued("Dependency", job_id=str(i), dependency=f"afterok:{i + 1}") for i in range(1, 3000)}
     assert count(jobs_view.chain("1", deep, {})) == jobs_view.MAX_CHAIN_DEPTH + 1  # not a RecursionError
 
@@ -167,6 +168,7 @@ def test_project_usage_gpu_hours_per_day_and_week() -> None:
     assert week[date(2026, 10, 19), "project-a"] == pytest.approx(11047 / 3600)  # job 202
     started = 1_792_105_200  # 2026-10-16 01:00 BST
     forged = "p:restart:x|user1|steady|FAILED\n999|p:restart:y|user1|steady|FAILED|1:0"
+    hand_made_ids = (1, 2, 3, 4)
     hand_made = sacct_json(
         (1, "p:restart:x", "u", started, 3600, 2),
         (2, "plain", "u", 0, 3600, 1),
@@ -178,7 +180,7 @@ def test_project_usage_gpu_hours_per_day_and_week() -> None:
     assert usage(Bucket.DAY, hand_made) == {(date(2026, 10, 16), "p"): 2.5}
     rows = jobs_view.history("2026-10-15", runner=lambda _: hand_made)
     assert [(r.job_id, r.user, r.state, r.name) for r in rows][-1] == ("4", "mallory", "COMPLETED", forged)
-    assert len(rows) == 4
+    assert len(rows) == len(hand_made_ids)  # the forged name adds no row
 
 
 def test_history_filters_and_efficiency_on_recorded_json() -> None:
@@ -197,6 +199,8 @@ def test_history_filters_and_efficiency_on_recorded_json() -> None:
     running = next(r for r in jobs_view.history("2026-10-15", state="running", runner=fake_sacct))
     assert (running.job_id, running.end, running.start is not None) == ("239", None, True)  # end is 0 until it ends
     assert jobs_view.efficiency("999", lambda _: "", {}).cpu_use is None
+    # a job cancelled before it ran: sacct says "None assigned", which is no node (the page showed "on None assigned")
+    assert (jobs_view._row({"nodes": jobs_view.NO_NODE}).node, jobs_view._row({"nodes": "gpu-node-1"}).node) == ("", "gpu-node-1")
 
 
 def test_log_tail_filters(tmp_path: Path) -> None:
