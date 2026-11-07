@@ -18,9 +18,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SELF = {"tools/check_private.py", "tests/test_check_private.py"}  # they hold the sample lines the rules must catch
 LOCAL_PATTERNS = ROOT / ".private-patterns"
-# (what it is, regular expression). 10.0.0.x is the documentation example used in the tests.
+# (what it is, regular expression). Each part of an address is 0-255, so a version number such as 10.0.22621.0 is
+# not one; 10.0.0.x is the documentation example used in the tests; 172.17.0.1 is Docker's default bridge, the same
+# on every machine.
+_OCTET = r"(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)"
 GENERIC = (
-    ("private network address", r"\b(192\.168\.\d+\.\d+|10\.(?!0\.0\.)\d+\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+)\b"),
+    ("private network address",
+     rf"\b(192\.168\.{_OCTET}\.{_OCTET}|10\.(?!0\.0\.){_OCTET}\.{_OCTET}\.{_OCTET}"
+     rf"|172\.(?!17\.0\.1\b)(1[6-9]|2\d|3[01])\.{_OCTET}\.{_OCTET})\b"),
     ("tailnet host name", r"\b[\w-]+\.(?!tailnet-example\.)[\w-]+\.ts\.net\b"),
     ("secret-shaped string", r"ghp_[A-Za-z0-9]{20}|github_pat_|sk-[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{12}|BEGIN (RSA|OPENSSH|EC|PRIVATE)"),
 )
