@@ -29,6 +29,7 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
 sys.path.insert(0, str(REPO / "slurm"))
 from levels import Level, priority_for  # noqa: E402 - stdlib only; the priority the agent gives each waiting job
+from site_config import RELEASE_SHA256, RELEASE_VERSION, with_slurm_pin  # noqa: E402 - stdlib only
 
 TOP_PRIORITY = 0xFFFF0000  # slurm's job_mgr.c: the most priority/basic gives a job by itself
 RUN = HERE / "run.sh"
@@ -38,6 +39,8 @@ BASE_SITE = "/src/tests/integration/harness.site.toml"
 SLURM_PIN = (os.environ.get("SLURM_VERSION", ""), os.environ.get("SLURM_SHA256", ""))
 SITE = os.environ.get("E2E_SITE") or ("/tmp/harness.site.slurm.toml" if all(SLURM_PIN) else BASE_SITE)
 INSTALL = "python3 /src/slurm/install/install.py"
+#: The proxy key is checked twice in the portal's Apache config: Open OnDemand's `auth` and a `<Location "/">` (portal.py).
+FRONTDOOR_GATES = 2
 STATE = "/var/lib/gpujobs"
 PORTAL = "https://testnode"
 APP = f"{PORTAL}/pun/sys/gpujobs"
@@ -939,7 +942,7 @@ def stage_proxy() -> None:
     mode, wrote_key, gates, login = (conf.out.split("\n") + ["", "", "", ""])[:4]
     check("Apache is up with the allow_from restriction; the portal config is 0640 root:www-data, holds the key's digest but not the key, "
           "and has no OIDC or Dex directives", apache.out.strip() == "active" and mode == "640 root:www-data"
-          and wrote_key == "0" and int(gates or 0) >= 2 and login == "0", f"{apache.out.strip()} | {conf.text}")
+          and wrote_key == "0" and int(gates or 0) >= FRONTDOOR_GATES and login == "0", f"{apache.out.strip()} | {conf.text}")
 
     base = f"{CURL} -o /dev/null -w '%{{http_code}}'"
     app = f"{PORTAL}/pun/sys/gpujobs/api/jobs"
@@ -1430,9 +1433,24 @@ def stage_part_time() -> None:
 
 
 
-# SchedMD's digests (plan notes, "Facts"): the release tarballs the harness builds.
-UPGRADE_STEPS = ("25.05.9", "7be633820df896df819ac2e9f2ebd0824de509515e5fb78ba1c19da2453b39ed")
-UPGRADE_TARGET = ("26.05.5", "4680cafc82b0689865c885eb703441e7ebf764896c40fd03a50f2fcb60664f68")
+# SchedMD's digests (plan notes, "Facts"): the release tarballs the harness builds. By default the stage goes from the
+# image's slurm through 25.05.9 to 26.05.5; UPGRADE_TO="<version>:<sha256>" goes straight to that release instead (the
+# release watch's test, `slurm_release.py test`, whose image is at the running release's pin).
+DEFAULT_UPGRADE = (("26.05.5", "4680cafc82b0689865c885eb703441e7ebf764896c40fd03a50f2fcb60664f68"),
+                   (("25.05.9", "7be633820df896df819ac2e9f2ebd0824de509515e5fb78ba1c19da2453b39ed"),))
+
+
+def upgrade_plan(value: str) -> tuple[tuple[str, str], tuple[tuple[str, str], ...]]:
+    """(target, steps) from UPGRADE_TO: the default path when it is empty."""
+    if not value:
+        return DEFAULT_UPGRADE
+    version, _, sha256 = value.partition(":")
+    if not (RELEASE_VERSION.fullmatch(version) and RELEASE_SHA256.fullmatch(sha256)):
+        raise SystemExit(f"UPGRADE_TO={value!r}: expected <version>:<sha256>, such as 26.11.1:<64 hex digits>")
+    return (version, sha256), ()
+
+
+UPGRADE_TARGET, UPGRADE_STEPS = upgrade_plan(os.environ.get("UPGRADE_TO", ""))
 UPGRADE_SITE = "/tmp/upgrade.site.toml"
 BACKUP_FILES = 3  # database dump, state tar, /etc/slurm tar
 UPGRADE_TIMEOUT_S = 4 * 3600  # two builds and two database conversions
@@ -1783,7 +1801,7 @@ def _memory_guard_scenarios() -> None:
 
 
 def stage_upgrade() -> None:
-    section("upgrade: `install.py upgrade-slurm` from the image's slurm 23.11 to the site file's release (last: it replaces slurm)")
+    section(f"upgrade: `install.py upgrade-slurm` from the image's slurm to {UPGRADE_TARGET[0]} (last: it replaces slurm)")
     clear_queue()
     old = submit("alice", "before-upgrade", 2)
     check("before: a job completes on the old slurm, so accounting has history to keep",
@@ -1791,9 +1809,7 @@ def stage_upgrade() -> None:
     waiting = submit("alice", "waits-through-upgrade", 2)  # a job still waiting is no reason to refuse; it must come through
     sh(f"scontrol hold {waiting}")
     before = sh("sinfo -V").text
-    site = sh(f"cat {SITE}").out + (f"\n[slurm]\nversion = '{UPGRADE_TARGET[0]}'\nsha256 = '{UPGRADE_TARGET[1]}'\n"
-                                   f"steps = ['{':'.join(UPGRADE_STEPS)}']\n")
-    put(UPGRADE_SITE, site)
+    put(UPGRADE_SITE, with_slurm_pin(sh(f"cat {SITE}").out, *UPGRADE_TARGET, UPGRADE_STEPS))
     done = sh(f"{INSTALL} upgrade-slurm --site {UPGRADE_SITE}", timeout=UPGRADE_TIMEOUT_S)
     done.rc and print(done.text[-4000:])  # the failing step and apt's own message, which the check below shortens
     check("upgrade-slurm exits 0 after both steps", done.rc == 0, done.text[-330:])

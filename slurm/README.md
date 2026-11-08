@@ -241,6 +241,37 @@ Nothing here restarts anything: the buttons only leave a request for the slot, w
 | `status_file` | required | Absolute path of the slot's status, JSON: `{"updated": epoch, "state": "none" \| "planned" \| "skipped" \| "running" \| "failed" \| "done", "planned_at": epoch or null, "waiting": [{"kind": "...", "summary": "one plain line"}], "detail": "one plain line"}`. A missing, malformed or more than an hour old file shows "status unavailable", never "nothing waits". |
 | `request_dir` | required | Absolute path where a button leaves `{"action": "restart_now" \| "skip_week", "at": epoch}` as `<user>-<ns>-<action>.json`, owned by the admin who pressed it. Only admins who can write this folder see the buttons; the slot checks the owner itself. |
 
+### `[slurm_release]` (optional)
+
+Watch SchedMD's releases and prove a newer one in the test cluster (`tests/integration`) before a maintenance window
+installs it; absent: no watch. Needs `[slurm]`. `slurm/slurm_release.py` has four commands:
+
+- `check`, nightly as `test_user`: reads SchedMD's GitHub release list (stable releases with a sha256 digest only), picks
+  the target and, when it has no record and no test in the queue, submits its test through `submit.py` as a `resume`
+  job asking the test cluster's own cores and memory (summed from `compose.yml`, since its containers run outside the
+  job's cgroup). A fetch that fails changes nothing; a test that could not run is tried again on later nights, 3 times
+  at most for one release; a failed test is not retried (delete its record to ask for a retry).
+- `test`, the job itself (about 50 minutes, once per release): every stage on the new release, then `install,upgrade`
+  from the site's pin with `UPGRADE_TO`; the cluster is always taken down, and test images of other releases are
+  removed. It writes `<records>/<version>.json` and the log beside it.
+- `status --json`, anyone, no network: `waiting` is true only for the newest release whose test passed from the
+  release running now and that leaves no node's slurmd three or more series older (SchedMD accepts slurmd up to
+  three major releases older; one is kept as margin, and a node that does not say its version blocks it); `ready` then holds the `version` and `sha256` to pass to `apply`.
+- `sudo slurm_release.py apply --site SITE --version V --sha256 S`, the window, once running jobs have ended: only with
+  a record of a passing test of V from the running release with that sha256, written by `test_user` (an admin) into a
+  folder nobody else can write. It pins the site file's `[slurm]` table to V (a backup beside it, the rest of the file
+  unchanged), runs `install.py upgrade-slurm` and returns its exit status: 0 done, 1 refused (nothing changed, the site
+  file put back), 2 failed after a package changed (do not restart; its restore commands were printed), 3 the accounting
+  conversion still runs (leave it running).
+
+| Field | Default | Meaning |
+|---|---|---|
+| `checkout` | required | Absolute path of a checkout of these tools with `tests/integration`; the test runs from it. |
+| `records` | required | Absolute path of the test results, owned by `test_user` or root and writable by nobody else. |
+| `test_user` | required | Who runs `check` and the test; must be an admin, since `apply` trusts only their records. |
+| `follow` | `series` | `patch`: newer releases of the running series only. `series`: also the next series, once it has its first maintenance release (`x.y.1`); one series at a time. |
+| `project` | `gpujobs` | The project the test job is submitted under. |
+
 ### `[slurm]` (optional)
 
 Build and install a SchedMD slurm release instead of the distribution's. Absent: the distribution's packages, as

@@ -77,6 +77,10 @@ scenarios below as alice, bob and carol, and exits 1 if any check failed. Each c
 as it happens; the summary lists the failures and any `NOTE` (something that could not be exercised). `--only` takes
 `install,jobs,urgent,service,failure,recovery,portal,proxy,ssh,lease,host,part_time,upgrade`; later stages need `install` to have run once on that cluster.
 
+The `upgrade` stage goes from the image's slurm through 25.05.9 to 26.05.5; `UPGRADE_TO=<version>:<sha256>` goes
+straight to that release instead (the release watch's test, `slurm/slurm_release.py test`, which also sets
+`GPUJOBS_TEST_IMAGE` to one image per release and `GPUJOBS_TEST_PROJECT` to its own compose project).
+
 Disk: the image stays 569 MB, but an installed container's writable layer grows to about 4 GB (Open OnDemand, Grafana,
 Prometheus, a Go toolchain, caches) in Docker's data root. `run.sh down` removes it; run it when you are done.
 

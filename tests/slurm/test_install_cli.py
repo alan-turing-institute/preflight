@@ -274,7 +274,7 @@ def test_apt_flags_apply_only_to_the_component_that_asks():
 
 
 
-def test_slurm_table_installs_the_built_packages_in_place_of_the_distros(env, monkeypatch):
+def test_slurm_table_installs_the_built_packages_in_place_of_the_distros(env, monkeypatch, capsys):
     tmp, site, fake = env
     site.write_text(SITE + "[slurm]\nversion = '26.05.5'\nsha256 = '" + "ab" * 32 + "'\n")
     built = []
@@ -288,7 +288,10 @@ def test_slurm_table_installs_the_built_packages_in_place_of_the_distros(env, mo
     policy.parent.mkdir(parents=True)
     policy.write_text("someone's own\n")  # kept, and put back afterwards
     fake.sinfo = "slurm-wlm 23.11.4"  # apply never changes the release: that is upgrade-slurm's
-    assert run(site, root, "apply") == 1 and built == []
+    assert run(site, root, "apply") == 1 and built == [] and "use install.py upgrade-slurm" in capsys.readouterr().err
+    site.write_text(site.read_text() + "[slurm_release]\ncheckout = '/c'\nrecords = '/r'\ntest_user = 'u'\n")
+    fake.sinfo = "slurm 26.11.1"  # newer than the pin: a maintenance window installed it; the refusal names its record
+    assert run(site, root, "apply") == 1 and 'version = "26.11.1" with the sha256 in /r/26.11.1.json' in capsys.readouterr().err
     fake.sinfo = "slurm 26.05.5"
     assert run(site, root, "apply") == 0
     assert built == [("26.05.5", "ab" * 32)]
@@ -431,7 +434,7 @@ def test_upgrade_slurm_refuses_before_touching_anything(upgrade, capsys, monkeyp
         return [tmp / f"slurm-smd_{version}.deb"]
 
     monkeypatch.setattr(slurm_component.slurm_build, "build", build)
-    assert run(site, tmp / "root", "upgrade-slurm") == cli.UpgradeExit.REFUSED
+    assert run(site, tmp / "root", "upgrade-slurm") == cli.site_config.UpgradeExit.REFUSED
     err = capsys.readouterr().err
     assert "no network" in err and "slurm was not touched" in err
     touched = ("systemctl", "mariadb-dump", "tar", "apt-get", "sudo")
@@ -444,7 +447,7 @@ def test_upgrade_slurm_refuses_before_touching_anything(upgrade, capsys, monkeyp
 def test_a_failed_step_prints_the_restore_commands_and_goes_no_further(upgrade, capsys, what):
     tmp, site, fake = upgrade
     vars(fake).update(what)
-    assert run(site, tmp / "root", "upgrade-slurm") == cli.UpgradeExit.FAILED_AFTER_CHANGE  # the window must not reboot
+    assert run(site, tmp / "root", "upgrade-slurm") == cli.site_config.UpgradeExit.FAILED_AFTER_CHANGE  # the window must not reboot
     err = capsys.readouterr().err
     assert "UPGRADE FAILED at slurm 25.05.9" in err and "apt-get install -y --allow-downgrades slurm-wlm" in err
     assert not any("26.05.5" in " ".join(c) for c in fake.calls if c[0] != "build") and ["apply"] not in fake.calls
@@ -467,7 +470,7 @@ def test_a_failed_step_prints_the_restore_commands_and_goes_no_further(upgrade, 
 def test_a_slurmdbd_still_converting_is_left_running_and_nothing_is_restored(upgrade, capsys):
     tmp, site, fake = upgrade
     fake.slow_dbd = True
-    assert run(site, tmp / "root", "upgrade-slurm") == cli.UpgradeExit.CONVERSION_RUNNING
+    assert run(site, tmp / "root", "upgrade-slurm") == cli.site_config.UpgradeExit.CONVERSION_RUNNING
     err = capsys.readouterr().err
     assert "still converting" in err and "pid 4242" in err and "tail -f" in err and "slurmdbd-conversion.log" in err
     assert ["terminated"] not in fake.calls  # never signalled
@@ -480,7 +483,7 @@ def test_a_slurmdbd_still_converting_is_left_running_and_nothing_is_restored(upg
 def test_a_failure_before_any_package_changes_puts_slurm_back(upgrade, capsys, what, reopened):
     tmp, site, fake = upgrade
     vars(fake).update(what)
-    assert run(site, tmp / "root", "upgrade-slurm") == cli.UpgradeExit.REFUSED  # nothing changed
+    assert run(site, tmp / "root", "upgrade-slurm") == cli.site_config.UpgradeExit.REFUSED  # nothing changed
     err = capsys.readouterr().err
     assert "UPGRADE REFUSED" in err and "UPGRADE FAILED" not in err and "DROP DATABASE" not in err
     calls = [" ".join(c) for c in fake.calls]

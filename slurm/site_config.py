@@ -14,8 +14,9 @@ import os
 import pwd
 import re
 import tomllib
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from enum import StrEnum
+from enum import IntEnum, StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -219,6 +220,7 @@ class Site:
     slurm_steps: tuple[tuple[str, str], ...] = ()  # ([slurm] steps) the releases `upgrade-slurm` passes through, in order
     health_check: HealthCheck | None = None  # None: no health-check lines and no node_check.json
     maintenance: Maintenance | None = None  # None: no maintenance banner on the jobs page
+    slurm_release: SlurmRelease | None = None  # None: no release watch
     constrain_devices: bool = True  # cgroup.conf ConstrainDevices: a job sees only the GPUs it holds
     shared_state: bool = False  # the part-time nodes see this state_dir (a shared filesystem): nothing is copied back
     node_python: str = "/usr/bin/python3"  # the interpreter a part-time job's wrapper runs with, there
@@ -414,10 +416,80 @@ def _parse_service(raw: Any, nodes: tuple[Node, ...]) -> Service:
     return Service(cores, t["group"])
 
 
+#: A slurm release as SchedMD numbers it, and its tarball's digest: the `[slurm]` pin and the release tool check both.
+RELEASE_VERSION = re.compile(r"\d+\.\d+\.\d+")
+RELEASE_SHA256 = re.compile(r"[0-9a-f]{64}")
+
+
+class UpgradeExit(IntEnum):
+    """`install.py upgrade-slurm`'s exit status, for a caller that must know whether slurm was changed (a maintenance
+    window reboots only after DONE, and alerts a person on FAILED_AFTER_CHANGE or CONVERSION_RUNNING)."""
+
+    DONE = 0
+    REFUSED = 1  # nothing was changed: slurm runs as before
+    FAILED_AFTER_CHANGE = 2  # a package changed and a later step failed: the restore commands were printed
+    CONVERSION_RUNNING = 3  # slurmdbd is still converting the accounting database: it must be left running
+
+
+class Follow(StrEnum):
+    """`[slurm_release] follow`: which newer releases the watch proposes."""
+
+    PATCH = "patch"  # newer releases of the running series only
+    SERIES = "series"  # also the next series, once it has its first maintenance release (x.y.1)
+
+
+@dataclass(frozen=True)
+class SlurmRelease:
+    """`[slurm_release]`: watch SchedMD's releases and prove a newer one in the container before a maintenance window
+    installs it (`slurm_release.py`)."""
+
+    follow: Follow
+    checkout: str  # a checkout of these tools holding tests/integration and the installer
+    records: str  # the folder of test results, owned by test_user (or root), writable by nobody else
+    test_user: str  # who runs the test (an admin: the window trusts only their records)
+    project: str = "gpujobs"  # the project the test job is submitted under; its size is the test cluster's (compose.yml)
+
+
+def _parse_slurm_release(raw: Any) -> SlurmRelease:
+    t = _table(raw, "slurm_release", {"checkout", "records", "test_user"}, {"follow": "series", "project": "gpujobs"})
+    for key in ("checkout", "records"):
+        if not (isinstance(t[key], str) and t[key].startswith("/")):
+            raise SiteError(f"site file: slurm_release.{key} = {t[key]!r}; expected an absolute path")
+    if not (isinstance(t["test_user"], str) and t["test_user"]) or not isinstance(t["project"], str):
+        raise SiteError("site file: slurm_release.test_user and project must be names")
+    return SlurmRelease(_enum(Follow, t["follow"], "slurm_release.follow"), t["checkout"], t["records"], t["test_user"],
+                        t["project"])
+
+
+def with_slurm_pin(text: str, version: str, sha256: str, steps: Sequence[tuple[str, str]] = ()) -> str:
+    """A site file's text with its `[slurm]` table pinned to one release, through `steps` (none: straight to it); every
+    other line kept byte for byte, and the table appended when the file has none."""
+    pin = [f'version = "{version}"\n', f'sha256 = "{sha256}"\n']
+    if steps:
+        pin.append("steps = [" + ", ".join(f'"{v}:{d}"' for v, d in steps) + "]\n")
+    out: list[str] = []
+    inside = seen = skipping = False  # skipping: inside an old `steps = [...]` spread over lines
+    for line in text.splitlines(keepends=True):
+        if header := re.match(r"\s*\[(\[?)([^\]]+)\]", line):
+            inside = header[2].strip() == "slurm" and not header[1]
+            if inside:
+                seen = True
+                out += [line, *pin]
+                continue
+        if inside and (skipping or re.match(r"\s*(version|sha256|steps)\s*=", line)):
+            skipping = re.match(r"\s*steps\s*=", line) is not None or skipping
+            skipping = skipping and "]" not in line
+            continue
+        out.append(line)
+    if not seen:
+        out.append(("\n" if text and not text.endswith("\n") else "") + "\n[slurm]\n" + "".join(pin))
+    return "".join(out)
+
+
 def _release(version: Any, sha256: Any, where: str) -> tuple[str, str]:
-    if not isinstance(version, str) or not re.fullmatch(r"\d+\.\d+\.\d+", version):
+    if not isinstance(version, str) or not RELEASE_VERSION.fullmatch(version):
         raise SiteError(f"site file: {where}version = {version!r}; expected a release such as 26.05.5")
-    if not isinstance(sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", sha256):
+    if not isinstance(sha256, str) or not RELEASE_SHA256.fullmatch(sha256):
         raise SiteError(f"site file: {where}sha256 must be 64 lowercase hex digits, the release tarball's digest")
     return version, sha256
 
@@ -465,6 +537,7 @@ def parse(raw: dict[str, Any]) -> Site:
             "slurm": None,
             "health_check": None,
             "maintenance": None,
+            "slurm_release": None,
             "shared_state": False,
             "node_python": "/usr/bin/python3",
             "requeue_delay_s": 60,
@@ -551,6 +624,7 @@ def parse(raw: dict[str, Any]) -> Site:
         slurm_steps=slurm[1],
         health_check=_parse_health_check(top["health_check"]) if top["health_check"] is not None else None,
         maintenance=_parse_maintenance(top["maintenance"]) if top["maintenance"] is not None else None,
+        slurm_release=_parse_slurm_release(top["slurm_release"]) if top["slurm_release"] is not None else None,
         constrain_devices=top["constrain_devices"],
         shared_state=top["shared_state"],
         node_python=top["node_python"],

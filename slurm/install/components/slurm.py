@@ -23,6 +23,8 @@ PACKAGES = ["slurm-wlm", "slurmdbd", "mariadb-server", "munge"]
 DISTRO_ONLY = ["mariadb-server", "munge"]
 #: Ubuntu's slurm packages, removed (when installed) before SchedMD's, which conflict with them.
 DISTRO_SLURM = ["slurm-wlm", "slurmctld", "slurmd", "slurmdbd", "slurm-client"]
+#: A `dpkg-query -f "${db:Status-Abbrev} ${Package}"` line: its status and the package.
+DPKG_FIELDS = 2
 RESTARTS = [["mariadb", "munge"], ["slurmdbd"], ["slurmctld", "slurmd"]]
 # slurmctld's StateSaveLocation (templates/slurm/slurm.conf). The packages do not make it, and slurmctld, running as
 # SlurmUser, cannot make it in /var/spool itself (Turing box, 2026-10-21: "mkdir(/var/spool/slurmctld): Permission denied").
@@ -69,7 +71,7 @@ def install_commands(built: list[Path]) -> list[list[str]]:
     if not wanted[0].endswith(".deb"):
         return [["dnf", "install", "-y", *wanted]]
     status = components.run(["dpkg-query", "-W", "-f=${db:Status-Abbrev} ${Package}\\n", *DISTRO_SLURM]).stdout or ""
-    installed = [fields[1] for line in status.splitlines() if len(fields := line.split()) == 2 and fields[0] == "ii"]
+    installed = [fields[1] for line in status.splitlines() if len(fields := line.split()) == DPKG_FIELDS and fields[0] == "ii"]
     return [*([["apt-get", "remove", "-y", *installed]] if installed else []), ["apt-get", "install", "-y", *wanted]]
 
 
@@ -139,8 +141,12 @@ def refusals(site, upgrading: bool = False) -> list[str]:
         out.append(f"{conf} was not written by this installer: this machine runs a slurm someone else set up, and "
                    "apply would replace its settings. Leave it, or back it up and pass --replace-existing-slurm")
     if site.slurm_build and not upgrading and (installed := _installed_version()) not in ("", site.slurm_build[0]):
+        hint = "use install.py upgrade-slurm"
+        if site.slurm_release and version_tuple(installed) > version_tuple(site.slurm_build[0]):
+            hint = (f"if a maintenance window installed it (slurm_release.py apply), pin the site file's [slurm] to "
+                    f'version = "{installed}" with the sha256 in {site.slurm_release.records}/{installed}.json, and no steps')
         out.append(f"slurm {installed} is installed and the site file's [slurm] version is {site.slurm_build[0]}: "
-                   "apply never changes the release; use install.py upgrade-slurm")
+                   f"apply never changes the release; {hint}")
     try:
         done = components.run(ACTIVE_JOBS)
     except FileNotFoundError:

@@ -31,7 +31,7 @@ import tempfile
 from collections.abc import Callable
 from contextlib import nullcontext
 from datetime import datetime
-from enum import IntEnum, StrEnum
+from enum import StrEnum
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -46,6 +46,7 @@ import components.slurm as slurm_component  # noqa: E402
 import detect  # noqa: E402
 import render  # noqa: E402
 import site_config  # noqa: E402
+from site_config import UpgradeExit  # noqa: E402
 import slurm_build  # noqa: E402
 from install_earlyoom import differing, install  # noqa: E402
 
@@ -314,16 +315,6 @@ def cmd_part_time(site, args, modules) -> int:
 
 
 BUILD_ERRORS = (slurm_build.SlurmBuildError, subprocess.CalledProcessError, OSError)
-
-
-class UpgradeExit(IntEnum):
-    """`upgrade-slurm`'s exit status, for a caller that must know whether slurm was changed (a maintenance window
-    reboots only after DONE, and alerts a person on FAILED_AFTER_CHANGE or CONVERSION_RUNNING)."""
-
-    DONE = 0
-    REFUSED = 1  # nothing was changed: slurm runs as before
-    FAILED_AFTER_CHANGE = 2  # a package changed and a later step failed: the restore commands were printed
-    CONVERSION_RUNNING = 3  # slurmdbd is still converting the accounting database: it must be left running
 
 
 def cmd_upgrade(site, args, modules, chown: Chown | None = _chown) -> int:

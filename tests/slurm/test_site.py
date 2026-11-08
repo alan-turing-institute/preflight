@@ -92,6 +92,17 @@ def test_example_loads_and_minimal_file_gets_every_default(tmp_path: Path) -> No
     assert built.slurm_build == ("26.05.5", SHA) and built.slurm_steps == ()
     stepped = gpujobs_site.load(write(tmp_path, MINIMAL + f"[slurm]\nversion = '26.05.5'\nsha256 = '{SHA}'\nsteps = ['25.05.9:{SHA}']\n"))
     assert stepped.slurm_steps == (("25.05.9", SHA),)
+    # the release tool's pin: only the [slurm] table changes, a multi-line steps goes, an absent table is appended
+    other, text = "cd" * 32, MINIMAL + f"[slurm]\nversion = '26.05.5'\nsha256 = '{SHA}'\nsteps = [\n  '25.05.9:{SHA}',\n]\n[metrics]\n"
+    pinned = gpujobs_site.with_slurm_pin(text, "26.11.1", other)
+    assert pinned.startswith(MINIMAL + "[slurm]\n") and pinned.endswith("[metrics]\n") and "25.05.9" not in pinned
+    again = gpujobs_site.load(write(tmp_path, pinned))
+    assert (again.slurm_build, again.slurm_steps) == (("26.11.1", other), ())
+    appended = gpujobs_site.load(write(tmp_path, gpujobs_site.with_slurm_pin(MINIMAL.rstrip("\n"), "26.11.1", other, [("26.05.5", SHA)])))
+    assert (appended.slurm_build, appended.slurm_steps) == (("26.11.1", other), (("26.05.5", SHA),))
+    assert site.slurm_release is None  # no [slurm_release]: no release watch
+    watch = gpujobs_site.load(write(tmp_path, MINIMAL + "[slurm_release]\ncheckout = '/c'\nrecords = '/r'\ntest_user = 'u'\n"))
+    assert watch.slurm_release == gpujobs_site.SlurmRelease(gpujobs_site.Follow.SERIES, "/c", "/r", "u", "gpujobs")
     # part-time nodes: their own limits, and the health check only when its table is there
     mixed = gpujobs_site.load(write(tmp_path, MINIMAL + PART_TIME + "address = 'a'\njobs_memory_gb = 5\nkeep_cpus = '0,2-3'\n"
                                    "[health_check]\n"))
@@ -134,6 +145,9 @@ def test_example_loads_and_minimal_file_gets_every_default(tmp_path: Path) -> No
         (MINIMAL + "[health_check]\ninterval_s = 0\n", "health_check.interval_s = 0"),
         (MINIMAL + "[maintenance]\nstatus_file = 's.json'\nrequest_dir = '/r'\n", "maintenance.status_file = 's.json'"),
         (MINIMAL + "[maintenance]\nstatus_file = '/s.json'\n", "[maintenance] is missing request_dir"),
+        (MINIMAL + "[slurm_release]\ncheckout = 'c'\nrecords = '/r'\ntest_user = 'u'\n", "slurm_release.checkout = 'c'"),
+        (MINIMAL + "[slurm_release]\ncheckout = '/c'\nrecords = '/r'\ntest_user = 'u'\nfollow = 'minor'\n", "slurm_release.follow = 'minor'"),
+        (MINIMAL + "[slurm_release]\ncheckout = '/c'\nrecords = '/r'\n", "[slurm_release] is missing test_user"),
         (MINIMAL + "[health_check]\ninterval_s = 9\n", "health_check.interval_s = 9"),
         (MINIMAL + "[health_check]\nintervals = 5\n", "unknown key(s) in [health_check]"),
         ("shared_state = 'yes'\n" + MINIMAL, "shared_state must be true or false"),

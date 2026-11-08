@@ -120,6 +120,15 @@ python = "/opt/gpujobs/venv/bin/python"       # interpreter with localmodels ins
 # sha256 = "4680cafc82b0689865c885eb703441e7ebf764896c40fd03a50f2fcb60664f68"   # its tarball's digest (required with version)
 # steps = ["25.05.9:7be633820df896df819ac2e9f2ebd0824de509515e5fb78ba1c19da2453b39ed"]   # releases `install.py upgrade-slurm` passes through first, "<version>:<sha256>", ascending, each older than version
 
+# Watch SchedMD's releases and prove a newer one in the test cluster before a maintenance window installs it
+# (slurm/slurm_release.py; README "[slurm_release]"). Needs [slurm]. Absent: no watch.
+# [slurm_release]
+# checkout = "/opt/src/gpujobs"  # a checkout of these tools with tests/integration
+# records = "/var/lib/gpujobs-release"  # test results: owned by test_user or root, writable by nobody else
+# test_user = "admin1"         # runs the nightly check and the test; must be an admin
+# follow = "series"            # patch | series (also the next series once it has its x.y.1). Default: series
+# project = "gpujobs"          # the project the test job is submitted under. Default: gpujobs
+
 # A restart slot of the site's own (a weekly window run outside these tools) writes status_file; the jobs page shows
 # its admins what waits for a restart, and its Restart now / Skip this week buttons leave a request in request_dir,
 # which that slot decides on. Both or neither; absent: no banner.
