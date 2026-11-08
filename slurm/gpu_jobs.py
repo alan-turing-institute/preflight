@@ -30,7 +30,7 @@ from pathlib import Path
 
 import site_config
 from levels import Level, level_of  # noqa: F401 - re-exported for the tools
-from host_memory import KB_BYTES, SLURM_MB, meminfo, meminfo_text  # noqa: F401 - re-exported for the tools
+from host_memory import KB_BYTES, MEMINFO, SLURM_MB, meminfo, meminfo_text  # noqa: F401 - re-exported for the tools
 
 
 def load_site() -> site_config.Site:
@@ -1158,6 +1158,14 @@ def flat_key(path: Path, key: str) -> int | None:
     except (OSError, ValueError):
         pass
     return None
+
+
+GB, MB = 10**9, 10**6  # decimal, as every size shown to people
+
+
+def size_text(n_bytes: float) -> str:
+    """A size for people: decimal GB, or MB below one GB."""
+    return f"{n_bytes / GB:.1f} GB" if n_bytes >= GB else f"{n_bytes / MB:.0f} MB"
 
 
 def held_bytes(cgroup: Path) -> int | None:

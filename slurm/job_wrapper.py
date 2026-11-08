@@ -285,9 +285,7 @@ def run_and_measure(
 
 
 #: Bytes in one of slurm's MB.
-SLURM_MB = 2**20
-#: Decimal units for the report (the owner's rule: GB and MB, never GiB labels).
-GB, MB = 10**9, 10**6
+SLURM_MB = gpu_jobs.SLURM_MB
 
 
 def cgroup_counters(cgroup: Path | None) -> tuple[int | None, int | None]:
@@ -332,10 +330,6 @@ def measure_usage(cgroup: Path | None, outcome: dict[str, object], before: tuple
     )
 
 
-def _size(n_bytes: float) -> str:
-    return f"{n_bytes / GB:.1f} GB" if n_bytes >= GB else f"{n_bytes / MB:.0f} MB"
-
-
 def usage_lines(u: Usage, *, gpu_job: bool, cores_cap: int | None, most_mb: int | None) -> list[str]:
     """The run's report (D37): what it used against what it asked for and, when anything is known, the request for the
     same work next time: memory at its peak plus `AUTO_MARGIN`, or after a memory kill at least `bumped_mem_mb` of what
@@ -344,10 +338,10 @@ def usage_lines(u: Usage, *, gpu_job: bool, cores_cap: int | None, most_mb: int 
     if u.mem_peak_bytes is None:
         memory = "memory peak unknown"
     elif u.mem_asked_bytes:
-        memory = (f"memory peak {_size(u.mem_peak_bytes)} of {_size(u.mem_asked_bytes)} asked "
+        memory = (f"memory peak {gpu_jobs.size_text(u.mem_peak_bytes)} of {gpu_jobs.size_text(u.mem_asked_bytes)} asked "
                   f"({round(100 * u.mem_peak_bytes / u.mem_asked_bytes)}%)")
     else:
-        memory = f"memory peak {_size(u.mem_peak_bytes)} (asked unknown)"
+        memory = f"memory peak {gpu_jobs.size_text(u.mem_peak_bytes)} (asked unknown)"
     if u.cores_avg is None:
         cores = "cores in use unknown" + (f" of {u.cores_held} held" if u.cores_held else "")
     elif u.cores_held:
