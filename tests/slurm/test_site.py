@@ -132,6 +132,8 @@ def test_example_loads_and_minimal_file_gets_every_default(tmp_path: Path) -> No
         (MINIMAL + "close_below_gb = 4\npush_back_below_gb = 5\n", "push_back_below_gb must not exceed"),
         (PART_TIME.replace("[[nodes]]", 'name = "x"\n[[nodes]]', 1) + "address = 'a'\n", "every node is part_time"),
         (MINIMAL + "[health_check]\ninterval_s = 0\n", "health_check.interval_s = 0"),
+        (MINIMAL + "[maintenance]\nstatus_file = 's.json'\nrequest_dir = '/r'\n", "maintenance.status_file = 's.json'"),
+        (MINIMAL + "[maintenance]\nstatus_file = '/s.json'\n", "[maintenance] is missing request_dir"),
         (MINIMAL + "[health_check]\ninterval_s = 9\n", "health_check.interval_s = 9"),
         (MINIMAL + "[health_check]\nintervals = 5\n", "unknown key(s) in [health_check]"),
         ("shared_state = 'yes'\n" + MINIMAL, "shared_state must be true or false"),

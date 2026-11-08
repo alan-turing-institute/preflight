@@ -273,6 +273,38 @@ def test_part_time_card_is_the_admins_and_its_buttons_leave_requests_the_agent_r
 
 
 
+def test_the_maintenance_banner_is_the_admins_and_its_buttons_leave_requests_for_the_restart_slot(tmp_path: Path) -> None:
+    site = site_config.parse({"name": "t", "nodes": [{"name": "head", "cpus": 8, "real_memory_mb": 60000}],
+                              "maintenance": {"status_file": "/slot/status.json", "request_dir": str(tmp_path)}})
+    plain, boss = Fake(), Fake(viewer="root", admin=True)
+    now = int(boss.backend.now().timestamp())
+    status: dict[str, object] = {"updated": now, "state": "planned", "planned_at": now + 3600, "detail": "waits for jobs",
+                                 "waiting": [{"kind": "kernel", "summary": "new kernel <b>6.17</b>"}]}
+    for fake in (plain, boss):
+        fake.backend.site = lambda: site
+        fake.backend.maintenance_status = lambda _path: status
+    assert "Updates waiting for a restart" not in call(plain, "/")[1]  # admins only (D3)
+    page = call(boss, "/")[1]
+    assert "A restart is planned for" in page and "new kernel &lt;b&gt;6.17&lt;/b&gt;" in page  # escaped: another program wrote it
+    assert 'data-maintenance="restart_now"' in page and 'data-maintenance="skip_week"' in page
+    for unavailable in (None, {**status, "updated": now - app.MAINTENANCE_STALE_S - 1}, {**status, "updated": now + 3600},
+                        {**status, "state": "rebooting"}, {**status, "waiting": "kernel"}):
+        boss.backend.maintenance_status = lambda _path, raw=unavailable: raw
+        assert "Maintenance status unavailable" in call(boss, "/")[1]  # never read as "nothing waits"
+    boss.backend.maintenance_status = lambda _path: {**status, "state": "none", "waiting": []}
+    assert "Updates waiting for a restart" not in call(boss, "/")[1]  # nothing waits: no banner
+    boss.backend.maintenance_status = lambda _path: status
+    boss.backend.can_write = lambda _path: False  # an admin the slot's folder does not admit gets no buttons
+    assert "data-maintenance" not in call(boss, "/")[1] and "not writable for you" in call(boss, "/")[1]
+    assert call(plain, "/api/maintenance/restart_now", "POST", {})[0][:3] == "403" and list(tmp_path.iterdir()) == []
+    assert call(boss, "/api/maintenance/reboot", "POST", {})[0][:3] == "404"
+    assert json.loads(call(boss, "/api/maintenance/skip_week", "POST", {})[1])["ok"]
+    (request,) = tmp_path.glob("root-*-skip_week.json")
+    assert json.loads(request.read_text())["action"] == "skip_week"
+    boss.backend.site = lambda: dataclasses.replace(site, maintenance=None)
+    assert "Updates waiting" not in call(boss, "/")[1] and call(boss, "/api/maintenance/skip_week", "POST", {})[0][:3] == "404"
+
+
 def test_the_log_of_a_job_that_ran_on_a_part_time_machine_is_its_copied_back_one(monkeypatch: pytest.MonkeyPatch) -> None:
     fake = Fake()
     fake.backend.log_tail = lambda path, text=None, errors_only=False: "" if path == "/copy/x.log" else jobs_view.NO_LOG

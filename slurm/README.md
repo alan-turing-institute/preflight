@@ -230,6 +230,17 @@ on a site of several.
 | `cores` | required | Cores the partition may use per node (`MaxCPUsPerNode`), 1 up to the cores CPU-only jobs may use. |
 | `group` | `gpujobs-service` | Unix group allowed to submit (`AllowGroups=`, with the admin group). `install.py service add USER` adds one. |
 
+### `[maintenance]` (optional)
+
+For a site whose machine is restarted for updates by a slot of its own (a weekly window run outside these tools). The
+jobs page shows the site's admins a banner of the updates that wait, with **Restart now** and **Skip this week**.
+Nothing here restarts anything: the buttons only leave a request for the slot, which decides and logs its verdict.
+
+| Field | Default | Meaning |
+|---|---|---|
+| `status_file` | required | Absolute path of the slot's status, JSON: `{"updated": epoch, "state": "none" \| "planned" \| "skipped" \| "running" \| "failed" \| "done", "planned_at": epoch or null, "waiting": [{"kind": "...", "summary": "one plain line"}], "detail": "one plain line"}`. A missing, malformed or more than an hour old file shows "status unavailable", never "nothing waits". |
+| `request_dir` | required | Absolute path where a button leaves `{"action": "restart_now" \| "skip_week", "at": epoch}` as `<user>-<ns>-<action>.json`, owned by the admin who pressed it. Only admins who can write this folder see the buttons; the slot checks the owner itself. |
+
 ### `[slurm]` (optional)
 
 Build and install a SchedMD slurm release instead of the distribution's. Absent: the distribution's packages, as

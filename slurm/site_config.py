@@ -133,6 +133,16 @@ class Node:
 
 
 @dataclass(frozen=True)
+class Maintenance:
+    """`[maintenance]`: a restart slot run outside these tools (the site's own) writes `status_file`, a JSON status of
+    the updates waiting for a restart, which the jobs page shows its admins; its buttons leave requests in
+    `request_dir`, which that slot reads and decides on."""
+
+    status_file: str
+    request_dir: str
+
+
+@dataclass(frozen=True)
 class HealthCheck:
     """`[health_check]`: slurmd runs `node_check.py` on every node each `interval_s` seconds (slurm's HealthCheckInterval)."""
 
@@ -208,6 +218,7 @@ class Site:
     slurm_build: tuple[str, str] | None = None  # ([slurm] version, sha256): build that release, not the distro's slurm
     slurm_steps: tuple[tuple[str, str], ...] = ()  # ([slurm] steps) the releases `upgrade-slurm` passes through, in order
     health_check: HealthCheck | None = None  # None: no health-check lines and no node_check.json
+    maintenance: Maintenance | None = None  # None: no maintenance banner on the jobs page
     constrain_devices: bool = True  # cgroup.conf ConstrainDevices: a job sees only the GPUs it holds
     shared_state: bool = False  # the part-time nodes see this state_dir (a shared filesystem): nothing is copied back
     node_python: str = "/usr/bin/python3"  # the interpreter a part-time job's wrapper runs with, there
@@ -352,6 +363,14 @@ def _check_part_time(node: Node, where: str) -> None:
 MIN_HEALTH_CHECK_S = 10
 
 
+def _parse_maintenance(raw: Any) -> Maintenance:
+    t = _table(raw, "maintenance", {"status_file", "request_dir"}, {})
+    for key in ("status_file", "request_dir"):
+        if not (isinstance(t[key], str) and t[key].startswith("/")):
+            raise SiteError(f"site file: maintenance.{key} = {t[key]!r}; expected an absolute path")
+    return Maintenance(t["status_file"], t["request_dir"])
+
+
 def _parse_health_check(raw: Any) -> HealthCheck:
     t = _table(raw, "health_check", set(), {"interval_s": 30})
     if type(t["interval_s"]) is not int or t["interval_s"] < MIN_HEALTH_CHECK_S:
@@ -445,6 +464,7 @@ def parse(raw: dict[str, Any]) -> Site:
             "remote": {},
             "slurm": None,
             "health_check": None,
+            "maintenance": None,
             "shared_state": False,
             "node_python": "/usr/bin/python3",
             "requeue_delay_s": 60,
@@ -530,6 +550,7 @@ def parse(raw: dict[str, Any]) -> Site:
         slurm_build=slurm[0],
         slurm_steps=slurm[1],
         health_check=_parse_health_check(top["health_check"]) if top["health_check"] is not None else None,
+        maintenance=_parse_maintenance(top["maintenance"]) if top["maintenance"] is not None else None,
         constrain_devices=top["constrain_devices"],
         shared_state=top["shared_state"],
         node_python=top["node_python"],

@@ -113,6 +113,7 @@ WHEN = re.compile(r"\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}:\d{2})?")
 ROUTE_JOB = re.compile(r"/job/(\d+)")
 ROUTE_API = re.compile(r"/api/job/([^/]+)/([a-z-]+)")
 ROUTE_PART_TIME = re.compile(r"/api/part-time/([^/]+)/([a-z_]+)")
+ROUTE_MAINTENANCE = re.compile(r"/api/maintenance/([a-z_]+)")
 
 
 class Action(StrEnum):
@@ -232,6 +233,8 @@ class Backend:
     site: Callable[[], site_config.Site | None] = _site
     part_time_state: Callable[[list[str]], Mapping[str, PartTimeState]] = lambda names: _part_time_state(names)
     requests_dir: Path = field(default_factory=lambda: gpu_jobs.STATE_DIR / "requests")
+    maintenance_status: Callable[[str], Mapping[str, object] | None] = lambda path: gpu_jobs.read_json(Path(path))
+    can_write: Callable[[str], bool] = lambda path: os.access(path, os.W_OK)
 
 
 def esc(value: object) -> str:
@@ -882,6 +885,7 @@ def index_page(backend: Backend, root: str = "") -> str:
         queue=_queue_table(rows, root, now),
         recent=recent_html,
         part_time=_part_time_card(backend),
+        maintenance=_maintenance_card(backend),
     )
     return _page(backend, "Queue", body, root=root, tab=Tab.QUEUE)
 
@@ -1485,11 +1489,121 @@ def _part_time_card(backend: Backend) -> str:
         '<span class="meta">Other people\'s machines, lent to the cluster while they are idle</span></div>'
         '<div class="card-body">' + "".join(_part_time_node(n, states.get(n.name), site.shared_state) for n in site.part_time_nodes)
         + '<div id="part-time-result" class="notice" role="status"></div></div></section>'
-        '<dialog id="confirm" aria-labelledby="confirm-title"><form method="dialog"><h2 id="confirm-title"></h2>'
-        '<pre id="confirm-detail"></pre><p id="confirm-lose-label" hidden><label><input id="confirm-lose" type="checkbox"></label></p>'
-        '<div class="actions"><button id="confirm-no" value="no">Keep it</button>'
-        '<button id="confirm-yes" value="yes" class="danger">Confirm</button></div></form></dialog>'
     )
+
+
+class MaintenanceState(StrEnum):
+    """The `state` a site's restart slot writes in its status file (`[maintenance] status_file`, D43)."""
+
+    NONE = "none"
+    PLANNED = "planned"
+    SKIPPED = "skipped"
+    RUNNING = "running"
+    FAILED = "failed"
+    DONE = "done"
+
+
+class MaintenanceAction(StrEnum):
+    """What the maintenance banner's buttons ask the restart slot for."""
+
+    RESTART_NOW = "restart_now"
+    SKIP_WEEK = "skip_week"
+
+
+#: A status not rewritten for this long is unavailable, never "nothing waits" (a slot rewrites it every 15 minutes).
+MAINTENANCE_STALE_S = 3600
+#: A status written this far in the future is believed (clock steps); further is unavailable too.
+CLOCK_SLACK_S = 60
+MAINTENANCE_WORDS = {
+    MaintenanceState.PLANNED: "A restart is planned",
+    MaintenanceState.SKIPPED: "This week's restart is skipped",
+    MaintenanceState.RUNNING: "The restart window is running",
+    MaintenanceState.FAILED: "The last restart window failed",
+}
+
+
+@dataclass(frozen=True)
+class MaintenanceStatus:
+    """The restart slot's status file, checked field by field: another program wrote it."""
+
+    state: MaintenanceState
+    updated: int
+    planned_at: int | None
+    waiting: tuple[str, ...]  # one plain line per update that waits
+    detail: str
+
+    @classmethod
+    def parse(cls, raw: Mapping[str, object] | None, now: float) -> MaintenanceStatus | None:
+        """None when the file is missing, not the agreed shape, stale or from the future."""
+        if not isinstance(raw, dict):
+            return None
+        updated, planned, waiting = raw.get("updated"), raw.get("planned_at"), raw.get("waiting")
+        if type(updated) is not int or not now - MAINTENANCE_STALE_S <= updated <= now + CLOCK_SLACK_S:
+            return None
+        if planned is not None and type(planned) is not int:
+            return None
+        if not isinstance(waiting, list) or not all(isinstance(w, dict) and isinstance(w.get("summary"), str) for w in waiting):
+            return None
+        try:
+            state = MaintenanceState(str(raw.get("state")))
+        except ValueError:
+            return None
+        detail = raw.get("detail")
+        return cls(state, updated, planned, tuple(w["summary"] for w in waiting), detail if isinstance(detail, str) else "")
+
+
+def _maintenance_card(backend: Backend) -> str:
+    """The admins' banner for updates that wait for a restart (D43): what waits, when, and two buttons that leave a
+    request for the site's restart slot. "" for anyone else, for a site without `[maintenance]`, and when nothing
+    waits; an unreadable or stale status says so instead of looking like nothing waits."""
+    site = backend.site()
+    if site is None or site.maintenance is None or not backend.is_admin(backend.viewer()):
+        return ""
+    status = MaintenanceStatus.parse(backend.maintenance_status(site.maintenance.status_file), backend.now().timestamp())
+    head = '<section class="card" aria-labelledby="h-maintenance"><div class="card-head"><h2 id="h-maintenance">Updates waiting for a restart</h2>'
+    if status is None:
+        return (head + '<span class="meta">admins only</span></div><div class="card-body"><p>Maintenance status unavailable: the '
+                "restart slot's status file is missing, not readable or more than an hour old.</p></div></section>")
+    if not status.waiting and status.state not in (MaintenanceState.RUNNING, MaintenanceState.FAILED):
+        return ""
+    when = MAINTENANCE_WORDS.get(status.state, "Updates wait for a restart")
+    if status.state is MaintenanceState.PLANNED and status.planned_at is not None:
+        when += f" for {datetime.fromtimestamp(status.planned_at):%a %d %b %H:%M}"  # noqa: DTZ006 - the box's local time
+    buttons = []
+    if status.waiting and status.state is not MaintenanceState.RUNNING:
+        buttons.append('<button type="button" class="danger" data-maintenance="restart_now" data-detail="The restart slot holds waiting '
+                       'jobs, waits for running ones to end, installs what waits and restarts the machine. It uses up this '
+                       "week's slot.\">Restart now</button>")
+    if status.state is MaintenanceState.PLANNED:
+        buttons.append('<button type="button" data-maintenance="skip_week">Skip this week</button>')
+    if buttons and not backend.can_write(site.maintenance.request_dir):
+        buttons = ['<p class="muted">You cannot leave requests: the restart slot\'s request folder is not writable for you.</p>']
+    items = "".join(f"<li>{esc(line)}</li>" for line in status.waiting)
+    return (head + f'<span class="meta">admins only</span></div><div class="card-body"><p>{esc(when)}.</p>'
+            + (f"<ul>{items}</ul>" if items else "") + (f'<p class="muted">{esc(status.detail)}</p>' if status.detail else "")
+            + (f'<div class="actions">{"".join(buttons)}</div>' if buttons else "")
+            + '<div id="maintenance-result" class="notice" role="status"></div></div></section>')
+
+
+def maintenance_request(backend: Backend, action: str) -> dict[str, object]:
+    """Leave a request for the site's restart slot (`<request_dir>/<viewer>-<ns>-<action>.json`). The file is the
+    viewer's own, which is how the slot knows who asked; it decides, and logs its verdict."""
+    site = backend.site()
+    if site is None or site.maintenance is None:
+        raise Refused("404 Not Found", "this site has no restart slot")
+    viewer = backend.viewer()
+    if not backend.is_admin(viewer):
+        raise Refused("403 Forbidden", "only an admin asks for a restart")
+    try:
+        kind = MaintenanceAction(action)
+    except ValueError:
+        raise Refused("404 Not Found", "no such action") from None
+    try:
+        gpu_jobs.write_json(Path(site.maintenance.request_dir) / f"{viewer}-{time.time_ns()}-{kind}.json",
+                            {"action": kind.value, "at": int(time.time())})
+    except OSError as exc:
+        return {"ok": False, "output": f"could not leave the request: {exc}"}
+    return {"ok": True, "output": "Request left; the restart slot decides (its decisions log says what it did)."}
 
 
 #: The request fields each part-time action may carry; anything else the page was sent is dropped.
@@ -1573,6 +1687,10 @@ def _api(backend: Backend, environ: Mapping[str, object], path: str, query: Mapp
     if match := ROUTE_PART_TIME.fullmatch(path):
         _check_post(environ)
         return _json(part_time_request(backend, match[1], match[2], _read_json(environ)))
+    if match := ROUTE_MAINTENANCE.fullmatch(path):
+        _check_post(environ)
+        _read_json(environ)  # the body is checked like every action's, and carries nothing
+        return _json(maintenance_request(backend, match[1]))
     match = ROUTE_API.fullmatch(path)
     if not match:
         raise Refused("404 Not Found", "no such route")

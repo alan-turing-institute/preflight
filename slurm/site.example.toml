@@ -120,6 +120,13 @@ python = "/opt/gpujobs/venv/bin/python"       # interpreter with localmodels ins
 # sha256 = "4680cafc82b0689865c885eb703441e7ebf764896c40fd03a50f2fcb60664f68"   # its tarball's digest (required with version)
 # steps = ["25.05.9:7be633820df896df819ac2e9f2ebd0824de509515e5fb78ba1c19da2453b39ed"]   # releases `install.py upgrade-slurm` passes through first, "<version>:<sha256>", ascending, each older than version
 
+# A restart slot of the site's own (a weekly window run outside these tools) writes status_file; the jobs page shows
+# its admins what waits for a restart, and its Restart now / Skip this week buttons leave a request in request_dir,
+# which that slot decides on. Both or neither; absent: no banner.
+# [maintenance]
+# status_file = "/var/lib/restart-slot/status.json"
+# request_dir = "/var/lib/restart-slot/requests"
+
 # Optional. slurmd runs slurm/node_check.py on every node each interval (as root): it closes a node that is low on
 # memory (or on battery) and reopens it, and requeues a resume job when memory is lower still. Per-node thresholds are
 # in [[nodes]]; settings are rendered to /etc/gpujobs/node_check.json. Leave the table out for no health check.

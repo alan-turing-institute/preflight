@@ -164,8 +164,27 @@ function partTimeControls() {
   }
 }
 
+// The admins' maintenance banner (D43): each button leaves one request for the site's restart slot, which decides.
+async function maintenance(action) {
+  const result = document.getElementById("maintenance-result");
+  const done = await postJson(ROOT + "api/maintenance/" + action, {});
+  result.className = "notice " + (done.ok ? "ok" : "err");
+  result.textContent = (done.ok ? "" : "Failed: ") + (done.output || done.error || action);
+}
+
+function maintenanceControls() {
+  for (const button of document.querySelectorAll("button[data-maintenance]")) {
+    button.addEventListener("click", async () => {
+      const action = button.dataset.maintenance;
+      if (action === "restart_now" && !(await confirmInPage("Restart the machine now?", button.dataset.detail, false))) return;
+      maintenance(action);
+    });
+  }
+}
+
 document.addEventListener("DOMContentLoaded", () => {
   partTimeControls();
+  maintenanceControls();
   if (document.querySelector("[data-live]")) setInterval(refreshLive, REFRESH_MS);
   if (document.querySelector("[data-tip]")) tooltips();
   const log = document.getElementById("log-viewer");
