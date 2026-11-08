@@ -748,8 +748,7 @@ def _queue_table(rows: list[dict[str, object]], root: str, now: datetime) -> str
         body.append(
             "<tr>"
             f'<td class="num muted">{position}</td>'
-            f'<td class="lead"><a class="title" href="{root}job/{esc(r["id"])}">{esc(r["short"])}</a> <span class="jobid">#{esc(r["id"])}</span>'
-            f'{f"<div class=\"desc\">{esc(r["description"])}</div>" if r["description"] else ""}</td>'
+            f'<td class="lead">{_job_link(root, str(r["id"]), str(r["short"]), str(r["description"]))}</td>'
             f"<td class=\"inline\">{_project(str(r['project']))}</td>"
             f'<td class="inline state">{_badge(str(r["kind"]), str(r["state_label"]))}{why}</td>'
             f'<td class="inline" data-k="level">{_level_pill(r["level"])}</td>'
@@ -778,7 +777,14 @@ def _finished_memory(r: jobs_view.HistoryRow) -> str:
                   ("asked", _size(r.req_mem_bytes) if r.req_mem_bytes else ""))
 
 
-def _finished_rows(rows: list[jobs_view.HistoryRow], root: str, now: datetime) -> str:
+def _job_link(root: str, job_id: str, short: str, what: str) -> str:
+    """A job's name linked to its page, its description on hover (2026-11-08: shown in full it made every row tall)."""
+    title = f' title="{esc(what)}"' if what else ""
+    return f'<a class="title" href="{root}job/{esc(job_id)}"{title}>{esc(short)}</a> <span class="jobid">#{esc(job_id)}</span>'
+
+
+def _finished_rows(rows: list[jobs_view.HistoryRow], root: str, now: datetime,
+                   what: Callable[[jobs_view.HistoryRow], str] = lambda _r: "") -> str:
     out = []
     for r in rows:
         kind, label = _result(r.state)
@@ -786,7 +792,7 @@ def _finished_rows(rows: list[jobs_view.HistoryRow], root: str, now: datetime) -
         exit_note = f' <span class="exit-bad small">{esc(code)}</span>' if code and kind != Kind.CANCELLED else ""
         out.append(
             "<tr>"
-            f'<td class="lead"><a class="title" href="{root}job/{esc(r.job_id)}">{esc(_short(r.name))}</a> <span class="jobid">#{esc(r.job_id)}</span></td>'
+            f'<td class="lead">{_job_link(root, r.job_id, _short(r.name), what(r))}</td>'
             f'<td class="inline">{_project(r.project)}</td>'
             f'<td class="inline">{_badge(kind, label)}{exit_note}{_node_line(r.node)}</td>'
             # how long it waited to start; one that never started, until it ended
@@ -803,12 +809,18 @@ def _finished_rows(rows: list[jobs_view.HistoryRow], root: str, now: datetime) -
     return "".join(out)
 
 
-def _finished_table(rows: list[jobs_view.HistoryRow], root: str, now: datetime) -> str:
+def _described(backend: Backend) -> Callable[[jobs_view.HistoryRow], str]:
+    """A finished job's description from its record (as the user slurm says ran it), "" without one."""
+    return lambda r: str((backend.record(r.job_id, user=r.user) or {}).get("what") or "")
+
+
+def _finished_table(rows: list[jobs_view.HistoryRow], root: str, now: datetime,
+                    what: Callable[[jobs_view.HistoryRow], str] = lambda _r: "") -> str:
     return (
         '<div class="table-wrap"><table class="stack"><thead><tr><th scope="col">Job</th><th scope="col">Project</th><th scope="col">Result</th>'
         '<th scope="col">Queued at</th><th scope="col">Started</th><th scope="col">Ended</th><th scope="col">Took</th><th scope="col" class="hide-sm">GPUs</th>'
         '<th scope="col" class="hide-sm">Memory</th><th scope="col" class="hide-sm">Cores used</th><th scope="col">User</th>'
-        f"</tr></thead><tbody>{_finished_rows(rows, root, now)}</tbody></table></div>"
+        f"</tr></thead><tbody>{_finished_rows(rows, root, now, what)}</tbody></table></div>"
     )
 
 
@@ -836,7 +848,7 @@ def index_page(backend: Backend, root: str = "") -> str:
     recent_html = (
         '<div class="card-head"><h2 id="h-recent">Finished in the last 24 hours</h2>'
         f'<a class="meta" href="{root}history">All history →</a></div>'
-        + (_finished_table(recent[:RECENT_ROWS], root, now) if recent else '<div class="empty">No job finished in the last 24 hours.</div>')
+        + (_finished_table(recent[:RECENT_ROWS], root, now, _described(backend)) if recent else '<div class="empty">No job finished in the last 24 hours.</div>')
     )
     body = _template("index.html").substitute(
         updated=now.strftime("%H:%M:%S"),
@@ -1140,7 +1152,7 @@ def history_page(backend: Backend, query: Mapping[str, list[str]], root: str = "
     shown = rows[(page - 1) * HISTORY_PAGE : page * HISTORY_PAGE]
     keep = {"since": since, "until": until or "", **filters}
     table = (
-        _finished_table(shown, root, now) if shown
+        _finished_table(shown, root, now, _described(backend)) if shown
         else '<div class="empty"><strong>No jobs match</strong>Try a longer period or clear a filter.</div>'
     )
 

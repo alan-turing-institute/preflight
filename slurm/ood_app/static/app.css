@@ -145,11 +145,11 @@ td.r, th.r { text-align: right; }
 td.num, td.nowrap { white-space: nowrap; }
 td .title { font-weight: 600; color: var(--ink); }
 td .title:hover { color: var(--accent-ink); }
-td .desc { color: var(--ink-2); font-size: 12.5px; margin-top: 2px; max-width: 56ch; }
 td .why { color: var(--ink-2); font-size: 12.5px; margin-top: 4px; }
 td ul.waits { list-style: none; margin: 2px 0 0; padding: 0; font-size: 12.5px; }
 td ul.waits li { margin-top: 2px; }
-td.state { min-width: 15rem; }
+td.state { min-width: 13rem; }
+tr:has(> td.state) > td.lead { min-width: 12rem; }
 details.waits > summary { cursor: pointer; color: var(--accent-ink); }
 .jobid { color: var(--muted); font-size: 12.5px; }
 .empty { padding: 36px 18px; text-align: center; color: var(--muted); }
@@ -276,7 +276,7 @@ dialog .actions { justify-content: flex-end; margin-top: 16px; }
   table.stack tr { display: block; padding: 12px 16px; border-bottom: 1px solid var(--border); }
   table.stack tbody tr:last-child { border-bottom: 0; }
   table.stack td { display: block; padding: 2px 0; border: 0; }
-  table.stack td.state { min-width: 0; }
+  table.stack td.state, table.stack tr:has(> td.state) > td.lead { min-width: 0; }
   table.stack td.lead { padding-bottom: 6px; }
   table.stack td.inline { display: inline-block; margin-right: 12px; }
   table.stack td.hide-sm { display: none; }

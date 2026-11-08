@@ -125,6 +125,11 @@ def test_every_get_route_answers(path: str) -> None:
             '<div class="why">waits for these to finish:</div><ul class="waits">'
             '<li><a href="/r/job/2203" title="put the &lt;scores&gt; in">store&lt;b&gt;</a> <span class="jobid">#2203</span></li>'
             '<li><a href="/r/job/2206" title="">job 2206</a> <span class="jobid">#2206</span></li></ul>')
+        # a job's description is its name's hover text in the queue and in the finished table, not a block of text
+        assert 'title="a run">train</a>' in body and 'class="desc"' not in body
+        done = jobs_view.HistoryRow("5", "p:restart:fit", "p", "alice", "cpu", "COMPLETED", "0:0", None, None, None, 0, 0, None)
+        assert 'href="/r/job/5" title="fit the &lt;model&gt;">fit</a>' in app._finished_rows(
+            [done], "/r/", datetime(2026, 10, 19), lambda r: "fit the <model>")
         # more than three fold behind one line, kept open across the 10 s refresh by its key
         assert app._waits_cell(waits * 2, "/r/", "9").startswith(
             '<details class="waits" data-key="waits-9"><summary class="why">waits for 4 jobs to finish</summary>')
