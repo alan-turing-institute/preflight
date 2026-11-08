@@ -24,7 +24,7 @@ def make_cgroup(tmp_path: Path) -> Callable[..., Path]:
     def make(name: str = "job", *, current: int = 4_350_000_000, cache: int = 600_000_000, shmem: int = 50_000_000,
              limit: str = "max", pids: str = "100\n101\n") -> Path:
         cgroup = tmp_path / name
-        cgroup.mkdir()
+        cgroup.mkdir(parents=True)
         (cgroup / "memory.current").write_text(f"{current}\n")
         (cgroup / "memory.stat").write_text(f"anon 1\nfile {cache}\nshmem {shmem}\n")
         (cgroup / "memory.max").write_text(f"{limit}\n")

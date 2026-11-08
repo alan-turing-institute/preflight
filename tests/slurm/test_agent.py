@@ -6,11 +6,14 @@ import dataclasses
 import json
 import subprocess
 import sys
+import time
+from collections.abc import Callable
 from pathlib import Path
 
 import agent as agent_module
 import gpu_jobs
 import levels
+import memory_guard
 import pytest
 import site_config
 
@@ -59,6 +62,11 @@ class World:
         self.notify_command: tuple[str, ...] = ()
         self.metrics_mode = "off"
         self.smi: dict[int, float] | None = {}  # nvidia-smi's GPU MiB per pid; None when it does not answer
+        self.smi_calls = 0
+        self.unified = False  # a unified-memory site (D44): then `guard` is the agent's memory guard
+        self.guard: memory_guard.MemoryGuard | None = None
+        self.extra = ""  # node n1's Extra in `scontrol show node n1 --json`
+        self.guard_lines: list[str] = []
         self.cgroups = tmp_path / "cgroup"
         self.live: dict[int, str] = {}  # pid -> job of the processes that still exist when the OOM guard names them
         (tmp_path / "agent").mkdir()
@@ -72,6 +80,8 @@ class World:
         self, argv: list[str], **_kw: object
     ) -> subprocess.CompletedProcess[str]:
         match argv[1:3]:
+            case ["show", "node"] if "--json" in argv and argv[3] == "n1":
+                return done(argv, out=json.dumps({"nodes": [{"name": "n1", "extra": self.extra}]}))
             case ["show", "node"] if "--json" in argv:
                 return done(argv, out=json.dumps({"nodes": [self.lap]}))
             case ["-h", "-t"]:  # squeue -h -t R -w NODE
@@ -95,7 +105,7 @@ class World:
             {"name": "t", "nodes": nodes + ([{"name": "lap", "cpus": 8, "real_memory_mb": 30000, "part_time": True,
                                                "address": "10.0.0.2"}] if self.lap else []),
              "notify_command": list(self.notify_command), "metrics": {"mode": self.metrics_mode},
-             "shared_state": self.shared_state}
+             "shared_state": self.shared_state, "unified_memory": self.unified}
         )
         return agent_module.Agent(
             site,
@@ -106,12 +116,28 @@ class World:
             clock=lambda: self.t,
             boot_id=lambda: self.boot,
             completion=lambda: self.records,
-            gpu_usage=lambda: self.smi,
+            gpu_usage=self.gpu_usage,
             cgroup_root=self.cgroups,
             pid_job=lambda pid: self.live.get(pid),
             part_time_conf=self.dir / "part_time_nodes.conf",
             copier=lambda argv, **_kw: self.copies.append(argv) or done(argv, self.copy_answer[0], err=self.copy_answer[1]),
+            guard=self.guard, hostname="n1.example", node_check_path=self.dir / "node_check.json",
+            meminfo_path=self.dir / "meminfo",
         )
+
+    def gpu_usage(self) -> dict[int, float] | None:
+        self.smi_calls += 1
+        return self.smi
+
+    def unify(self) -> memory_guard.MemoryGuard:
+        """Make the site unified-memory, with a memory guard whose scancel is recorded like scontrol's writes."""
+        self.unified = True
+        (self.dir / "meminfo").write_text("MemTotal: 125000000 kB\nMemAvailable: 100000000 kB\n")
+        actuator = memory_guard.Actuator(self.dir, scancel=lambda argv: self.writes.append(argv) or 0)
+        self.guard = memory_guard.MemoryGuard(memory_guard.StopPolicy(), actuator, meminfo_path=self.dir / "meminfo",
+                                              clock=lambda: self.t, log=self.guard_lines.append)
+        self.agent = self.new_agent()
+        return self.guard
 
     def step(self) -> dict[str, object]:
         return self.agent.step()
@@ -210,6 +236,121 @@ def test_oom_guard_kills_are_recorded_for_the_job_that_lost_the_process_and_drop
     world.queue = [job("6", "PENDING")]  # job 5 has left the queue: its wrapper has read its record already
     world.step()
     assert sorted(p.name for p in kills.iterdir()) == ["job_6.json"]
+
+
+GB = 10**9
+SCOPE = "cgroup/system.slice/n1_slurmstepd.scope"
+OVER, STOP = frozenset({gpu_jobs.EventAction.OVER_ASK}), frozenset({gpu_jobs.EventAction.MEMORY_STOP})
+FIRST_RUN = 100  # slurm start times of a job's runs
+SITE_LEVEL_MB, FILE_LEVEL_MB, EXTRA_LEVEL_MB = 16_000, 20_000, 30_000  # the site default, the settings, the Extra
+
+
+def test_a_unified_node_tells_each_run_over_its_ask_once_from_one_card_sample_per_step(
+        world: World, make_cgroup: Callable[..., Path], monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(gpu_jobs, "SLURM_USER", gpu_jobs.current_user())  # the agent writes the events here
+    make_cgroup(f"{SCOPE}/job_5", current=3 * GB, cache=0, shmem=0, limit=str(GB), pids="10\n")  # 2 GB over, + card
+    make_cgroup(f"{SCOPE}/job_6", current=GB + GB // 2, cache=0, shmem=0, limit=str(GB), pids="20\n")  # 0.5 GB: noise
+    world.smi, world.metrics_mode = {10: 512.0}, "local"
+    world.unify()
+    over = dataclasses.replace(job("5"), user="ann", name="p:resume:big", start=FIRST_RUN)
+    world.queue = [over, dataclasses.replace(job("6"), start=101)]
+    world.step()
+    beat = world.step()
+    assert world.smi_calls == len(["first step", "second step"]) and (world.dir / "metrics" / "job_5.prom").exists()  # one sample feeds both
+    told = gpu_jobs.agent_notices("5", OVER)
+    assert len(told) == 1 and told[0].fields["start"] == FIRST_RUN and told[0].fields["card"] == 512 * 2**20
+    assert told[0].fields["message"] == "job 5 (p:resume:big) uses 3.5 GB (memory 3.0 GB + card 537 MB), over its ask of 1.0 GB"
+    assert gpu_jobs.agent_notices("6", OVER) == []
+    world.agent = world.new_agent()  # a restarted agent does not tell the same run again ...
+    world.step()
+    world.queue = [dataclasses.replace(over, start=200)]  # ... but a requeued run is a new one
+    world.step()
+    assert [e.fields["start"] for e in gpu_jobs.agent_notices("5", OVER)] == [100, 200]
+    # the guard watches this node at the health check's own level: the site's 16 GB, then the node's valid Extra
+    assert beat["memory_guard"]["level_mb"] == SITE_LEVEL_MB
+    settings = {"node": "n1", "close_below_mb": FILE_LEVEL_MB, "push_back_below_mb": 10_000, "meminfo_path": "/proc/meminfo",
+                "power_supply_dir": "/x", "state_path": "/x", "log_path": "/x"}
+    (world.dir / "node_check.json").write_text(json.dumps(settings))
+    world.extra = json.dumps({"close_below_mb": EXTRA_LEVEL_MB})
+    assert world.step()["memory_guard"]["level_mb"] == EXTRA_LEVEL_MB
+    world.extra = json.dumps({"close_below_mb": "lots"})
+    beat = world.step()
+    assert beat["memory_guard"]["level_mb"] == FILE_LEVEL_MB and "Extra ignored" in beat["last_error"]
+
+
+def test_the_agent_carries_a_stop_to_its_end_and_records_each_outcome_once(
+        world: World, monkeypatch: pytest.MonkeyPatch) -> None:
+    me = gpu_jobs.current_user()
+    monkeypatch.setattr(gpu_jobs, "SLURM_USER", me)
+    guard = world.unify()
+    running = dataclasses.replace(job("5"), user=me, name="p:resume:big", start=100)
+    world.queue = [running]
+
+    def stop(start: int) -> memory_guard.StopRequest:
+        return guard.actuator.request(gpu_jobs.JobMemory("5", me, "p:resume:big", start, 3 * GB, GB, GB), 15 * GB, world.t)
+
+    def ends() -> list[str]:
+        return [str(e.fields["ended"]) for e in gpu_jobs.agent_notices("5", STOP)]
+
+    scancel = ["scancel", "--signal=KILL", "5"]
+    stop(100)
+    world.t += memory_guard.ACK_S - 1
+    world.step()
+    assert scancel not in world.writes
+    world.t += 1  # no acknowledgement in 2 s (a plain sbatch job, or a hung wrapper): scancel
+    world.step()
+    assert world.writes.count(scancel) == 1 and ends() == ["by_scancel"]
+    world.t += memory_guard.STUCK_S  # still there 15 s later: recorded as not ended, once
+    world.step()
+    world.step()
+    assert ends() == ["by_scancel", "not_ended"] and world.writes.count(scancel) == 1
+    world.queue = []
+    world.step()
+    assert not memory_guard.stop_path("5", world.dir).exists()  # gone, recorded and past the hold-off: pruned
+    # acknowledged by the wrapper: no scancel until 15 s, then not ended and scancel anyway (an ack never protects)
+    world.queue = [dataclasses.replace(running, start=300)]
+    request = stop(300)
+    gpu_jobs.update_sidecar("5", **request.ack_fields(world.t))
+    world.t += memory_guard.STUCK_S - 1
+    world.step()
+    assert world.writes.count(scancel) == 1
+    world.t += 1
+    world.step()
+    assert world.writes.count(scancel) == len(["first run", "second run"]) and ends() == ["by_scancel", "not_ended", "not_ended"]
+    # a run its wrapper ended (here requeued, a new start): by the wrapper, and its total sizes the next run
+    world.queue = [dataclasses.replace(running, start=400)]
+    stop(400)
+    world.queue = [dataclasses.replace(running, start=500)]
+    world.step()
+    assert ends()[-1] == "by_wrapper" and gpu_jobs.agent_notices("5", STOP)[-1].fields["total"] == 4 * GB
+    world.t += memory_guard.HOLD_S
+    world.step()
+    assert not memory_guard.stop_path("5", world.dir).exists()  # the older run's request is gone
+
+
+def test_a_unified_node_records_its_outside_use_each_minute_and_a_separate_memory_site_none_of_it(
+        world: World, make_cgroup: Callable[..., Path], monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(gpu_jobs, "SLURM_USER", gpu_jobs.current_user())
+    make_cgroup(f"{SCOPE}/job_5", current=3 * GB, cache=0, shmem=0, limit=str(GB), pids="10\n")
+    world.smi, world.queue = {10: 1000.0}, [dataclasses.replace(job("5"), start=FIRST_RUN)]
+    world.metrics_mode = "local"  # the memory step runs for the metrics ...
+    world.agent = world.new_agent()  # ... but a site that is not unified gets no guard, no record and no over_ask
+    beat = world.step()
+    assert "memory_guard" not in beat and not (world.dir / "agent" / "outside").exists()
+    assert gpu_jobs.agent_notices("5", OVER) == []
+    world.unify()
+    folder = world.dir / "agent" / "outside"
+    folder.mkdir()
+    old = folder / f"{time.strftime('%Y-%m-%d', time.localtime(world.t - 15 * 86400))}.jsonl"
+    old.write_text("{}\n")
+    world.step()
+    world.t += agent_module.OUTSIDE_EVERY_S - 1
+    world.step()  # not yet a minute: one line only
+    [line] = [json.loads(text) for path in folder.glob("*.jsonl") for text in path.read_text().splitlines()]
+    used = (125_000_000 - 100_000_000) * 1024
+    assert line == {"t": int(world.t - agent_module.OUTSIDE_EVERY_S + 1), "node": "n1", "used": used,
+                    "jobs_held": 3 * GB, "jobs_card": 1000 * 2**20, "outside": used - 3 * GB - 1000 * 2**20}
+    assert not old.exists()  # older than 14 days
 
 
 def test_slurmctld_uptime_probe_reads_the_monotonic_timestamp() -> None:

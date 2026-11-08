@@ -332,7 +332,7 @@ def test_a_memory_stop_of_this_run_is_carried_out_by_its_wrapper_and_only_that_o
         assert record["stop_ack"]["at"] >= record["stop_ack"]["request_at"]  # acknowledged before the kill
         assert record["last_leg"]["killed_by"]["guard"] == "memory stop-gap" and "stopped" not in record["last_leg"]
         assert "stopped by the memory guard" in capsys.readouterr().err
-        assert len((state / "footprints" / "91.jsonl").read_text().splitlines()) >= 2  # --sample 0.2 still samples
+        assert len((state / "footprints" / "91.jsonl").read_text().splitlines()) > 1  # --sample 0.2 still samples
         stop("92", time.time() - 100)  # an earlier run's request
         assert run("92", "import time; time.sleep(1)")[0] == 0
         monkeypatch.setattr(gpu_jobs, "SLURM_USER", "somebody-else")  # a request the agent did not write

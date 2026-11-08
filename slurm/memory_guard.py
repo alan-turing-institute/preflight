@@ -80,6 +80,8 @@ class StopRequest:
     card: int
     ask: int
     free: int
+    user: str = ""  # the job's, for the notice once the job has left the queue
+    name: str = ""
     escalated_at: float | None = None  # when the agent sent scancel
     ended: str | None = None  # the `MemoryStopEnd` of the newest memory_stop event written for this request
 
@@ -110,7 +112,8 @@ class StopRequest:
         except TypeError:  # a field missing
             return None
         numbers = (request.start, request.held, request.card, request.ask, request.free)
-        if not (isinstance(request.job, str) and isinstance(request.at, int | float)
+        texts = (request.job, request.user, request.name)
+        if not (all(isinstance(t, str) for t in texts) and isinstance(request.at, int | float)
                 and all(isinstance(n, int) for n in numbers)):
             return None
         return request
@@ -168,7 +171,7 @@ class Actuator:
         self.state_dir, self.scancel = state_dir, scancel
 
     def request(self, jm: JobMemory, free: int, now: float) -> StopRequest:
-        request = StopRequest(jm.job_id, jm.start, now, jm.held, jm.card, jm.ask, free)
+        request = StopRequest(jm.job_id, jm.start, now, jm.held, jm.card, jm.ask, free, jm.user, jm.name)
         request.write(self.state_dir)
         return request
 

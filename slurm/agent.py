@@ -65,6 +65,7 @@ import dataclasses
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 import threading
@@ -79,6 +80,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import gpu_jobs  # the path is set just above
 import jobs_view
 import levels
+import memory_guard
+import node_check
 import site_config
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "install"))  # the installer ships render.py there
@@ -95,6 +98,11 @@ ROOM_WAIT_S = 60.0
 ROOM_RETRY_S = 300.0
 NOTIFY_TIMEOUT_S = 30
 MIB = 1024 * 1024
+#: How often a unified-memory node records the memory used outside its jobs (`status.py --reserve` reads it, D44).
+OUTSIDE_EVERY_S = 60.0
+#: Days of that record kept.
+OUTSIDE_KEEP_DAYS = 14
+DAY_S = 86400
 #: How many ended jobs are remembered.
 ENDED_KEPT = 5000
 
@@ -149,6 +157,8 @@ class NotifyEvent(StrEnum):
 
     FAILED = "failed"  # a job ended FAILED, OUT_OF_MEMORY, TIMEOUT or NODE_FAIL
     IDLE = "idle"  # a waste finding (D40): a job waits beside hardware a moved job would put to work
+    OVER_ASK = "over_ask"  # a running job holds more memory (host + card) than it asked for (D44)
+    MEMORY_STOP = "memory_stop"  # the memory guard stopped a job, and how it ended (D44)
 
 
 class NotifyRole(StrEnum):
@@ -561,8 +571,20 @@ class Agent:
         pid_job: Callable[[int], str | None] = job_of_pid,
         part_time_conf: Path = Path(render.PART_TIME_CONF_PATH),
         copier: Runner = subprocess.run,
+        guard: memory_guard.MemoryGuard | None = None,
+        hostname: str | None = None,
+        node_check_path: Path = node_check.SETTINGS_PATH,
+        meminfo_path: Path = gpu_jobs.MEMINFO,
     ) -> None:
         self.site = site
+        # the unified-memory part (D44) watches the agent's own node: the installer refuses a GPU node elsewhere
+        here = (hostname or socket.gethostname()).split(".")[0]
+        self.own_node = next((node for node in site.nodes if node.name == here), None)
+        self.guard, self.node_check_path, self.meminfo_path = guard, node_check_path, meminfo_path
+        self._guard_level: int | None = None  # the close level last handed to the guard, logged when it changes
+        self._last_usage: dict[int, float] = {}  # the last card sample, for the guard when nvidia-smi is silent
+        self._over_told: set[tuple[str, int]] = set()  # runs already given their over_ask event
+        self._outside_at = -OUTSIDE_EVERY_S
         self.copier = copier
         self._copy_at: dict[str, float] = {}  # node -> when it was last tried
         self.copied: dict[str, int] = {}  # node -> when its state was last copied (kept in agent.json)
@@ -658,8 +680,8 @@ class Agent:
         if now - self._notices_at >= NOTICES_EVERY_S:
             self._notices_at = now
             self._failure_notices(errors)
-        if queue is not None and self.site.metrics.mode != site_config.MetricsMode.OFF:
-            self._job_metrics(queue, errors)
+        if queue is not None and (self.site.unified_memory or self.site.metrics.mode != site_config.MetricsMode.OFF):
+            self._memory_step(queue, now, errors)
         if errors:
             self.last_error, self.last_error_at = "; ".join(errors), int(now)
         return self._persist(now)
@@ -694,6 +716,7 @@ class Agent:
             "note": self.note,
             "copied": self.copied,
             "idle": [dataclasses.asdict(f) | {"text": f.text} for f in self.idle],
+            **({"memory_guard": self.guard.heartbeat()} if self.guard is not None else {}),
         }
         gpu_jobs.write_json(self.dir / "agent.json", beat)
         return beat
@@ -1294,23 +1317,36 @@ class Agent:
         for path in (self.dir / "oom_kills").glob("job_*.json"):
             if path.stem.removeprefix("job_") not in queued:
                 gpu_jobs.remove_quietly(path)
+        if self.guard is not None:  # a stop request goes once its run is gone and recorded (and the hold-off is over)
+            by_id = {job.job_id: job for job in queue}
+            for request in self.guard.actuator.requests():
+                if self.guard.prunable(request, by_id.get(request.job)):
+                    gpu_jobs.remove_quietly(memory_guard.stop_path(request.job, self.state_dir))
 
     # -- 5. job metrics -------------------------------------------------------------------------------------
 
     def _job_cgroup(self, job: gpu_jobs.QueuedJob) -> Path | None:
         return gpu_jobs.job_cgroup(job, self.cgroup_root)
 
-    def _job_metrics(self, queue: list[gpu_jobs.QueuedJob], errors: list[str]) -> None:
+    def _memory_step(self, queue: list[gpu_jobs.QueuedJob], now: float, errors: list[str]) -> None:
+        """One card sample and one list of running jobs with their cgroups, for the metrics and the unified part."""
         # a site without GPUs has no nvidia-smi to ask: its jobs' GPU memory is 0, not unknown
         usage = self.gpu_usage() if any(node.gpus for node in self.site.nodes) else {}
+        running = [(job, cgroup) for job in queue
+                   if job.state == gpu_jobs.State.RUNNING and (cgroup := self._job_cgroup(job)) is not None]
         if usage is None:
-            errors.append("nvidia-smi did not answer; the job metrics files stay as they are")
-            return
+            errors.append("nvidia-smi did not answer; the job metrics files and the over-ask check wait")
+        elif self.site.metrics.mode != site_config.MetricsMode.OFF:
+            self._job_metrics(running, usage, errors)
+        if self.site.unified_memory:
+            self._unified_memory(queue, running, usage, now, errors)
+        if usage is not None:
+            self._last_usage = usage
+
+    def _job_metrics(self, running: list[tuple[gpu_jobs.QueuedJob, Path]], usage: dict[int, float],
+                     errors: list[str]) -> None:
         texts: dict[str, str] = {}
-        for job in queue:
-            cgroup = self._job_cgroup(job) if job.state == gpu_jobs.State.RUNNING else None
-            if cgroup is None:
-                continue
+        for job, cgroup in running:
             pids = gpu_jobs.job_pids(cgroup, set(), job.job_id, set(usage))
             mem = gpu_jobs.read_int(cgroup / "memory.current") or 0
             gpu_mib = sum(mib for pid, mib in usage.items() if pid in pids)
@@ -1340,6 +1376,133 @@ class Agent:
             errors.append(f"job metrics: {exc}")
 
 
+    # -- 7. memory on a unified-memory node (D44) -------------------------------------------------------------
+
+    def _unified_memory(self, queue: list[gpu_jobs.QueuedJob], running: list[tuple[gpu_jobs.QueuedJob, Path]],
+                        usage: dict[int, float] | None, now: float, errors: list[str]) -> None:
+        node = self.own_node
+        if node is None:
+            errors.append("this host is not a node of the site file: the memory guard has nothing to watch")
+            return
+        jobs_memory = node.jobs_mb * gpu_jobs.SLURM_MB
+        level = self._close_level(node, errors)
+        if self.guard is not None:
+            if level != self._guard_level:
+                print(f"[agent] memory guard watching {node.name}: close level {gpu_jobs.size_text(level)}, "
+                      f"jobs memory {gpu_jobs.size_text(jobs_memory)}", flush=True)
+                self._guard_level = level
+            self.guard.update(running, level, jobs_memory, self._last_usage if usage is None else usage)
+            self._stops(queue, now, errors)
+        if usage is None:
+            return  # card memory unknown: no over-ask finding and no outside-use sample this step
+        memories = [m for job, cgroup in running if (m := gpu_jobs.JobMemory.measure(job, cgroup, usage, jobs_memory))]
+        self._over_ask(memories, {(job.job_id, job.start) for job, _ in running}, errors)
+        self._outside(node, memories, now, errors)
+
+    def _close_level(self, node: site_config.Node, errors: list[str]) -> int:
+        """The node's close level in bytes, exactly as its health check computes it: the settings file, then the node's
+        `Extra`; the site's level when there is no health check (or its settings cannot be read)."""
+        try:
+            settings = node_check.load_settings(self.node_check_path, (node.name,))
+        except (OSError, ValueError, KeyError, TypeError, StopIteration) as exc:
+            if self.site.health_check is not None:
+                errors.append(f"health-check settings unreadable ({exc!r}); the memory guard uses the site's close level")
+            return node.close_below_mb * gpu_jobs.MB
+        extra = str((self._node_json(node.name) or {}).get("extra") or "")
+        settings, note = node_check.apply_extra(settings, extra)
+        if note:
+            errors.append(f"memory guard: {note}")
+        return settings.close_below_mb * gpu_jobs.MB
+
+    def _over_ask(self, memories: list[gpu_jobs.JobMemory], runs: set[tuple[str, int]], errors: list[str]) -> None:
+        """One `over_ask` event (and notice) per run that holds at least MIN_EXCESS more than it asked for."""
+        self._over_told &= runs
+        kinds = frozenset({gpu_jobs.EventAction.OVER_ASK})
+        for m in memories:
+            if m.excess < memory_guard.MIN_EXCESS or (m.job_id, m.start) in self._over_told:
+                continue
+            self._over_told.add((m.job_id, m.start))
+            if any(e.fields.get("start") == m.start for e in gpu_jobs.agent_notices(m.job_id, kinds)):
+                continue  # told before this agent started
+            size = gpu_jobs.size_text
+            message = (f"job {m.job_id} ({m.name}) uses {size(m.total)} (memory {size(m.held)} + card {size(m.card)}), "
+                       f"over its ask of {size(m.ask)}")
+            try:
+                gpu_jobs.write_event(m.job_id, gpu_jobs.EventAction.OVER_ASK, message=message, start=m.start,
+                                     held=m.held, card=m.card, ask=m.ask, total=m.total)
+            except OSError as exc:
+                errors.append(f"over_ask event for job {m.job_id}: {exc}")
+            print(f"[agent] {message}", flush=True)
+            self._notify(NotifyEvent.OVER_ASK, m.job_id, m.user, m.name, message, errors)
+
+    def _stops(self, queue: list[gpu_jobs.QueuedJob], now: float, errors: list[str]) -> None:
+        """Carry each pending stop forward: scancel when the wrapper did not act, and one event per outcome."""
+        guard, by_id = self.guard, {job.job_id: job for job in queue}
+        if guard is None:
+            return
+        for request, step in guard.pending(queue):
+            if step is memory_guard.StopStep.ENDED:
+                self._stop_event(request, gpu_jobs.MemoryStopEnd.BY_WRAPPER, "its wrapper ended it", errors)
+            elif step is memory_guard.StopStep.STUCK:
+                print(f"[agent] memory guard: job {request.job} is still running {memory_guard.STUCK_S:.0f} s after "
+                      "scancel: a process may be stuck in the driver", flush=True)
+                self._stop_event(request, gpu_jobs.MemoryStopEnd.NOT_ENDED, "still running after scancel", errors)
+            else:  # ESCALATE
+                job = by_id[request.job]
+                acked = request.acked(gpu_jobs.read_sidecar(job.job_id, job.user))
+                if acked:  # an acknowledgement is the job user's to write: it never makes a run unstoppable
+                    request = self._stop_event(request, gpu_jobs.MemoryStopEnd.NOT_ENDED,
+                                               f"acknowledged, but still running after {memory_guard.STUCK_S:.0f} s", errors)
+                sent = guard.actuator.escalate(request)
+                print(f"[agent] memory guard: scancel --signal=KILL {request.job} "
+                      f"({'acknowledged, not ended' if acked else 'no acknowledgement'}): {'sent' if sent else 'failed'}",
+                      flush=True)
+                request = request.updated(self.state_dir, escalated_at=now)
+                if not acked:
+                    self._stop_event(request, gpu_jobs.MemoryStopEnd.BY_SCANCEL if sent else gpu_jobs.MemoryStopEnd.NOT_ENDED,
+                                     "ended by scancel" if sent else "scancel failed", errors)
+
+    def _stop_event(self, request: memory_guard.StopRequest, ended: gpu_jobs.MemoryStopEnd, how: str,
+                    errors: list[str]) -> memory_guard.StopRequest:
+        size = gpu_jobs.size_text
+        message = (f"job {request.job} ({request.name}) was stopped for memory: free memory was {size(request.free)}, "
+                   f"the run held {size(request.held + request.card)} (memory {size(request.held)} + card "
+                   f"{size(request.card)}) of its {size(request.ask)} ask; {how}")
+        try:
+            gpu_jobs.write_event(request.job, gpu_jobs.EventAction.MEMORY_STOP, **request.event_fields(ended, message))
+        except OSError as exc:
+            errors.append(f"memory_stop event for job {request.job}: {exc}")
+        print(f"[agent] {message}", flush=True)
+        self._notify(NotifyEvent.MEMORY_STOP, request.job, request.user, request.name, message, errors, ended=str(ended))
+        return request.updated(self.state_dir, ended=str(ended))
+
+    def _outside(self, node: site_config.Node, memories: list[gpu_jobs.JobMemory], now: float, errors: list[str]) -> None:
+        """Once a minute, what the node uses outside its jobs, for measuring its reserve (`status.py --reserve`)."""
+        if now - self._outside_at < OUTSIDE_EVERY_S:
+            return
+        self._outside_at = now
+        try:
+            memory = gpu_jobs.meminfo(self.meminfo_path)
+        except (OSError, ValueError) as exc:
+            errors.append(f"outside-use record: {exc}")
+            return
+        used = memory["MemTotal"] - memory["MemAvailable"]
+        held, card = sum(m.held for m in memories), sum(m.card for m in memories)
+        folder = self.dir / "outside"
+        line = {"t": int(now), "node": node.name, "outside": used - held - card, "used": used, "jobs_held": held,
+                "jobs_card": card}
+        oldest = time.strftime("%Y-%m-%d", time.localtime(now - OUTSIDE_KEEP_DAYS * DAY_S))
+        try:
+            folder.mkdir(exist_ok=True)
+            with (folder / f"{time.strftime('%Y-%m-%d', time.localtime(now))}.jsonl").open("a", encoding="utf-8") as out:
+                out.write(json.dumps(line, sort_keys=True) + "\n")
+            for path in folder.glob("*.jsonl"):
+                if path.stem < oldest:
+                    gpu_jobs.remove_quietly(path)
+        except OSError as exc:
+            errors.append(f"outside-use record: {exc}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
@@ -1350,7 +1513,13 @@ def main() -> int:
     )
     arguments = parser.parse_args()
 
-    agent = Agent(site_config.load(), gpu_jobs.STATE_DIR)
+    site = site_config.load()
+    guard = None
+    if site.unified_memory:  # D44: the card shares the host's memory, so a job over its ask can starve the box
+        guard = memory_guard.MemoryGuard(memory_guard.StopPolicy(), memory_guard.Actuator(gpu_jobs.STATE_DIR),
+                                         log=lambda line: print(line, flush=True))
+        guard.start()
+    agent = Agent(site, gpu_jobs.STATE_DIR, guard=guard)
     agent.watch = OomWatch(agent.record_kill)
     agent.watch.start()
     while True:
