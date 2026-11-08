@@ -149,13 +149,19 @@ def resolve_mem(mem: str | None, name: str | None, gpu: bool) -> str | None:
             warn(f"{said} with the whole box given; it asks for the whole box again")
             return WHOLE_BOX
         else:
-            ask = max(math.ceil(gpu_jobs.bumped_mem_mb(kill.asked_mb) / MB_PER_G), history or 0)
+            # a stop-gap stop measured what the run held (host + card, D44): never ask below that plus the margin
+            used_mb = (kill.used_mb or 0) * (1 + AUTO_MARGIN)
+            ask = math.ceil(max(gpu_jobs.bumped_mem_mb(kill.asked_mb), used_mb, (history or 0) * MB_PER_G) / MB_PER_G)
             most_mb = max((node.jobs_mb for node in gpu_jobs.load_site().nodes), default=None)
             said += f" with {_gb(kill.asked_mb)} given"
+            rule = f"at least {OOM_BUMP_RATIO} times that (D35)"
+            if kill.used_mb is not None:
+                said += f" and {_gb(kill.used_mb)} measured in use (memory + card)"
+                rule = f"at least {OOM_BUMP_RATIO} times what it was given and what it used plus {AUTO_MARGIN:.0%} (D35, D44)"
             if most_mb is not None and ask * MB_PER_G > most_mb:
-                warn(f"{said}; {OOM_BUMP_RATIO} times that is more than any node gives jobs, so it asks for the whole box")
+                warn(f"{said}; that is more than any node gives jobs, so it asks for the whole box")
                 return WHOLE_BOX
-            print(f"[submit] memory: {said}; asking {ask}G, at least {OOM_BUMP_RATIO} times that (D35)")
+            print(f"[submit] memory: {said}; asking {ask}G, {rule}")
             return f"{ask}G"
     if history is not None:
         return f"{history}G"

@@ -206,6 +206,26 @@ def test_mem_auto_is_the_highest_of_the_three_newest_clean_runs_and_a_memory_kil
     assert ask() == "14G" and "killed" not in "".join(capsys.readouterr())
 
 
+def test_a_memory_stop_sizes_the_next_run_from_what_it_used(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(gpu_jobs, "STATE_DIR", tmp_path)
+    (tmp_path / "jobs").mkdir()
+    stop = gpu_jobs.MemoryKill("9", 5150, "the memory stop-gap", used_mb=83923)  # 5.4 GB given, 88 GB held + card
+    monkeypatch.setattr(gpu_jobs, "memory_kill", lambda _name: stop)
+
+    def ask(jobs_gib: int) -> str:
+        fake_site(monkeypatch, lease=None, dgx_gate=False, nodes=(site_config.Node("n", 20, jobs_gib * 1024, ()),))
+        script = dry("--project", "p", "--what", "w", "--class", "restart", "--gpu", "--mem", "auto", "--name", "n", "--", "x")
+        return next(line.split("=")[1] for line in script.splitlines() if line.startswith(f"{DIRECTIVE} --mem="))
+
+    assert ask(120) == "91G"  # what it used plus 10% (96.8 GB), far above 1.2 times its 5.4 GB ask
+    assert "killed by the memory stop-gap with 5.4 GB given and 88.0 GB measured in use" in capsys.readouterr().out
+    assert ask(80) == "0"  # no node gives jobs that much: the whole box
+    stop = gpu_jobs.MemoryKill("9", 40 * 1024, "the memory stop-gap", used_mb=30_000)  # used less than 1.2 x given
+    assert ask(120) == "48G"  # the bump stands
+
+
 def test_a_named_measured_job_asks_for_shards_and_its_share_of_the_cores(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
 ) -> None:
