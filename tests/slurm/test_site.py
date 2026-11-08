@@ -100,6 +100,8 @@ def test_example_loads_and_minimal_file_gets_every_default(tmp_path: Path) -> No
     assert (full.close_below_mb, full.push_back_below_mb, part.close_below_mb, part.push_back_below_mb) == (16000, 10000, 6000, 2000)
     assert (part.mem_spec_limit_mb, full.mem_spec_limit_mb, part.mains_only) == (8000 - 4768, None, None)  # 5 decimal GB is 4768 of slurm's 2^20-byte MB
     assert site.health_check is None
+    # a full node may hold a measured reserve too (D44): 0.5 decimal GB is 477 of slurm's 2^20-byte MB
+    assert gpujobs_site.load(write(tmp_path, MINIMAL + "jobs_memory_gb = 0.5\n")).nodes[0].mem_spec_limit_mb == 1000 - 477
     # card sharing (D28): absent = the card is one token; "cores" = one shard per core held for the card; a number as given
     def shared(extra: str, head: str = "") -> gpujobs_site.Site:
         return gpujobs_site.load(write(tmp_path, head + SHARING_NODE + extra))
@@ -126,6 +128,7 @@ def test_example_loads_and_minimal_file_gets_every_default(tmp_path: Path) -> No
         (MINIMAL + "close_below_gb = inf\n", "close_below_gb = inf"),
         (MINIMAL + PART_TIME + "address = 'a'\nkeep_cpus = '0-'\n", "keep_cpus = '0-'"),
         (MINIMAL + "address = 'a'\n", "apply only with part_time = true"),
+        (MINIMAL + "jobs_memory_gb = 9\n", "jobs_memory_gb = 9"),  # a full node's reserve is checked as a part-time one's
         (MINIMAL + "close_below_gb = 4\npush_back_below_gb = 5\n", "push_back_below_gb must not exceed"),
         (PART_TIME.replace("[[nodes]]", 'name = "x"\n[[nodes]]', 1) + "address = 'a'\n", "every node is part_time"),
         (MINIMAL + "[health_check]\ninterval_s = 0\n", "health_check.interval_s = 0"),

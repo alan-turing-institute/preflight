@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import socket
 from pathlib import Path
 from string import Template
 
@@ -49,8 +50,14 @@ def packages(site) -> list[str]:
     return ["rsync"] if site.part_time_nodes and not site.shared_state else []  # the copy-back of job state
 
 
-def refusals(site) -> list[str]:
-    return []
+def refusals(site, hostname: str | None = None) -> list[str]:
+    """On a unified-memory site the agent's memory guard watches only the agent's own node (D44), so a GPU node
+    elsewhere would run unguarded: refused at install rather than installed half-watched."""
+    if not site.unified_memory:
+        return []
+    here = (hostname or socket.gethostname()).split(".")[0]
+    return [f"node {node.name} has GPUs on a unified-memory site but is not this machine: the memory guard watches only "
+            "the agent's own node (several GPU nodes are a later change)" for node in site.nodes if node.gpus and node.name != here]
 
 
 def state_dir_commands(site) -> list[list[str]]:

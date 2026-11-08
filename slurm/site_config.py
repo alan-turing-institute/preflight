@@ -82,7 +82,8 @@ class Node:
     part_time: bool = False  # someone's own machine, lent to the cluster when idle; the health check opens and closes it
     address: str | None = None  # slurm NodeAddr: where the controller reaches a part-time node (required with part_time)
     keep_cpus: str | None = None  # CpuSpecList: OS CPUs slurm never hands to jobs on a part-time node, e.g. "0-11"
-    jobs_memory_gb: float | None = None  # part-time: memory jobs may use; MemSpecLimit is the real memory less this
+    jobs_memory_gb: float | None = None  # memory jobs may use; MemSpecLimit is the real memory less this (full node: measured,
+    # `status.py --reserve`)
     mains_only: bool | None = None  # health check: close on battery; None = decided at run time (true with a battery)
     close_below_gb: float | None = None  # health check: close the node below this much free memory
     push_back_below_gb: float | None = None  # health check: requeue a resume job below this much free memory
@@ -327,7 +328,12 @@ def _check_part_time(node: Node, where: str) -> None:
     if node.push_back_below_mb > node.close_below_mb:
         raise SiteError(f"site file: [{where}] push_back_below_gb must not exceed close_below_gb: "
                         "a node pushes jobs back only after it would already be closed")
-    own = {"address": node.address, "keep_cpus": node.keep_cpus, "jobs_memory_gb": node.jobs_memory_gb}
+    jobs = node.jobs_memory_gb
+    if jobs is not None and (isinstance(jobs, bool) or not isinstance(jobs, int | float) or not math.isfinite(jobs)
+                             or not 0 < round(jobs * SLURM_MB_PER_GB) < node.real_memory_mb):
+        raise SiteError(f"site file: [{where}] jobs_memory_gb = {jobs!r}; expected more than 0 and less than the "
+                        f"node's memory ({node.real_memory_mb / SLURM_MB_PER_GB:.1f} GB)")
+    own = {"address": node.address, "keep_cpus": node.keep_cpus}
     if not node.part_time:
         stray = sorted(k for k, v in own.items() if v is not None)
         if stray:
@@ -340,11 +346,6 @@ def _check_part_time(node: Node, where: str) -> None:
     if node.keep_cpus is not None and not (isinstance(node.keep_cpus, str) and _CPU_SPEC_LIST.fullmatch(node.keep_cpus)):
         raise SiteError(f"site file: [{where}] keep_cpus = {node.keep_cpus!r}; expected CPU numbers and ranges "
                         "such as \"0-11\" or \"0,2,4-7\"")
-    jobs = node.jobs_memory_gb
-    if jobs is not None and (isinstance(jobs, bool) or not isinstance(jobs, int | float) or not math.isfinite(jobs)
-                             or not 0 < round(jobs * SLURM_MB_PER_GB) < node.real_memory_mb):
-        raise SiteError(f"site file: [{where}] jobs_memory_gb = {jobs!r}; expected more than 0 and less than the "
-                        f"node's memory ({node.real_memory_mb / SLURM_MB_PER_GB:.1f} GB)")
 
 
 #: The shortest `[health_check] interval_s`: slurm's HealthCheckTimeout must stay below it.

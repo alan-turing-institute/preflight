@@ -174,6 +174,22 @@ def test_sharing_card_renders_shard_lines_and_the_unshared_site_has_none():
     assert "shard" not in plain["/etc/slurm/slurm.conf"].content + plain["/etc/slurm/gres.conf"].content
 
 
+def test_unified_memory_full_node_reserve_and_gpu_node_elsewhere_refused():
+    gpu = {"index": 0, "uuid": "GPU-0", "device": "/dev/nvidia0", "type": "t"}
+    raw = {"name": "u", "unified_memory": True,
+           "nodes": [{"name": "head", "cpus": 20, "real_memory_mb": 100000, "jobs_memory_gb": 80, "gpus": [gpu]}]}
+    site = site_config.parse(raw)
+    conf = render.render(site, "slurm")["/etc/slurm/slurm.conf"].content
+    head = next(line for line in conf.splitlines() if line.startswith("NodeName=head "))
+    assert " MemSpecLimit=23706" in head  # a full node's measured reserve: 80 decimal GB is 76294 of slurm's 2^20-byte MB
+    # the memory guard watches only the agent's own node (D44): a GPU node elsewhere is refused, and only on a unified site
+    agent = importlib.import_module("components.agent")
+    assert agent.refusals(site, hostname="head.lan") == []
+    elsewhere = agent.refusals(site, hostname="other")
+    assert len(elsewhere) == 1 and elsewhere[0].startswith("node head has GPUs on a unified-memory site but is not this machine")
+    assert agent.refusals(site_config.parse({**raw, "unified_memory": False}), hostname="other") == []
+
+
 def test_part_time_node_and_health_check():
     raw = {
         "name": "mix",
