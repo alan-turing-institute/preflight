@@ -211,7 +211,6 @@ class Backend:
     elapsed: Callable[[], Mapping[str, str]] = _elapsed_by_job
     efficiency: Callable[..., jobs_view.Efficiency] = jobs_view.efficiency
     history: Callable[..., list[jobs_view.HistoryRow]] = jobs_view.history
-    usage: Callable[..., list[jobs_view.UsageRow]] = jobs_view.project_usage
     log_tail: Callable[..., str] = jobs_view.log_tail
     viewer: Callable[[], str] = _viewer
     is_admin: Callable[[str], bool] = _is_admin
@@ -664,7 +663,7 @@ def _of(part: float, whole: float) -> str:
     return f"{part / MB:.0f} of {whole / MB:.0f} MB"
 
 
-def _share(used: int, total: int) -> float | None:
+def _share(used: float, total: float) -> float | None:
     return used / total if total else None
 
 
@@ -1199,18 +1198,20 @@ def _nice_max(value: float) -> float:
     return float(int(value) + 1)
 
 
-def _chart(rows: list[jobs_view.UsageRow], periods: list[date], projects: list[str], bucket: jobs_view.Bucket) -> str:
-    """Stacked columns, one per period, one segment per project (largest at the base), with a 2 px gap between."""
-    if not rows:
-        return '<div class="empty">No GPU time in this period.</div>'
-    by = {(r.period, r.project): r.gpu_hours for r in rows}
+def _chart(rows: list[jobs_view.UsageRow], periods: list[date], projects: list[str], bucket: jobs_view.Bucket,
+           value: Callable[[jobs_view.UsageRow], float] = lambda r: r.gpu_hours, unit: str = "GPU-hours") -> str:
+    """Stacked columns of `value` (`unit`), one per period, one segment per project (largest at the base), with a 2 px
+    gap between."""
+    by = {(r.period, r.project): value(r) for r in rows}
+    if not any(v > 0 for v in by.values()):
+        return f'<div class="empty">No {esc(unit)} in this period.</div>'
     totals = [sum(by.get((p, proj), 0.0) for proj in projects) for p in periods]
     top = _nice_max(max(totals))
     width, height, left, bottom = 1000, 260, 40, 24
     plot_h = height - bottom - 8
     slot = (width - left) / max(1, len(periods))
     bar_w = max(4.0, min(36.0, slot * 0.62))
-    parts = [f'<svg viewBox="0 0 {width} {height}" role="img" aria-label="GPU-hours per {bucket.value} by project">']
+    parts = [f'<svg viewBox="0 0 {width} {height}" role="img" aria-label="{esc(unit)} per {bucket.value} by project">']
     for tick in range(5):
         value = top * tick / 4
         y = 8 + plot_h - plot_h * tick / 4
@@ -1227,10 +1228,10 @@ def _chart(rows: list[jobs_view.UsageRow], periods: list[date], projects: list[s
             h = plot_h * hours / top
             seg = max(0.0, h - 2)  # the 2 px surface gap between stacked segments
             y -= h
-            tip = f"{proj}|{period:%a %-d %b}|{hours:.2f} GPU-hours"
+            tip = f"{proj}|{period:%a %-d %b}|{hours:.2f} {unit}"
             parts.append(
                 f'<rect class="series bar {_colour(proj)}" x="{x:.1f}" y="{y + 2:.1f}" width="{bar_w:.1f}" height="{seg:.1f}" rx="2" data-tip="{esc(tip)}">'
-                f"<title>{esc(proj)}, {period:%-d %b}: {hours:.2f} GPU-hours</title></rect>"
+                f"<title>{esc(proj)}, {period:%-d %b}: {hours:.2f} {esc(unit)}</title></rect>"
             )
         if i % label_every == 0:
             fmt = "%-d %b" if bucket == jobs_view.Bucket.DAY else "wk %-d %b"
@@ -1240,58 +1241,90 @@ def _chart(rows: list[jobs_view.UsageRow], periods: list[date], projects: list[s
     return f'<div class="chart">{"".join(parts)}</div><div class="legend">{legend}</div>'
 
 
+def _hbars(totals: Mapping[str, float], note: Callable[[str], str] = lambda _p: "", empty: str = "") -> str:
+    """One bar per project, longest first, its total in hours (and an optional note) at the end."""
+    projects = sorted((p for p in totals if totals[p] > 0), key=lambda p: -totals[p])
+    if not projects:
+        return f'<div class="empty">{esc(empty)}</div>'
+    peak = totals[projects[0]]
+    return '<div class="hbars">' + "".join(
+        f"<div>{_project(p)}</div>"
+        f'<svg viewBox="0 0 100 10" preserveAspectRatio="none" aria-hidden="true"><rect class="track" width="100" height="10"/>'
+        f'<rect class="series {_colour(p)}" width="{max(1.0, 100 * totals[p] / peak):.1f}" height="10"/></svg>'
+        f'<div class="num">{_hours(totals[p])}{f" <span class=\"muted small\">{esc(note(p))}</span>" if note(p) else ""}</div>'
+        for p in projects
+    ) + "</div>"
+
+
+def _percent(part: float, whole: float) -> str:
+    """`part` of `whole` as a whole percent, "—" when there is no whole."""
+    share = _share(part, whole)
+    return "—" if share is None else f"{share:.0%}"
+
+
+def _full_time_nodes(backend: Backend) -> dict[str, tuple[int, int]]:
+    """The site's full-time machines (name -> (cores, GPUs)); a part-time machine lends only when idle, so its hours
+    are no fixed capacity. {} when the site file cannot be read."""
+    site = backend.site()
+    return {n.name: (n.cpus, len(n.gpus)) for n in site.nodes if not n.part_time} if site else {}
+
+
 def projects_page(backend: Backend, query: Mapping[str, list[str]], root: str = "") -> str:
     since, until = _window(query, PROJECTS_DEFAULT_DAYS)
     try:
         bucket = jobs_view.Bucket((query.get("bucket") or ["day"])[0])
     except ValueError:
         raise Refused("400 Bad Request", "bucket must be day or week") from None
-    rows = backend.usage(since, until, bucket)
-    totals: dict[str, float] = {}
+    jobs = backend.history(since, until, None, None, None)
+    rows = jobs_view.usage_rows(jobs, bucket)
+    gpu: dict[str, float] = {}
+    core: dict[str, float] = {}
+    ended: dict[str, float] = {}
+    used: dict[str, float] = {}
     for r in rows:
-        totals[r.project] = totals.get(r.project, 0.0) + r.gpu_hours
-    projects = sorted(totals, key=lambda p: -totals[p])
-    grand = sum(totals.values())
+        for totals, amount in ((gpu, r.gpu_hours), (core, r.core_hours), (ended, r.core_hours_ended), (used, r.core_hours_used)):
+            totals[r.project] = totals.get(r.project, 0.0) + amount
+    gpu_projects = sorted((p for p in gpu if gpu[p] > 0), key=lambda p: -gpu[p])
+    core_projects = sorted((p for p in core if core[p] > 0), key=lambda p: -core[p])
     periods = _periods(since, until, bucket)
-    busiest = projects[0] if projects else "—"
+    start = datetime.combine(date.fromisoformat(since[:10]), datetime.min.time())
+    end = datetime.combine(date.fromisoformat(until[:10]), datetime.min.time()) if until else backend.now()
+    nodes = _full_time_nodes(backend)
+    machine = jobs_view.machine_share(jobs, nodes, max(0.0, (end - start).total_seconds() / 3600))
+    names = ", ".join(nodes) or "the machines"
     tiles = _tiles([
-        ("GPU-hours", f"{grand:.1f}", f"since {date.fromisoformat(since[:10]):%-d %b}"),
-        ("Busiest project", busiest, f"{totals[busiest]:.1f} GPU-hours ({totals[busiest] / grand:.0%})" if projects and grand else ""),
-        ("Projects", str(len(projects)), "with GPU time in the period"),
-        ("Busy share", f"{grand / max(1, len(periods) * (7 if bucket == jobs_view.Bucket.WEEK else 1) * 24):.0%}", "of the card's hours in the period"),
+        ("GPU-hours", f"{sum(gpu.values()):.1f}", f"since {start:%-d %b}"),
+        ("Core-hours", f"{sum(core.values()):.0f}", f"{_percent(sum(used.values()), sum(ended.values()))} of them used (ended jobs)"),
+        ("GPU held", _percent(machine.gpu_hours, machine.gpu_hours_possible), f"of {names}'s GPU-hours"),
+        ("Cores held", _percent(machine.core_hours, machine.core_hours_possible),
+         f"of {names}'s core-hours; {_percent(machine.core_hours_used, machine.core_hours_ended)} of those used"),
     ])
-    peak = max(totals.values(), default=0.0) or 1.0
-    totals_html = (
-        '<div class="hbars">' + "".join(
-            f"<div>{_project(p)}</div>"
-            f'<svg viewBox="0 0 100 10" preserveAspectRatio="none" aria-hidden="true"><rect class="track" width="100" height="10"/>'
-            f'<rect class="series {_colour(p)}" width="{max(1.0, 100 * totals[p] / peak):.1f}" height="10"/></svg>'
-            f'<div class="num">{_hours(totals[p])}</div>'
-            for p in projects
-        ) + "</div>"
-        if projects else '<div class="empty">No GPU time in this period.</div>'
-    )
     buckets = "".join(
         f'<a href="{root}projects?{esc(urlencode({"since": since, **({"until": until} if until else {}), "bucket": b.value}))}" '
         f'aria-current="{"true" if b == bucket else "false"}">Per {b.value}</a>'
         for b in jobs_view.Bucket
     )
     table_rows = "".join(
-        f'<tr><td class="num">{r.period:%a %-d %b %Y}</td><td>{_project(r.project)}</td><td class="num r">{r.gpu_hours:.2f}</td></tr>'
-        for r in sorted(rows, key=lambda r: (r.period, -r.gpu_hours), reverse=True)
+        f'<tr><td class="num">{r.period:%a %-d %b %Y}</td><td>{_project(r.project)}</td><td class="num r">{r.gpu_hours:.2f}</td>'
+        f'<td class="num r">{r.core_hours:.1f}</td><td class="num r">{_percent(r.core_hours_used, r.core_hours_ended)}</td></tr>'
+        for r in sorted(rows, key=lambda r: (r.period, -r.gpu_hours, -r.core_hours), reverse=True)
     )
     table = (
-        '<div class="table-wrap"><table><thead><tr><th scope="col">Period</th><th scope="col">Project</th><th scope="col" class="r">GPU-hours</th></tr></thead>'
+        '<div class="table-wrap"><table><thead><tr><th scope="col">Period</th><th scope="col">Project</th><th scope="col" class="r">GPU-hours</th>'
+        '<th scope="col" class="r">Core-hours held</th><th scope="col" class="r">Of those used (ended jobs)</th></tr></thead>'
         f"<tbody>{table_rows}</tbody></table></div>"
     )
     body = _template("projects.html").substitute(
         presets=_presets(f"{root}projects", since, until, {"bucket": bucket.value}),
         buckets=buckets,
         tiles=tiles,
-        window=esc(f"{date.fromisoformat(since[:10]):%-d %b} – {date.fromisoformat(until[:10]) if until else _today():%-d %b}"),
-        totals=totals_html,
+        window=esc(f"{start:%-d %b} – {date.fromisoformat(until[:10]) if until else _today():%-d %b}"),
+        totals=_hbars(gpu, empty="No GPU time in this period."),
+        core_totals=_hbars(core, lambda p: f"{_percent(used.get(p, 0.0), ended.get(p, 0.0))} used" if ended.get(p) else "",
+                           empty="No core time in this period."),
         bucket=esc(bucket.value),
-        chart=_chart(rows, periods, projects, bucket),
+        chart=_chart(rows, periods, gpu_projects, bucket),
+        core_chart=_chart(rows, periods, core_projects, bucket, lambda r: r.core_hours, "core-hours"),
         table=table,
     )
     return _page(backend, "Use per project", body, root=root, tab=Tab.PROJECTS)

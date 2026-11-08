@@ -1,17 +1,25 @@
 <div class="page-head">
-<div><h1>Use per project</h1><p class="sub">GPU-hours: GPUs held × hours, counted on the day each job started.</p></div>
+<div><h1>Use per project</h1><p class="sub">GPU-hours: GPUs held × hours. Core-hours: cores held × hours (4 cores for an hour are 4). "Used" is the CPU time jobs really spent, as a share of the cores they held; slurm fills it in when a job ends, so it counts ended jobs only. Everything is counted on the day each job started.</p></div>
 <div class="actions"><span class="segmented" aria-label="Period">$presets</span><span class="segmented" aria-label="Group by">$buckets</span></div>
 </div>
 $tiles
 <div class="grid">
 <section class="card" aria-labelledby="h-totals">
-<div class="card-head"><h2 id="h-totals">By project</h2><span class="meta">$window</span></div>
+<div class="card-head"><h2 id="h-totals">GPU-hours by project</h2><span class="meta">$window</span></div>
 <div class="card-body">$totals</div>
+</section>
+<section class="card" aria-labelledby="h-core-totals">
+<div class="card-head"><h2 id="h-core-totals">Core-hours by project</h2><span class="meta">$window</span></div>
+<div class="card-body">$core_totals</div>
 </section>
 </div>
 <section class="card" aria-labelledby="h-chart">
 <div class="card-head"><h2 id="h-chart">GPU-hours per $bucket</h2><span class="meta">hover a bar for its numbers</span></div>
 $chart
+</section>
+<section class="card" aria-labelledby="h-core-chart">
+<div class="card-head"><h2 id="h-core-chart">Core-hours per $bucket</h2><span class="meta">hover a bar for its numbers</span></div>
+$core_chart
 </section>
 <section class="card">
 <details class="code"><summary>All numbers as a table</summary>$table</details>

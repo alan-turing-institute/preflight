@@ -49,7 +49,6 @@ class Fake:
             elapsed=lambda: {"7": "1:00"},
             efficiency=lambda job_id, record=None: jobs_view.Efficiency(job_id, 4 * 1024**3, None, None, 0.5),
             history=lambda *_a: [],
-            usage=lambda *_a: [jobs_view.UsageRow(date(2026, 10, 19), "proj", 2.0)],
             log_tail=lambda path, text=None, errors_only=False: f"tail of {path} {text} {errors_only}",
             viewer=lambda: viewer,
             is_admin=lambda user: admin and user == viewer,
@@ -180,6 +179,15 @@ def test_every_get_route_answers(path: str) -> None:
         lap_silent = {**lap, "comment": ""}  # a machine that has not reported: said so on its strip and the cluster's, left out of the sum
         silent = app._resource_tiles(total, running, 0.5, {"mem_total": 2 * 10**9, "mem_used": 10**9, "cores": 20, "cores_busy": 3.0}, [dgx, lap_silent])
         assert silent.count("in use not reported by lap") == SILENT_NOTES and "3.0 of 20" in silent.split("<section")[1]
+
+
+    if path.startswith("/projects"):  # 4 cores for an hour are 4 core-hours; the machine tiles say what share was held
+        ran = jobs_view.HistoryRow("9", "proj:resume:x", "proj", "u", "cpu", "COMPLETED", "0:0", None,
+                                   datetime(2026, 10, 19, 1), datetime(2026, 10, 19, 2), 3600, 0, None, node="n",
+                                   cpus=4, cpu_s=3600.0)
+        page = app.projects_page(dataclasses.replace(fake.backend, history=lambda *_a: [ran], site=lambda: None),
+                                 {"since": ["2026-10-19"], "until": ["2026-10-20"]})
+        assert "Core-hours by project" in page and "4.0 h" in page and "25% used" in page and "GPU held" in page
 
 
 def test_unknown_things_are_not_found_or_bad() -> None:

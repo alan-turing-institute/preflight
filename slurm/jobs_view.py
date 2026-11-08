@@ -14,13 +14,13 @@ import os
 import re
 import stat
 import subprocess
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
 
 import gpu_jobs
-from gpu_jobs import Event, EventAction, QueuedJob, Reason
+from gpu_jobs import Event, EventAction, QueuedJob, Reason, State
 
 #: Runs a command line and returns what it printed; "" when slurm does not answer.
 Runner = Callable[[list[str]], str]
@@ -106,6 +106,21 @@ class UsageRow:
     period: date  # the day, or the Monday of the week, the job STARTED in
     project: str
     gpu_hours: float
+    core_hours: float = 0.0  # cores held x hours, every job that started (running ones so far)
+    core_hours_ended: float = 0.0  # the same, jobs that have ended only: what `core_hours_used` is a share of
+    core_hours_used: float = 0.0  # CPU time ended jobs really spent (sacct's TotalCPU, filled in when a job ends)
+
+
+@dataclass(frozen=True)
+class MachineShare:
+    """What jobs held of the full-time machines over a window, and how much of the cores held they really used."""
+
+    gpu_hours: float
+    gpu_hours_possible: float
+    core_hours: float
+    core_hours_possible: float
+    core_hours_ended: float
+    core_hours_used: float
 
 
 def run_command(argv: list[str]) -> str:
@@ -332,18 +347,49 @@ def history(
     ]
 
 
-def project_usage(
-    since: str, until: str | None = None, bucket: Bucket = Bucket.DAY, runner: Runner = run_command
-) -> list[UsageRow]:
-    """GPU-hours per project per day or week: allocated GPUs x elapsed seconds / 3600, by the day the job started."""
-    totals: dict[tuple[date, str], float] = {}
-    for row in _rows(runner, since, until):
-        if not row.gpus or row.start is None:
+def usage_rows(rows: Iterable[HistoryRow], bucket: Bucket = Bucket.DAY) -> list[UsageRow]:
+    """GPU-hours (GPUs held x hours) and core-hours (cores held x hours; for ended jobs also the CPU time they spent)
+    per project per day or week, by the day the job started. 4 cores held for an hour are 4 core-hours."""
+    totals: dict[tuple[date, str], list[float]] = {}
+    for row in rows:
+        if row.start is None:
             continue
         day = row.start.date()
         period = day - timedelta(days=day.weekday()) if bucket == Bucket.WEEK else day
-        totals[period, row.project] = totals.get((period, row.project), 0.0) + row.gpus * row.elapsed_s / SECONDS_PER_HOUR
-    return [UsageRow(period, project, hours) for (period, project), hours in sorted(totals.items())]
+        hours = row.elapsed_s / SECONDS_PER_HOUR
+        held = (row.cpus or 0) * hours
+        ended = row.end is not None and row.state != State.RUNNING and row.cpu_s is not None
+        add = totals.setdefault((period, row.project), [0.0, 0.0, 0.0, 0.0])
+        add[0] += (row.gpus or 0) * hours
+        add[1] += held
+        add[2] += held if ended else 0.0
+        add[3] += (row.cpu_s or 0.0) / SECONDS_PER_HOUR if ended else 0.0
+    return [UsageRow(period, project, *values) for (period, project), values in sorted(totals.items())]
+
+
+def project_usage(
+    since: str, until: str | None = None, bucket: Bucket = Bucket.DAY, runner: Runner = run_command
+) -> list[UsageRow]:
+    """`usage_rows` of the jobs slurm's accounting has from `since` (to `until`)."""
+    return usage_rows(_rows(runner, since, until), bucket)
+
+
+def machine_share(rows: Iterable[HistoryRow], nodes: Mapping[str, tuple[int, int]], hours: float) -> MachineShare:
+    """What jobs that started in a window of `hours` held on `nodes` (name -> (cores, GPUs)), against what those nodes
+    had: GPU-hours and core-hours held, and the CPU time ended jobs spent of the cores they held. A job that ran on
+    another node (a part-time machine) is left out of both sides."""
+    gpu = core = ended = used = 0.0
+    for row in rows:
+        if row.start is None or not set(row.node.split(",")) <= set(nodes) or not row.node:
+            continue
+        job_hours = row.elapsed_s / SECONDS_PER_HOUR
+        gpu += (row.gpus or 0) * job_hours
+        core += (row.cpus or 0) * job_hours
+        if row.end is not None and row.state != State.RUNNING and row.cpu_s is not None:
+            ended += (row.cpus or 0) * job_hours
+            used += row.cpu_s / SECONDS_PER_HOUR
+    return MachineShare(gpu, sum(g for _c, g in nodes.values()) * hours, core,
+                        sum(c for c, _g in nodes.values()) * hours, ended, used)
 
 
 def efficiency(

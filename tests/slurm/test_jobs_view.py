@@ -11,7 +11,8 @@ import os
 import signal
 import time
 from collections.abc import Iterator
-from datetime import date
+import dataclasses
+from datetime import date, datetime
 from pathlib import Path
 
 import gpu_jobs
@@ -156,7 +157,7 @@ def test_chain_walks_both_ways_and_stays_finite() -> None:
 def test_project_usage_gpu_hours_per_day_and_week() -> None:
     def usage(bucket: Bucket, text: str | None = None) -> dict[tuple[date, str], float]:
         rows = jobs_view.project_usage("2026-10-15", None, bucket, (lambda _: text) if text else fake_sacct)
-        return {(r.period, r.project): r.gpu_hours for r in rows}
+        return {(r.period, r.project): r.gpu_hours for r in rows if r.gpu_hours}
 
     day = usage(Bucket.DAY)
     assert day[date(2026, 10, 16), "stagec"] == pytest.approx((122 + 6 + 59 + 3 + 43) / 3600)  # job 33 "stagec:urgent" has no class field: (other)
@@ -178,6 +179,16 @@ def test_project_usage_gpu_hours_per_day_and_week() -> None:
     # two GPUs for an hour is 2 GPU-hours; the never-started job and the CPU-only job add nothing; a job name with
     # '|' and a newline is one row of its owner's, billed once, and shifts no column nor adds a row
     assert usage(Bucket.DAY, hand_made) == {(date(2026, 10, 16), "p"): 2.5}
+    # core-hours: 4 cores held for an hour are 4; "used" counts ended jobs' CPU time against what those held
+    ran = jobs_view.HistoryRow("9", "p:resume:x", "p", "u", "cpu", "COMPLETED", "0:0", None, datetime(2026, 10, 16, 1),
+                               datetime(2026, 10, 16, 2), 3600, 0, None, node="box", cpus=4, cpu_s=3600.0)
+    running = dataclasses.replace(ran, job_id="10", state="RUNNING", end=None, cpu_s=0.0)
+    elsewhere = dataclasses.replace(ran, job_id="11", node="laptop")
+    [row] = jobs_view.usage_rows([ran, running])
+    assert (row.core_hours, row.core_hours_ended, row.core_hours_used) == (8.0, 4.0, 1.0)
+    # the machine's share counts only its own jobs, against its own cores and GPUs over the window
+    share = jobs_view.machine_share([ran, running, elsewhere], {"box": (8, 1)}, 10.0)
+    assert (share.core_hours, share.core_hours_possible, share.core_hours_ended, share.gpu_hours_possible) == (8.0, 80.0, 4.0, 10.0)
     rows = jobs_view.history("2026-10-15", runner=lambda _: hand_made)
     assert [(r.job_id, r.user, r.state, r.name) for r in rows][-1] == ("4", "mallory", "COMPLETED", forged)
     assert len(rows) == len(hand_made_ids)  # the forged name adds no row
