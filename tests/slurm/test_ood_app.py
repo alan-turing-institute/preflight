@@ -120,14 +120,14 @@ def test_every_get_route_answers(path: str) -> None:
         assert (app._running_note(2, 0), app._running_note(2, 1)) == ("none on the GPU", "1 on the GPU")
         # the State cell lists each job waited on by name, one per line, its description on hover (2026-11-08)
         waiting = gpu_jobs.QueuedJob("9", "normal", "PENDING", "Dependency", "p:restart:x", dependency="afterok:2203:2206")
-        upstream = gpu_jobs.QueuedJob("2203", "normal", "PENDING", "Resources", "tc:restart:store<b>")
+        upstream = gpu_jobs.QueuedJob("2203", "normal", "PENDING", "Resources", "p:restart:store<b>")
         waits = app._waits_on(waiting, {"2203": upstream}, {"2203": {"what": "put the <scores> in"}})
         assert app._waits_cell(waits, "/r/") == (
             '<div class="why">waits for:</div><ul class="waits">'
             '<li><a href="/r/job/2203" title="store&lt;b&gt; — put the &lt;scores&gt; in">store&lt;b&gt;</a> <span class="jobid">#2203</span></li>'
             '<li><a href="/r/job/2206" title="">job 2206</a> <span class="jobid">#2206</span></li></ul>')
         # one line each: the words a job's name shares with the waiting job's go, a long rest loses its middle (full on hover)
-        assert app._middle(app._unshared("tc-det-2-18-run-token-tagger-fewer-human-36", "tc-det-2-18-record-x")) == "…run-token…human-36"
+        assert app._middle(app._unshared("study-2-18-run-small-model-fold-36", "study-2-18-record-x")) == "…run-small…fold-36"
         assert app._unshared("store", "store") == "store"  # the last word always stays
         # more than three fold behind one line, kept open across the 10 s refresh by its key
         assert app._waits_cell(waits * 2, "/r/", "9").startswith(

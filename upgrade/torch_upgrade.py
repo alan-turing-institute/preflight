@@ -11,7 +11,7 @@ Policy and history: ~/.claude/software-upgrade-policy.md ("A project upgrade").
         One slurm GPU job runs `<venv>/bin/python PROBE ARGS --out FILE` under both venvs; prints
         each version's step time and the largest relative difference of the probe's values.
         The probe writes JSON {"seconds_per_step": float, "values": [float, ...]} and takes seconds
-        (autocast: scripts/torch_upgrade_probe.py).
+        (for example, a short training run that times its steps).
 
 A reboot is never needed: the PyTorch wheel brings its own CUDA libraries. Only a wheel built for
 a CUDA newer than the driver supports can fail, and `check` shows that (CUDA 13.2 wheels ran on

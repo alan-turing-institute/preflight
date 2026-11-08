@@ -2,6 +2,10 @@
 
     python3 tools/check_private.py            # every tracked file
     python3 tools/check_private.py --staged   # only what is staged (the pre-commit hook)
+    python3 tools/check_private.py --message FILE   # a commit message (the commit-msg hook)
+
+Hooks, in each clone: `.git/hooks/pre-commit` runs `--staged`, `.git/hooks/commit-msg` runs `--message "$1"`. A commit
+message is published with the commit, so it is held to the same rules as the files.
 
 Your own names (user name, host names, domains) go one regular expression per line in `.private-patterns` at the
 repository root: that file is ignored by git, so the names it holds never reach a commit. Machine-specific files
@@ -48,6 +52,16 @@ def _git(*args: str) -> list[str]:
 
 
 def main(argv: list[str]) -> int:
+    if "--message" in argv:  # the commit-msg hook: the message, minus git's own comment lines
+        path = Path(argv[argv.index("--message") + 1])
+        text = "\n".join(line for line in path.read_text().splitlines() if not line.startswith("#"))
+        found = hits(text, patterns())
+        for line_no, what in found:
+            print(f"commit message:{line_no}: {what}")
+        if found:
+            print("check_private: the commit message names something private; say it generically "
+                  "(\"the GPU host\", \"a part-time machine\")")
+        return 1 if found else 0
     staged = "--staged" in argv
     names = _git("diff", "--cached", "--name-only", "--diff-filter=ACM", "-z") if staged else _git("ls-files", "-z")
     rules, bad = patterns(), 0

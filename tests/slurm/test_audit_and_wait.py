@@ -30,7 +30,7 @@ def test_attribution_by_job_cgroup_service_cgroup_and_ancestry(tmp_path: Path) -
     fake_proc(proc, 108, "/system.slice/slurmstepd.scope/s00000000000RN/step_batch/user/task_0", 1)  # 26.05: the SLUID
     fake_proc(proc, 102, "/user.slice/service-a-models.service", 1)  # same unit as the lease owner
     fake_proc(proc, 103, "/user.slice/other.scope", owner)  # a child of the lease owner
-    fake_proc(proc, 104, "/user.slice/autocast-swe32-patch4.service", 1, "python train patch4\x1b[2J")
+    fake_proc(proc, 104, "/user.slice/proj-a-patch4.service", 1, "python train patch4\x1b[2J")
     # containers: one labelled for the leased project, one for a project with no lease, one unlabelled
     labelled, other, bare = ("a" * 64), ("b" * 64), ("c" * 64)
     fake_proc(proc, 105, f"/system.slice/docker-{labelled}.scope", 2)

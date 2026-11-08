@@ -37,3 +37,14 @@ def test_each_generic_rule_catches_its_line_and_lets_the_placeholders_through() 
     ]
     assert all(check_private.hits(line, GENERIC_ONLY) for line in bad)
     assert not any(check_private.hits(line, GENERIC_ONLY) for line in ok)
+
+
+def test_a_commit_message_is_held_to_the_same_rules(tmp_path: Path, monkeypatch, capsys) -> None:
+    monkeypatch.setattr(check_private, "LOCAL_PATTERNS", tmp_path / "patterns")
+    (tmp_path / "patterns").write_text("gpu-host-7\n")
+    message = tmp_path / "COMMIT_EDITMSG"
+    message.write_text("fix: Count only idle hardware\n\nOn gpu-host-7 the page listed 25 lines.\n# gpu-host-7 in a comment\n")
+    assert check_private.main(["--message", str(message)]) == 1
+    assert "commit message:3: a name in .private-patterns" in capsys.readouterr().out
+    message.write_text("fix: Count only idle hardware\n\nOn the GPU host the page listed 25 lines.\n# gpu-host-7 git's comment\n")
+    assert check_private.main(["--message", str(message)]) == 0  # git strips its own comment lines

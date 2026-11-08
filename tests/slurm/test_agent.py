@@ -655,7 +655,7 @@ def idle_world(world: World, *, gpus_used: int = 0, mem_used: int = 22888) -> Wo
     world.totals = (f"CPUTot=4 CPUAlloc=2 RealMemory=100000 AllocMem={mem_used} State=MIXED Partitions=normal,cpu "
                     f"CfgTRES=cpu=4,gres/gpu=1 AllocTRES=gres/gpu={gpus_used}")
     waiting = gpu_jobs.QueuedJob("596", "normal", "PENDING", "Resources", "wait:resume:big", user="a", gpus=1, cpus=4, mem_mb=0)
-    holder = gpu_jobs.QueuedJob("611", "cpu", "RUNNING", "None", "crypto-quant-research:restart:scan", user="b", cpus=2, mem_mb=22888)
+    holder = gpu_jobs.QueuedJob("611", "cpu", "RUNNING", "None", "project-b:restart:scan", user="b", cpus=2, mem_mb=22888)
     world.queue = [waiting, holder]
     return world
 
@@ -671,11 +671,11 @@ def test_a_whole_box_job_waiting_beside_a_restart_cpu_job_is_found_noticed_hourl
     beat = world.step()
     [finding] = beat["idle"]
     assert finding["rule"] == "memory" and finding["since"] == 1000
-    assert finding["text"] == "Waiting: #596 needs all memory; #611 crypto-quant-research holds 24.0 GB (restart, cannot be moved)"
+    assert finding["text"] == "Waiting: #596 needs all memory; #611 project-b holds 24.0 GB (restart, cannot be moved)"
     assert [(h["job"], h["movable"]) for h in finding["holders"]] == [("611", False)]
     assert agent_module.read_idle(world.dir) == beat["idle"]
     # both sides are told, each about its own job with its real name's project and user, naming the other side
-    assert sink.read_text().splitlines() == ["idle waiting 596 a wait 611", "idle holding 611 b crypto-quant-research 596"]
+    assert sink.read_text().splitlines() == ["idle waiting 596 a wait 611", "idle holding 611 b project-b 596"]
     # and each side gets one `idle` event for the job page and gpujobs-wait, written once while the pair lasts
     assert [(e.job, e.fields["role"], e.fields["other_job"]) for e in gpu_jobs.events() if e.action == "idle"] == [
         ("596", "waiting", "611"), ("611", "holding", "596")]

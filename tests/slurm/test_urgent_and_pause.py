@@ -43,7 +43,7 @@ def test_classes_of_what_is_in_the_way() -> None:
     assert "loses all of that run" in text
     # job 6 is not in the way, but the normal job 1 it pre-empts restarts above it and may take its cores (2026-11-03: 1739 and 1687)
     assert "normal job(s) 1 " in text and "running now, not otherwise touched: 6" in text and "6" not in victims
-    # the warning does not depend on a cpu_fill job running now: one that starts in the gap is hit too (automl, same day)
+    # the warning does not depend on a cpu_fill job running now: one that starts in the gap is hit too (seen the same day)
     alone, _, _, _ = urgent.plan([job("1", "normal")], gpu=True, whole_box=False, leases=[], unregistered=[], services={})
     assert any("KNOCK-ON  normal job(s) 1 " in line and "running now" not in line for line in alone)
     # no normal job pre-empted, no knock-on; a cpu_fill job already in the way (cores short) is not named twice
