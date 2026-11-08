@@ -6,7 +6,7 @@
 
 Runs on the host and drives the container through `run.sh shell`. Every check prints PASS or FAIL with its
 evidence as it happens; the exit status is 1 when any check failed. Stages: install, jobs, urgent, failure,
-recovery, portal, proxy, ssh, lease, host, part_time, sharing, upgrade (in this order; `--only` takes a subset, later stages need `install` to have run once).
+recovery, portal, proxy, ssh, lease, host, part_time, sharing, sched_switch, shards_reconfigure, memory_guard, upgrade (in this order; `--only` takes a subset, later stages need `install` to have run once).
 """
 
 from __future__ import annotations
@@ -226,6 +226,10 @@ GRAFANA_VHOST = """Listen 3443
   ProxyPassReverse / http://127.0.0.1:3001/
 </VirtualHost>
 """
+# The fake GPUs run no process: the stand-in answers with none, except the card memory the memory_guard stage lists in
+# FAKE_CARD ("pid, MiB" lines) for the card-memory query the agent and the guard make.
+FAKE_CARD = "/run/fake-gpu-usage"
+NVIDIA_SMI_STUB = f'#!/bin/sh\ncase "$*" in *used_memory*) [ -f {FAKE_CARD} ] && cat {FAKE_CARD} ;; esac\nexit 0\n'
 NOTIFY = '#!/bin/sh\necho "$GPUJOBS_JOB $GPUJOBS_STATE $GPUJOBS_USER $GPUJOBS_NAME" >> /var/tmp/harness-notify.log\n'
 HASH_USERS = """
 import crypt, json, os, sys, uuid
@@ -259,7 +263,7 @@ def stage_install() -> None:
     put("/usr/local/bin/harness-notify", NOTIFY, "0755")
     # The job wrapper refuses to start a GPU job when nvidia-smi does not answer (occupancy unknown). The fake GPUs are
     # /dev/null, so no compute process ever runs on them: this stand-in answers with none.
-    put("/usr/local/bin/nvidia-smi", "#!/bin/sh\nexit 0\n", "0755")
+    put("/usr/local/bin/nvidia-smi", NVIDIA_SMI_STUB, "0755")
     # The container refuses the namespace sandboxing of the services' units (systemd: "Failed to set up mount
     # namespacing: Operation not supported"); a real host does not. Harness drop-ins switch it off.
     for unit in ("prometheus", "grafana-server"):
@@ -1619,6 +1623,165 @@ def stage_shards_reconfigure() -> None:
     clear_queue()
 
 
+# -- stage: memory_guard ---------------------------------------------------------------------------------------
+
+GUARD_SITE = "/tmp/memory_guard.site.toml"
+GUARD_RESULT = Path.home() / "cache" / "preflight" / "e2e" / "memory_guard.last"  # on the host running e2e.py
+GUARD_LEVEL_GB = 99_999  # above any free memory: the one-shot pass acts as if the node were short
+CARD_MIB = 1500  # fake card memory per process of a job made to be over its 200M ask
+STOP_S = 2  # memory_guard.ACK_S: a wrapper acts within it
+STUCK_S = 15  # memory_guard.STUCK_S
+HOLD_S = 10  # memory_guard.HOLD_S: a further stop waits this long
+STEP_SLACK_S = 3 * AGENT_LOOP_S  # the agent acts on a stop at its next steps
+JOBS_MEMORY_GB = 3  # a full node's measured reserve for check (f): 4096 MB real, 3 GB for jobs
+JOBS_MEMORY_MB = 4096 - round(JOBS_MEMORY_GB * 1e9 / 2**20)  # the MemSpecLimit slurm should report
+ACK_FORGER = r"""
+import json, os, pathlib, time
+job = os.environ["SLURM_JOB_ID"]
+stop, record = pathlib.Path("/var/lib/gpujobs/agent/stops") / f"job_{job}.json", pathlib.Path(f"/var/lib/gpujobs/jobs/{job}.json")
+while True:
+    if stop.exists():
+        at = json.loads(stop.read_text())["at"]
+        record.write_text(json.dumps({"job_id": job, "stop_ack": {"request_at": at, "at": time.time()}}))
+    time.sleep(0.5)
+"""
+
+
+def over_its_ask(job: str) -> None:
+    """Report CARD_MIB of card memory for every process of `job`: with a 200M ask it is then about 1.4 GB over."""
+    put(FAKE_CARD, "".join(f"{pid}, {CARD_MIB}\n" for pid in job_pids(job)))
+
+
+def stop_once(job: str) -> str:
+    """One pass of the guard as slurm's user, short by construction, allowed to stop only `job`; retried through the
+    hold-off left by the previous scenario's stop. Returns the pass's output."""
+    argv = f"runuser -u slurm -- python3 /opt/gpujobs/slurm/memory_guard.py --once --level-gb {GUARD_LEVEL_GB} --only-job {job}"
+
+    def decided() -> str | None:
+        out = sh(argv).text
+        return out if "stopping" in out or "none over" in out else None  # not "holding off"
+
+    return str(wait_for(decided, HOLD_S + 5, 1) or sh(argv).text)
+
+
+def stop_events(job: str) -> list[dict]:
+    """The memory_stop events on `job` written by slurm's user (the agent), oldest first."""
+    names = sh(f"stat -c '%U %n' {STATE}/events/{job}-*-memory_stop.json 2>/dev/null").out.split("\n")
+    paths = sorted(line.split(" ", 1)[1] for line in names if line.startswith("slurm "))
+    return [json.loads(sh(f"cat {path}").out or "{}") for path in paths]
+
+
+def stage_memory_guard() -> None:
+    section("memory_guard: on a unified-memory node a job over its ask (memory + card) is stopped by its wrapper, else by scancel (D44)")
+    clear_queue()
+    put(GUARD_SITE, sh(f"cat {SITE}").out.replace("unified_memory = false", "unified_memory = true"))
+    applied = sh(f"{INSTALL} --site {GUARD_SITE} apply --component agent", timeout=300)
+    watching = wait_for(lambda: "memory guard watching testnode" in sh("journalctl -u gpujobs-agent --since -2min").out, 60, 2)
+    check("a unified-memory site's agent runs the memory guard on its own node", applied.rc == 0 and bool(watching),
+          applied.text[-200:])
+    try:
+        _memory_guard_scenarios()
+    finally:
+        sh(f"rm -f {FAKE_CARD}")
+        clear_queue()
+        sh(f"{INSTALL} --site {SITE} apply --component agent", timeout=300)
+    names = [name for name, _, _ in RESULTS if name.startswith("memory_guard")]
+    failed = [name for name, ok, _ in RESULTS if name.startswith("memory_guard") and not ok]
+    GUARD_RESULT.parent.mkdir(parents=True, exist_ok=True)
+    GUARD_RESULT.write_text((f"FAIL stage memory_guard: {failed}" if failed else "PASS stage memory_guard") + "\n"
+                            + "\n".join(f"{'PASS' if ok else 'FAIL'} {name}: {evidence}" for name, ok, evidence in RESULTS
+                                         if name in names) + "\n" + "\n".join(f"NOTE {n}" for n in NOTES) + "\n")
+
+
+def _memory_guard_scenarios() -> None:
+    # (a) a resume job run by the wrapper: stopped within 2 s, requeued, recorded, and its next run sized from what it used
+    job = submit("alice", "mg-resume", 600)
+    wait_state(job, "RUNNING", 60)
+    over_its_ask(job)
+    chose = stop_once(job)
+    requeued = wait_for(lambda: jobinfo(job).get("Restarts") == "1", 30, 1)
+    record = json.loads(sh(f"cat {STATE}/jobs/{job}.json").out or "{}")
+    ack, killed = record.get("stop_ack") or {}, (record.get("last_leg") or {}).get("killed_by") or {}
+    check("memory_guard (a): the pass names the job over its ask and stops it", f"stopping {job}" in chose, chose[-300:])
+    check("memory_guard (a): its wrapper acknowledged within 2 s, killed the command and recorded the stop-gap",
+          bool(ack) and ack["at"] - ack["request_at"] < STOP_S and killed.get("guard") == "memory stop-gap", json.dumps(record)[:300])
+    check("memory_guard (a): a resume job is requeued", bool(requeued), str(jobinfo(job))[:300])
+    ended = wait_for(lambda: [e.get("ended") for e in stop_events(job)] or None, STEP_SLACK_S, 1)
+    check("memory_guard (a): the agent records it once, ended by the wrapper", ended == ["by_wrapper"], str(ended))
+    sized = cl("gpujobs-submit", "--project", "e2e", "--what", "x", "--class", "resume", "--resume-ok", "--name", "mg-resume",
+               "--dry-run", "--", "true", user="alice").text
+    check("memory_guard (a): the next --mem auto names the stop-gap and asks for at least what the run used",
+          "memory stop-gap" in sized and "measured in use" in sized, sized[-300:])
+    # (b) the requeued run is a new run: the old request never touches it
+    sh(f"rm -f {FAKE_CARD}")
+    rerun = wait_for(lambda: state(job) == "RUNNING" and jobinfo(job).get("Restarts") == "1", REQUEUE_DELAY_S + 60, 2)
+    time.sleep(STEP_SLACK_S)
+    check("memory_guard (b): the requeued run runs on, untouched by the earlier run's request",
+          bool(rerun) and state(job) == "RUNNING" and len(stop_events(job)) == 1, str(jobinfo(job))[:200])
+    sh(f"scancel {job}")
+    # (c) a restart-class job fails with the memory-kill exit
+    job = submit("alice", "mg-restart", 600, cls="restart")
+    wait_state(job, "RUNNING", 60)
+    over_its_ask(job)
+    stop_once(job)
+    def ended_failed() -> str | None:
+        out = sh(f"sacct -X -n -P -j {job} -o State,ExitCode").out.strip()
+        return out if out.startswith("FAILED") else None
+
+    failed = wait_for(ended_failed, 30, 1)
+    check("memory_guard (c): a restart job fails with the memory-kill exit (5)", str(failed).endswith(":0") and "|5:" in str(failed),
+          str(failed))
+    # (d) a plain sbatch job has no wrapper: scancel after 2 s; one that forges an acknowledgement: scancel after 15 s anyway
+    plain, _ = plain_running_job("mg-plain")
+    over_its_ask(plain)
+    stop_once(plain)
+    gone = wait_for(lambda: state(plain) not in ("RUNNING", "COMPLETING"), STOP_S + STEP_SLACK_S, 1)
+    check("memory_guard (d): a plain sbatch job is ended by scancel", bool(gone) and
+          [e.get("ended") for e in stop_events(plain)] == ["by_scancel"], f"{state(plain)} {stop_events(plain)}")
+    done = cl("sbatch", "--parsable", "-J", "mg-forger", "--mem=100M", "-c", "1", "--wrap", f"python3 -c {shlex.quote(ACK_FORGER)}",
+              user="bob")
+    forger = done.out.strip().split(";")[0]
+    wait_state(forger, "RUNNING", 60)
+    over_its_ask(forger)
+    stop_once(forger)
+    time.sleep(STUCK_S - AGENT_LOOP_S)
+    held_on = state(forger) == "RUNNING"
+    gone = wait_for(lambda: state(forger) not in ("RUNNING", "COMPLETING"), 2 * STEP_SLACK_S, 1)
+    check("memory_guard (d): a forged acknowledgement buys at most 15 s, then not ended and scancel",
+          held_on and bool(gone) and [e.get("ended") for e in stop_events(forger)] == ["not_ended"],
+          f"held on {held_on}, {state(forger)} {stop_events(forger)}")
+    # (e) a job within its ask is never chosen
+    sh(f"rm -f {FAKE_CARD}")
+    within, _ = plain_running_job("mg-within")
+    passed = stop_once(within)
+    check("memory_guard (e): a job within its ask is never chosen", "none over their ask" in passed
+          and sh(f"test -e {STATE}/agent/stops/job_{within}.json").rc != 0, passed[-200:])
+    # (h) does a running job's slurm start time move across suspend and resume? (the run's identity)
+    start = sh(f"squeue --json -j {within} | python3 -c 'import json,sys; print(json.load(sys.stdin)[\"jobs\"][0][\"start_time\"][\"number\"])'").out.strip()
+    sh(f"scontrol suspend {within}; sleep 3; scontrol resume {within}; sleep 2")
+    after = sh(f"squeue --json -j {within} | python3 -c 'import json,sys; print(json.load(sys.stdin)[\"jobs\"][0][\"start_time\"][\"number\"])'").out.strip()
+    note(f"memory_guard (h): squeue start_time across suspend and resume: {start} -> {after} ({'unchanged' if start == after else 'MOVED'})")
+    # (f) a full node's reserve goes live by reconfigure, and a running job keeps its run
+    survivor, started = plain_running_job("mg-survivor")
+    reserved = sh(f"cat {SITE}").out.replace("name = \"testnode\"\n", f"name = \"testnode\"\njobs_memory_gb = {JOBS_MEMORY_GB}\n", 1)
+    put("/tmp/reserve.site.toml", reserved)
+    sh("cp -a /etc/slurm/slurm.conf /root/slurm.conf.before-reserve")
+    rendered = sh(f"{INSTALL} --site /tmp/reserve.site.toml render --out /tmp/reserve-render && cp /tmp/reserve-render/etc/slurm/slurm.conf "
+                  "/etc/slurm/slurm.conf && scontrol reconfigure", timeout=120)
+    time.sleep(SCHEDULER_PASSES_S)
+    node = nodes_alloc()
+    check("memory_guard (f): reconfigure alone applies the node's MemSpecLimit, RealMemory unchanged",
+          rendered.rc == 0 and f"MemSpecLimit={JOBS_MEMORY_MB}" in node and "RealMemory=4096" in node, (rendered.text + node)[-300:])
+    check("memory_guard (f): a job running across it keeps its run", untouched(survivor, started), str(jobinfo(survivor))[:200])
+    # (g) what a --mem 0 job's cgroup limit is with a reserve in place (the guard reads `max` as the node's jobs memory)
+    whole = cl("sbatch", "--parsable", "-J", "mg-whole", "--mem=0", "-c", "1", "--wrap", "sleep 600", user="alice").out.strip().split(";")[0]
+    wait_state(whole, "RUNNING", 60)
+    pid = (job_pids(whole) or ["0"])[0]
+    limits = sh(f"d=/sys/fs/cgroup$(cut -d: -f3 /proc/{pid}/cgroup); while [ \"$d\" != /sys/fs/cgroup ]; do echo \"$d $(cat $d/memory.max 2>/dev/null)\"; d=$(dirname $d); done").out
+    note(f"memory_guard (g): a --mem 0 job's memory.max up its cgroup path, with MemSpecLimit={JOBS_MEMORY_MB}: {' | '.join(limits.split(chr(10))[:5])}")
+    sh("cp -a /root/slurm.conf.before-reserve /etc/slurm/slurm.conf && scontrol reconfigure")
+
+
 def stage_upgrade() -> None:
     section("upgrade: `install.py upgrade-slurm` from the image's slurm 23.11 to the site file's release (last: it replaces slurm)")
     clear_queue()
@@ -1665,6 +1828,7 @@ STAGES: dict[str, Callable[[], None]] = {
     "sharing": stage_sharing,
     "sched_switch": stage_sched_switch,
     "shards_reconfigure": stage_shards_reconfigure,
+    "memory_guard": stage_memory_guard,
     "upgrade": stage_upgrade,
 }
 
