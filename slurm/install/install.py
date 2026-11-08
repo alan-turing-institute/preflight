@@ -31,7 +31,7 @@ import tempfile
 from collections.abc import Callable
 from contextlib import nullcontext
 from datetime import datetime
-from enum import StrEnum
+from enum import IntEnum, StrEnum
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -316,6 +316,16 @@ def cmd_part_time(site, args, modules) -> int:
 BUILD_ERRORS = (slurm_build.SlurmBuildError, subprocess.CalledProcessError, OSError)
 
 
+class UpgradeExit(IntEnum):
+    """`upgrade-slurm`'s exit status, for a caller that must know whether slurm was changed (a maintenance window
+    reboots only after DONE, and alerts a person on FAILED_AFTER_CHANGE or CONVERSION_RUNNING)."""
+
+    DONE = 0
+    REFUSED = 1  # nothing was changed: slurm runs as before
+    FAILED_AFTER_CHANGE = 2  # a package changed and a later step failed: the restore commands were printed
+    CONVERSION_RUNNING = 3  # slurmdbd is still converting the accounting database: it must be left running
+
+
 def cmd_upgrade(site, args, modules, chown: Chown | None = _chown) -> int:
     """Step a running slurm up to the site's `[slurm]` release, through each of its `steps` first (plan A5, A6.1).
 
@@ -329,13 +339,13 @@ def cmd_upgrade(site, args, modules, chown: Chown | None = _chown) -> int:
     if refusals := slurm_component.upgrade_refusals(site, running):
         for r in refusals:
             print(f"REFUSED: {r}", file=sys.stderr)
-        return 1
+        return UpgradeExit.REFUSED
     manager = package_manager(site)
     try:
         built = slurm_component.build_all(site, running)
     except BUILD_ERRORS as error:
         print(f"slurm build failed: {error}\nslurm was not touched.", file=sys.stderr)
-        return 1
+        return UpgradeExit.REFUSED
     state_save, user = slurm_component.config_value("StateSaveLocation"), slurm_component.config_value("SlurmUser")
     window = slurm_component.history_window(datetime.now())
     before = slurm_component.history(window)
@@ -368,7 +378,7 @@ def cmd_upgrade(site, args, modules, chown: Chown | None = _chown) -> int:
         print(f"UPGRADE STOPPED at slurm {version}: {error}\nThe backup is {folder}. Do not stop that slurmdbd or restore "
               f"while it runs. Once it answers, stop it (kill {error.pid}), then as root:\n  systemctl start slurmdbd slurmctld "
               f"slurmd\nand reopen the partitions, which the upgrade closed:\n{reopen}", file=sys.stderr)
-        return 1
+        return UpgradeExit.CONVERSION_RUNNING
     except (SystemExit, *BUILD_ERRORS) as error:
         if not installing:
             print(f"UPGRADE REFUSED: {error}", file=sys.stderr)
@@ -378,15 +388,15 @@ def cmd_upgrade(site, args, modules, chown: Chown | None = _chown) -> int:
                 print(again, file=sys.stderr)
             else:
                 print("No package was changed; slurm is running with its partitions as they were.", file=sys.stderr)
-            return 1
+            return UpgradeExit.REFUSED
         print(f"UPGRADE FAILED at slurm {version}: {error}", file=sys.stderr)
         print(f"Nothing further was done. To go back, as root:\n"
               f"{slurm_component.restore_text(folder, state_save, previous, manager, states)}", file=sys.stderr)
-        return 1
+        return UpgradeExit.FAILED_AFTER_CHANGE
     if failed := slurm_component.set_partitions(states):
         print("could not reopen the partitions; run by hand:\n" + "\n".join(f"  {c}" for c in failed), file=sys.stderr)
-        return 1
-    return cmd_apply(site, args, modules, chown)
+        return UpgradeExit.FAILED_AFTER_CHANGE
+    return UpgradeExit.DONE if cmd_apply(site, args, modules, chown) == 0 else UpgradeExit.FAILED_AFTER_CHANGE
 
 
 def cmd_user(site, args, modules) -> int:
