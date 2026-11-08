@@ -15,6 +15,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # slurm/, a standalone driver like footprint.py
 
 import cores  # noqa: E402 - path set just above
+import host_memory  # noqa: E402 - path set just above
 
 DEFAULT_RESERVE_MB = 12288  # the host memory guard's 12 GiB
 NO_VALUE = "[N/A]"
@@ -33,10 +34,8 @@ def run_command(argv: list[str]) -> str | None:
 
 
 def parse_mem_total_mb(meminfo: str) -> int:
-    match = re.search(r"^MemTotal:\s+(\d+)\s+kB", meminfo, re.MULTILINE)
-    if not match:
-        raise ValueError("no MemTotal line in meminfo")
-    return int(match.group(1)) // 1024
+    """MemTotal in slurm's MB (2^20 bytes)."""
+    return host_memory.meminfo_text(meminfo)["MemTotal"] // host_memory.SLURM_MB
 
 
 def parse_gpus(csv_text: str) -> list[dict]:

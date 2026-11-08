@@ -50,7 +50,6 @@ CALL_TIMEOUT_S = 10
 REOPEN_AFTER = 3
 #: A job is pushed back this many times from a node before it is barred from it (when its partition has another node).
 PUSHES_BEFORE_EXCLUDE = 2
-KB_BYTES = 1024
 MB_BYTES = 1_000_000  # decimal, as everything shown to people
 GB_MB = 1000
 DRAIN_FLAG = "DRAIN"
@@ -122,10 +121,7 @@ def apply_extra(settings: Settings, extra: str) -> tuple[Settings, str]:
 
 def free_mb(meminfo: Path) -> int:
     """MemAvailable in decimal megabytes."""
-    for line in meminfo.read_text(encoding="utf-8").splitlines():
-        if line.startswith("MemAvailable:"):
-            return int(line.split()[1]) * KB_BYTES // MB_BYTES
-    raise ValueError("no MemAvailable line")
+    return gpu_jobs.meminfo(meminfo)["MemAvailable"] // MB_BYTES
 
 
 def power(directory: Path) -> tuple[bool, bool]:

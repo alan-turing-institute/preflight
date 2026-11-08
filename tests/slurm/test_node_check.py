@@ -319,3 +319,12 @@ def test_a_launch_refusal_bars_the_node_from_the_pending_job_of_the_events_owner
     os.utime(waiting, (1, 1))
     box.run(slurm)
     assert not waiting.exists() and len(slurm.updates()) == before  # no exclusion for a job that is not waiting
+
+
+def test_free_mb_is_memavailable_in_decimal_megabytes_and_refuses_a_file_without_it(tmp_path: Path) -> None:
+    meminfo = tmp_path / "meminfo"
+    meminfo.write_text("MemTotal: 9 kB\nMemAvailable: 1953125 kB\n")
+    assert node_check.free_mb(meminfo) == 2000
+    meminfo.write_text("MemTotal: 9 kB\n")
+    with pytest.raises(ValueError):
+        node_check.free_mb(meminfo)

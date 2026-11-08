@@ -512,3 +512,88 @@ def test_a_job_listing_two_partitions_reads_right_and_one_on_a_part_time_machine
         [running], gpu=True, whole_box=True, leases=[], unregistered=[], services={}, memory_short=True, cores_short=True
     )
     assert (victims, steady, wait_only) == ([], [], [])  # it holds none of this machine's cores, memory or card
+
+
+def test_meminfo_gives_bytes_and_refuses_a_file_without_memavailable(tmp_path: Path) -> None:
+    path = tmp_path / "meminfo"
+    path.write_text("MemTotal: 1000 kB\nMemAvailable: 400 kB\nHugePages_Total: 0\nShmem: 7 kB\n")
+    assert gpu_jobs.meminfo(path) == {"MemTotal": 1000 * 1024, "MemAvailable": 400 * 1024, "Shmem": 7 * 1024}
+    with pytest.raises(ValueError):
+        gpu_jobs.meminfo_text("MemTotal: 1000 kB\n")
+
+
+def cgroup_with(tmp_path: Path, *, current: int = 4_350_000_000, cache: int = 600_000_000, shmem: int = 50_000_000,
+                limit: str = "max", pids: str = "100\n101\n") -> Path:
+    cgroup = tmp_path / "job"
+    cgroup.mkdir()
+    (cgroup / "memory.current").write_text(f"{current}\n")
+    (cgroup / "memory.stat").write_text(f"anon 1\nfile {cache}\nshmem {shmem}\n")
+    (cgroup / "memory.max").write_text(f"{limit}\n")
+    (cgroup / "cgroup.procs").write_text(pids)
+    return cgroup
+
+
+def test_held_bytes_drops_only_cache_the_host_can_take_back(tmp_path: Path) -> None:
+    cgroup = cgroup_with(tmp_path)
+    assert gpu_jobs.held_bytes(cgroup) == 3_800_000_000
+    (tmp_path / "x").mkdir()
+    assert gpu_jobs.held_bytes(cgroup_with(tmp_path / "x", current=1, cache=9, shmem=0)) == 0  # cache above current: floored
+    (cgroup / "memory.stat").unlink()
+    assert gpu_jobs.held_bytes(cgroup) is None  # a missing file is unknown, never zero
+
+
+def test_job_memory_measure_takes_unlimited_as_the_jobs_share_and_trusts_no_label(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(gpu_jobs, "container_label", lambda *_a, **_k: "5")  # every foreign container claims job 5
+    job = QueuedJob("5", "gpu", "RUNNING", "", "n", user="ann", start=77)
+    usage = {100: 3.0, 999: 50.0}  # pid 999 is some other job's process; pid 101 is not on the card
+    memory = gpu_jobs.JobMemory.measure(job, cgroup_with(tmp_path), usage, 8_000_000_000)
+    assert memory == gpu_jobs.JobMemory("5", "ann", "n", 77, 3_800_000_000, 3 * gpu_jobs.SLURM_MB, 8_000_000_000)
+    assert memory.total == memory.held + memory.card and memory.excess == memory.total - 8_000_000_000
+    (tmp_path / "b").mkdir()
+    limited = gpu_jobs.JobMemory.measure(job, cgroup_with(tmp_path / "b", limit="123"), usage, 8_000_000_000)
+    assert limited is not None and limited.ask == 123
+    assert gpu_jobs.JobMemory.measure(job, tmp_path / "gone", usage, 1) is None
+
+
+def test_queued_start_is_the_start_time_of_a_running_job_only() -> None:
+    started = {"set": True, "infinite": False, "number": 1700}
+    running, pending = gpu_jobs.parse_squeue(squeue_json(
+        {"job_id": 1, "job_state": ["RUNNING"], "start_time": started}, {"job_id": 2, "start_time": started}))
+    assert (running.start, pending.start) == (1700, 0)  # a waiting job's start_time is only an estimate
+
+
+def test_agent_notices_count_only_files_the_agent_user_wrote(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(gpu_jobs, "STATE_DIR", tmp_path)
+    gpu_jobs.write_event("7", EventAction.MEMORY_STOP, message="stopped")
+    gpu_jobs.write_event("7", EventAction.PAUSE, message="not a notice")
+    kinds = frozenset({EventAction.MEMORY_STOP})
+    monkeypatch.setattr(gpu_jobs, "SLURM_USER", "somebody-else")  # the file's owner is not the agent's user
+    assert gpu_jobs.agent_notices("7", kinds) == []
+    monkeypatch.setattr(gpu_jobs, "SLURM_USER", gpu_jobs.current_user())
+    assert [e.action for e in gpu_jobs.agent_notices("7", kinds)] == ["memory_stop"]
+    assert gpu_jobs.idle_notices("7") == []
+
+
+def test_memory_kill_reads_the_stop_gaps_event_and_ignores_a_forged_one(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(gpu_jobs, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(gpu_jobs, "_sacct_jobs", lambda *_a, **_k: [])
+    record = {"name": "n", "job_id": "5", "mem": "8G", "legs": [{"exit": 143, "signals": ["SIGTERM"], "ended_at": 2_000}]}
+    monkeypatch.setattr(gpu_jobs, "own_records", lambda _name: [record])
+    gpu_jobs.write_event("5", EventAction.MEMORY_STOP, message="m", total=3 * gpu_jobs.SLURM_MB + 1)
+    monkeypatch.setattr(gpu_jobs, "SLURM_USER", gpu_jobs.current_user())
+    kill = gpu_jobs.memory_kill("n")
+    assert kill is not None and (kill.used_mb, kill.by, kill.asked_mb) == (4, "the memory stop-gap", 8192)
+    monkeypatch.setattr(gpu_jobs, "SLURM_USER", "somebody-else")  # the job's own user wrote it: a forgery
+    assert gpu_jobs.memory_kill("n") is None
+
+
+def test_container_label_never_waits_on_a_hung_docker(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: dict[str, object] = {}
+
+    def run(*_a: object, **kwargs: object) -> None:
+        seen.update(kwargs)
+        raise subprocess.TimeoutExpired("docker", 5)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    assert gpu_jobs.container_label(f"/docker-{'ab' * 32}.scope", "l") == "" and seen["timeout"] == gpu_jobs.DOCKER_TIMEOUT_S

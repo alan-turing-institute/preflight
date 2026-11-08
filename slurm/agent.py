@@ -1298,10 +1298,7 @@ class Agent:
     # -- 5. job metrics -------------------------------------------------------------------------------------
 
     def _job_cgroup(self, job: gpu_jobs.QueuedJob) -> Path | None:
-        """The job's cgroup under slurm's scope: `job_<id>` in `<node>_slurmstepd.scope` (23.11), its SLUID in
-        `slurmstepd.scope` (26.05); None on another node."""
-        names = [f"job_{job.job_id}", *([job.sluid] if job.sluid else [])]
-        return next((path for name in names for path in self.cgroup_root.glob(f"system.slice/*slurmstepd.scope/{name}")), None)
+        return gpu_jobs.job_cgroup(job, self.cgroup_root)
 
     def _job_metrics(self, queue: list[gpu_jobs.QueuedJob], errors: list[str]) -> None:
         # a site without GPUs has no nvidia-smi to ask: its jobs' GPU memory is 0, not unknown

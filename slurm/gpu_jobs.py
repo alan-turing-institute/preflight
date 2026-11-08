@@ -30,6 +30,7 @@ from pathlib import Path
 
 import site_config
 from levels import Level, level_of  # noqa: F401 - re-exported for the tools
+from host_memory import KB_BYTES, SLURM_MB, meminfo, meminfo_text  # noqa: F401 - re-exported for the tools
 
 
 def load_site() -> site_config.Site:
@@ -183,6 +184,7 @@ class QueuedJob:
     submitted: int = 0  # epoch seconds it last entered the queue (a requeue resets it, measured); 0 when unknown
     node: str = ""  # the node a running job is on (squeue's `nodes`); "" while it waits
     sluid: str = ""  # 26.05 names the job's cgroup by this (`step_id.sluid`) instead of `job_<id>`; "" on 23.11
+    start: int = 0  # epoch seconds slurm started the running job (`start_time`); 0 when it has not started
 
     @property
     def uses_card(self) -> bool:
@@ -290,6 +292,7 @@ def parse_squeue(text: str) -> list[QueuedJob]:
                 cpus, level_of(str(raw.get("qos") or "")), _memory_mb(raw, cpus), _cores(raw),
                 int(submitted.get("number", 0)) if submitted.get("set") else 0,
                 str(raw.get("nodes") or ""), _sluid(raw),
+                _number(raw.get("start_time")) or 0 if state in ACTIVE_STATES else 0,
             )
         )
     return jobs
@@ -883,6 +886,15 @@ class MemoryKill:
     job_id: str
     asked_mb: int | None  # the memory it was given, in slurm MB (2^20 bytes); 0: the whole box (`--mem 0`); None: unknown
     by: str  # what killed it, for the line `submit.py` prints
+    used_mb: int | None = None  # what it held when the stop-gap stopped it, in slurm MB; None for any other kill
+
+
+class MemoryStopEnd(StrEnum):
+    """How a memory stop ended the job (the `ended` field of a MEMORY_STOP event)."""
+
+    BY_WRAPPER = "by_wrapper"
+    BY_SCANCEL = "by_scancel"
+    NOT_ENDED = "not_ended"
 
 
 def memory_kill(name: str) -> MemoryKill | None:
@@ -905,9 +917,14 @@ def memory_kill(name: str) -> MemoryKill | None:
         return None
     accounting = {str(job.get("job_id")): job
                   for job in _sacct_jobs("-j", ",".join(sorted(unclean)), timeout=SUBMIT_SACCT_S) or []}
-    kills: list[tuple[int, str, str]] = []  # (ended, job id, by)
+    kills: list[tuple[int, str, str, int | None]] = []  # (ended, job id, by, used_mb)
     for job_id, record in unclean.items():
         job = accounting.get(job_id, {})
+        stop = next((e for e in reversed(agent_notices(job_id, frozenset({EventAction.MEMORY_STOP})))
+                     if e.at // 10**9 >= newest_clean and isinstance(e.fields.get("total"), int | float)), None)
+        if stop is not None:
+            kills.append((ended(record), job_id, "the memory stop-gap", math.ceil(float(stop.fields["total"]) / SLURM_MB)))
+            continue
         guard = next((leg["killed_by"] for leg in record_legs(record) if isinstance(leg.get("killed_by"), dict)), None)
         if guard is not None:
             by = f"the host's OOM guard ({guard.get('guard') or 'earlyoom'})"
@@ -915,17 +932,17 @@ def memory_kill(name: str) -> MemoryKill | None:
             by = "slurm (OUT_OF_MEMORY: it passed its memory limit)"
         else:
             continue
-        kills.append((ended(record), job_id, by))
+        kills.append((ended(record), job_id, by, None))
     if not kills:
         return None
-    _, job_id, by = max(kills)
+    _, job_id, by, used_mb = max(kills, key=lambda kill: kill[:2])
     asked, job = unclean[job_id].get("mem"), accounting.get(job_id, {})
     try:
         asked_mb = mem_mb(str(asked)) if asked is not None else next(
             int(t["count"]) for t in job.get("tres", {}).get("allocated", []) if t.get("type") == "mem")
     except (ValueError, IndexError, KeyError, TypeError, StopIteration):
         asked_mb = None  # not slurm notation, or accounting does not say
-    return MemoryKill(job_id, asked_mb, by)
+    return MemoryKill(job_id, asked_mb, by, used_mb)
 
 
 #: The earliest start time sacct accepts: its window bounds which jobs are searched, and history is wanted whole.
@@ -988,6 +1005,8 @@ class EventAction(StrEnum):
     PUSH_BACK = "push_back"  # node_check.py requeued a job to free memory on a part-time machine
     LAUNCH_REFUSED = "launch_refused"  # the wrapper found a part-time machine unfit for the job at launch and requeued it
     IDLE = "idle"  # the agent found this job on one side of a waste finding (D40): waiting beside, or holding what is needed
+    OVER_ASK = "over_ask"  # the agent found this job holding more memory than it asked for
+    MEMORY_STOP = "memory_stop"  # the agent stopped this job because the host was out of memory
 
 
 @dataclass(frozen=True)
@@ -1001,16 +1020,28 @@ class Event:
     fields: dict[str, object] = field(default_factory=dict)
 
 
-def is_idle_notice(event: Event) -> bool:
-    """An idle finding the agent recorded (D41). The events folder is open to every user, so only a file the agent's
-    own user (or root) wrote counts: anyone else's is a forgery and is ignored."""
-    return (event.action == EventAction.IDLE and event.actor in {SLURM_USER, "root"}
+AGENT_NOTICES = frozenset({EventAction.IDLE, EventAction.OVER_ASK, EventAction.MEMORY_STOP})
+
+
+def is_agent_notice(event: Event, kinds: frozenset[EventAction]) -> bool:
+    """A finding of one of `kinds` the agent recorded (D41). The events folder is open to every user, so only a file
+    the agent's own user (or root) wrote counts: anyone else's is a forgery and is ignored."""
+    return (event.action in kinds and event.actor in {SLURM_USER, "root"}
             and isinstance(event.fields.get("message"), str))
+
+
+def agent_notices(job_id: str, kinds: frozenset[EventAction]) -> list[Event]:
+    """The findings of `kinds` the agent recorded on a job, oldest first."""
+    return [e for e in events(job_id) if is_agent_notice(e, kinds)]
+
+
+def is_idle_notice(event: Event) -> bool:
+    return is_agent_notice(event, frozenset({EventAction.IDLE}))
 
 
 def idle_notices(job_id: str) -> list[Event]:
     """The idle findings the agent recorded on a job, oldest first."""
-    return [e for e in events(job_id) if is_idle_notice(e)]
+    return agent_notices(job_id, frozenset({EventAction.IDLE}))
 
 
 def write_event(job_id: str, action: EventAction, **fields: object) -> Path:
@@ -1062,6 +1093,9 @@ def events(job_id: str | None = None) -> list[Event]:
 _LABELS: dict[tuple[str, str], str] = {}
 
 
+DOCKER_TIMEOUT_S = 5  # a hung docker daemon must not hold the agent's step; `container_label` answers "" then
+
+
 def _docker_label(container_id: str, label: str) -> str:
     if (container_id, label) in _LABELS:
         return _LABELS[container_id, label]
@@ -1069,6 +1103,7 @@ def _docker_label(container_id: str, label: str) -> str:
         ["docker", "inspect", "-f", f'{{{{index .Config.Labels "{label}"}}}}', container_id],
         capture_output=True,
         text=True,
+        timeout=DOCKER_TIMEOUT_S,
         check=False,
     )
     if done.returncode != 0:  # docker down or the container gone: not remembered, asked again next time
@@ -1125,6 +1160,60 @@ def flat_key(path: Path, key: str) -> int | None:
     return None
 
 
+def held_bytes(cgroup: Path) -> int | None:
+    """What a cgroup holds that the host cannot take back: `memory.current` less the page cache it could drop
+    (`file` less `shmem`, which is cache but not droppable), floored at 0; None when either file cannot be read."""
+    current = read_int(cgroup / "memory.current")
+    cache, shmem = flat_key(cgroup / "memory.stat", "file"), flat_key(cgroup / "memory.stat", "shmem")
+    if current is None or cache is None or shmem is None:
+        return None
+    return max(0, current - (cache - shmem))
+
+
+def card_bytes(usage: Mapping[int, float], pids: Iterable[int]) -> int:
+    """GPU memory (bytes) of `pids`, from `gpu_usage()`'s MiB per pid; a pid not on the card adds nothing."""
+    return int(sum(usage[pid] for pid in set(pids) if pid in usage) * SLURM_MB)
+
+
+def job_cgroup(job: QueuedJob, cgroup_root: Path = CGROUP_ROOT) -> Path | None:
+    """The job's cgroup under slurm's scope: `job_<id>` in `<node>_slurmstepd.scope` (23.11), its SLUID in
+    `slurmstepd.scope` (26.05); None on another node."""
+    names = [f"job_{job.job_id}", *([job.sluid] if job.sluid else [])]
+    return next((path for name in names for path in cgroup_root.glob(f"system.slice/*slurmstepd.scope/{name}")), None)
+
+
+@dataclass(frozen=True)
+class JobMemory:
+    """What one running job takes from the host: memory its cgroup holds plus the card memory of its own processes."""
+
+    job_id: str
+    user: str
+    name: str
+    start: int  # slurm's start time of the run (epoch s)
+    held: int  # bytes (`held_bytes`)
+    card: int  # bytes (`card_bytes`)
+    ask: int  # bytes the job asked for (its `memory.max`; the jobs' share when that is unlimited)
+
+    @property
+    def total(self) -> int:
+        return self.held + self.card
+
+    @property
+    def excess(self) -> int:
+        return self.total - self.ask
+
+    @classmethod
+    def measure(cls, job: QueuedJob, cgroup: Path, usage: Mapping[int, float], jobs_memory: int) -> JobMemory | None:
+        """None when the cgroup's memory cannot be read. Card memory counts the cgroup's own processes only: a docker
+        label is set by the job's user, so a forged one would put another job's card memory on this one."""
+        held = held_bytes(cgroup)
+        if held is None:
+            return None
+        ask = read_int(cgroup / "memory.max")  # the literal `max` (no limit) does not parse
+        return cls(job.job_id, job.user, job.name, job.start, held, card_bytes(usage, cgroup_pids(cgroup)),
+                   jobs_memory if ask is None else ask)
+
+
 # Sizing arithmetic shared by `submit.py` (--mem auto, cores from history) and the job wrapper's end-of-run advice
 # (D37), so the two cannot drift apart. Here, not in submit.py: the wrapper must not import submit (submit imports
 # audit, which imports the wrapper).
@@ -1153,14 +1242,14 @@ def mem_option(mb: float, most_mb: int | None) -> str:
     return "0" if most_mb is not None and whole_g * MB_PER_G > most_mb else f"{whole_g}G"
 
 
-def gpu_usage() -> dict[int, float] | None:
+def gpu_usage(timeout: float = 30.0) -> dict[int, float] | None:
     """GPU memory (MiB) per pid, summed over every GPU the pid uses; None when `nvidia-smi` does not answer."""
     try:
         done = subprocess.run(
             ["nvidia-smi", "--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits"],
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=timeout,
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired):
@@ -1311,8 +1400,8 @@ def machine_use(
     """What this host is really using, slurm or not: memory in use (MemTotal - MemAvailable, bytes, as `free`'s
     "available") and how many cores were busy over `interval_s` (/proc/stat). {} when /proc cannot be read."""
     try:
-        meminfo = {key: value.split() for key, _, value in (line.partition(":") for line in read("/proc/meminfo").splitlines())}
-        total, available = int(meminfo["MemTotal"][0]) * 1024, int(meminfo["MemAvailable"][0]) * 1024  # kB in meminfo
+        memory = meminfo_text(read("/proc/meminfo"))
+        total, available = memory["MemTotal"], memory["MemAvailable"]
         before = _cpu_ticks(read("/proc/stat"))
         sleep(interval_s)
         after = _cpu_ticks(read("/proc/stat"))
