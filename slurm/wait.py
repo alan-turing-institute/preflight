@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Wait until a slurm job and every job chained after it have finished; print their final states, each with the
-usage report its last run left (D37: what it used, what to ask for next time; see `job_wrapper.usage_lines`).
+usage report its last run left (D37: what it used, what to ask for next time; see `job_wrapper.usage_lines`). While it
+waits it prints each idle finding the agent records on those jobs (D41).
 
 Design 3.8-3.9: watchers wait on slurm, not on systemd units. A pre-empted job is pending again, so it
 never reads as done; a job cancelled because its dependency failed (`kill_invalid_depend`) leaves the
@@ -67,14 +68,30 @@ def usage_lines(job_id: str, user: str) -> list[str]:
     return [gpu_jobs.printable(line)[:LINE_MAX] for line in lines]
 
 
+def new_notices(jobs: list[str], seen: set[tuple[str, int]]) -> list[str]:
+    """One line per idle finding the agent recorded on `jobs` since the last call (D41), adding them to `seen`: a
+    session waiting on its jobs learns that one waits beside an unused GPU, or holds what such a job needs."""
+    lines = []
+    for job in jobs:
+        for event in gpu_jobs.idle_notices(job):
+            if (job, event.at) not in seen:
+                seen.add((job, event.at))
+                role = str(event.fields.get("role") or "idle")
+                lines.append(gpu_jobs.printable(f"[wait] #{job} {role}: {event.fields['message']}"[:LINE_MAX]))
+    return lines
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("job_id")
     parser.add_argument("--poll", type=float, default=60.0)
     parser.add_argument("--once", action="store_true", help="report now and exit 2 if anything is unfinished")
     arguments = parser.parse_args()
+    seen: set[tuple[str, int]] = set()
     while True:
         jobs = chain(arguments.job_id, all_sidecars())
+        for line in new_notices(jobs, seen):
+            print(line, flush=True)
         queue = gpu_jobs.read_queue()
         if queue is not None:
             unfinished = {job.job_id for job in queue} & set(jobs)

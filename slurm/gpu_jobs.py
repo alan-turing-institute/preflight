@@ -987,6 +987,7 @@ class EventAction(StrEnum):
     FAILED = "failed"
     PUSH_BACK = "push_back"  # node_check.py requeued a job to free memory on a part-time machine
     LAUNCH_REFUSED = "launch_refused"  # the wrapper found a part-time machine unfit for the job at launch and requeued it
+    IDLE = "idle"  # the agent found this job on one side of a waste finding (D40): waiting beside, or holding what is needed
 
 
 @dataclass(frozen=True)
@@ -998,6 +999,18 @@ class Event:
     actor: str
     at: int  # time_ns, from the file name
     fields: dict[str, object] = field(default_factory=dict)
+
+
+def is_idle_notice(event: Event) -> bool:
+    """An idle finding the agent recorded (D41). The events folder is open to every user, so only a file the agent's
+    own user (or root) wrote counts: anyone else's is a forgery and is ignored."""
+    return (event.action == EventAction.IDLE and event.actor in {SLURM_USER, "root"}
+            and isinstance(event.fields.get("message"), str))
+
+
+def idle_notices(job_id: str) -> list[Event]:
+    """The idle findings the agent recorded on a job, oldest first."""
+    return [e for e in events(job_id) if is_idle_notice(e)]
 
 
 def write_event(job_id: str, action: EventAction, **fields: object) -> Path:

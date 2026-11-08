@@ -76,10 +76,19 @@ def test_wait_repeats_the_last_runs_usage_report_from_the_jobs_own_record_only(
         assert wait.usage_lines("5", me) == []
     record(["[job] \x1b]0;forged\x07" + "x" * 400])
     assert wait.usage_lines("5", me)[0].isprintable() and len(wait.usage_lines("5", me)[0]) == wait.LINE_MAX
+    # an idle finding the agent recorded on a waited-on job is printed once while waiting (D41); one written by any other
+    # user (the events folder is open to all) is a forgery and is not
+    (tmp_path / "events").mkdir()
+    wait.gpu_jobs.write_event("5", wait.gpu_jobs.EventAction.IDLE, role="holding", other_job="7", message="holds 8 cores\x1b[2J")
+    assert wait.new_notices(["5"], set()) == []  # written by this test's user, not the agent's
+    monkeypatch.setattr(wait.gpu_jobs, "SLURM_USER", me)  # now this user stands for the agent
+    seen: set[tuple[str, int]] = set()
+    assert wait.new_notices(["5"], seen) == ["[wait] #5 holding: holds 8 cores?[2J"]
+    assert wait.new_notices(["5"], seen) == []  # once
     # the command itself prints them under the job's final state
     record(report)
     monkeypatch.setattr(wait.gpu_jobs, "read_queue", list)  # nothing unfinished
     monkeypatch.setattr(wait.gpu_jobs, "completion_records", lambda _jobs: {"5": {"JobState": "COMPLETED", "UserId": me}})
     monkeypatch.setattr(sys, "argv", ["wait.py", "5"])
     assert wait.main() == 0
-    assert capsys.readouterr().out.splitlines() == ["[wait] 5: COMPLETED", *report]
+    assert capsys.readouterr().out.splitlines() == ["[wait] #5 holding: holds 8 cores?[2J", "[wait] 5: COMPLETED", *report]

@@ -397,7 +397,10 @@ Every 10 minutes it also looks for jobs waiting beside hardware they could use: 
 wants it waits for memory or cores, or cores free while a CPU-only job waits only for the `cpu` partition's core cap,
 both judged on the machines the job may run on. Spare memory while every core is busy is not reported, since moving a
 job would only change who uses the cores. Each finding names the running jobs holding what the waiting job lacks; the
-jobs page and `status.py` show them one line per cause, and the site's `notify_command` is told once an hour per pair.
+jobs page and `status.py` show them one line per cause. Each new pair (waiting job, holding job) is recorded once as
+an `idle` event on both jobs: the job's page shows it in its timeline and `gpujobs-wait` prints it to whoever waits on
+either job, so nobody has to be messaged. A site that also wants notices pushed sets `notify_command` (told once an
+hour per pair).
 
 **`lease`** (only when `[lease]` is present). `slurm-gpu-lease-keeper.service`, a systemd **user** unit of
 `keeper_user`, written to `/etc/systemd/user/` and enabled through that user's manager (nothing is written in the

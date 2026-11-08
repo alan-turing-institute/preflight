@@ -45,7 +45,9 @@ class Fake:
             record=lambda job_id, user=None: self.asked.append((job_id, user)) or record,
             events=lambda _j: [gpu_jobs.Event("7", "pause", "alice", 1_700_000_000_000_000_000),
                                gpu_jobs.Event("7", "push_back", "root", 1_700_000_100_000_000_000,
-                                              {"node": "laptop", "free_mb": 7300})],
+                                              {"node": "laptop", "free_mb": 7300}),
+                               gpu_jobs.Event("7", "idle", "slurm", 1_700_000_200_000_000_000, {"message": "holds 8 cores"}),
+                               gpu_jobs.Event("7", "idle", "alice", 1_700_000_300_000_000_000, {"message": "forged by alice"})],
             elapsed=lambda: {"7": "1:00"},
             efficiency=lambda job_id, record=None: jobs_view.Efficiency(job_id, 4 * 1024**3, None, None, 0.5),
             history=lambda *_a: [],
@@ -140,7 +142,9 @@ def test_every_get_route_answers(path: str) -> None:
         assert "asked</span> 64.4 GB</div></td>" in body  # slurm's request now (60 x 2^30 bytes), not the record's 4G
         # where a running job is, as a small line inside the state cell; a pushed-back job's timeline says why it moved
         assert '<div class="why">on gpu-node-1</div>' in body
-        assert "Pushed back: 7.3 GB free on laptop" in call(fake, "/job/7")[1]
+        job_page = call(fake, "/job/7")[1]
+        assert "Pushed back: 7.3 GB free on laptop" in job_page
+        assert "Idle finding: holds 8 cores" in job_page and "forged by alice" not in job_page  # only the agent's (D41)
         # who queued each job, and its level, at every width (not hide-sm)
         assert '<td class="inline" data-k="user">alice</td>' in body and '<td class="inline" data-k="level"><span class="pill level-normal"' in body
         # its own column: when slurm (last) queued a job, and for a waiting one how long ago; unknown shows a dash

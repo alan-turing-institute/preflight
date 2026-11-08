@@ -394,6 +394,7 @@ class State:
     part_time_resources: dict[str, dict[str, object]] = field(default_factory=dict)  # node -> jobs_memory_gb, keep_cpus
     idle_since: dict[str, int] = field(default_factory=dict)  # "<waiting job>:<rule>" -> when the finding first showed
     idle_told: dict[str, float] = field(default_factory=dict)  # "<waiting job>:<holder job>" -> when it was last told
+    idle_recorded: list[str] = field(default_factory=list)  # "<waiting job>:<holder job>" pairs already written as events
 
 
 def _by_id(job_id: str) -> tuple[int, str]:
@@ -1215,6 +1216,7 @@ class Agent:
             finding.since = s.idle_since.setdefault(key, int(now))
         s.idle_told = {k: v for k, v in s.idle_told.items() if now - v < IDLE_NOTICE_EVERY_S}
         jobs = {j.job_id: j for j in queue}
+        self._record_idle(found, errors)
         told = 0
         for finding in found:
             waiting = jobs.get(finding.waiting)
@@ -1235,6 +1237,33 @@ class Agent:
                              f"#{finding.waiting} needs while it waits with {finding.idle} ({holder.job_class}, {moved})",
                              errors, role=NotifyRole.HOLDING, other_job=finding.waiting, other_project=finding.project)
         self.idle = found
+
+    def _record_idle(self, found: list[IdleFinding], errors: list[str]) -> None:
+        """Write each new (waiting job, holder) pair of a finding as an `idle` event on both jobs, once while the pair
+        lasts (D41): the page's timeline and `gpujobs-wait` read them, so nobody has to be messaged."""
+        s = self.state
+        pairs = {f"{f.waiting}:{h.job}": (f, h) for f in found for h in f.holders}
+        s.idle_recorded = [key for key in s.idle_recorded if key in pairs]
+        for key, (finding, holder) in pairs.items():
+            if key in s.idle_recorded:
+                continue
+            moved = "it can be moved" if holder.movable else "it cannot be moved"
+            sides = (
+                (finding.waiting, NotifyRole.WAITING, holder.job, holder.project,
+                 (f"waits for {finding.lacks} with {finding.idle}; {holder.project} job #{holder.job} holds "
+                  f"{holder.amount} ({holder.job_class}, {moved})")),
+                (holder.job, NotifyRole.HOLDING, finding.waiting, finding.project,
+                 (f"holds {holder.amount} that {finding.project} job #{finding.waiting} needs while it waits with "
+                  f"{finding.idle} ({holder.job_class}, {moved})")),
+            )
+            try:
+                for job, role, other, other_project, message in sides:
+                    gpu_jobs.write_event(job, gpu_jobs.EventAction.IDLE, role=role.value, other_job=other,
+                                         other_project=other_project, message=message)
+            except OSError as exc:
+                errors.append(f"recording idle finding {key} failed: {exc}")
+                continue
+            s.idle_recorded.append(key)
 
     # -- 6. OOM guard kills ----------------------------------------------------------------------------------
 

@@ -676,6 +676,9 @@ def test_a_whole_box_job_waiting_beside_a_restart_cpu_job_is_found_noticed_hourl
     assert agent_module.read_idle(world.dir) == beat["idle"]
     # both sides are told, each about its own job with its real name's project and user, naming the other side
     assert sink.read_text().splitlines() == ["idle waiting 596 a wait 611", "idle holding 611 b crypto-quant-research 596"]
+    # and each side gets one `idle` event for the job page and gpujobs-wait, written once while the pair lasts
+    assert [(e.job, e.fields["role"], e.fields["other_job"]) for e in gpu_jobs.events() if e.action == "idle"] == [
+        ("596", "waiting", "611"), ("611", "holding", "596")]
     world.step()  # inside the 600 s timer: not looked at again
     world.t += agent_module.IDLE_EVERY_S
     world.step()
@@ -683,6 +686,7 @@ def test_a_whole_box_job_waiting_beside_a_restart_cpu_job_is_found_noticed_hourl
     world.t += agent_module.IDLE_NOTICE_EVERY_S
     world.step()
     assert len(sink.read_text().splitlines()) == 4
+    assert len([e for e in gpu_jobs.events() if e.action == "idle"]) == 2  # still the same pair: no new events
     assert world.step()["idle"][0]["since"] == 1000  # the same finding keeps its start
     # no finding for a job that waits on a dependency, nor on a machine with nothing idle
     idle_world(world)
