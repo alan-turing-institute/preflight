@@ -61,6 +61,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "hostguard"))
 
 import cores  # noqa: E402 - path set just above
 import gpu_jobs  # noqa: E402
+import memory_guard  # noqa: E402
 import portability  # noqa: E402
 from gpu_jobs import (  # audit.py imports gpu_mib_by_pid from here
     CGROUP_ROOT,
@@ -233,8 +234,28 @@ def append_row(out: IO[str], row: dict[str, object]) -> None:
     out.flush()
 
 
+#: How often a running command's wrapper looks for a memory stop of its run (D44): the agent escalates after ACK_S.
+STOP_POLL_S = 1.0
+
+
+def carry_out_stop(job_id: str, pid: int, leg_started: float) -> dict[str, object] | None:
+    """A memory stop the agent asked for this leg (D44): acknowledge it in the job's record, then SIGKILL the command's
+    process group. The kill description, or None when there is no stop of this leg."""
+    request = memory_guard.StopRequest.read(job_id, log=lambda line: print(f"[job] {line}", file=sys.stderr, flush=True))
+    if request is None or not request.for_leg(leg_started):
+        return None
+    now = time.time()
+    best_effort("sidecar", lambda: gpu_jobs.update_sidecar(job_id, **request.ack_fields(now)))
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(pid, signal.SIGKILL)
+    print(f"[job] stopped by the memory guard: free memory was {gpu_jobs.size_text(request.free)}, and this run held "
+          f"{gpu_jobs.size_text(request.held + request.card)} (memory + card) of its {gpu_jobs.size_text(request.ask)} ask",
+          file=sys.stderr, flush=True)
+    return request.kill_description(pid, now)
+
+
 def run_and_measure(
-    command: list[str], footprint: Path, cgroup: Path | None, sample_s: float, job_id: str = ""
+    command: list[str], footprint: Path, cgroup: Path | None, sample_s: float, job_id: str = "", leg_started: float = 0.0
 ) -> dict[str, object]:
     received: list[int] = []
 
@@ -261,14 +282,22 @@ def run_and_measure(
         with contextlib.suppress(ProcessLookupError):
             os.killpg(child.pid, missed[0])
     peak_gpu, peak_mem = 0.0, 0
+    stopped: dict[str, object] | None = None
+    # waits in short slices so a memory stop is seen within STOP_POLL_S; samples every sample_s
+    next_sample = time.monotonic() + sample_s
     out = best_effort("footprint", open_footprint, footprint)
     with out or contextlib.nullcontext():
         while True:
             try:
-                status = child.wait(timeout=sample_s)
+                status = child.wait(timeout=min(STOP_POLL_S, sample_s))
                 break
             except subprocess.TimeoutExpired:
                 pass
+            if job_id and stopped is None:  # a run outside slurm never reads requests
+                stopped = carry_out_stop(job_id, child.pid, leg_started)
+            if time.monotonic() < next_sample:
+                continue
+            next_sample += sample_s
             row = sample(cgroup, {child.pid}, job_id)
             if out:
                 best_effort("footprint", append_row, out, row)
@@ -281,6 +310,7 @@ def run_and_measure(
         "signals": [signal.Signals(s).name for s in received],
         "peak_gpu_mib": peak_gpu,
         "peak_mem_bytes": max(peak_mem, final or 0),
+        **({"stopped": stopped} if stopped else {}),
     }
 
 
@@ -518,7 +548,8 @@ def main() -> int:
         print("[job] part-time launch check passed", flush=True)
 
     footprint = gpu_jobs.STATE_DIR / "footprints" / f"{job_id}.jsonl"
-    started = int(time.time())
+    leg_started = time.time()  # a stop request older than this is an earlier run's
+    started = int(leg_started)
     if site.hostguard:
         # The job is what a memory shortage should end, not a session: 2026-10-18 13:57 earlyoom ended three
         # Claude sessions while a training job holding 68.5 GB of the unified pool sat at oom_score_adj 0 (GPU
@@ -534,11 +565,13 @@ def main() -> int:
     received = best_effort("cores", lambda: cores.CoreSpeeds.read().received(os.sched_getaffinity(0)))
     # core time and memory-cap kills are read right around the command, on a monotonic clock (D37's report)
     before, clock_start = cgroup_counters(cgroup), time.monotonic()
-    outcome = run_and_measure(command, footprint, cgroup, arguments.sample, job_id)
+    outcome = run_and_measure(command, footprint, cgroup, arguments.sample, job_id, leg_started=leg_started)
     after, wall_s = cgroup_counters(cgroup), time.monotonic() - clock_start
     ended = int(time.time())
-    # slurm's own SIGTERM (pre-emption, cancel, time limit) ends the job its own way; only an unforwarded one is a kill
-    killed = None if outcome["signals"] else guard_kill(job_id, started, ended, int(outcome["pid"]))  # type: ignore[call-overload]
+    # slurm's own SIGTERM (pre-emption, cancel, time limit) ends the job its own way; only an unforwarded one is a kill.
+    # A memory stop is a kill even when such a SIGTERM came in the same second (D44).
+    stopped = outcome.pop("stopped", None)
+    killed = stopped or (None if outcome["signals"] else guard_kill(job_id, started, ended, int(outcome["pid"])))  # type: ignore[call-overload]
     usage = measure_usage(cgroup, outcome, before, after, wall_s, guard_killed=killed is not None, unified=site.unified_memory)
     in_service = os.environ.get("SLURM_JOB_PARTITION") == gpu_jobs.Partition.SERVICE and site.service is not None
     report = usage_lines(

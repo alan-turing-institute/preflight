@@ -7,11 +7,13 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
 import gpu_jobs
 import job_wrapper
+import memory_guard
 import pytest
 
 WRAPPER = Path(job_wrapper.__file__)
@@ -301,6 +303,48 @@ def test_a_run_the_oom_guard_killed_fails_or_is_requeued_never_passes(tmp_path: 
     job_wrapper.after_kill("78", kill, [*legs, {"killed_by": kill}], "p:resume:x", lambda argv: ran.append(argv) or 0)
     job_wrapper.after_kill("78", kill, [{"killed_by": kill}], "p:restart:x", lambda argv: ran.append(argv) or 0)
     assert len(ran) == 1
+
+
+def test_a_memory_stop_of_this_run_is_carried_out_by_its_wrapper_and_only_that_one(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    gb, state = 10**9, tmp_path / "state"
+    monkeypatch.setattr(job_wrapper.gpu_jobs, "STATE_DIR", state)
+    monkeypatch.setattr(gpu_jobs, "SLURM_USER", gpu_jobs.current_user())  # the agent's user wrote the requests below
+
+    def stop(job_id: str, at: float) -> None:
+        memory_guard.StopRequest(job_id, 0, at, 9 * gb, 2 * gb, 8 * gb, 3 * gb).write()
+
+    def run(job_id: str, child: str, then=None) -> tuple[int, float, dict]:
+        monkeypatch.setenv("SLURM_JOB_ID", job_id)
+        monkeypatch.setenv("SLURM_JOB_NAME", "p:restart:x")
+        monkeypatch.setattr(sys, "argv", ["job_wrapper.py", "--sample", "0.2", "--", sys.executable, "-c", child])
+        if then:
+            threading.Timer(0.5, then).start()
+        began = time.monotonic()
+        status = job_wrapper.main()
+        return status, time.monotonic() - began, json.loads((state / "jobs" / f"{job_id}.json").read_text())
+
+    before = signal.getsignal(signal.SIGTERM)
+    try:
+        status, took, record = run("91", "import time; time.sleep(30)", lambda: stop("91", time.time()))
+        assert status == job_wrapper.Exit.KILLED_FOR_MEMORY and took < 0.5 + memory_guard.ACK_S  # inside the agent's wait
+        assert record["stop_ack"]["at"] >= record["stop_ack"]["request_at"]  # acknowledged before the kill
+        assert record["last_leg"]["killed_by"]["guard"] == "memory stop-gap" and "stopped" not in record["last_leg"]
+        assert "stopped by the memory guard" in capsys.readouterr().err
+        assert len((state / "footprints" / "91.jsonl").read_text().splitlines()) >= 2  # --sample 0.2 still samples
+        stop("92", time.time() - 100)  # an earlier run's request
+        assert run("92", "import time; time.sleep(1)")[0] == 0
+        monkeypatch.setattr(gpu_jobs, "SLURM_USER", "somebody-else")  # a request the agent did not write
+        stop("93", time.time() + 100)
+        assert run("93", "import time; time.sleep(1)")[0] == 0 and "ignoring" in capsys.readouterr().err
+        monkeypatch.setattr(gpu_jobs, "SLURM_USER", gpu_jobs.current_user())
+        # slurm's SIGTERM in the same moment (a child that ignores it): the stop still counts as a memory kill
+        stubborn = "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)"
+        status, _, record = run("94", stubborn, lambda: (os.kill(os.getpid(), signal.SIGTERM), stop("94", time.time())))
+        assert status == job_wrapper.Exit.KILLED_FOR_MEMORY and record["last_leg"]["signals"] == ["SIGTERM"]
+    finally:
+        signal.signal(signal.SIGTERM, before)
 
 
 def test_a_part_time_launch_that_no_longer_holds_is_requeued_with_a_marker_and_the_third_in_a_row_fails(

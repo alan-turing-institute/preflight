@@ -94,12 +94,13 @@ class StopRequest:
 
     @classmethod
     def read(cls, job_id: str, state_dir: Path | None = None, log: Log = print) -> StopRequest | None:
-        """The request for `job_id`, trusted only when slurm's user or root wrote it; None otherwise (logged)."""
+        """The request for `job_id`, trusted only when slurm's user or root wrote it; None otherwise (logged, without a
+        prefix: the agent and the wrapper each add their own)."""
         path = stop_path(job_id, state_dir)
         data = gpu_jobs.read_json(path, gpu_jobs.SLURM_USER) or gpu_jobs.read_json(path, "root")
         request = cls._parse(data) if data is not None else None
         if request is None and path.is_file():
-            log(f"{PREFIX} ignoring {path}: not a request written by {gpu_jobs.SLURM_USER} or root")
+            log(f"ignoring {path}: not a stop request written by {gpu_jobs.SLURM_USER} or root")
         return request
 
     @classmethod
@@ -178,7 +179,8 @@ class Actuator:
     def requests(self, log: Log = print) -> list[StopRequest]:
         folder = stops_dir(self.state_dir)
         names = sorted(p.name for p in folder.glob("job_*.json")) if folder.is_dir() else []
-        found = (StopRequest.read(name.removeprefix("job_").removesuffix(".json"), self.state_dir, log) for name in names)
+        found = (StopRequest.read(name.removeprefix("job_").removesuffix(".json"), self.state_dir,
+                                  lambda line: log(f"{PREFIX} {line}")) for name in names)
         return [r for r in found if r is not None]
 
 
