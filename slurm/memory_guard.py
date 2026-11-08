@@ -14,7 +14,6 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
-import socket
 import sys
 import threading
 import time
@@ -307,7 +306,7 @@ def main(argv: list[str] | None = None) -> int:
     if queue is None:
         print("squeue did not answer", file=sys.stderr)
         return 1
-    here = socket.gethostname().split(".")[0]
+    here = gpu_jobs.this_host()
     node = next((n for n in gpu_jobs.load_site().nodes if n.name == here), None)
     if node is None:
         print(f"this host ({here}) is not a node of the site", file=sys.stderr)

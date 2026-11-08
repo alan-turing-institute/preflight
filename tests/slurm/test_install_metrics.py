@@ -138,6 +138,8 @@ def test_slurm_conf_lines_match_the_jobstats_docs_and_render_into_slurm_conf():
     ]
     conf = render.render(site, "slurm", {"slurm_conf": lines})["/etc/slurm/slurm.conf"].content
     assert conf.count("Prolog=/etc/slurm/prolog.d/*.sh\n") == 1
+    # the containers epilog is the first Epilog= line, so it runs before Jobstats' glob (slurm stops at a failing one)
+    assert [ln for ln in conf.splitlines() if ln.startswith("Epilog=")] == ["Epilog=gpujobs_containers.sh", "Epilog=/etc/slurm/epilog.d/*.sh"]
     # docs/setup/cgroups.md:5,11-13 and overview.md:5: slurm must account by cgroup, with gpu in the TRES list.
     for needed in ("JobAcctGatherType=jobacct_gather/cgroup", "ProctrackType=proctrack/cgroup", "AccountingStorageTRES=gres/gpu"):
         assert needed in conf

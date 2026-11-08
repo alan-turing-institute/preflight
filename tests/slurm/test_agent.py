@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
 import subprocess
 import sys
 import time
@@ -68,6 +69,7 @@ class World:
         self.extra = ""  # node n1's Extra in `scontrol show node n1 --json`
         self.guard_lines: list[str] = []
         self.cgroups = tmp_path / "cgroup"
+        self.containers: list[gpu_jobs.JobContainer] | None = []  # the root health check's map of labelled containers
         self.live: dict[int, str] = {}  # pid -> job of the processes that still exist when the OOM guard names them
         (tmp_path / "agent").mkdir()
         (tmp_path / "agent" / "boot_id").write_text(
@@ -122,7 +124,7 @@ class World:
             part_time_conf=self.dir / "part_time_nodes.conf",
             copier=lambda argv, **_kw: self.copies.append(argv) or done(argv, self.copy_answer[0], err=self.copy_answer[1]),
             guard=self.guard, hostname="n1.example", node_check_path=self.dir / "node_check.json",
-            meminfo_path=self.dir / "meminfo",
+            meminfo_path=self.dir / "meminfo", containers=lambda: self.containers,
         )
 
     def gpu_usage(self) -> dict[int, float] | None:
@@ -188,12 +190,15 @@ def test_the_agent_writes_the_metrics_of_running_jobs_with_the_queues_user_and_r
     running = dataclasses.replace(job("5"), user="ann", name="proj:train")
     world.queue = [running, job("7", "COMPLETING"), dataclasses.replace(job("6"), user="bob"),
                    dataclasses.replace(job("8"), sluid="s8VSM5Q2WYAV00")]
+    (world.cgroups / "system.slice" / "docker-c.scope").mkdir()
+    (world.cgroups / "system.slice" / "docker-c.scope" / "memory.current").write_text("1000\n")
+    world.containers = [gpu_jobs.JobContainer("c" * 64, "8", float(world.queue[3].start), "/system.slice/docker-c.scope")]
     world.step()
     assert sorted(path.name for path in metrics.iterdir()) == ["job_5.prom", "job_8.prom"]  # job 6 runs, but on another node (no cgroup here), 7 is ending, the rest is gone
     text = (metrics / "job_5.prom").read_text()
     assert 'jobid="5",user="ann",project="proj"' in text  # the queue's user, never the writer's
     assert f"}} {300 * agent_module.MIB}\n" in text and "} 4096\n" in text  # pid 20 is nobody's here
-    assert "} 2048\n" in (metrics / "job_8.prom").read_text()
+    assert "} 3048\n" in (metrics / "job_8.prom").read_text()  # its cgroup and its run's docker container
     world.queue, world.smi = [], None  # job 5 ended, but nvidia-smi is silent: unknown is not zero
     assert "nvidia-smi did not answer" in str(world.step())
     assert (metrics / "job_5.prom").exists()
@@ -339,6 +344,13 @@ def test_a_unified_node_records_its_outside_use_each_minute_and_a_separate_memor
     assert "memory_guard" not in beat and not (world.dir / "agent" / "outside").exists()
     assert gpu_jobs.agent_notices("5", OVER) == []
     world.unify()
+    # the run's docker container is the job's, not outside use; one left by an earlier run of the id is outside use
+    mine = gpu_jobs.cgroup_of(os.getpid())  # a real process stands for the container's, so its card memory is found
+    make_cgroup(f"cgroup{mine}", current=2 * GB, cache=GB, shmem=0)  # holds 1 GB
+    world.smi[os.getpid()] = 500.0
+    make_cgroup("cgroup/system.slice/old.scope", current=GB, cache=0, shmem=0)  # the earlier run's: outside use
+    world.containers = [gpu_jobs.JobContainer("a" * 64, "5", FIRST_RUN, mine),
+                        gpu_jobs.JobContainer("b" * 64, "5", FIRST_RUN - 1, "/system.slice/old.scope")]
     folder = world.dir / "agent" / "outside"
     folder.mkdir()
     old = folder / f"{time.strftime('%Y-%m-%d', time.localtime(world.t - 15 * 86400))}.jsonl"
@@ -348,8 +360,10 @@ def test_a_unified_node_records_its_outside_use_each_minute_and_a_separate_memor
     world.step()  # not yet a minute: one line only
     [line] = [json.loads(text) for path in folder.glob("*.jsonl") for text in path.read_text().splitlines()]
     used = (125_000_000 - 100_000_000) * 1024
+    in_containers = GB + 500 * 2**20
     assert line == {"t": int(world.t - agent_module.OUTSIDE_EVERY_S + 1), "node": "n1", "used": used,
-                    "jobs_held": 3 * GB, "jobs_card": 1000 * 2**20, "outside": used - 3 * GB - 1000 * 2**20}
+                    "jobs_held": 3 * GB, "jobs_card": 1000 * 2**20, "jobs_containers": in_containers,
+                    "outside": used - 3 * GB - 1000 * 2**20 - in_containers}
     assert not old.exists()  # older than 14 days
 
 

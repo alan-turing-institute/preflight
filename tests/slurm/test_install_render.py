@@ -3,9 +3,11 @@ import difflib
 import importlib
 import importlib.util
 import json
+import subprocess
 import sys
 from pathlib import Path
 
+import gpu_jobs
 import site_config
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -44,6 +46,11 @@ EXPECTED_DIFF = {
         "-# which are requeued (SIGTERM to every process of the job, then SIGKILL after KillWait) and start again when resources free.",
         "+# Pre-emption by partition priority, strictly lower tiers only (accounting is through slurmdbd, below): an `urgent` job (tier 3) takes",
         "+# resources from `normal` and `cpu_fill` jobs, and a `normal` GPU job (tier 2) from `cpu_fill` jobs; they are requeued (SIGTERM to every process of the job, then SIGKILL after KillWait) and start again when resources free.",
+        # D45: slurm's Epilog on every site, which removes an ended job's docker containers
+        "+# Slurm's own end-of-job hook, run as root on every node when a job's allocation is released (its end, a requeue, a",
+        "+# pre-emption): removes the job's docker containers. No path, so slurm sends it to configless nodes too; this first",
+        "+# Epilog= line runs before any later one (metrics adds Jobstats' epilog.d glob).",
+        "+Epilog=gpujobs_containers.sh",
         "-# (stage C, 2026-10-16). It also records each job's GPU use (`sacct`), which this box's ledger never had.",
         "+# (stage C, 2026-10-16). It also keeps the finished-job history that `sacct` reads.",
         "-AccountingStorageTRES=gres/gpu",
@@ -115,6 +122,8 @@ def test_golden_matches_tracked_files_except_the_planned_lines():
     site = site_config.load(ROOT / "tests/slurm/fixtures/site.toml")
     site = dataclasses.replace(site, nodes=site.full_nodes, health_check=None)  # the golden files predate part-time machines
     files = render.render(site, "slurm")
+    epilog = files.pop(render.JOB_CONTAINERS_EPILOG)  # D45: on every site, newer than the golden files
+    assert (epilog.mode, epilog.owner) == (0o755, "root") and epilog.content.startswith("#!/bin/sh\n")
     assert set(files) == set(TRACKED)
     for target, name in TRACKED.items():
         got = _changed_lines((GOLDEN / name).read_text(), files[target].content)
@@ -236,3 +245,51 @@ def test_part_time_node_and_health_check():
     }
     assert (node_check["head"]["close_below_mb"], node_check["head"]["push_back_below_mb"],
             node_check["head"]["mains_only"]) == (16000, 10000, None)
+
+
+def test_the_container_epilog_removes_only_the_jobs_containers_and_always_exits_0(tmp_path):
+    """slurmd runs it as root with no PATH (`env -i`); exit 0 in every case, since a failing epilog drains the node."""
+    calls, log = tmp_path / "calls", tmp_path / "log"
+    good = "ab" * 32
+    docker = tmp_path / "docker"
+    docker.write_text(f'''#!/bin/sh
+echo "$*" >> {calls}
+case "$MODE:$1" in
+hang:*) sleep 30 ;;
+down:*) echo "Cannot connect to the Docker daemon" >&2; exit 1 ;;
+none:ps) exit 0 ;;
+rmfails:rm) echo "removal of container is already in progress" >&2; exit 1 ;;
+*:ps) printf '%s\\nnot-an-id\\n{"c" * 63}\\n*\\n' {good}; echo "WARNING: * [a-f]*" >&2 ;;
+esac
+''')
+    logger = tmp_path / "logger"
+    logger.write_text(f'#!/bin/sh\nshift 3\necho "$*" >> {log}\n')  # drops `-t TAG --`
+    for f in (docker, logger):
+        f.chmod(0o755)
+    script = tmp_path / "epilog.sh"
+    script.write_text(render.job_containers_epilog())
+    assert f"label={gpu_jobs.JOB_LABEL}=$job" in script.read_text()  # the one label name the Python side uses
+    (tmp_path / ("f" * 64)).write_text("")  # a file whose name a glob of docker's warning would turn into an "id"
+
+    def epilog(mode: str, job: str = "77", docker_path: Path = docker) -> list[str]:
+        for f in (calls, log):
+            f.unlink(missing_ok=True)
+        env = {"SLURM_JOB_ID": job, "DOCKER": str(docker_path), "LOGGER": str(logger), "DOCKER_WAIT_S": "1", "MODE": mode}
+        done = subprocess.run(["/usr/bin/env", "-i", *(f"{k}={v}" for k, v in env.items()), "/bin/sh", str(script)],
+                              capture_output=True, text=True, timeout=20, check=False, cwd=tmp_path)
+        assert done.returncode == 0, (mode, done.stderr)
+        return log.read_text().splitlines() if log.exists() else []
+
+    said = epilog("some")
+    assert calls.read_text().splitlines() == ["ps -aq --no-trunc --filter label=slurm-job=77", f"rm -f {good}"]
+    assert said == ["job 77: skipped 3 word(s) of docker output that are not container ids", f"job 77: removed container(s) {good}"]
+    assert epilog("none") == ["job 77: no containers"]
+    assert "ps --filter label=slurm-job=77' did not answer (exit 1)" in epilog("down")[0] and "rm -f" not in calls.read_text()
+    assert "did not answer" in epilog("hang")[0]  # bounded: a hung daemon never holds the node COMPLETING
+    assert epilog("rmfails")[-1].startswith(f"job 77: '{docker} rm -f {good}' failed (")  # names job, containers, command
+    assert "not a job id" in epilog("some", job="7;rm -rf /")[0] and not calls.exists()
+    missing = epilog("some", docker_path=tmp_path / "no-such-docker")
+    socket_line = ("job 77: /var/run/docker.sock exists but no docker command was found: "
+                   "its containers were not checked")
+    assert not calls.exists() and missing in ([], [socket_line])
+

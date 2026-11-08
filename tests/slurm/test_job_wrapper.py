@@ -19,6 +19,12 @@ import pytest
 WRAPPER = Path(job_wrapper.__file__)
 
 
+@pytest.fixture(autouse=True)
+def no_docker(monkeypatch):
+    """No test asks this machine's docker daemon: a run's containers are none unless a test says otherwise."""
+    monkeypatch.setattr(job_wrapper, "job_containers", lambda *_a, **_k: [])
+
+
 def fake_clock():
     now = [0.0]
     return (lambda: now[0]), (lambda s: now.__setitem__(0, now[0] + s))
@@ -92,6 +98,7 @@ def test_declared_sharing_skips_the_occupancy_check(monkeypatch) -> None:
     monkeypatch.setattr(audit, "descends_from", lambda *_a: False)
     monkeypatch.setattr(audit, "command_of", lambda *_a: "python")
     monkeypatch.setattr(job_wrapper.gpu_jobs, "container_label", lambda *_a: "")
+    monkeypatch.setattr(job_wrapper.gpu_jobs, "known_containers", list)
     free, why = job_wrapper.card_is_free({1}, shard_job=True)
     assert not free and "pid 20" in why and "pid 10" not in why  # pid 10 is a neighbouring slurm job's
     monkeypatch.setattr(job_wrapper.gpu_jobs, "gpu_usage", lambda: {10: 300.0})
@@ -100,25 +107,41 @@ def test_declared_sharing_skips_the_occupancy_check(monkeypatch) -> None:
     assert job_wrapper.card_is_free({1}, shard_job=True)[0] is False  # occupancy unknown is not free
 
 
-def test_footprint_sums_all_gpus_and_counts_labelled_containers(tmp_path: Path, monkeypatch) -> None:
-    import audit
-
+def test_footprint_counts_the_runs_containers_gpu_and_host_memory(tmp_path: Path, monkeypatch) -> None:
     cg = tmp_path / "job_5"
     cg.mkdir()
     (cg / "cgroup.procs").write_text("10\n")
     (cg / "memory.current").write_text("4096\n")
-    box = "/system.slice/docker-" + "a" * 64 + ".scope"
+    mine, theirs = ("/system.slice/docker-" + c * 64 + ".scope" for c in "ab")
+    scope = tmp_path / "cgroups" / mine.lstrip("/")
+    scope.mkdir(parents=True)
+    (scope / "memory.current").write_text("1000\n")
+    (scope / "memory.peak").write_text("3000\n")
+    monkeypatch.setattr(job_wrapper.gpu_jobs, "CGROUP_ROOT", tmp_path / "cgroups")
     monkeypatch.setattr(job_wrapper, "gpu_mib_by_pid", lambda: {10: 300.0, 20: 50.0, 30: 70.0})
-    monkeypatch.setattr(audit, "cgroup_of", lambda pid: box if pid == 20 else "/user.slice")
-    labels = {"a" * 64: "5"}
-    real = job_wrapper.gpu_jobs.container_label
-    monkeypatch.setattr(
-        job_wrapper.gpu_jobs, "container_label",
-        lambda cgroup, label: real(cgroup, label, lambda cid, _l: labels.get(cid, "")),
-    )
-    row = job_wrapper.sample(cg, set(), "5")
-    assert row["gpu_mib"] == 350.0  # pid 10 (cgroup) + pid 20 (container of job 5); pid 30 is someone else's
-    assert row["mem_current"] == 4096
+    monkeypatch.setattr(job_wrapper.gpu_jobs, "cgroup_of", lambda pid, *_a: {20: mine + "/sub", 30: theirs}.get(pid, "/user.slice"))
+    asked = []
+    run_containers = [job_wrapper.gpu_jobs.JobContainer("a" * 64, "5", 101.0, mine)]
+    monkeypatch.setattr(job_wrapper, "job_containers", lambda job_id, since: asked.append((job_id, since)) or run_containers)
+    row = job_wrapper.sample(cg, set(), "5", 100.0)
+    assert asked == [("5", 100.0)]  # only containers made during this run
+    assert row["gpu_mib"] == 350.0  # pid 10 (cgroup) + pid 20 (this run's container); pid 30's container is not this run's
+    assert (row["mem_current"], row["ctr_current"], row["ctr_peak"], row["ctr_ids"]) == (4096, 1000, 3000, ["a" * 12])
+    monkeypatch.setattr(job_wrapper, "job_containers", lambda job_id, since: None)  # docker absent or refused
+    row = job_wrapper.sample(cg, set(), "5", 100.0)
+    assert (row["gpu_mib"], row["ctr_peak"], row["ctr_ids"]) == (300.0, 0, None)  # unknown, not "none"
+    # SIGTERM reaches the run's running containers, which slurm's signal never does
+    calls = []
+    monkeypatch.setattr(job_wrapper, "job_containers", lambda job_id, since, run: [*run_containers, job_wrapper.gpu_jobs.JobContainer("c" * 64, "5", 102.0, "")])
+    assert job_wrapper.pass_term("5", 100.0, run=lambda argv, **_k: calls.append(argv)) == ["a" * 64]
+    assert calls == [["docker", "kill", "--signal", "TERM", "a" * 64]]  # not the one that is not running
+    assert job_wrapper.pass_term("5", 100.0, run=lambda argv, **_k: calls.append(argv), told=frozenset({"a" * 64})) == []
+    # after slurm's SIGTERM the wrapper waits while they stop; slurm's SIGKILL at KillWait's end bounds it
+    views = [run_containers, run_containers, []]
+    monkeypatch.setattr(job_wrapper, "job_containers", lambda job_id, since: views.pop(0))
+    naps: list[float] = []
+    job_wrapper.wait_for_containers("5", 100.0, poll_s=0.5, sleep=naps.append)
+    assert naps == [0.5, 0.5] and not views
 
 
 SITE = 'name = "t"\n[[nodes]]\nname = "n"\ncpus = 1\nreal_memory_mb = 1\n[metrics]\nmode = "%s"\n'
@@ -193,6 +216,54 @@ def test_sigterm_is_passed_to_the_child_which_saves_then_the_leg_is_recorded(
     finally:
         signal.signal(signal.SIGTERM, before)
     assert (leg["signals"], leg["exit"]) == (["SIGTERM"], -signal.SIGTERM)
+    # the leg's memory peak is the job's own plus its containers', which slurm's cgroup does not see
+    row = {"gpu_mib": 0.0, "mem_peak": 100, "mem_current": 90, "ctr_peak": 50, "ctr_ids": ["c1"]}
+    sampled: list[tuple[object, ...]] = []
+    monkeypatch.setattr(job_wrapper, "sample", lambda *a: sampled.append(a) or row)
+    leg = job_wrapper.run_and_measure([sys.executable, "-c", "import time; time.sleep(0.5)"], tmp_path / "g.jsonl", None, 0.05, "5",
+                                      leg_started=42.0)
+    assert (leg["peak_mem_bytes"], leg["peak_container_bytes"]) == (150, 50)
+    assert sampled[0][2:] == ("5", 42.0)  # containers are counted only from this run's start
+    # docker refusing this user (or hung) at the leg's one probe: said once, and no other docker call this leg
+    monkeypatch.setattr(job_wrapper, "job_containers", lambda *_a, **_k: None)
+    monkeypatch.setattr(job_wrapper.shutil, "which", lambda name: f"/usr/bin/{name}")
+    sampled.clear()
+    capsys.readouterr()
+    leg = job_wrapper.run_and_measure([sys.executable, "-c", "import time; time.sleep(0.3)"], tmp_path / "g2.jsonl", None, 0.05,
+                                      "5", leg_started=42.0)
+    assert leg["docker"] is False and sampled and all(a[2] == "" for a in sampled)
+    assert capsys.readouterr().err.count("docker did not answer") == 1
+    sockets = job_wrapper.DOCKER_SOCKETS
+    monkeypatch.setattr(job_wrapper, "DOCKER_SOCKETS", (tmp_path / "no-socket",))  # a user without access to docker
+    job_wrapper.run_and_measure([sys.executable, "-c", "pass"], tmp_path / "g3.jsonl", None, 0.05, "5", leg_started=42.0)
+    assert "docker did not answer" not in capsys.readouterr().err  # not using docker is no fault
+    monkeypatch.setattr(job_wrapper, "DOCKER_SOCKETS", sockets)
+    real_sample = job_wrapper.sample
+    # docker going silent mid-run: one slow sample, then no docker call for the rest of the leg (the stop poll, D44)
+    answers = iter([[], None])
+    monkeypatch.setattr(job_wrapper, "job_containers", lambda *_a, **_k: next(answers, "asked again"))
+    monkeypatch.setattr(job_wrapper, "sample", lambda c, p, j, s: {"gpu_mib": 0.0, "mem_peak": 1, "mem_current": 1, "ctr_peak": 0,
+                                                                     "ctr_ids": job_wrapper.job_containers() if j else []})
+    leg = job_wrapper.run_and_measure([sys.executable, "-c", "import time; time.sleep(0.4)"], tmp_path / "g4.jsonl", None, 0.05,
+                                      "5", leg_started=42.0)
+    assert leg["docker"] is False and next(answers, "unused") == "unused"
+    assert "docker stopped answering" in capsys.readouterr().err
+    monkeypatch.setattr(job_wrapper, "job_containers", lambda *_a, **_k: [])
+    monkeypatch.setattr(job_wrapper, "sample", real_sample)
+    # a command that ends at once on SIGTERM leaves the loop before its first poll: its containers are still told, once
+    told_calls: list[tuple[str, frozenset[str]]] = []
+    monkeypatch.setattr(job_wrapper, "pass_term", lambda job_id, since, told=frozenset(): told_calls.append((job_id, told)) or [])
+    sent.clear()
+    before = signal.signal(signal.SIGTERM, lambda *_: None)
+    try:
+        leg = job_wrapper.run_and_measure([sys.executable, "-c", "import time; time.sleep(5)"], tmp_path / "h.jsonl", None, 5.0, "5",
+                                          leg_started=42.0)
+    finally:
+        signal.signal(signal.SIGTERM, before)
+    assert leg["signals"] == ["SIGTERM"] and told_calls == [("5", frozenset())]
+    monkeypatch.undo()  # back to the real sample for main() below, with no docker asked
+    monkeypatch.setattr(job_wrapper.gpu_jobs, "STATE_DIR", tmp_path / "state")
+    monkeypatch.setattr(job_wrapper, "job_containers", lambda *_a, **_k: [])
 
     # legs copied back from a part-time machine are never written into the user's own sidecar (the merged view is not read)
     monkeypatch.setattr(job_wrapper.gpu_jobs, "read_sidecar", lambda *a, **k: {"legs": [{"leg": "copied"}]})
@@ -419,6 +490,9 @@ def test_the_end_of_run_report_measures_from_the_cgroup_and_advises_the_next_req
     assert killed[0].endswith("; the memory cap killed a process") and "--mem 39G or more" in killed[1]  # 1.2 x 32 GiB
     assert "--mem 0 " in lines(asked=most_mb * 2**20, guard=True)[1] + " "  # killed with the whole box: no more to give
     assert lines(guard=True, asked=None)[0].endswith("killed to free the host's memory")
+    contained = job_wrapper.Usage(40 * gib, int(9.4e9), 8, 1.7, containers_bytes=int(3.7e9))
+    assert job_wrapper.usage_lines(contained, gpu_job=True, cores_cap=8, most_mb=most_mb)[0].startswith(
+        "[job] used: memory peak 9.4 GB (containers 3.7 GB) of 42.9 GB asked")  # the share outside the job's cgroup
     assert "--mem 7G or more" in lines(peak=6.7e9, asked=2 * gib, guard=True)[1]  # stopped over its ask: its peak + 10% (D44)
     assert lines(peak=None, asked=None, avg=None) == ["[job] used: memory peak unknown; cores in use unknown of 8 held"]
     record = job_wrapper.usage_record(u, ["[job] x"])

@@ -45,8 +45,8 @@ import contextlib
 import json
 import math
 import os
+import shutil
 import signal
-import socket
 import subprocess
 import sys
 import time
@@ -65,8 +65,13 @@ import memory_guard  # noqa: E402
 import portability  # noqa: E402
 from gpu_jobs import (  # audit.py imports gpu_mib_by_pid from here
     CGROUP_ROOT,
+    DOCKER_SOCKETS,
+    DOCKER_TIMEOUT_S,
+    MemoryFile,
     cgroup_pids,
+    container_bytes,
     gpu_mib_by_pid,
+    job_containers,
     job_pids,
     read_int,
 )
@@ -143,7 +148,8 @@ def card_is_free(own_pids: set[int], max_jobs: int = 1, shard_job: bool = False)
         stray = audit.unregistered(usage)
         if not stray:
             return True, ""
-        return False, "compute process(es) outside slurm and the lease protocol: " + ", ".join(f"pid {p}" for p, _, _ in stray)
+        return False, "compute process(es) outside slurm and the lease protocol: " + ", ".join(
+            f"pid {s.pid}" + (f" ({s.why})" if s.why else "") for s in stray)
     if max_jobs > 1:
         return True, ""
     foreign = foreign_gpu_processes(own_pids)
@@ -195,9 +201,14 @@ def job_cgroup(proc_cgroup: Path = Path("/proc/self/cgroup")) -> Path | None:
     return CGROUP_ROOT.joinpath(*parts[: scopes[0] + 2])
 
 
-def sample(cgroup: Path | None, fallback_pids: set[int], job_id: str = "") -> dict[str, object]:
+def sample(cgroup: Path | None, fallback_pids: set[int], job_id: str = "", since: float = 0.0) -> dict[str, object]:
+    """One footprint row. `mem_*` are the job's cgroup; `ctr_*` the run's docker containers (labelled with the job and
+    created since `since`), whose processes are outside that cgroup: their own cgroups' memory, and their card memory
+    in `gpu_mib`. Without a job id, no docker call. `ctr_ids` is None when docker did not answer (not "none")."""
     usage = gpu_mib_by_pid()
-    pids = job_pids(cgroup, fallback_pids, job_id, set(usage))
+    listed = job_containers(job_id, since=since) if job_id else []
+    containers = listed or []
+    pids = job_pids(cgroup, fallback_pids, set(usage), containers)
     gpu = {pid: mib for pid, mib in usage.items() if pid in pids}
     return {
         "t": int(time.time()),
@@ -205,7 +216,54 @@ def sample(cgroup: Path | None, fallback_pids: set[int], job_id: str = "") -> di
         "gpu_by_pid": gpu,
         "mem_current": read_int(cgroup / "memory.current") if cgroup else None,
         "mem_peak": read_int(cgroup / "memory.peak") if cgroup else None,
+        "ctr_ids": None if listed is None else [c.short for c in containers],
+        "ctr_current": container_bytes(containers, MemoryFile.CURRENT),
+        "ctr_peak": container_bytes(containers, MemoryFile.PEAK),
     }
+
+
+def docker_answers(job_id: str, since: float) -> bool:
+    """One docker call per leg, before the command starts: when docker is absent, refuses this user or does not answer,
+    the leg makes no other (a hung daemon would stall every 1-s memory-stop poll, D44, and CPU jobs of users who cannot
+    reach docker would pay for nothing). Said once in the job's log when this user may use docker and it did not
+    answer; a user without access to docker's socket is simply not using it."""
+    if job_containers(job_id, since=since) is not None:
+        return True
+    if shutil.which("docker") and any(os.access(sock, os.R_OK | os.W_OK) for sock in DOCKER_SOCKETS):
+        print("[job] docker did not answer: this run's containers are not counted or signalled", file=sys.stderr, flush=True)
+    return False
+
+
+def pass_term(job_id: str, since: float, run: Callable[..., subprocess.CompletedProcess] | None = None,
+              told: frozenset[str] = frozenset()) -> list[str]:
+    """Send SIGTERM to the run's running containers not yet `told`, which slurm's signal never reaches (they are the
+    docker daemon's): with `wait_for_containers` a detached one then has the job's KillWait to save its work before the
+    Epilog removes it. The ids signalled."""
+    run = run or subprocess.run
+    containers = [c for c in job_containers(job_id, since=since, run=run) or [] if c.cgroup and c.id not in told]  # running
+    if containers:
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            run(["docker", "kill", "--signal", "TERM", *(c.id for c in containers)], capture_output=True, text=True,
+                timeout=DOCKER_TIMEOUT_S, check=False)
+        for c in containers:
+            print(f"[job] passed SIGTERM to container {c.short}", file=sys.stderr, flush=True)
+    return [c.id for c in containers]
+
+
+def wait_for_containers(job_id: str, since: float, *, poll_s: float = 1.0, sleep: Callable[[float], None] = time.sleep) -> None:
+    """After slurm's SIGTERM, wait while the run's containers still run (`pass_term` told them), so a detached one gets
+    the job's KillWait to save its work. Slurm's SIGKILL at KillWait's end bounds the wait (this process is in the job's
+    cgroup; its containers are not), and the leg's records are written before, so that SIGKILL loses nothing."""
+    waiting: set[str] = set()
+    while running := {c.short for c in job_containers(job_id, since=since) or [] if c.cgroup}:
+        for cid in sorted(running - waiting):
+            print(f"[job] waiting for container {cid} to stop (slurm ends the wait at KillWait)", file=sys.stderr, flush=True)
+        for cid in sorted(waiting - running):
+            print(f"[job] container {cid} stopped", file=sys.stderr, flush=True)
+        waiting = running
+        sleep(poll_s)
+    for cid in sorted(waiting):
+        print(f"[job] container {cid} stopped", file=sys.stderr, flush=True)
 
 
 _WARNED: set[str] = set()
@@ -277,11 +335,13 @@ def run_and_measure(
             os.killpg(child.pid, signum)
 
     signal.signal(signal.SIGTERM, forward)
+    docker = bool(job_id) and docker_answers(job_id, leg_started)
     child = subprocess.Popen(command, start_new_session=True)
     if missed:
         with contextlib.suppress(ProcessLookupError):
             os.killpg(child.pid, missed[0])
-    peak_gpu, peak_mem = 0.0, 0
+    peak_gpu, peak_mem, peak_ctr = 0.0, 0, 0
+    told: set[str] = set()  # containers already sent the job's SIGTERM
     stopped: dict[str, object] | None = None
     # waits in short slices so a memory stop is seen within STOP_POLL_S; samples every sample_s
     next_sample = time.monotonic() + sample_s
@@ -295,14 +355,26 @@ def run_and_measure(
                 pass
             if job_id and stopped is None:  # a run outside slurm never reads requests
                 stopped = carry_out_stop(job_id, child.pid, leg_started)
+            if docker and received and not told:  # here, not in the handler: docker may take seconds
+                told.update(pass_term(job_id, leg_started) or ["none"])
             if time.monotonic() < next_sample:
                 continue
             next_sample += sample_s
-            row = sample(cgroup, {child.pid}, job_id)
+            row = sample(cgroup, {child.pid}, job_id if docker else "", leg_started)  # no job id: no docker calls
+            if docker and row["ctr_ids"] is None:  # docker stopped answering: never asked again this leg (D44's poll)
+                docker = False
+                print("[job] docker stopped answering: this run's containers are no longer counted or signalled",
+                      file=sys.stderr, flush=True)
+            if job_id and stopped is None:  # a slow sample delays a stop by that one sample at most
+                stopped = carry_out_stop(job_id, child.pid, leg_started)
             if out:
                 best_effort("footprint", append_row, out, row)
             peak_gpu = max(peak_gpu, float(row["gpu_mib"]))
-            peak_mem = max(peak_mem, int(row["mem_peak"] or row["mem_current"] or 0))
+            # each container's own peak, summed: an upper bound of what they held together, the safe side for sizing
+            peak_ctr = max(peak_ctr, int(row["ctr_peak"]))
+            peak_mem = max(peak_mem, int(row["mem_peak"] or row["mem_current"] or 0) + int(row["ctr_peak"]))
+    if docker and received:  # a command that ended at once on SIGTERM left the loop before the pass-on above
+        pass_term(job_id, leg_started, told=frozenset(told))
     final = read_int(cgroup / "memory.peak") if cgroup else None
     return {
         "exit": status,
@@ -310,6 +382,8 @@ def run_and_measure(
         "signals": [signal.Signals(s).name for s in received],
         "peak_gpu_mib": peak_gpu,
         "peak_mem_bytes": max(peak_mem, final or 0),
+        "peak_container_bytes": peak_ctr,
+        "docker": docker,
         **({"stopped": stopped} if stopped else {}),
     }
 
@@ -336,6 +410,7 @@ class Usage:
     cores_avg: float | None
     cap_killed: bool = False  # the job's memory cap killed one of its processes during the run
     guard_killed: bool = False  # the host's OOM guard killed it
+    containers_bytes: int = 0  # the part of mem_peak_bytes held by the run's docker containers (outside its cgroup)
 
 
 def measure_usage(cgroup: Path | None, outcome: dict[str, object], before: tuple[int | None, int | None],
@@ -357,6 +432,7 @@ def measure_usage(cgroup: Path | None, outcome: dict[str, object], before: tuple
         cores_avg=used_usec / 1e6 / wall_s if used_usec is not None and wall_s > 0 else None,
         cap_killed=None not in (before[1], after[1]) and after[1] > before[1],  # type: ignore[operator]
         guard_killed=guard_killed,
+        containers_bytes=int(outcome.get("peak_container_bytes") or 0),
     )
 
 
@@ -367,11 +443,10 @@ def usage_lines(u: Usage, *, gpu_job: bool, cores_cap: int | None, most_mb: int 
     only (a GPU job's are held for the card, D17/D33), its average times `CORES_MARGIN` within `cores_cap`."""
     if u.mem_peak_bytes is None:
         memory = "memory peak unknown"
-    elif u.mem_asked_bytes:
-        memory = (f"memory peak {gpu_jobs.size_text(u.mem_peak_bytes)} of {gpu_jobs.size_text(u.mem_asked_bytes)} asked "
-                  f"({round(100 * u.mem_peak_bytes / u.mem_asked_bytes)}%)")
     else:
-        memory = f"memory peak {gpu_jobs.size_text(u.mem_peak_bytes)} (asked unknown)"
+        peak = gpu_jobs.size_text(u.mem_peak_bytes) + (f" (containers {gpu_jobs.size_text(u.containers_bytes)})" if u.containers_bytes else "")
+        memory = (f"memory peak {peak} of {gpu_jobs.size_text(u.mem_asked_bytes)} asked ({round(100 * u.mem_peak_bytes / u.mem_asked_bytes)}%)"
+                  if u.mem_asked_bytes else f"memory peak {peak} (asked unknown)")
     if u.cores_avg is None:
         cores = "cores in use unknown" + (f" of {u.cores_held} held" if u.cores_held else "")
     elif u.cores_held:
@@ -401,7 +476,8 @@ def usage_record(u: Usage, lines: list[str]) -> dict[str, object]:
     """The leg's `usage`: the known figures, whether the cap killed a process, and the printed lines (`wait.py` repeats them)."""
     figures = {"mem_asked_bytes": u.mem_asked_bytes, "mem_peak_bytes": u.mem_peak_bytes, "cores_held": u.cores_held,
                "cores_avg": None if u.cores_avg is None else round(u.cores_avg, 3)}
-    return {**{k: v for k, v in figures.items() if v is not None}, "memory_cap_killed": u.cap_killed, "lines": lines}
+    return {**{k: v for k, v in figures.items() if v is not None}, "memory_cap_killed": u.cap_killed, "lines": lines,
+            **({"containers_bytes": u.containers_bytes} if u.containers_bytes else {})}
 
 
 def guard_kill(
@@ -463,7 +539,7 @@ def _requeued(run: Callable[[list[str]], int], job_id: str) -> bool:
 def refuse_launch(job_id: str, problems: list[str], run: Callable[[list[str]], int] = gpu_jobs.run_slurm) -> int:
     """Say why this machine cannot run the job, leave the marker `node_check.py` bars the node by, and requeue; fail the
     job on the LAUNCH_REFUSALS_LIMIT-th refusal in a row, or when the refusal cannot be counted or the requeue is refused."""
-    print(f"[job] REFUSED at launch on {socket.gethostname().split('.')[0]}: " + "; ".join(problems), file=sys.stderr, flush=True)
+    print(f"[job] REFUSED at launch on {gpu_jobs.this_host()}: " + "; ".join(problems), file=sys.stderr, flush=True)
     try:
         record = gpu_jobs.read_json(gpu_jobs.sidecar_path(job_id), gpu_jobs.current_user()) or {}
         so_far = record.get("launch_refusals")
@@ -472,7 +548,7 @@ def refuse_launch(job_id: str, problems: list[str], run: Callable[[list[str]], i
         if refusals >= LAUNCH_REFUSALS_LIMIT:
             print(f"[job] refused {refusals} times in a row: the job fails instead of being requeued again", file=sys.stderr, flush=True)
             return Exit.LAUNCH_CHECK_FAILED
-        gpu_jobs.write_event(job_id, gpu_jobs.EventAction.LAUNCH_REFUSED, node=socket.gethostname().split(".")[0], problems=problems)
+        gpu_jobs.write_event(job_id, gpu_jobs.EventAction.LAUNCH_REFUSED, node=gpu_jobs.this_host(), problems=problems)
     except OSError as error:
         print(f"[job] the refusal could not be recorded ({error}): the job fails", file=sys.stderr, flush=True)
         return Exit.LAUNCH_CHECK_FAILED
@@ -590,6 +666,8 @@ def main() -> int:
     print(f"[job] exit {outcome['exit']}; signals {outcome['signals']}; peak GPU {outcome['peak_gpu_mib']:.0f} MiB",
           flush=True)
     print("\n".join(report), flush=True)  # what the run used, and what to ask for next time (D37)
+    if outcome["signals"] and outcome["docker"]:  # slurm is ending the job: its containers get the rest of KillWait to stop
+        wait_for_containers(job_id, leg_started, poll_s=STOP_POLL_S)
     if killed:
         return after_kill(job_id, killed, legs, os.environ.get("SLURM_JOB_NAME", ""))
     status = int(outcome["exit"])

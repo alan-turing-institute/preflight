@@ -153,6 +153,18 @@ def _service_partition(site: Site, names: list[str]) -> str:
     )
 
 
+#: The epilog that removes an ended job's docker containers (label `slurm-job=<id>`), named with no path on slurm.conf's
+#: first `Epilog=` line, like PART_TIME_CONF: slurmd finds it beside slurm.conf, runs it before a later line's scripts
+#: (Jobstats' glob), and configless (part-time) nodes are sent it at slurmd start and every `scontrol reconfigure`
+#: (slurm 26.05.5 `fetch_config.c`: an Epilog not starting with "/" is pushed, mode 0755; `slurmd.c` get_extra_conf_path).
+JOB_CONTAINERS_EPILOG_NAME = "gpujobs_containers.sh"
+JOB_CONTAINERS_EPILOG = f"/etc/slurm/{JOB_CONTAINERS_EPILOG_NAME}"
+
+
+def job_containers_epilog() -> str:
+    return (TEMPLATES / "slurm" / "job-containers-epilog.sh").read_text()
+
+
 def _slurm(site: Site, extra: dict[str, str]) -> dict[str, FileSpec]:
     names = [n.name for n in site.full_nodes]  # slurmctld and the partitions' Nodes: full nodes; part-time ones have theirs
     extra_conf = extra.get("slurm_conf", "")
@@ -176,6 +188,7 @@ def _slurm(site: Site, extra: dict[str, str]) -> dict[str, FileSpec]:
         "health_lines": _health_lines(site),
         "part_time_partition": _part_time_partition(site),
         "extra_slurm_conf": extra_conf if not extra_conf or extra_conf.endswith("\n") else extra_conf + "\n",
+        "job_containers_epilog": JOB_CONTAINERS_EPILOG_NAME,
     }
     out = {
         "/etc/slurm/slurm.conf": FileSpec(_template("slurm", "slurm.conf").substitute(values), FILE_MODE, "root"),
@@ -187,6 +200,7 @@ def _slurm(site: Site, extra: dict[str, str]) -> dict[str, FileSpec]:
         "/etc/mysql/mariadb.conf.d/90-slurm.cnf": FileSpec(
             _template("slurm", "mariadb-slurm.cnf").substitute(values), FILE_MODE, "root"
         ),
+        JOB_CONTAINERS_EPILOG: FileSpec(job_containers_epilog(), EXEC_MODE, "root"),
     }
     if site.part_time_nodes:  # owned by SlurmUser: the agent, which runs as it, rewrites the file in place
         out[PART_TIME_CONF_PATH] = FileSpec(part_time_nodes_conf(site), FILE_MODE, SLURM_USER)

@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import socket
 import statistics
 import sys
 import time
@@ -70,6 +69,7 @@ def lines(queue: list[gpu_jobs.QueuedJob] | None) -> list[str]:
         ))
     out += [f"[idle] {line}" for line in agent.idle_summary(agent.read_idle())]
     out += audit.report(audit.unregistered())
+    out += audit.leftover_containers(gpu_jobs.known_containers(), queue, gpu_jobs.this_host(), time.time())
     return out
 
 
@@ -120,7 +120,7 @@ def main() -> int:
     arguments = parser.parse_args()
     if arguments.reserve:
         print("\n".join(reserve_lines(gpu_jobs.load_site(), gpu_jobs.STATE_DIR / "agent" / "outside",
-                                      socket.gethostname().split(".")[0], gpu_jobs.meminfo()["MemTotal"])))
+                                      gpu_jobs.this_host(), gpu_jobs.meminfo()["MemTotal"])))
         return 0
     if arguments.site:
         try:

@@ -13,6 +13,10 @@ Rules, in order, each run (plan B2, `plan notes`):
    this node (`ExcNodeList`; a running job cannot be changed, measured 2026-10-31) and delete the event.
 3. Free memory below `close_below_mb`, or `mains_only` and on battery: drain, reason `gpujobs-check: ...`.
 4. We closed it and the last 3 runs all passed rule 3: resume.
+5. Docker containers labelled `slurm-job=J` (README "A job's docker containers"): written to the root map
+   `gpu_jobs.CONTAINER_MAP` for readers that cannot ask docker (the agent, a job's user outside the docker group); one
+   whose job J is in no unfinished job and that is older than `STALE_CONTAINER_S` is removed: what slurm's Epilog
+   missed (docker hung, a restart policy after a reboot, a container made after the Epilog listed). Never closes the node.
 A drain whose reason does not start `gpujobs-check:` is never changed. Any exception drains the node (fail closed).
 Every run logs one line, a decision to allow included, and (when `owners/` exists, made by `apply --part-time`) writes
 `owners/manifest.json`: who owns each state file here, which the controller trusts for the copy of them (B7.1).
@@ -22,10 +26,10 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import dataclasses
 import json
 import os
 import re
-import socket
 import stat
 import subprocess
 import sys
@@ -66,7 +70,12 @@ LAUNCH_EVENT_WAIT_S = 60
 #: The keys the node's `Extra` may override, and the type each must have.
 EXTRA_KEYS: dict[str, type] = {"close_below_mb": int, "push_back_below_mb": int, "mains_only": bool}
 
+#: A labelled container whose job is in no unfinished job is removed only once it is this old: a job that started after
+#: this run read the queue can already have made one, and its Epilog had time to act on it.
+STALE_CONTAINER_S = 120
+
 Runner = Callable[[list[str]], subprocess.CompletedProcess]
+Lister = Callable[[], "list[gpu_jobs.JobContainer] | None"]
 Recorder = Callable[..., object]
 
 
@@ -324,6 +333,39 @@ def write_manifest(state_dir: Path) -> str:
     return ""
 
 
+def sweep_containers(containers: Lister, unfinished: set[str], run: Runner, map_path: Path, now: float) -> list[str]:
+    """Rule 5: write the map of this node's labelled containers and remove those whose job has ended. `unfinished` and
+    `now` come from the same moment (the queue read), so a job that started after it is protected by the age. The
+    decisions taken; never raises (a failure is a decision line), because any exception here would drain the node.
+    A container whose removal failed stays in the map, so `status.py` keeps listing it."""
+    try:
+        found = containers()
+        if found is None:  # no docker here, or it did not answer: readers must not trust an old map
+            map_path.unlink(missing_ok=True)
+            return []
+        stale = [c for c in found if c.job_id not in unfinished and now - c.created > STALE_CONTAINER_S]
+        decisions, removed = [], []
+        if stale:
+            done = run(["docker", "rm", "-f", *(c.id for c in stale)])
+            if done.returncode == 0:
+                removed = stale
+                decisions.append(f"removed container(s) of ended jobs: {_names(stale)}")
+            else:
+                decisions.append(f"could not remove container(s) of ended jobs {_names(stale)}: {done.stderr.strip()[:200]}")
+        kept = [c for c in found if c not in removed]
+        if young := [c for c in kept if c.job_id not in unfinished and c not in stale]:
+            decisions.append(f"kept new container(s) of no unfinished job, for now: {_names(young)}")
+        map_path.parent.mkdir(mode=0o755, exist_ok=True)
+        gpu_jobs.write_json(map_path, {"at": int(now), "containers": [dataclasses.asdict(c) for c in kept]})
+        return decisions
+    except Exception as error:  # noqa: BLE001 - rule 5 never closes the node; the log line is the record
+        return [f"containers not checked: {type(error).__name__}: {error}"]
+
+
+def _names(containers: list[gpu_jobs.JobContainer]) -> str:
+    return ", ".join(f"{c.short} (job {c.job_id})" for c in containers)
+
+
 def drain(run: Runner, node: str, why: str) -> None:
     done = run(["scontrol", "update", f"NodeName={node}", "State=DRAIN", f"Reason={REASON_PREFIX}{why}"])
     if done.returncode != 0:
@@ -375,14 +417,16 @@ def log_line(path: Path, line: str) -> None:
 def check(
     settings_path: Path, run: Runner = run_command, record: Recorder = gpu_jobs.write_event,
     hostname: str | None = None, gpu_busy: Callable[[], float | None] = gpu_jobs.gpu_busy,
-    sleep: Callable[[float], None] = time.sleep,
+    sleep: Callable[[float], None] = time.sleep, containers: Lister = gpu_jobs.job_containers,
+    container_map: Path = gpu_jobs.CONTAINER_MAP,
 ) -> list[str]:
     """One run of the rules; the decisions taken (empty = allow). Raises on any failure: the caller fails closed."""
-    host = (hostname or socket.gethostname()).split(".")[0]
+    host = (hostname or gpu_jobs.this_host()).split(".")[0]
     info = read_node(run, host)
     settings, note = apply_extra(load_settings(settings_path, (info.name, host)), info.extra)
     free, (on_mains, battery) = free_mb(settings.meminfo_path), power(settings.power_supply_dir)
     urgent, running, unfinished = read_queue(run, info.name)
+    queue_read = time.time()  # rule 5 judges a container's age from here: a job started after this has no entry
     state = read_state(settings.state_path)
     state["pushes"] = {k: n for k, n in state["pushes"].items() if k.split("@")[0] in unfinished}  # a pushed job waits in the queue: keep it
     decisions = [note] if note else []
@@ -443,6 +487,8 @@ def check(
             log_line(settings.log_path, f"{info.name} {skipped}")
     except OSError as error:  # a manifest that is stale only hides copied files; it never closes the node
         log_line(settings.log_path, f"{info.name} manifest not written: {error}")
+    # last before the log line: a slow docker must not keep the rules' state, the report or the manifest unwritten
+    decisions += sweep_containers(containers, unfinished, run, container_map, queue_read)
     log_line(settings.log_path, f"{info.name} free={free} MB {'; '.join(decisions) or 'allow'}")
     return decisions
 
@@ -471,7 +517,7 @@ def main() -> int:
     try:
         check(arguments.settings)
     except Exception as error:  # noqa: BLE001 - fail closed
-        fail_closed(error, run_command, socket.gethostname().split(".")[0], LOG_PATH)
+        fail_closed(error, run_command, gpu_jobs.this_host(), LOG_PATH)
         return 1
     return 0
 

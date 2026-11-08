@@ -18,6 +18,7 @@ import math
 import os
 import pwd
 import re
+import socket
 import stat
 import subprocess
 import sys
@@ -25,6 +26,7 @@ import tempfile
 import time
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
 
@@ -312,14 +314,14 @@ def _cores(raw: dict) -> frozenset[str]:
     resources = raw.get("job_resources") or {}
     found = set()
     for node in resources.get("allocated_nodes") or []:
-        for socket, entry in (node.get("sockets") or {}).items():
-            found.update(f"{node.get('nodename')}:{socket}:{core}" for core in (entry.get("cores") or {}))
+        for board_socket, entry in (node.get("sockets") or {}).items():
+            found.update(f"{node.get('nodename')}:{board_socket}:{core}" for core in (entry.get("cores") or {}))
     nodes = resources.get("nodes")  # 23.11 gives the node list as a string here, 26.05 a table
     for node in (nodes.get("allocation") if isinstance(nodes, dict) else None) or []:
-        for socket in node.get("sockets") or []:
+        for board_socket in node.get("sockets") or []:
             found.update(
-                f"{node.get('name')}:{socket.get('index')}:{core.get('index')}"
-                for core in socket.get("cores") or []
+                f"{node.get('name')}:{board_socket.get('index')}:{core.get('index')}"
+                for core in board_socket.get("cores") or []
                 if "ALLOCATED" in (core.get("status") or [])
             )
     return frozenset(found)
@@ -1084,6 +1086,8 @@ def events(job_id: str | None = None) -> list[Event]:
 _LABELS: dict[tuple[str, str], str] = {}
 
 
+#: Where a docker daemon listens by default; a user who cannot open either is not using docker.
+DOCKER_SOCKETS = (Path("/var/run/docker.sock"), Path("/run/docker.sock"))
 DOCKER_TIMEOUT_S = 5  # a hung docker daemon must not hold the agent's step; `container_label` answers "" then
 
 
@@ -1118,8 +1122,127 @@ def container_label(cgroup: str, label: str, runner: Callable[[str, str], str] =
 
 
 CGROUP_ROOT = Path("/sys/fs/cgroup")
-#: The docker label `submit.py`-launched containers carry so their GPU memory counts toward the job.
+#: The docker label a job's containers carry (`slurm-job=<SLURM_JOB_ID>`): counted with the job, excused by the audit
+#: while it runs, removed by slurm's Epilog when its allocation is released (README "A job's docker containers").
 JOB_LABEL = "slurm-job"
+_CONTAINER_ID = re.compile(r"[0-9a-f]{64}")
+_DIGITS = re.compile(r"[0-9]+")  # ASCII only: str.isdigit() accepts "²", which int() refuses
+#: The id docker shows in `docker ps`, and every log line here names a container by.
+SHORT_ID = 12
+
+
+class MemoryFile(StrEnum):
+    """The cgroup v2 memory files read for a container."""
+
+    CURRENT = "memory.current"
+    PEAK = "memory.peak"
+
+
+@dataclass(frozen=True)
+class JobContainer:
+    """A docker container labelled `slurm-job=<job id>`."""
+
+    id: str  # 64 hex digits
+    job_id: str
+    created: float  # epoch seconds
+    cgroup: str  # its main process's cgroup as /proc/<pid>/cgroup names it; "" when it is not running
+
+    @property
+    def short(self) -> str:
+        return self.id[:SHORT_ID]
+
+    def of_run(self, job: QueuedJob) -> bool:
+        """It belongs to `job`'s current run: labelled with the job and made at or after slurm's start of the run (one
+        left by an earlier run of the same id, after a requeue, is not this run's)."""
+        return self.job_id == job.job_id and self.created >= job.start
+
+
+def job_containers(job_id: str | None = None, *, since: float = 0.0, run: Callable[..., subprocess.CompletedProcess] | None = None,
+                   proc: Path = Path("/proc")) -> list[JobContainer] | None:
+    """The containers labelled `slurm-job` (`= job_id` when given) created at or after `since`; None when docker is
+    absent, refuses (no permission) or does not answer, so a caller counts and excuses nothing rather than guess."""
+    run = run or subprocess.run
+    label = JOB_LABEL if job_id is None else f"{JOB_LABEL}={job_id}"
+    # the labels come last and as JSON: their values are whatever the container's creator chose, and JSON escapes a
+    # newline or "|" that would otherwise forge a line for another container
+    fmt = "{{.Id}}|{{.Created}}|{{.State.Pid}}|{{json .Config.Labels}}"
+    try:
+        listed = run(["docker", "ps", "-aq", "--no-trunc", "--filter", f"label={label}"], capture_output=True, text=True,
+                     timeout=DOCKER_TIMEOUT_S, check=False)
+        if listed.returncode != 0:
+            return None
+        ids = [i for i in listed.stdout.split() if _CONTAINER_ID.fullmatch(i)]
+        if not ids:
+            return []
+        # every line inspect prints counts even when it exits 1: a container gone between the two calls is just absent
+        shown = run(["docker", "inspect", "-f", fmt, *ids], capture_output=True, text=True, timeout=DOCKER_TIMEOUT_S, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if shown.returncode != 0 and not (shown.stdout or "").strip():
+        return None  # inspect failed as a whole: not "no containers"
+    found, wanted = [], set(ids)
+    for line in (shown.stdout or "").splitlines():
+        cid, created, pid, labels = (line.split("|", 3) + ["", "", ""])[:4]
+        try:
+            when, owner = datetime.fromisoformat(created).timestamp(), json.loads(labels).get(JOB_LABEL)
+        except (ValueError, AttributeError):
+            continue
+        if cid not in wanted or not isinstance(owner, str) or not _DIGITS.fullmatch(owner) or not _DIGITS.fullmatch(pid) \
+                or when < since:
+            continue
+        wanted.discard(cid)  # one record per id that `docker ps` listed, never more
+        found.append(JobContainer(cid, owner, when, cgroup_of(int(pid), proc) if int(pid) else ""))
+    return found
+
+
+def this_host() -> str:
+    """This machine's short host name, which the site file's node names are (D2)."""
+    return socket.gethostname().split(".")[0]
+
+
+def within(cgroup: str, scope: str) -> bool:
+    """`cgroup` is `scope` or below it (a container that makes sub-cgroups puts its processes one level down)."""
+    return bool(scope) and (cgroup == scope or cgroup.startswith(f"{scope}/"))
+
+
+#: The labelled containers of this node, written by the root health check (`node_check.py`) each run, for readers that
+#: cannot ask docker themselves (the agent runs as SlurmUser; a job's user may be outside the docker group).
+CONTAINER_MAP = Path("/run/gpujobs/containers.json")
+#: A map older than this is not used: the health check that writes it has stopped.
+CONTAINER_MAP_MAX_AGE_S = 600
+
+
+def node_containers(path: Path | None = None, owner: str = "root", now: Callable[[], float] = time.time) -> list[JobContainer] | None:
+    """The containers in the health check's map, when it is `owner`'s and fresh; None otherwise (no health check here,
+    or it stopped), so the caller falls back to docker or counts nothing."""
+    raw = read_json(path or CONTAINER_MAP, owner)
+    at, entries = (raw or {}).get("at"), (raw or {}).get("containers")
+    if not isinstance(at, int) or not isinstance(entries, list) or not 0 <= now() - at <= CONTAINER_MAP_MAX_AGE_S:
+        return None
+    found = []
+    for e in entries:
+        try:
+            container = JobContainer(str(e["id"]), str(e["job_id"]), float(e["created"]), str(e["cgroup"]))
+        except (TypeError, KeyError, ValueError):
+            continue
+        if _CONTAINER_ID.fullmatch(container.id) and _DIGITS.fullmatch(container.job_id):
+            found.append(container)
+    return found
+
+
+def known_containers() -> list[JobContainer] | None:
+    """This node's labelled containers: the root health check's map when fresh, else docker itself (None when neither
+    answers)."""
+    mapped = node_containers()
+    return mapped if mapped is not None else job_containers()
+
+
+def cgroup_of(pid: int, proc: Path = Path("/proc")) -> str:
+    """The cgroup v2 path a process is in (`/proc/<pid>/cgroup`), "" when it cannot be read."""
+    try:
+        return (proc / str(pid) / "cgroup").read_text(encoding="utf-8").strip().split("::", 1)[-1]
+    except OSError:
+        return ""
 
 
 def cgroup_pids(cgroup: Path) -> set[int]:
@@ -1285,15 +1408,35 @@ def gpu_mib_by_pid() -> dict[int, float]:
     return gpu_usage() or {}
 
 
-def job_pids(cgroup: Path | None, fallback_pids: set[int], job_id: str, gpu_pids: set[int]) -> set[int]:
-    """The cgroup's pids plus those of `gpu_pids` running in a docker container labelled `slurm-job=<id>`."""
-    import audit  # lazy: audit imports job_wrapper, which imports this module
-
+def job_pids(cgroup: Path | None, fallback_pids: set[int], gpu_pids: set[int], containers: Iterable[JobContainer] = (),
+             proc: Path = Path("/proc")) -> set[int]:
+    """The cgroup's pids plus those of `gpu_pids` running in one of `containers` (the run's, `job_containers`)."""
     pids = cgroup_pids(cgroup) if cgroup else set(fallback_pids)
-    for pid in gpu_pids - pids:
-        if container_label(audit.cgroup_of(pid), JOB_LABEL) == job_id:
+    scopes = {c.cgroup for c in containers if c.cgroup}
+    for pid in gpu_pids - pids if scopes else ():
+        if any(within(cgroup_of(pid, proc), scope) for scope in scopes):
             pids.add(pid)
     return pids
+
+
+def run_containers(containers: Iterable[JobContainer], job: QueuedJob) -> list[JobContainer]:
+    """The containers of `job`'s current run (`JobContainer.of_run`)."""
+    return [c for c in containers if c.of_run(job)]
+
+
+def container_bytes(containers: Iterable[JobContainer], name: MemoryFile, cgroup_root: Path | None = None) -> int:
+    """The sum of one memory file (`memory.current`, `memory.peak`) over the containers' own cgroups; 0 for each one
+    whose file cannot be read (it has just ended)."""
+    root = cgroup_root or CGROUP_ROOT
+    return sum(read_int(root / c.cgroup.lstrip("/") / name) or 0 for c in containers if c.cgroup)
+
+
+def container_memory(containers: Iterable[JobContainer], usage: Mapping[int, float],
+                     cgroup_root: Path | None = None) -> tuple[int, int]:
+    """(held, card) bytes of the containers: what their own cgroups hold (`held_bytes`) and their processes' card memory."""
+    live, root = [c for c in containers if c.cgroup], cgroup_root or CGROUP_ROOT
+    held = sum(held_bytes(root / c.cgroup.lstrip("/")) or 0 for c in live)
+    return held, card_bytes(usage, job_pids(None, set(), set(usage), live))
 
 
 class NodeFlag(StrEnum):

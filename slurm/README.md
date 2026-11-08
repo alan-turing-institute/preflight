@@ -647,11 +647,8 @@ no copy of the job, so the local page does not list it (D24).
   through. `apply` refuses, and `check` reports, a kernel with `fs.protected_regular`, `fs.protected_symlinks` or
   `fs.protected_hardlinks` at 0: those settings stop a log, record or request left under someone else's name from
   being written through (Ubuntu turns all three on).
-- **A job's docker containers are its own to stop.** The wrapper counts a container labelled `slurm-job=JOBID`
-  toward the job's GPU memory, but the container runs outside the job's cgroup, so slurm's final SIGKILL reaches
-  only the `docker` client. A job that starts a container must stop it on SIGTERM (an attached `docker run`
-  passes SIGTERM on; `docker run -d` does not); a container left running holds the GPU outside slurm and the
-  lease, and the job's next run waits for the card it holds. Nothing stops leftover containers for you yet.
+- **A job's docker containers** are counted with it, signalled with it and removed when it ends: see "A job's docker
+  containers" below.
 - **Reboot recovery.** The agent's boot step runs once per boot (it compares `agent/boot_id` with the kernel's
   boot id): 30 seconds after `slurmctld` started, it runs `scontrol update nodename=N state=undrain` for every
   node that was not drained on purpose, so slurm registers the nodes again and purges the jobs they lost
@@ -708,6 +705,60 @@ starve the machine. Two pieces keep the machine responsive:
   card) plus 10 percent. No job's size is changed for it.
 - **Unchanged:** sites whose GPUs have their own memory, earlyoom's settings, and the health check's push-back of
   `resume` jobs. A job's container (Docker) runs outside its cgroup and is not counted for a stop.
+
+### A job's docker containers
+
+A container started from a job with the label `slurm-job=$SLURM_JOB_ID` (for example `docker run --label
+slurm-job=$SLURM_JOB_ID ...`) belongs to that job's current run. The Docker daemon, not the job, owns the container, so
+its processes are outside the job's cgroup and slurm's own kill never reaches them; the label is how this layer finds
+them. The key `slurm-job` is reserved for this use on a site that installs this layer: the end-of-job script removes,
+as root, every container carrying it with the number of a job that ended. A container belongs to a run when its label
+is the job's id and it was made at or after that run started, so one left by an earlier run of the same id (after a
+requeue) is never counted as the new run's.
+
+- **Counted.** The wrapper adds the memory of the run's containers (their own cgroups) to the job's memory peak, and
+  their processes' card memory to its GPU memory, so `--mem auto` and the end-of-run report include them: `[job] used:
+  memory peak 4.2 GB (containers 3.7 GB) of 8.6 GB asked`. The jobs page counts them too, and the memory each node
+  records as used outside its jobs (`status.py --reserve`) leaves them out, since the job's ask already covers them.
+  A container that lives less than one sample (5 s) can be missed.
+- **Excused while the job runs.** The audit (`status.py`, `urgent.py`, a shard job's card check) does not list GPU
+  work in such a container while its job runs on this node holding a GPU or shards. Otherwise it is listed with the
+  reason (`container of job 7, which is not running`). A container of a CPU job using the GPU is listed: that is GPU
+  work slurm did not give out. On a node with several GPUs nothing is excused, because Docker is not held to the GPU
+  slurm gave the job and which card the container uses is not checked.
+- **Signalled.** When slurm ends the job (its end, a pre-emption, a requeue, `scancel`), the wrapper passes slurm's
+  SIGTERM to the run's running containers (`[job] passed SIGTERM to container ID`), writes the leg's records, and then
+  waits while they still run (`[job] waiting for container ID to stop`, then `[job] container ID stopped`). A detached
+  container (`docker run -d`) thus gets the job's KillWait (120 s) to save its work. Its main process must handle
+  SIGTERM: a shell running as a container's first process ignores it unless it sets a handler (`trap 'exit 0' TERM`,
+  or `docker run --init`). The wait follows any SIGTERM, so a `scancel --signal=TERM` that ends your command but not the
+  job leaves the job waiting until its containers stop (stop them, or `scancel` the job). Docker is asked once before
+  the command starts and then at each sample; if it does not answer, the run says so once in its log and asks it no
+  more, so a hung daemon cannot slow the memory guard's stop.
+- **Removed when the job ends.** Slurm's end-of-job script (`Epilog=gpujobs_containers.sh`, the first `Epilog=`
+  line, run by slurmd as root on every node of the job) runs `docker rm -f` on every container labelled with the job,
+  whatever its state, when the job's allocation is released, so the card is free when the next job (an urgent one
+  after a pre-emption, say) starts. It has no path in `slurm.conf`, so slurm sends it to configless (part-time) nodes
+  too, at slurmd start and at every `scontrol reconfigure`. It always exits 0 (a failing end-of-job script would
+  drain the node), gives docker at most 10 s to list and 30 s to remove, and logs every decision: `journalctl -t
+  gpujobs-job-containers`.
+- **Swept, and visible.** On a site with `[health_check]`, the health check (root, every node, every `interval_s`, 30 s by default) writes the
+  map `/run/gpujobs/containers.json` of the node's labelled containers, which the agent and users outside the
+  `docker` group read in place of docker, and removes a container whose job is in no unfinished job and that is more
+  than 2 minutes old: what the end-of-job script missed (docker did not answer, a container with a restart policy
+  after a reboot, one made after the script listed). Its log line says what it removed and what it kept.
+  `status.py` lists every labelled container that no current run on this node owns, so one listed for minutes is one
+  neither could remove.
+- **Not covered.** A suspended job's containers keep running (only `cpu` jobs are suspended, for a service's stand-in);
+  a container without the label, or with another job's number, is not the job's; the memory guard of unified-memory
+  nodes does not count containers for a stop (a label is set by the job's user and could be forged); a site without
+  `[health_check]` has no sweep and no map, so there readers outside the `docker` group (the agent included) see no
+  containers, and only the end-of-job script removes them. Membership of the `docker` group amounts to root on the
+  host: give it only to people you would give root.
+- **Rootless Podman** is slurm's own route for containers inside a job (slurm's Containers Guide, "Integration with
+  Podman using Slurm cgroup"): with `cgroupns = "host"` and `cgroup_manager = "cgroupfs"` the container's processes
+  stay in the job's cgroup, so slurm counts, limits, signals and kills them like any other process of the job, and
+  none of the above is needed. It is not yet checked on this layer's sites with a GPU.
 
 ### Part-time machines
 

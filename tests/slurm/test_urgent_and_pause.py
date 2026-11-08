@@ -31,7 +31,7 @@ def test_classes_of_what_is_in_the_way() -> None:
     lines, victims, steady, wait_only = urgent.plan(
         queue, gpu=True, whole_box=False,
         leases=[("service-a", False), ("service-b", False), ("service-c", False), ("slurm", False)],
-        unregistered=[(99, 500.0, "python patch4")],
+        unregistered=[urgent.audit.Stray(99, 500.0, "python patch4")],
         services={"service-a": "yields within a minute", "service-b": "yields at its next job"},
     )
     assert victims == ["1"]  # job 3 holds no GPU, so a GPU-only urgent job leaves it alone

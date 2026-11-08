@@ -65,7 +65,6 @@ import dataclasses
 import json
 import os
 import re
-import socket
 import subprocess
 import sys
 import threading
@@ -494,11 +493,10 @@ def kill_from_entry(line: str) -> tuple[int, str, float] | None:
 
 
 def job_of_pid(pid: int) -> str | None:
-    """The slurm job a live process belongs to: its cgroup, else the docker container labelled with the job."""
-    import audit  # noqa: PLC0415 - lazy, as in gpu_jobs.job_pids: audit imports job_wrapper
-
-    cgroup = audit.cgroup_of(pid)
-    return gpu_jobs.job_of_cgroup(cgroup) or gpu_jobs.container_label(cgroup, gpu_jobs.JOB_LABEL) or None
+    """The slurm job a live process belongs to, by its cgroup."""
+    # a docker container's process is never attributed (D44: a label can be forged, and an OOM kill attributed to a job
+    # ends its run as KILLED_FOR_MEMORY): only the cgroup slurm made counts
+    return gpu_jobs.job_of_cgroup(gpu_jobs.cgroup_of(pid)) or None
 
 
 class OomWatch:
@@ -575,10 +573,11 @@ class Agent:
         hostname: str | None = None,
         node_check_path: Path = node_check.SETTINGS_PATH,
         meminfo_path: Path = gpu_jobs.MEMINFO,
+        containers: Callable[[], list[gpu_jobs.JobContainer] | None] = gpu_jobs.known_containers,
     ) -> None:
         self.site = site
         # the unified-memory part (D44) watches the agent's own node: the installer refuses a GPU node elsewhere
-        here = (hostname or socket.gethostname()).split(".")[0]
+        here = (hostname or gpu_jobs.this_host()).split(".")[0]
         self.own_node = next((node for node in site.nodes if node.name == here), None)
         self.guard, self.node_check_path, self.meminfo_path = guard, node_check_path, meminfo_path
         self._guard_level: int | None = None  # the close level last handed to the guard, logged when it changes
@@ -595,6 +594,7 @@ class Agent:
         self.watch: OomWatch | None = None  # main() starts one; a test drives record_kill itself
         self._pid_jobs: dict[int, str] = {}  # each running job's processes at the last step, for a kill seen late
         self.gpu_usage, self.cgroup_root = gpu_usage, cgroup_root
+        self.containers = containers  # the root health check's map of labelled containers (the agent has no docker access)
         self.dir = state_dir / "agent"
         self.metrics = state_dir / "metrics"
         self._mem_samples: dict[str, tuple[int, int]] = {}  # job -> (sum of memory samples, how many) since the agent saw it
@@ -1334,21 +1334,28 @@ class Agent:
         usage = self.gpu_usage() if any(node.gpus for node in self.site.nodes) else {}
         running = [(job, cgroup) for job in queue
                    if job.state == gpu_jobs.State.RUNNING and (cgroup := self._job_cgroup(job)) is not None]
+        metrics = self.site.metrics.mode != site_config.MetricsMode.OFF
+        listed = self.containers() if running and (metrics or self.site.unified_memory) else []
+        own = {job.job_id: gpu_jobs.run_containers(listed or [], job) for job, _ in running}
         if usage is None:
             errors.append("nvidia-smi did not answer; the job metrics files and the over-ask check wait")
-        elif self.site.metrics.mode != site_config.MetricsMode.OFF:
-            self._job_metrics(running, usage, errors)
+        elif metrics:
+            self._job_metrics(running, usage, own, errors)
         if self.site.unified_memory:
-            self._unified_memory(queue, running, usage, now, errors)
+            self._unified_memory(queue, running, usage, own, now, errors)
         if usage is not None:
             self._last_usage = usage
 
     def _job_metrics(self, running: list[tuple[gpu_jobs.QueuedJob, Path]], usage: dict[int, float],
-                     errors: list[str]) -> None:
+                     own: dict[str, list[gpu_jobs.JobContainer]], errors: list[str]) -> None:
         texts: dict[str, str] = {}
         for job, cgroup in running:
-            pids = gpu_jobs.job_pids(cgroup, set(), job.job_id, set(usage))
-            mem = gpu_jobs.read_int(cgroup / "memory.current") or 0
+            containers = own[job.job_id]  # the run's docker containers count with it (README "A job's docker containers")
+            pids = gpu_jobs.job_pids(cgroup, set(), set(usage), containers)
+            mem = (gpu_jobs.read_int(cgroup / "memory.current") or 0) + gpu_jobs.container_bytes(
+                containers, gpu_jobs.MemoryFile.CURRENT, self.cgroup_root)
+            peak = gpu_jobs.read_int(cgroup / "memory.peak")
+            peak = None if peak is None else peak + gpu_jobs.container_bytes(containers, gpu_jobs.MemoryFile.PEAK, self.cgroup_root)
             gpu_mib = sum(mib for pid, mib in usage.items() if pid in pids)
             cpu_s, now = _cpu_seconds(cgroup), time.time()
             before = self._cpu_prev.get(job.job_id)
@@ -1360,7 +1367,7 @@ class Agent:
             total, count = self._mem_samples.get(job.job_id, (0, 0))
             self._mem_samples[job.job_id] = (total + mem, count + 1)
             texts[f"job_{job.job_id}.prom"] = metrics_text(
-                job, gpu_mib, mem, cpu_s, cores_now, gpu_jobs.read_int(cgroup / "memory.peak"), self._cores_peak.get(job.job_id),
+                job, gpu_mib, mem, cpu_s, cores_now, peak, self._cores_peak.get(job.job_id),
                 (total + mem) // (count + 1),
             )
         try:
@@ -1379,7 +1386,8 @@ class Agent:
     # -- 7. memory on a unified-memory node (D44) -------------------------------------------------------------
 
     def _unified_memory(self, queue: list[gpu_jobs.QueuedJob], running: list[tuple[gpu_jobs.QueuedJob, Path]],
-                        usage: dict[int, float] | None, now: float, errors: list[str]) -> None:
+                        usage: dict[int, float] | None, own: dict[str, list[gpu_jobs.JobContainer]], now: float,
+                        errors: list[str]) -> None:
         node = self.own_node
         if node is None:
             errors.append("this host is not a node of the site file: the memory guard has nothing to watch")
@@ -1397,7 +1405,7 @@ class Agent:
             return  # card memory unknown: no over-ask finding and no outside-use sample this step
         memories = [m for job, cgroup in running if (m := gpu_jobs.JobMemory.measure(job, cgroup, usage, jobs_memory))]
         self._over_ask(memories, {(job.job_id, job.start) for job, _ in running}, errors)
-        self._outside(node, memories, now, errors)
+        self._outside(node, memories, [c for cs in own.values() for c in cs], usage, now, errors)
 
     def _close_level(self, node: site_config.Node, errors: list[str]) -> int:
         """The node's close level in bytes, exactly as its health check computes it: the settings file, then the node's
@@ -1476,8 +1484,11 @@ class Agent:
         self._notify(NotifyEvent.MEMORY_STOP, request.job, request.user, request.name, message, errors, ended=str(ended))
         return request.updated(self.state_dir, ended=str(ended))
 
-    def _outside(self, node: site_config.Node, memories: list[gpu_jobs.JobMemory], now: float, errors: list[str]) -> None:
-        """Once a minute, what the node uses outside its jobs, for measuring its reserve (`status.py --reserve`)."""
+    def _outside(self, node: site_config.Node, memories: list[gpu_jobs.JobMemory], containers: list[gpu_jobs.JobContainer],
+                 usage: dict[int, float], now: float, errors: list[str]) -> None:
+        """Once a minute, what the node uses outside its jobs, for measuring its reserve (`status.py --reserve`). The
+        running jobs' docker containers are theirs, not outside use: their asks already cover them, and counting them
+        here too would hold the same memory back twice."""
         if now - self._outside_at < OUTSIDE_EVERY_S:
             return
         self._outside_at = now
@@ -1488,9 +1499,10 @@ class Agent:
             return
         used = memory["MemTotal"] - memory["MemAvailable"]
         held, card = sum(m.held for m in memories), sum(m.card for m in memories)
+        in_containers = sum(gpu_jobs.container_memory(containers, usage, self.cgroup_root))
         folder = self.dir / "outside"
-        line = {"t": int(now), "node": node.name, "outside": used - held - card, "used": used, "jobs_held": held,
-                "jobs_card": card}
+        line = {"t": int(now), "node": node.name, "outside": used - held - card - in_containers, "used": used,
+                "jobs_held": held, "jobs_card": card, "jobs_containers": in_containers}
         oldest = time.strftime("%Y-%m-%d", time.localtime(now - OUTSIDE_KEEP_DAYS * DAY_S))
         try:
             folder.mkdir(exist_ok=True)

@@ -76,7 +76,7 @@ def _describe(job: gpu_jobs.QueuedJob) -> str:
 
 def plan(
     queue: list[gpu_jobs.QueuedJob], *, gpu: bool, whole_box: bool, leases: list[tuple[str, bool]],
-    unregistered: list[tuple[int, float, str]], services: dict[str, str], memory_short: bool = False,
+    unregistered: list[audit.Stray], services: dict[str, str], memory_short: bool = False,
     cores_short: bool = False,
 ) -> tuple[list[str], list[str], list[str], list[str]]:
     """(lines to print, normal victims, steady blockers, other wait-only blockers).
@@ -129,9 +129,10 @@ def plan(
             wait_only.append(f"lease:{project}")
             state = "waiting for the card" if waiting else "holds the card"
             lines.append(f"[urgent] WAIT-ONLY {project} {state} and does not yield to a request")
-    for pid, mib, command in unregistered:
-        wait_only.append(f"pid:{pid}")
-        lines.append(f"[urgent] WAIT-ONLY unregistered GPU work, pid {pid} ({mib:.0f} MiB): {command[:120]}")
+    for stray in unregistered:
+        wait_only.append(f"pid:{stray.pid}")
+        lines.append(f"[urgent] WAIT-ONLY unregistered GPU work, pid {stray.pid} ({stray.mib:.0f} MiB): {stray.command[:120]}"
+                     + (f" ({stray.why})" if stray.why else ""))
     if not lines:
         lines.append("[urgent] nothing in the way")
     return lines, victims, steady, wait_only

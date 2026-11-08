@@ -7,7 +7,7 @@ for gpu in $(echo "${GPU_DEVICE_ORDINAL:-} ${CUDA_VISIBLE_DEVICES:-}" | tr ',' '
     case $gpu in
     MIG*) ;;
     *)
-        uuid=$("$smi" --query-gpu=uuid --format=noheader,csv -i "$gpu" 2>/dev/null)
+        uuid=$(timeout -k 2 10 "$smi" --query-gpu=uuid --format=noheader,csv -i "$gpu" 2>/dev/null)
         if [ -n "$uuid" ]; then
             rm -f "$dest/$uuid"
         fi

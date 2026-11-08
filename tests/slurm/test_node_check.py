@@ -65,6 +65,8 @@ class FakeSlurm:
         self.calls.append(command)
         if command[:2] == ["scontrol", "requeue"] and self.requeue_fails:
             return done(code=1)
+        if command[0] == "docker" and getattr(self, "fail_docker", False):
+            return done(code=1)
         if command[0] == "scancel":
             self.jobs = [entry for entry in self.jobs if entry["job_id"] != command[1]]
         if command[:2] == ["scontrol", "requeue"]:
@@ -98,6 +100,8 @@ def box(tmp_path: Path):
     class Box:
         settings_path, log, state_dir = path, Path(settings["log_path"]), tmp_path / "state"
         pushes = events
+        containers: list[gpu_jobs.JobContainer] | None = None  # what docker lists; None: no docker, or it did not answer
+        container_map = tmp_path / "run" / "containers.json"
 
         @staticmethod
         def free(mb: int) -> None:  # MemAvailable is in kB; the check reads decimal MB
@@ -114,6 +118,7 @@ def box(tmp_path: Path):
             return node_check.check(
                 path, slurm, lambda *args, **fields: (events.append((*args, fields)), Path("/events") / args[0])[1],
                 hostname=NODE + ".lan", gpu_busy=lambda: 0.4, sleep=lambda _s: None,
+                containers=lambda: Box.containers, container_map=Box.container_map,
             )
 
     Box.free(20000)
@@ -329,3 +334,31 @@ def test_free_mb_is_memavailable_in_decimal_megabytes_and_refuses_a_file_without
     meminfo.write_text("MemTotal: 9 kB\n")
     with pytest.raises(ValueError):
         node_check.free_mb(meminfo)
+
+
+def test_containers_of_ended_jobs_are_removed_and_the_rest_mapped_and_a_failure_never_closes(box, monkeypatch):
+    now = 10_000.0
+    monkeypatch.setattr(node_check.time, "time", lambda: now)
+    ctr = {name: gpu_jobs.JobContainer(name * 64, job_id, now - age, "/system.slice/x.scope")
+           for name, job_id, age in (("a", "1", 999), ("b", "9", 999), ("c", "9", 30))}  # job 1 runs; 9 has ended
+    box.containers = list(ctr.values())
+    slurm = FakeSlurm([job("1", 10)])
+    decisions = box.run(slurm)
+    assert slurm.calls == [["docker", "rm", "-f", "b" * 64]]  # old and of no unfinished job; c is too new to judge
+    assert decisions == [f"removed container(s) of ended jobs: {'b' * 12} (job 9)",
+                         f"kept new container(s) of no unfinished job, for now: {'c' * 12} (job 9)"]
+    mapped = gpu_jobs.node_containers(box.container_map, owner=gpu_jobs.current_user(), now=lambda: now)
+    assert mapped == [ctr["a"], ctr["c"]]  # what readers without docker see
+    assert "removed container(s)" in box.log.read_text()  # one log line per run carries it
+    rm_fails = FakeSlurm([job("1", 10)])
+    rm_fails.fail_docker = True
+    assert box.run(rm_fails)[0].startswith(f"could not remove container(s) of ended jobs {'b' * 12} (job 9): ")
+    stuck = gpu_jobs.node_containers(box.container_map, owner=gpu_jobs.current_user(), now=lambda: now)
+    assert ctr["b"] in stuck  # still in the map, so status.py keeps listing what could not be removed
+    box.containers = None  # docker gone or hung: an old map must not be trusted
+    assert box.run(FakeSlurm([job("1", 10)])) == [] and not box.container_map.exists()
+    box.containers = [ctr["a"]]
+    (blocker := box.container_map.parent / "file").write_text("")
+    box.container_map = blocker / "containers.json"  # its folder cannot be made: the map cannot be written
+    slurm = FakeSlurm([job("1", 10)])
+    assert box.run(slurm)[0].startswith("containers not checked: ") and slurm.drained is None

@@ -12,6 +12,7 @@ import subprocess
 import time
 import types
 from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
 
 import gpu_jobs
@@ -95,6 +96,7 @@ def test_a_hostile_or_foreign_record_is_ignored_and_never_blocks(tmp_path: Path,
     monkeypatch.setattr(status.gpu_jobs, "node_state", lambda: "idle")
     monkeypatch.setattr(status.audit, "unregistered", list)
     monkeypatch.setattr(status.audit, "report", lambda _u: [])
+    monkeypatch.setattr(status.gpu_jobs, "known_containers", list)  # never this machine's map or docker
     assert not any("forged" in line for line in status.lines([job]))
     named = QueuedJob("8", "normal", "PENDING", "None", "p:resume:\x1b]0;forged\x07")
     assert all(line.isprintable() for line in status.lines([named]))  # a terminal shows a name, never acts on it
@@ -586,6 +588,58 @@ def test_container_label_never_waits_on_a_hung_docker(monkeypatch: pytest.Monkey
 
     monkeypatch.setattr(subprocess, "run", run)
     assert gpu_jobs.container_label(f"/docker-{'ab' * 32}.scope", "l") == "" and seen["timeout"] == gpu_jobs.DOCKER_TIMEOUT_S
+    assert gpu_jobs.job_containers() is None  # docker silent: None, never "no containers"
+
+    # a job's containers: one ps and one inspect; ids, labels and times checked; a gone container just absent
+    good, old_one, stopped = "a" * 64, "b" * 64, "c" * 64
+    proc = Path(__file__).parent / "unused-proc"
+    def line(cid: str, created: str, pid: str, label: str) -> str:  # docker's `{{json .Config.Labels}}` comes last
+        return f"{cid}|{created}|{pid}|{json.dumps({'slurm-job': label, 'other': 'x'})}\n"
+
+    forged = f"5\n{'f' * 64}|2000-01-01T00:00:00Z|0|" + '{"slurm-job": "9999"}'  # a label trying to add a line
+    shown = (line(good, "2026-11-08T13:04:15.364309345Z", "4242", "5") + line(old_one, "2026-11-08T12:00:00Z", "17", "5")
+             + line(stopped, "2026-11-08T13:05:00Z", "0", "5") + line("d" * 64, "2026-11-08T13:04:15Z", "1", "five")
+             + line("e" * 64, "yesterday", "1", "5") + line("short", "2026-11-08T13:04:15Z", "1", "5")
+             + line("1" * 64, "2026-11-08T13:04:15Z", "1", "\u00b2") + line("2" * 64, "2026-11-08T13:04:15Z", "1", forged)
+             + f"{'f' * 64}|2000-01-01T00:00:00Z|0|" + '{"slurm-job": "9999"}\n'  # an id `docker ps` never listed
+             + line(good, "2026-11-08T13:04:15Z", "1", "9999"))  # a second record for one id: the first one stands
+    calls: list[list[str]] = []
+
+    def docker(argv: list[str], **_k: object) -> subprocess.CompletedProcess:
+        calls.append(argv)
+        if argv[1] == "ps":
+            return subprocess.CompletedProcess(argv, 0, f"{good}\n{old_one}\n{stopped}\n{'d' * 64}\n{'e' * 64}\n{'1' * 64}\n{'2' * 64}\nnot-an-id\n", "")
+        return subprocess.CompletedProcess(argv, 1, shown, "Error: No such object: gone")  # exits 1, prints the rest
+
+    since = datetime(2026, 11, 8, 12, 30, tzinfo=UTC).timestamp()
+    found = gpu_jobs.job_containers("5", since=since, run=docker, proc=proc)
+    assert [(c.id, c.job_id, c.cgroup) for c in found] == [(good, "5", ""), (stopped, "5", "")]  # no /proc entry here: ""
+    assert calls[0][-1] == "label=slurm-job=5" and calls[1][4:] == [good, old_one, stopped, *(c * 64 for c in "de12")]
+    # a forged line, an id not listed and a non-ASCII digit are all dropped, never a record or a crash (the root sweep)
+    assert [c.id for c in gpu_jobs.job_containers(run=docker, proc=proc)] == [good, old_one, stopped]
+    assert gpu_jobs.job_containers(run=lambda argv, **_k: subprocess.CompletedProcess(argv, 1, "", "permission denied")) is None
+    assert gpu_jobs.job_containers(run=lambda argv, **_k: subprocess.CompletedProcess(argv, 0, "", "")) == []
+    def failed(argv: list[str], **_k: object) -> subprocess.CompletedProcess:
+        listing = argv[1] == "ps"
+        return subprocess.CompletedProcess(argv, 0 if listing else 1, good if listing else "", "")
+
+    assert gpu_jobs.job_containers(run=failed) is None  # inspect failing as a whole is not "no containers"
+
+
+def test_the_root_map_is_believed_only_when_roots_fresh_and_well_formed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path, now, me = tmp_path / "containers.json", 10_000.0, gpu_jobs.current_user()
+    entry = {"id": "a" * 64, "job_id": "5", "created": 9000.0, "cgroup": "/system.slice/x.scope"}
+    gpu_jobs.write_json(path, {"at": int(now) - 5, "containers": [entry, {**entry, "id": "zz"}, {**entry, "job_id": "5;x"}, {"id": 1}]})
+    assert gpu_jobs.node_containers(path, owner=me, now=lambda: now) == [gpu_jobs.JobContainer("a" * 64, "5", 9000.0, entry["cgroup"])]
+    assert gpu_jobs.node_containers(path, owner="root" if me != "root" else "nobody", now=lambda: now) is None  # not the owner's
+    assert gpu_jobs.node_containers(path, owner=me, now=lambda: now + gpu_jobs.CONTAINER_MAP_MAX_AGE_S) is None  # too old
+    assert gpu_jobs.node_containers(path, owner=me, now=lambda: now - 60) is None  # from the future
+    asked: list[int] = []
+    monkeypatch.setattr(gpu_jobs, "job_containers", lambda: asked.append(1) or ["from docker"])
+    monkeypatch.setattr(gpu_jobs, "node_containers", list)
+    assert gpu_jobs.known_containers() == [] and asked == []  # a fresh empty map is the answer: docker is not asked
+    monkeypatch.setattr(gpu_jobs, "node_containers", lambda: None)
+    assert gpu_jobs.known_containers() == ["from docker"]
 
 
 def test_status_reserve_recommends_jobs_memory_from_two_weeks_of_outside_use(tmp_path: Path) -> None:
