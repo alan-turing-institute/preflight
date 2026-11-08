@@ -121,17 +121,15 @@ def test_every_get_route_answers(path: str) -> None:
         upstream = gpu_jobs.QueuedJob("2203", "normal", "PENDING", "Resources", "tc:restart:store<b>")
         waits = app._waits_on(waiting, {"2203": upstream}, {"2203": {"what": "put the <scores> in"}})
         assert app._waits_cell(waits, "/r/") == (
-            '<div class="why">waits for these to finish:</div><ul class="waits">'
-            '<li><a href="/r/job/2203" title="put the &lt;scores&gt; in">store&lt;b&gt;</a> <span class="jobid">#2203</span></li>'
+            '<div class="why">waits for:</div><ul class="waits">'
+            '<li><a href="/r/job/2203" title="store&lt;b&gt; — put the &lt;scores&gt; in">store&lt;b&gt;</a> <span class="jobid">#2203</span></li>'
             '<li><a href="/r/job/2206" title="">job 2206</a> <span class="jobid">#2206</span></li></ul>')
-        # a job's description is its name's hover text in the queue and in the finished table, not a block of text
-        assert 'title="a run">train</a>' in body and 'class="desc"' not in body
-        done = jobs_view.HistoryRow("5", "p:restart:fit", "p", "alice", "cpu", "COMPLETED", "0:0", None, None, None, 0, 0, None)
-        assert 'href="/r/job/5" title="fit the &lt;model&gt;">fit</a>' in app._finished_rows(
-            [done], "/r/", datetime(2026, 10, 19), lambda r: "fit the <model>")
+        # one line each: the words a job's name shares with the waiting job's go, a long rest loses its middle (full on hover)
+        assert app._middle(app._unshared("tc-det-2-18-run-token-tagger-fewer-human-36", "tc-det-2-18-record-x")) == "…run-token…human-36"
+        assert app._unshared("store", "store") == "store"  # the last word always stays
         # more than three fold behind one line, kept open across the 10 s refresh by its key
         assert app._waits_cell(waits * 2, "/r/", "9").startswith(
-            '<details class="waits" data-key="waits-9"><summary class="why">waits for 4 jobs to finish</summary>')
+            '<details class="waits" data-key="waits-9"><summary class="why">waits for 4 jobs</summary>')
         # each resource as reserved by jobs (of what slurm can give) beside really in use (of the whole machine), in GB
         assert "Reserved by jobs" in body and "1 of 1" in body and "37%" in body
         assert "8 of 20" in body and "3.0 of 20" in body and "12 left to reserve" in body

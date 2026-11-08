@@ -374,23 +374,49 @@ def _waits_on(job: gpu_jobs.QueuedJob, by_id: dict[str, gpu_jobs.QueuedJob],
     if job.reason != gpu_jobs.Reason.DEPENDENCY:
         return []
     return [{"id": dep, "short": _short(by_id[dep].name if dep in by_id else str(records.get(dep, {}).get("name") or "")),
-             "what": str(records.get(dep, {}).get("what") or "")} for dep in job.depends_on]
+             "what": str(records.get(dep, {}).get("what") or ""), "waiter": _short(job.name)} for dep in job.depends_on]
 
 
 #: Jobs waited on listed open in the State cell; a longer list folds behind one line to click.
 WAITS_SHOWN = 3
+#: Characters of a waited-on job's name shown in the State cell; a longer name loses its middle (the full name is on
+#: hover). Names of one study share their start and differ at the end, so both ends are kept.
+WAITS_NAME_CHARS = 22
+
+
+def _middle(name: str, limit: int = WAITS_NAME_CHARS) -> str:
+    """`name`, or its two ends joined by an ellipsis when it is longer than `limit` characters."""
+    if len(name) <= limit:
+        return name
+    head = name[: (limit - 1) // 2]
+    head = head[: head.rfind("-") + 1] if head.rfind("-") >= len(head) // 2 else head  # cut after a hyphen if one is near
+    tail = name[-(limit - 1 - len(head)):]
+    tail = tail[tail.find("-") + 1:] if 0 <= tail.find("-") < len(tail) // 2 else tail
+    return f"{head}…{tail}"
+
+
+def _unshared(name: str, other: str) -> str:
+    """`name` without the hyphen-separated words it starts with in common with `other`, marked by a leading ellipsis;
+    one study's jobs share a long start and differ just after it. At least the last word is kept."""
+    words, theirs = name.split("-"), other.split("-")
+    same = 0
+    while same < min(len(words) - 1, len(theirs)) and words[same] == theirs[same]:
+        same += 1
+    return "…" + "-".join(words[same:]) if same else name
 
 
 def _waits_cell(waits_on: list[dict[str, str]], root: str, job_id: str = "") -> str:
-    """The State cell's list of jobs waited on: one per line, its name linked to its page, its description on hover;
-    more than WAITS_SHOWN fold behind "waits for N jobs to finish" (2026-11-08: a run-on sentence of names filled it)."""
+    """The State cell's list of jobs waited on, one line each: its name (middle cut when long) linked to its page and
+    `#id`, the full name and description on hover; more than WAITS_SHOWN fold behind "waits for N jobs"
+    (2026-11-08: long names wrapped over three lines each)."""
     items = "".join(
-        f'<li><a href="{root}job/{esc(d["id"])}" title="{esc(d["what"] or d["short"])}">{esc(d["short"] or "job " + d["id"])}</a>'
-        f' <span class="jobid">#{esc(d["id"])}</span></li>' for d in waits_on
+        f'<li><a href="{root}job/{esc(d["id"])}" title="{esc(" — ".join(t for t in (d["short"], d["what"]) if t))}">'
+        f'{esc(_middle(_unshared(d["short"], d.get("waiter", ""))) or "job " + d["id"])}</a> <span class="jobid">#{esc(d["id"])}</span></li>'
+        for d in waits_on
     )
     if len(waits_on) > WAITS_SHOWN:
-        return f'<details class="waits" data-key="waits-{esc(job_id)}"><summary class="why">waits for {len(waits_on)} jobs to finish</summary><ul class="waits">{items}</ul></details>'
-    return f'<div class="why">waits for {"these" if len(waits_on) > 1 else "this"} to finish:</div><ul class="waits">{items}</ul>'
+        return f'<details class="waits" data-key="waits-{esc(job_id)}"><summary class="why">waits for {len(waits_on)} jobs</summary><ul class="waits">{items}</ul></details>'
+    return f'<div class="why">waits for:</div><ul class="waits">{items}</ul>'
 
 
 def _exit_words(exit_code: str) -> str:
