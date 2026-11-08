@@ -10,6 +10,7 @@ import pwd
 import signal
 import subprocess
 import types
+from collections.abc import Callable
 from pathlib import Path
 
 import gpu_jobs
@@ -522,36 +523,23 @@ def test_meminfo_gives_bytes_and_refuses_a_file_without_memavailable(tmp_path: P
         gpu_jobs.meminfo_text("MemTotal: 1000 kB\n")
 
 
-def cgroup_with(tmp_path: Path, *, current: int = 4_350_000_000, cache: int = 600_000_000, shmem: int = 50_000_000,
-                limit: str = "max", pids: str = "100\n101\n") -> Path:
-    cgroup = tmp_path / "job"
-    cgroup.mkdir()
-    (cgroup / "memory.current").write_text(f"{current}\n")
-    (cgroup / "memory.stat").write_text(f"anon 1\nfile {cache}\nshmem {shmem}\n")
-    (cgroup / "memory.max").write_text(f"{limit}\n")
-    (cgroup / "cgroup.procs").write_text(pids)
-    return cgroup
-
-
-def test_held_bytes_drops_only_cache_the_host_can_take_back(tmp_path: Path) -> None:
-    cgroup = cgroup_with(tmp_path)
+def test_held_bytes_drops_only_cache_the_host_can_take_back(make_cgroup: Callable[..., Path]) -> None:
+    cgroup = make_cgroup()
     assert gpu_jobs.held_bytes(cgroup) == 3_800_000_000
-    (tmp_path / "x").mkdir()
-    assert gpu_jobs.held_bytes(cgroup_with(tmp_path / "x", current=1, cache=9, shmem=0)) == 0  # cache above current: floored
+    assert gpu_jobs.held_bytes(make_cgroup("x", current=1, cache=9, shmem=0)) == 0  # cache above current: floored
     (cgroup / "memory.stat").unlink()
     assert gpu_jobs.held_bytes(cgroup) is None  # a missing file is unknown, never zero
 
 
 def test_job_memory_measure_takes_unlimited_as_the_jobs_share_and_trusts_no_label(
-        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, make_cgroup: Callable[..., Path]) -> None:
     monkeypatch.setattr(gpu_jobs, "container_label", lambda *_a, **_k: "5")  # every foreign container claims job 5
     job = QueuedJob("5", "gpu", "RUNNING", "", "n", user="ann", start=77)
     usage = {100: 3.0, 999: 50.0}  # pid 999 is some other job's process; pid 101 is not on the card
-    memory = gpu_jobs.JobMemory.measure(job, cgroup_with(tmp_path), usage, 8_000_000_000)
+    memory = gpu_jobs.JobMemory.measure(job, make_cgroup(), usage, 8_000_000_000)
     assert memory == gpu_jobs.JobMemory("5", "ann", "n", 77, 3_800_000_000, 3 * gpu_jobs.SLURM_MB, 8_000_000_000)
     assert memory.total == memory.held + memory.card and memory.excess == memory.total - 8_000_000_000
-    (tmp_path / "b").mkdir()
-    limited = gpu_jobs.JobMemory.measure(job, cgroup_with(tmp_path / "b", limit="123"), usage, 8_000_000_000)
+    limited = gpu_jobs.JobMemory.measure(job, make_cgroup("b", limit="123"), usage, 8_000_000_000)
     assert limited is not None and limited.ask == 123
     assert gpu_jobs.JobMemory.measure(job, tmp_path / "gone", usage, 1) is None
 
