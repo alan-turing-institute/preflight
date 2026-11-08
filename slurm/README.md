@@ -520,7 +520,7 @@ Sizing from a job's own history. Give a job `--name` and the same name on every 
   or more, plus 25 percent; with no run at all, the whole box for a GPU job and slurm's default for a CPU job.
 - After a run was killed for memory (slurm's `OUT_OF_MEMORY`, or the host's OOM guard) and no clean run has ended
   since, the next ask is at least 1.2 times what that run was given and at least 105 MB more (the autoscaler's rule), never
-  below the history's ask, and the whole box when that is more than any node gives jobs. `submit` prints
+  below the history's ask nor, after a memory guard stop, below what the run used (memory plus card) plus 10 percent, and the whole box when that is more than any node gives jobs. `submit` prints
   `[submit] memory: run J of 'NAME' was killed by ... ; asking NG`.
 - A hand-set `--mem` below the history's peak, or `--mem 0` for a measured job, warns; it is never refused.
 - Cores, for a CPU-only job without `--cpus`: `[submit] cores: measured A avg over N completed runs; would ask K (asking D now)`,
@@ -537,8 +537,8 @@ and `gpujobs-wait` repeats the last run's under each job's final state:
 Memory asked is the job's cgroup cap (its `--mem`); the peak is the host side plus, where the card shares system memory
 (`unified_memory`), the card's, so it can pass 100% there. Cores held are slurm's cpuset; the average is the cgroup's core
 time over the run's wall time. The advice is this run's peak plus 10 percent and its average times 1.25 (within the cores
-the job may have); after a memory kill (the job's cap killed a process, or the host's OOM guard killed it) it is at least
-1.2 times what the run was given; `--mem 0` (the whole box) when that is more than any node gives jobs. GPU jobs get no
+the job may have); after a memory kill (the job's cap killed a process, or the host's OOM guard killed it) it is the larger of
+1.2 times what the run was given and its peak plus 10 percent (the rule `submit --mem auto` applies); `--mem 0` (the whole box) when that is more than any node gives jobs. GPU jobs get no
 `--cpus` advice. The report is per job, never per user, and changes nothing by itself: the project decides its next
 request. A figure that cannot be read shows as unknown.
 
