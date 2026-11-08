@@ -1229,9 +1229,10 @@ CORES_MARGIN = 1.25
 MB_PER_G = 1024
 
 
-def bumped_mem_mb(asked_mb: float) -> float:
-    """The least a run killed for memory with `asked_mb` slurm MB given should ask for next time (D35)."""
-    return max(asked_mb + OOM_MIN_BUMP_MB, asked_mb * OOM_BUMP_RATIO)
+def bumped_mem_mb(asked_mb: float, used_mb: float | None = None) -> float:
+    """The least a run killed for memory with `asked_mb` slurm MB given should ask for next time (D35), and never below
+    what it was measured to use plus `AUTO_MARGIN` when that is known (a stop-gap stop counts host + card, D44)."""
+    return max(asked_mb + OOM_MIN_BUMP_MB, asked_mb * OOM_BUMP_RATIO, (used_mb or 0) * (1 + AUTO_MARGIN))
 
 
 def mem_option(mb: float, most_mb: int | None) -> str:

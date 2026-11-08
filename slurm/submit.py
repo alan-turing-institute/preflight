@@ -150,8 +150,7 @@ def resolve_mem(mem: str | None, name: str | None, gpu: bool) -> str | None:
             return WHOLE_BOX
         else:
             # a stop-gap stop measured what the run held (host + card, D44): never ask below that plus the margin
-            used_mb = (kill.used_mb or 0) * (1 + AUTO_MARGIN)
-            ask = math.ceil(max(gpu_jobs.bumped_mem_mb(kill.asked_mb), used_mb, (history or 0) * MB_PER_G) / MB_PER_G)
+            ask = math.ceil(max(gpu_jobs.bumped_mem_mb(kill.asked_mb, kill.used_mb), (history or 0) * MB_PER_G) / MB_PER_G)
             most_mb = max((node.jobs_mb for node in gpu_jobs.load_site().nodes), default=None)
             said += f" with {_gb(kill.asked_mb)} given"
             rule = f"at least {OOM_BUMP_RATIO} times that (D35)"

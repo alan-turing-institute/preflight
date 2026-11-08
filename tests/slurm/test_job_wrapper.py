@@ -418,7 +418,8 @@ def test_the_end_of_run_report_measures_from_the_cgroup_and_advises_the_next_req
     killed = lines(asked=32 * gib, cap=True)
     assert killed[0].endswith("; the memory cap killed a process") and "--mem 39G or more" in killed[1]  # 1.2 x 32 GiB
     assert "--mem 0 " in lines(asked=most_mb * 2**20, guard=True)[1] + " "  # killed with the whole box: no more to give
-    assert lines(guard=True, asked=None)[0].endswith("killed by the host's OOM guard")
+    assert lines(guard=True, asked=None)[0].endswith("killed to free the host's memory")
+    assert "--mem 7G or more" in lines(peak=6.7e9, asked=2 * gib, guard=True)[1]  # stopped over its ask: its peak + 10% (D44)
     assert lines(peak=None, asked=None, avg=None) == ["[job] used: memory peak unknown; cores in use unknown of 8 held"]
     record = job_wrapper.usage_record(u, ["[job] x"])
     assert record == {"mem_asked_bytes": 40 * gib, "mem_peak_bytes": 4 * 10**9 + gib, "cores_held": u.cores_held,

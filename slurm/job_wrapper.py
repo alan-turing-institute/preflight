@@ -363,7 +363,7 @@ def measure_usage(cgroup: Path | None, outcome: dict[str, object], before: tuple
 def usage_lines(u: Usage, *, gpu_job: bool, cores_cap: int | None, most_mb: int | None) -> list[str]:
     """The run's report (D37): what it used against what it asked for and, when anything is known, the request for the
     same work next time: memory at its peak plus `AUTO_MARGIN`, or after a memory kill at least `bumped_mem_mb` of what
-    it was given (the whole box, `0`, when no node gives that much, as for a run that had the whole box); cores, for a job without GPUs
+    it was given and of its peak (the whole box, `0`, when no node gives that much, as for a run that had the whole box); cores, for a job without GPUs
     only (a GPU job's are held for the card, D17/D33), its average times `CORES_MARGIN` within `cores_cap`."""
     if u.mem_peak_bytes is None:
         memory = "memory peak unknown"
@@ -378,13 +378,14 @@ def usage_lines(u: Usage, *, gpu_job: bool, cores_cap: int | None, most_mb: int 
         cores = f"cores {u.cores_avg:.1f} on average of {u.cores_held} held ({round(100 * u.cores_avg / u.cores_held)}%)"
     else:
         cores = f"cores {u.cores_avg:.1f} on average"
-    note = ("; the memory cap killed a process" if u.cap_killed else "") + ("; killed by the host's OOM guard" if u.guard_killed else "")
+    note = ("; the memory cap killed a process" if u.cap_killed else "") + ("; killed to free the host's memory" if u.guard_killed else "")
     lines = [f"[job] used: {memory}; {cores}{note}"]
     flags = []
     asked_mb = u.mem_asked_bytes / SLURM_MB if u.mem_asked_bytes else None
     if u.cap_killed or u.guard_killed:
         if asked_mb is not None:  # a run that had the whole box already gets `0` again: 1.2 times it fits no node
-            option = gpu_jobs.mem_option(gpu_jobs.bumped_mem_mb(asked_mb), most_mb)
+            used_mb = None if u.mem_peak_bytes is None else u.mem_peak_bytes / SLURM_MB
+            option = gpu_jobs.mem_option(gpu_jobs.bumped_mem_mb(asked_mb, used_mb), most_mb)
             flags.append(f"--mem {option}" + (" or more" if option != "0" else ""))
     elif u.mem_peak_bytes is not None:
         flags.append(f"--mem {gpu_jobs.mem_option(u.mem_peak_bytes * (1 + gpu_jobs.AUTO_MARGIN) / SLURM_MB, most_mb)}")
