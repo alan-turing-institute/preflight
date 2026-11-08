@@ -80,10 +80,11 @@ def test_wait_repeats_the_last_runs_usage_report_from_the_jobs_own_record_only(
     # user (the events folder is open to all) is a forgery and is not
     (tmp_path / "events").mkdir()
     wait.gpu_jobs.write_event("5", wait.gpu_jobs.EventAction.IDLE, role="holding", other_job="7", message="holds 8 cores\x1b[2J")
+    wait.gpu_jobs.write_event("5", wait.gpu_jobs.EventAction.MEMORY_STOP, message="stopped for memory")  # D44, the same rule
     assert wait.new_notices(["5"], set()) == []  # written by this test's user, not the agent's
     monkeypatch.setattr(wait.gpu_jobs, "SLURM_USER", me)  # now this user stands for the agent
     seen: set[tuple[str, int]] = set()
-    assert wait.new_notices(["5"], seen) == ["[wait] #5 holding: holds 8 cores?[2J"]
+    assert wait.new_notices(["5"], seen) == ["[wait] #5 holding: holds 8 cores?[2J", "[wait] #5 memory stop: stopped for memory"]
     assert wait.new_notices(["5"], seen) == []  # once
     # the command itself prints them under the job's final state
     record(report)
@@ -91,4 +92,5 @@ def test_wait_repeats_the_last_runs_usage_report_from_the_jobs_own_record_only(
     monkeypatch.setattr(wait.gpu_jobs, "completion_records", lambda _jobs: {"5": {"JobState": "COMPLETED", "UserId": me}})
     monkeypatch.setattr(sys, "argv", ["wait.py", "5"])
     assert wait.main() == 0
-    assert capsys.readouterr().out.splitlines() == ["[wait] #5 holding: holds 8 cores?[2J", "[wait] 5: COMPLETED", *report]
+    assert capsys.readouterr().out.splitlines() == ["[wait] #5 holding: holds 8 cores?[2J", "[wait] #5 memory stop: stopped for memory",
+                                                    "[wait] 5: COMPLETED", *report]

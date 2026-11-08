@@ -47,7 +47,9 @@ class Fake:
                                gpu_jobs.Event("7", "push_back", "root", 1_700_000_100_000_000_000,
                                               {"node": "laptop", "free_mb": 7300}),
                                gpu_jobs.Event("7", "idle", "slurm", 1_700_000_200_000_000_000, {"message": "holds 8 cores"}),
-                               gpu_jobs.Event("7", "idle", "alice", 1_700_000_300_000_000_000, {"message": "forged by alice"})],
+                               gpu_jobs.Event("7", "idle", "alice", 1_700_000_300_000_000_000, {"message": "forged by alice"}),
+                               gpu_jobs.Event("7", "memory_stop", "slurm", 1_700_000_400_000_000_000, {"message": "held 9 GB"}),
+                               gpu_jobs.Event("7", "memory_stop", "alice", 1_700_000_500_000_000_000, {"message": "forged stop"})],
             elapsed=lambda: {"7": "1:00"},
             efficiency=lambda job_id, record=None: jobs_view.Efficiency(job_id, 4 * 1024**3, None, None, 0.5),
             history=lambda *_a: [],
@@ -145,6 +147,7 @@ def test_every_get_route_answers(path: str) -> None:
         job_page = call(fake, "/job/7")[1]
         assert "Pushed back: 7.3 GB free on laptop" in job_page
         assert "Idle finding: holds 8 cores" in job_page and "forged by alice" not in job_page  # only the agent's (D41)
+        assert "Stopped for memory: held 9 GB" in job_page and "forged stop" not in job_page  # (D44)
         # who queued each job, and its level, at every width (not hide-sm)
         assert '<td class="inline" data-k="user">alice</td>' in body and '<td class="inline" data-k="level"><span class="pill level-normal"' in body
         # its own column: when slurm (last) queued a job, and for a waiting one how long ago; unknown shows a dash

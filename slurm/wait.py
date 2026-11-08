@@ -69,14 +69,15 @@ def usage_lines(job_id: str, user: str) -> list[str]:
 
 
 def new_notices(jobs: list[str], seen: set[tuple[str, int]]) -> list[str]:
-    """One line per idle finding the agent recorded on `jobs` since the last call (D41), adding them to `seen`: a
-    session waiting on its jobs learns that one waits beside an unused GPU, or holds what such a job needs."""
+    """One line per notice the agent recorded on `jobs` since the last call (D41, D44), adding them to `seen`: a
+    session waiting on its jobs learns that one waits beside an unused GPU or holds what such a job needs, that one
+    holds more memory than it asked for, or that the memory guard stopped one."""
     lines = []
     for job in jobs:
-        for event in gpu_jobs.idle_notices(job):
+        for event in gpu_jobs.agent_notices(job, gpu_jobs.AGENT_NOTICES):
             if (job, event.at) not in seen:
                 seen.add((job, event.at))
-                role = str(event.fields.get("role") or "idle")
+                role = str(event.fields.get("role") or event.action.replace("_", " "))
                 lines.append(gpu_jobs.printable(f"[wait] #{job} {role}: {event.fields['message']}"[:LINE_MAX]))
     return lines
 

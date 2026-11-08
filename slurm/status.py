@@ -4,7 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import json
+import math
+import socket
+import statistics
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -68,10 +73,55 @@ def lines(queue: list[gpu_jobs.QueuedJob] | None) -> list[str]:
     return out
 
 
+#: `--reserve` (D44): the share of the one-minute samples the reserve must cover, and the least history to judge from.
+RESERVE_PERCENTILE = 99
+RESERVE_MIN_DAYS = 7
+
+
+def reserve_lines(site: gpu_jobs.site_config.Site, folder: Path, here: str, mem_total: int) -> list[str]:
+    """What each node used outside its jobs (the agent's one-minute record on a unified-memory node, D44) and, for the
+    node this runs on, the `jobs_memory_gb` that keeps it free: its memory less the 99th percentile of that use, less
+    the node's close level, so the health check and the memory guard are not reached in normal use."""
+    samples: dict[str, list[tuple[int, int]]] = {}
+    for path in sorted(folder.glob("*.jsonl")) if folder.is_dir() else []:
+        for text in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            try:
+                line = json.loads(text)
+            except ValueError:
+                continue
+            if isinstance(line, dict) and isinstance(line.get("node"), str) and all(
+                    type(line.get(key)) is int for key in ("t", "outside")):
+                samples.setdefault(line["node"], []).append((line["t"], line["outside"]))
+    if not samples:
+        return ["[reserve] no record of memory used outside jobs yet (the agent writes one on a unified-memory node)"]
+    nodes, size, out = {node.name: node for node in site.nodes}, gpu_jobs.size_text, []
+    for name, found in sorted(samples.items()):
+        days = len({time.strftime("%Y-%m-%d", time.localtime(t)) for t, _ in found})
+        if days < RESERVE_MIN_DAYS:
+            out.append(f"[reserve] {name}: not enough data ({days} days; at least {RESERVE_MIN_DAYS})")
+            continue
+        outside = statistics.quantiles([o for _, o in found], n=100, method="inclusive")[RESERVE_PERCENTILE - 1]
+        out.append(f"[reserve] {name}: {len(found)} samples over {days} days; used outside jobs: {size(outside)} at the "
+                   f"{RESERVE_PERCENTILE}th percentile")
+        if name != here or name not in nodes:
+            out.append(f"[reserve] {name}: run this on {name} for its jobs_memory_gb (it needs that machine's memory)")
+            continue
+        level = nodes[name].close_below_mb * gpu_jobs.MB
+        out.append(f"[reserve] {name}: jobs_memory_gb = {math.floor((mem_total - outside - level) / gpu_jobs.GB)} "
+                   f"(memory {size(mem_total)} less {size(outside)} used outside jobs less the {size(level)} close level)")
+    return out
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--site", default=None, metavar="NAME", help="show another site's queue ([remote.NAME] in the site file)")
+    parser.add_argument("--reserve", action="store_true",
+                        help="the memory each node used outside its jobs, and the jobs_memory_gb that keeps it (D44)")
     arguments = parser.parse_args()
+    if arguments.reserve:
+        print("\n".join(reserve_lines(gpu_jobs.load_site(), gpu_jobs.STATE_DIR / "agent" / "outside",
+                                      socket.gethostname().split(".")[0], gpu_jobs.meminfo()["MemTotal"])))
+        return 0
     if arguments.site:
         try:
             print(remote.status(gpu_jobs.load_site(), arguments.site))

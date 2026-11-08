@@ -170,7 +170,7 @@ TOML. Tables: the top level, `[[nodes]]` with `[[nodes.gpus]]`, `[lease]` with `
 | `unified_memory` | `false` | True when the GPU shares system memory with the host (`nvidia-smi` reports total memory as `[N/A]`). `detect` sets it. On such a site the Jobstats dashboard's GPU memory panel plots the agent's per-job series, because the GPU exporter has none to report. |
 | `hostguard` | `false` | The job wrapper marks every job as the preferred out-of-memory victim (`oom_score_adj` 800, through the host memory guard in `hostguard/hostguard.py`), so a memory shortage ends a job rather than a login session. The `tools` component installs the guard when this is on. |
 | `dgx_gate` | `false` | Require the DGX submission gate for jobs submitted with `--entry` (other jobs are not gated). The `tools` component installs the gate (`dgx/`) and the host memory guard it checks when this is on. |
-| `notify_command` | `[]` | Command (list of arguments, no shell, 30 s limit) the agent runs once per notice, with the notice in its environment. Every notice: `GPUJOBS_EVENT` (`failed`: a job ended FAILED, OUT_OF_MEMORY, TIMEOUT or NODE_FAIL; `idle`: a waste finding), `GPUJOBS_JOB` (the job the notice is about), its `GPUJOBS_NAME`, `GPUJOBS_PROJECT` (the name's first `:` field) and `GPUJOBS_USER`, and `GPUJOBS_MESSAGE`, one plain sentence ready to send. A failure adds `GPUJOBS_STATE`. An idle finding is sent to both sides, at most once an hour per pair: `GPUJOBS_ROLE` is `waiting` (the job that waits) or `holding` (a running job holding what it lacks), and `GPUJOBS_OTHER_JOB` and `GPUJOBS_OTHER_PROJECT` name the other side. Names are whatever their submitter typed, with control characters shown as `?`: quote them wherever they go into a shell command or a mail header. Empty means no notification. `slurm/notify_mail.py` is a working example that mails each notice to the job's user through `sendmail` (`["/usr/bin/python3", "/opt/gpujobs/slurm/notify_mail.py", "--domain", "example.org"]`); any other channel is a script reading the same variables. |
+| `notify_command` | `[]` | Command (list of arguments, no shell, 30 s limit) the agent runs once per notice, with the notice in its environment. Every notice: `GPUJOBS_EVENT` (`failed`: a job ended FAILED, OUT_OF_MEMORY, TIMEOUT or NODE_FAIL; `idle`: a waste finding; `over_ask`: a running job holds at least 1 GB more memory, host plus card, than it asked for, once per run, unified-memory nodes only; `memory_stop`: the memory guard stopped a job, see "Memory on unified-memory nodes"), `GPUJOBS_JOB` (the job the notice is about), its `GPUJOBS_NAME`, `GPUJOBS_PROJECT` (the name's first `:` field) and `GPUJOBS_USER`, and `GPUJOBS_MESSAGE`, one plain sentence ready to send. A failure adds `GPUJOBS_STATE`; a memory stop adds `GPUJOBS_ENDED` (`by_wrapper`, `by_scancel` or `not_ended`). An idle finding is sent to both sides, at most once an hour per pair: `GPUJOBS_ROLE` is `waiting` (the job that waits) or `holding` (a running job holding what it lacks), and `GPUJOBS_OTHER_JOB` and `GPUJOBS_OTHER_PROJECT` name the other side. Names are whatever their submitter typed, with control characters shown as `?`: quote them wherever they go into a shell command or a mail header. Empty means no notification. `slurm/notify_mail.py` is a working example that mails each notice to the job's user through `sendmail` (`["/usr/bin/python3", "/opt/gpujobs/slurm/notify_mail.py", "--domain", "example.org"]`); any other channel is a script reading the same variables. |
 | `sharing_memory_fraction` | absent | Only for sites that share a card (`shards`, below). A number above 0 and at most 1: the share of a node's jobs memory that the jobs sharing a card may fill together, counted at their measured peaks. It tightens two gates alike: `sharing.py measure` drops any level whose peak memory in use passes it (of the box's total memory), and `submit.py` caps the copies by it (of the node's jobs memory). Absent: they may fill all of it. |
 | `cpus_from_history` | `recommend` | Cores for a CPU-only job given `--name` and no `--cpus` (section 7). `off`: nothing. `recommend`: `submit` prints the cores the job's 3 newest completed runs of the same `project:class:name` justify and asks as before. `enforce`: it asks for them. The figure is their highest average cores in use (core time over wall time, from `sacct`) times 1.25, rounded up, from 1 to the cores the job may have. |
 | `nodes` | required | One `[[nodes]]` table per compute node; at least one. |
@@ -186,6 +186,7 @@ TOML. Tables: the top level, `[[nodes]]` with `[[nodes.gpus]]`, `[lease]` with `
 | `cpus` | required | CPUs slurm may hand out. |
 | `real_memory_mb` | required | Memory in MB slurm may hand out (the machine's memory minus what the host keeps back). |
 | `gpus` | `[]` | `[[nodes.gpus]]` tables, one per GPU on this node. |
+| `jobs_memory_gb` | absent | Memory jobs may be given on this node, in decimal GB, below `real_memory_mb`; slurm keeps the rest for work outside its jobs (`MemSpecLimit`). Any node may set it. On a part-time machine it is what its owner lends. On a full node, measure it: after a week or more of the agent running on a unified-memory node, `python3 slurm/status.py --reserve` on that node prints the figure, its memory less the 99th percentile of what it used outside jobs (one-minute samples, kept 14 days) less its health check's close level. Absent: no reserve, so jobs may be given all of `real_memory_mb`. |
 | `cores_per_gpu` | absent | Cores held for GPU jobs, per GPU. A GPU job gets this many per GPU by default, and CPU-only jobs (partition `cpu`) are capped by `MaxCPUsPerNode` at the node's cores less those held, so a free GPU never waits for cores taken by CPU jobs (slurm.conf(5)'s own use of `MaxCPUsPerNode`; slurm 23.11 has no `RestrictedCoresPerGPU`). Set it from a measurement: the fewest cores at which your GPU jobs stop getting faster. With several nodes the cap is the tightest node's and applies to every node, CPU-only ones included. At least 1, and must leave CPU-only jobs a core. Absent: nothing is held, and a GPU job's default is its GPUs' share of the node's cores (all of them on a one-GPU node), so any CPU job running holds a GPU job back. `submit.py` refuses a CPU-only job asking for more than the cap, which would otherwise wait forever. |
 
 ### `[[nodes.gpus]]`
@@ -638,6 +639,33 @@ no copy of the job, so the local page does not list it (D24).
 - **Without a site file** (none at `/etc/gpujobs/site.toml`, or `$GPUJOBS_SITE` naming a missing or broken one) the
   tools refuse, naming the file and what is wrong with it; there is no built-in fallback. `$SLURM_GPU_STATE_DIR`
   and `$GPU_LEASE_DIR` override the site file's two directories (the unit tests use them).
+
+### Memory on unified-memory nodes
+
+On a node whose GPU shares the host's memory (`unified_memory = true`), a job's card memory comes out of the same pool
+as everything else, but slurm's memory limit counts only the host side: a job can pass its ask with card memory and
+starve the machine. Two pieces keep the machine responsive:
+
+- **A measured reserve.** `jobs_memory_gb` holds back the memory the machine needs outside its jobs (slurm's
+  `MemSpecLimit`). Measure it with `status.py --reserve` (see the `[[nodes]]` table); a typed guess errs one way or
+  the other.
+- **The memory guard.** It runs in the agent and watches the agent's own node; the installer refuses a unified-memory
+  site with a GPU node elsewhere, which it could not watch. Every second it reads the node's free memory. Below the
+  node's close level (the health check's: `close_below_gb`, 16 GB on a full node by default, or the node's `Extra`)
+  it stops the running job furthest over its ask, counting the memory its cgroup holds (page cache left out, shared
+  memory counted) plus the card memory of its own processes, if that is at least 1 GB over. One job at a time: the
+  next waits 10 s for the memory to come back. When no job is over its ask it does nothing, and the health check and
+  earlyoom act as before. Every decision is in the agent's log (`journalctl -u gpujobs-agent | grep "memory guard"`).
+- **How a stop ends a job.** The guard writes a stop request for that run in the agent's own folder. The job's
+  wrapper (every job `submit.py` and `urgent.py` make) acknowledges it in the job's record and kills the command: a
+  `resume` job is requeued from its checkpoint, any other job fails, exit status 5, as for an earlyoom kill. A job
+  with no wrapper (plain `sbatch`), or one whose wrapper has not acknowledged within 2 s, gets `scancel --signal=KILL`;
+  so does one still running 15 s after acknowledging. Each outcome is a `memory_stop` event on the job, shown on the
+  job's page and by `gpujobs-wait`, and sent through `notify_command`.
+- **The next run.** After a stop, `submit.py --mem auto` asks for at least what the stopped run used (memory plus
+  card) plus 10 percent. No job's size is changed for it.
+- **Unchanged:** sites whose GPUs have their own memory, earlyoom's settings, and the health check's push-back of
+  `resume` jobs. A job's container (Docker) runs outside its cgroup and is not counted for a stop.
 
 ### Part-time machines
 

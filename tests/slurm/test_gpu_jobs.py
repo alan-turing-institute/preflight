@@ -9,6 +9,7 @@ import os
 import pwd
 import signal
 import subprocess
+import time
 import types
 from collections.abc import Callable
 from pathlib import Path
@@ -560,7 +561,7 @@ def test_agent_notices_count_only_files_the_agent_user_wrote(tmp_path: Path, mon
     assert gpu_jobs.agent_notices("7", kinds) == []
     monkeypatch.setattr(gpu_jobs, "SLURM_USER", gpu_jobs.current_user())
     assert [e.action for e in gpu_jobs.agent_notices("7", kinds)] == ["memory_stop"]
-    assert gpu_jobs.idle_notices("7") == []
+    assert gpu_jobs.agent_notices("7", frozenset({EventAction.IDLE})) == []  # only the kinds asked for
 
 
 def test_memory_kill_reads_the_stop_gaps_event_and_ignores_a_forged_one(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -585,3 +586,27 @@ def test_container_label_never_waits_on_a_hung_docker(monkeypatch: pytest.Monkey
 
     monkeypatch.setattr(subprocess, "run", run)
     assert gpu_jobs.container_label(f"/docker-{'ab' * 32}.scope", "l") == "" and seen["timeout"] == gpu_jobs.DOCKER_TIMEOUT_S
+
+
+def test_status_reserve_recommends_jobs_memory_from_two_weeks_of_outside_use(tmp_path: Path) -> None:
+    gb, midnight = 10**9, int(time.mktime((2026, 11, 1, 0, 0, 0, 0, 0, -1)))
+    site = site_config.parse({"name": "s", "nodes": [{"name": "n1", "cpus": 4, "real_memory_mb": 124_608}]})
+    per_day = 100
+
+    def record(days: int) -> Path:
+        folder = tmp_path / f"outside-{days}"
+        folder.mkdir()
+        for i in range(days * per_day):  # 27.1 GB used outside jobs, but for a few spikes, under 1 percent of the time
+            outside = 60 * gb if i % 200 == 0 else 27_100_000_000
+            t = midnight + i * 86400 // per_day
+            with (folder / f"{time.strftime('%Y-%m-%d', time.localtime(t))}.jsonl").open("a") as out:
+                out.write(json.dumps({"t": t, "node": "n1", "outside": outside}) + "\n")
+        (folder / "broken.jsonl").write_text("not json\n{}\n")  # skipped, never a crash
+        return folder
+
+    lines = status.reserve_lines(site, record(8), "n1", 130_660_000_000)
+    assert lines == ["[reserve] n1: 800 samples over 8 days; used outside jobs: 27.1 GB at the 99th percentile",
+                     "[reserve] n1: jobs_memory_gb = 87 (memory 130.7 GB less 27.1 GB used outside jobs less the 16.0 GB close level)"]
+    assert status.reserve_lines(site, record(3), "n1", 0) == ["[reserve] n1: not enough data (3 days; at least 7)"]
+    assert "run this on n1" in status.reserve_lines(site, tmp_path / "outside-8", "elsewhere", 0)[1]
+    assert status.reserve_lines(site, tmp_path / "none", "n1", 0)[0].startswith("[reserve] no record")

@@ -996,6 +996,8 @@ EVENT_WORDS = {
     gpu_jobs.EventAction.FAILED: "Failed",
     gpu_jobs.EventAction.PUSH_BACK: "Pushed back",
     gpu_jobs.EventAction.IDLE: "Idle finding",
+    gpu_jobs.EventAction.OVER_ASK: "Over its ask",
+    gpu_jobs.EventAction.MEMORY_STOP: "Stopped for memory",
 }
 
 
@@ -1007,9 +1009,9 @@ def _timeline_html(row: jobs_view.HistoryRow | None, events: list[gpu_jobs.Event
         items.append((row.start, "Started"))
     for event in events:
         moment = datetime.fromtimestamp(event.at / 1e9)  # noqa: DTZ006 - local, like slurm's times above
-        if event.action == gpu_jobs.EventAction.IDLE:  # the agent's finding (D41); one written by anyone else is ignored
-            if gpu_jobs.is_idle_notice(event):
-                items.append((moment, f"Idle finding: {event.fields['message']}"))
+        if event.action in gpu_jobs.AGENT_NOTICES:  # the agent's findings (D41, D44); anyone else's are ignored
+            if gpu_jobs.is_agent_notice(event, gpu_jobs.AGENT_NOTICES):
+                items.append((moment, f"{EVENT_WORDS[event.action]}: {event.fields['message']}"))
             continue
         words = EVENT_WORDS.get(event.action, event.action.replace("_", " ").capitalize())  # type: ignore[call-overload]
         if event.action == gpu_jobs.EventAction.PUSH_BACK:  # the health check's own record: no person to name

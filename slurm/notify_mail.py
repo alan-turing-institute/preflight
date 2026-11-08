@@ -4,9 +4,9 @@
 Site file:  notify_command = ["/usr/bin/python3", "/opt/gpujobs/slurm/notify_mail.py", "--domain", "example.org"]
 
 The agent runs the command once per notice with the notice in its environment (the contract is the `notify_command`
-row of the README): GPUJOBS_EVENT (failed | idle), GPUJOBS_JOB, GPUJOBS_NAME, GPUJOBS_PROJECT, GPUJOBS_USER and
-GPUJOBS_MESSAGE, plus GPUJOBS_STATE for a failure and GPUJOBS_ROLE, GPUJOBS_OTHER_JOB and GPUJOBS_OTHER_PROJECT for an
-idle finding. Without `--domain` the mail goes to the local mailbox of GPUJOBS_USER. A notice with no user (the job
+row of the README): GPUJOBS_EVENT (failed | idle | over_ask | memory_stop), GPUJOBS_JOB, GPUJOBS_NAME,
+GPUJOBS_PROJECT, GPUJOBS_USER and GPUJOBS_MESSAGE, plus GPUJOBS_STATE for a failure, GPUJOBS_ROLE, GPUJOBS_OTHER_JOB
+and GPUJOBS_OTHER_PROJECT for an idle finding, and GPUJOBS_ENDED for a memory stop. The subject names the event. Without `--domain` the mail goes to the local mailbox of GPUJOBS_USER. A notice with no user (the job
 had already left slurm) is skipped. Any other channel (Slack, a chat bot) is a script reading the same variables.
 """
 

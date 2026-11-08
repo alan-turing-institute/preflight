@@ -1035,15 +1035,6 @@ def agent_notices(job_id: str, kinds: frozenset[EventAction]) -> list[Event]:
     return [e for e in events(job_id) if is_agent_notice(e, kinds)]
 
 
-def is_idle_notice(event: Event) -> bool:
-    return is_agent_notice(event, frozenset({EventAction.IDLE}))
-
-
-def idle_notices(job_id: str) -> list[Event]:
-    """The idle findings the agent recorded on a job, oldest first."""
-    return agent_notices(job_id, frozenset({EventAction.IDLE}))
-
-
 def write_event(job_id: str, action: EventAction, **fields: object) -> Path:
     """Record an event as `events/<job>-<time_ns>-<action>.json` (0644; the directory is sticky and shared)."""
     at = time.time_ns()
