@@ -144,6 +144,20 @@ IDLE_WAITING_REASONS = frozenset({gpu_jobs.Reason.RESOURCES, gpu_jobs.Reason.PRI
 MOVABLE_PARTITIONS = frozenset({gpu_jobs.Partition.NORMAL, gpu_jobs.Partition.CPU_FILL, gpu_jobs.Partition.PART_TIME})
 
 
+class NotifyEvent(StrEnum):
+    """What a call of the site's notify command is about (`GPUJOBS_EVENT`)."""
+
+    FAILED = "failed"  # a job ended FAILED, OUT_OF_MEMORY, TIMEOUT or NODE_FAIL
+    IDLE = "idle"  # a waste finding (D40): a job waits beside hardware a moved job would put to work
+
+
+class NotifyRole(StrEnum):
+    """Which side of an idle finding a notice is addressed to (`GPUJOBS_ROLE`)."""
+
+    WAITING = "waiting"
+    HOLDING = "holding"
+
+
 class IdleRule(StrEnum):
     """What a waiting job lacks while the machine has something idle."""
 
@@ -1154,25 +1168,31 @@ class Agent:
                 gpu_jobs.write_event(
                     job_id, gpu_jobs.EventAction.FAILED, state=state, name=name
                 )
-                self._notify(job_id, state, user, name, errors)
+                self._notify(NotifyEvent.FAILED, job_id, user, name,
+                             f"{jobs_view.project_of(name)} job #{job_id} ({name}) ended {state}", errors, state=state)
             known.add(job_id)
         s.ended_seen = sorted(known, key=_by_id)[-ENDED_KEPT:]
 
-    def _notify(
-        self, job_id: str, state: str, user: str, name: str, errors: list[str]
-    ) -> None:
+    def _notify(self, event: NotifyEvent, job: str, user: str, name: str, message: str, errors: list[str],
+                **extra: str) -> None:
+        """Run the site's notify command once, with the notice in its environment (the contract is in the README's
+        `notify_command` row): the job it is about, that job's real name, project and user, one ready sentence, and
+        `extra` fields (GPUJOBS_<KEY>) such as the failed state or an idle finding's other side."""
         if not self.site.notify_command:
             return
         env = {
-            "GPUJOBS_JOB": job_id,
-            "GPUJOBS_STATE": state,
+            "GPUJOBS_EVENT": event.value,
+            "GPUJOBS_JOB": job,
             "GPUJOBS_USER": user,
             "GPUJOBS_NAME": gpu_jobs.printable(name),  # what the submitter typed
+            "GPUJOBS_PROJECT": gpu_jobs.printable(jobs_view.project_of(name)),
+            "GPUJOBS_MESSAGE": gpu_jobs.printable(message),
+            **{f"GPUJOBS_{key.upper()}": gpu_jobs.printable(value) for key, value in extra.items()},
         }
         try:
             self.notify(list(self.site.notify_command), env)
         except (OSError, subprocess.SubprocessError) as exc:
-            errors.append(f"notify command for job {job_id} failed: {exc}")
+            errors.append(f"notify command for job {job} failed: {exc}")
 
     # -- 5b. idle resources while jobs wait (Part C2) ----------------------------------------------------------
 
@@ -1194,18 +1214,26 @@ class Agent:
                 print(f"[agent] idle ({finding.rule}): {finding.text}; unused: {finding.idle}", flush=True)
             finding.since = s.idle_since.setdefault(key, int(now))
         s.idle_told = {k: v for k, v in s.idle_told.items() if now - v < IDLE_NOTICE_EVERY_S}
-        users = {j.job_id: j.user for j in queue}
+        jobs = {j.job_id: j for j in queue}
         told = 0
         for finding in found:
+            waiting = jobs.get(finding.waiting)
             for holder in finding.holders:
                 key = f"{finding.waiting}:{holder.job}"
                 if key in s.idle_told or told >= NOTICES_PER_LOOK:
                     continue
                 s.idle_told[key] = now
                 told += 1
-                message = (f"idle resources ({finding.rule}): {finding.project} job #{finding.waiting} waits, "
-                           f"{holder.project} job #{holder.job} holds it; {finding.text}")
-                self._notify(finding.waiting, "idle", users.get(finding.waiting, ""), message, errors)
+                held = jobs.get(holder.job)
+                moved = "it can be moved" if holder.movable else "it cannot be moved"
+                self._notify(NotifyEvent.IDLE, finding.waiting, waiting.user if waiting else "", waiting.name if waiting else "",
+                             f"{finding.project} job #{finding.waiting} waits for {finding.lacks} with {finding.idle}; "
+                             f"{holder.project} job #{holder.job} holds {holder.amount} ({holder.job_class}, {moved})",
+                             errors, role=NotifyRole.WAITING, other_job=holder.job, other_project=holder.project)
+                self._notify(NotifyEvent.IDLE, holder.job, held.user if held else "", held.name if held else "",
+                             f"{holder.project} job #{holder.job} holds {holder.amount} that {finding.project} job "
+                             f"#{finding.waiting} needs while it waits with {finding.idle} ({holder.job_class}, {moved})",
+                             errors, role=NotifyRole.HOLDING, other_job=finding.waiting, other_project=finding.project)
         self.idle = found
 
     # -- 6. OOM guard kills ----------------------------------------------------------------------------------

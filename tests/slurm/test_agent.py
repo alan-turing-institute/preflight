@@ -386,6 +386,8 @@ def test_failed_jobs_raise_an_event_and_run_the_notify_command_once(
         "GPUJOBS_STATE",
         "GPUJOBS_USER",
         "GPUJOBS_NAME",
+        "GPUJOBS_EVENT",
+        "GPUJOBS_PROJECT",
     )
     world.agent = world.new_agent()
     world.agent.notify = agent_module.notify_run
@@ -419,7 +421,7 @@ def test_failed_jobs_raise_an_event_and_run_the_notify_command_once(
     assert [(e.job, e.action, e.fields) for e in gpu_jobs.events()] == [
         ("9", "failed", {"state": "OUT_OF_MEMORY", "name": "p:resume:train\x1b[2J"})
     ]
-    assert sink.read_text() == "9 OUT_OF_MEMORY user1 p:resume:train?[2J\n"  # the notify command gets it shown, not live
+    assert sink.read_text() == "9 OUT_OF_MEMORY user1 p:resume:train?[2J failed p\n"  # the notify command gets it shown, not live
     assert json.loads((world.dir / "agent" / "state.json").read_text())[
         "ended_seen"
     ] == ["3", "9", "10"]
@@ -637,6 +639,17 @@ def test_a_part_times_job_state_is_copied_back_each_minute_and_a_failure_is_logg
     assert world.copies == []
 
 
+def test_the_example_mail_adapter_mails_the_jobs_user_and_never_puts_the_submitters_text_in_a_header() -> None:
+    import notify_mail  # noqa: PLC0415 - the example adapter, imported only here
+
+    env = {"GPUJOBS_EVENT": "idle", "GPUJOBS_JOB": "611", "GPUJOBS_USER": "b",
+           "GPUJOBS_MESSAGE": "p job #611 holds 24.0 GB\nBcc: x@evil"}
+    mail = notify_mail.build(env, "example.org", "gpujobs")
+    assert mail is not None and (mail["To"], mail["Subject"]) == ("b@example.org", "[gpujobs] idle: job #611")
+    assert mail["Bcc"] is None and "Bcc: x@evil" in mail.get_content()  # the message is body text only
+    assert notify_mail.build(env | {"GPUJOBS_USER": "a@b, c"}, None, "gpujobs") is None  # not a user name: not mailed
+
+
 def idle_world(world: World, *, gpus_used: int = 0, mem_used: int = 22888) -> World:
     """The 596/611 case: a whole-box GPU job waits, a 24 GB `restart` CPU job runs, the GPU is unreserved."""
     world.totals = (f"CPUTot=4 CPUAlloc=2 RealMemory=100000 AllocMem={mem_used} State=MIXED Partitions=normal,cpu "
@@ -649,8 +662,9 @@ def idle_world(world: World, *, gpus_used: int = 0, mem_used: int = 22888) -> Wo
 
 def test_a_whole_box_job_waiting_beside_a_restart_cpu_job_is_found_noticed_hourly_and_shown(world: World, tmp_path: Path) -> None:
     sink = tmp_path / "notified"
-    script = "import os,sys; open(sys.argv[1],'a').write(os.environ['GPUJOBS_JOB']+' '+os.environ['GPUJOBS_NAME']+'\\n')"
-    world.notify_command = (sys.executable, "-c", script, str(sink))
+    keys = ("GPUJOBS_EVENT", "GPUJOBS_ROLE", "GPUJOBS_JOB", "GPUJOBS_USER", "GPUJOBS_PROJECT", "GPUJOBS_OTHER_JOB")
+    script = "import os,sys; open(sys.argv[1],'a').write(' '.join(os.environ[k] for k in sys.argv[2:])+'\\n')"
+    world.notify_command = (sys.executable, "-c", script, str(sink), *keys)
     idle_world(world)
     world.agent = world.new_agent()
     world.agent.notify = agent_module.notify_run
@@ -660,14 +674,15 @@ def test_a_whole_box_job_waiting_beside_a_restart_cpu_job_is_found_noticed_hourl
     assert finding["text"] == "Waiting: #596 needs all memory; #611 crypto-quant-research holds 24.0 GB (restart, cannot be moved)"
     assert [(h["job"], h["movable"]) for h in finding["holders"]] == [("611", False)]
     assert agent_module.read_idle(world.dir) == beat["idle"]
-    assert len(sink.read_text().splitlines()) == 1 and "wait job #596" in sink.read_text()
+    # both sides are told, each about its own job with its real name's project and user, naming the other side
+    assert sink.read_text().splitlines() == ["idle waiting 596 a wait 611", "idle holding 611 b crypto-quant-research 596"]
     world.step()  # inside the 600 s timer: not looked at again
     world.t += agent_module.IDLE_EVERY_S
     world.step()
-    assert len(sink.read_text().splitlines()) == 1  # told once an hour per (waiting job, holder)
+    assert len(sink.read_text().splitlines()) == 2  # told once an hour per (waiting job, holder)
     world.t += agent_module.IDLE_NOTICE_EVERY_S
     world.step()
-    assert len(sink.read_text().splitlines()) == 2
+    assert len(sink.read_text().splitlines()) == 4
     assert world.step()["idle"][0]["since"] == 1000  # the same finding keeps its start
     # no finding for a job that waits on a dependency, nor on a machine with nothing idle
     idle_world(world)

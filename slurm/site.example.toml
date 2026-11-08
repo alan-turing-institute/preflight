@@ -36,8 +36,10 @@ constrain_devices = true
 # shared_state = false
 # The interpreter a job's wrapper runs with on a part-time machine, whose own paths are not the submitter's. Default: /usr/bin/python3
 # node_python = "/usr/bin/python3"
-# Command (argv, no shell) run when a job fails, with GPUJOBS_JOB, GPUJOBS_STATE, GPUJOBS_USER and GPUJOBS_NAME in its
-# environment; empty means no notification. Default: []
+# Command (argv, no shell) run once per notice: a failed job, or an idle finding told to both the waiting and the
+# holding job's side. The notice is in its environment (GPUJOBS_EVENT, _JOB, _NAME, _PROJECT, _USER, _MESSAGE, and
+# _STATE or _ROLE, _OTHER_JOB, _OTHER_PROJECT; see the README). slurm/notify_mail.py is an example that mails the job's
+# user. Empty means no notification. Default: []
 notify_command = []
 
 # One [[nodes]] table per compute node (at least one is required).
