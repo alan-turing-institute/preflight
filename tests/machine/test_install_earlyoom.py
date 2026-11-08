@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import re
+import shlex
+
 import install_earlyoom as mod
 
 
@@ -33,3 +36,8 @@ def test_tracked_settings_ignore_swap_and_use_fixed_sizes():
     assert "-s 100,100" in args
     assert "-M 8388608,4194304" in args
     assert " -m " not in args
+    words = shlex.split(args.split("=", 1)[1].strip('"'))
+    prefer = re.compile(words[words.index("--prefer") + 1])
+    # the kernel's 15-character process names, as earlyoom reads them (comm)
+    assert all(prefer.search(name) for name in ("python3", "python3.12", "llama-server", "llama-bench", "llama-perplexit"))
+    assert not any(prefer.search(name) for name in ("ollama", "claude", "sshd"))

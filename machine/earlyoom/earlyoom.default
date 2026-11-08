@@ -47,5 +47,12 @@
 #            sessions' inherited oom_score_adj 200 (score 800) out-ranked the unmarked job (677). A session cannot lower
 #            its own adj, so the wrappers now name themselves (prctl PR_SET_NAME) and are avoided here by that name.
 #            --avoid subtracts 300; it does not exempt, so a session is still killable when nothing else is left.
+#  --prefer  + llama.cpp's programs (2026-11-08, asked by localmodels): their card memory is not in RSS either, and in
+#            slurm job 2187 (2026-11-07 17:18) earlyoom chose the tune's python first (1500 = its score + 300 for --prefer)
+#            over llama-bench (1200), the process holding the memory, and reached it only at 4.0 GB available, when its
+#            kill no longer worked ("kill failed: Timer expired" until the 17:30 reboot). On equal badness earlyoom 1.7
+#            takes the larger VmRSS (kill.c is_larger), so llama-bench (88 MiB) would have been chosen at 6.5 GB.
+#            One pattern for every llama-* tool: the kernel keeps 15 characters of a name, so 'llama-perplexity'
+#            appears as 'llama-perplexit' and a full name would never match.
 # Previous line kept in /etc/default/earlyoom.bak-2026-10-06.
-EARLYOOM_ARGS="-r 3600 -p -M 8388608,4194304 -s 100,100 --prefer '(^|/)python[0-9.]*$' --avoid '(^|/)(sshd|tailscaled|systemd|dockerd|containerd|shpool|slurmctld|slurmd|munged|ccage-auto|ccage-watch|claude)$'"
+EARLYOOM_ARGS="-r 3600 -p -M 8388608,4194304 -s 100,100 --prefer '(^|/)(python[0-9.]*|llama-[a-z-]+)$' --avoid '(^|/)(sshd|tailscaled|systemd|dockerd|containerd|shpool|slurmctld|slurmd|munged|ccage-auto|ccage-watch|claude)$'"
