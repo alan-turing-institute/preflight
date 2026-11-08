@@ -136,8 +136,6 @@ RESUME_PROTECTED = frozenset({gpu_jobs.Partition.URGENT, gpu_jobs.Partition.SERV
 #: The idle check (Part C2) looks this often, and tells one project about one holder at most this often.
 IDLE_EVERY_S = 600.0
 IDLE_NOTICE_EVERY_S = 3600.0
-#: Unreserved memory this large (decimal GB) counts as idle, as does one free core or an unreserved GPU.
-IDLE_MEMORY_GB = 8
 #: Holders named per finding (and told per look), largest first.
 IDLE_HOLDERS = 3
 #: Waiting for room, as opposed to a dependency, a hold or a begin time.
@@ -152,8 +150,6 @@ class IdleRule(StrEnum):
     MEMORY = "memory"
     CORES = "cores"
     CPU_CORE_CAP = "cpu_core_cap"
-    GPU = "gpu"
-    SHARDS = "shards"
 
 
 class PartTimeAction(StrEnum):
@@ -283,23 +279,13 @@ def _holder(job: gpu_jobs.QueuedJob, amount: str) -> Holder:
 
 def idle_findings(queue: list[gpu_jobs.QueuedJob], total: dict[str, int], cpu_cap: int | None,
                   total_for: Callable[[str], dict[str, int]] | None = None) -> list[IdleFinding]:
-    """One finding per job waiting for room while the machine has a GPU unreserved, a core free or memory unreserved.
+    """One finding per waiting job beside hardware it could use that sits idle for a reason moving a job would cure (D40).
 
-    `total` is the capacity of the nodes that can start jobs; `total_for(partitions)`, when given, is the capacity a job
-    in those partitions can use (a drained node, or one only another partition reaches, is no room for it). The lacking resource is the first of memory, cores, the cpu partition's core cap
-    and GPUs the job asks for more of than is free; its holders are the running jobs holding it, largest first."""
-    free_mem, free_cpus = total["mem_mb"] - total["mem_used_mb"], total["cpus"] - total["cpus_used"]
-    free_gpus = total["gpus"] - total["gpus_used"]
-    free_shards = total.get("shards", 0) - total.get("shards_used", 0)
-    idle = [
-        what for what, unused in (
-            ("a GPU unreserved", total["gpus"] and not total["gpus_used"] and not total.get("shards_used", 0)),
-            (f"{free_cpus} cores free", free_cpus >= 1),
-            (f"{_gb(free_mem):.1f} GB unreserved", _gb(free_mem) >= IDLE_MEMORY_GB),
-        ) if unused
-    ]
-    if not idle:
-        return []
+    Two cases count, judged on the nodes the job can start on (`total_for(partitions)`; `total` when not given): the GPU
+    unreserved while a job that wants it (a GPU or shards) waits for memory or cores, and cores free while a cpu-only job
+    fits in them and waits only for the cpu partition's core cap. Spare memory beside full cores, or spare cores beside
+    full memory, is packing, not a finding: moving a job would only change who uses the full resource. Holders are the
+    running jobs holding what the job lacks, largest first."""
     active = [j for j in queue if j.active]
     in_cpu = [j for j in active if j.partition == gpu_jobs.Partition.CPU]
     found = []
@@ -308,27 +294,56 @@ def idle_findings(queue: list[gpu_jobs.QueuedJob], total: dict[str, int], cpu_ca
             continue
         mine = total_for(job.partition) if total_for else total
         free_mem, free_cpus = mine["mem_mb"] - mine["mem_used_mb"], mine["cpus"] - mine["cpus_used"]
-        free_gpus = mine["gpus"] - mine["gpus_used"]
-        free_shards = mine.get("shards", 0) - mine.get("shards_used", 0)
+        gpu_idle = bool(mine["gpus"]) and not mine["gpus_used"] and not mine.get("shards_used", 0)
         need_mem = mine["mem_mb"] if job.mem_mb == 0 else job.mem_mb or 0
-        cpu_only = not job.gpus and gpu_jobs.Partition.CPU in job.partition.split(",")
+        cpu_only = not job.gpus and not job.shards and gpu_jobs.Partition.CPU in job.partition.split(",")
         held_mem = lambda j: mine["mem_mb"] if j.mem_mb == 0 else j.mem_mb or 0  # noqa: E731
-        options = (
-            (IdleRule.MEMORY, need_mem > free_mem, "all memory" if job.mem_mb == 0 else f"{_gb(need_mem):.1f} GB memory",
-             [(held_mem(j), f"{_gb(held_mem(j)):.1f} GB", j) for j in active]),
-            (IdleRule.CORES, job.cpus > free_cpus, f"{job.cpus} cores", [(j.cpus, f"{j.cpus} cores", j) for j in active]),
-            (IdleRule.CPU_CORE_CAP, cpu_only and cpu_cap is not None and job.cpus + sum(j.cpus for j in in_cpu) > (cpu_cap or 0),
-             f"{job.cpus} cores under the cpu cap of {cpu_cap}", [(j.cpus, f"{j.cpus} cores", j) for j in in_cpu]),
-            (IdleRule.GPU, job.gpus > free_gpus, f"{job.gpus} GPU", [(j.gpus, f"{j.gpus} GPU", j) for j in active]),
-            (IdleRule.SHARDS, job.shards > free_shards, f"{job.shards} shards", [(j.shards, f"{j.shards} shards", j) for j in active]),
-        )
+        if (job.gpus or job.shards) and gpu_idle:
+            idle = "the GPU unreserved"
+            options = (
+                (IdleRule.MEMORY, need_mem > free_mem, "all memory" if job.mem_mb == 0 else f"{_gb(need_mem):.1f} GB memory",
+                 [(held_mem(j), f"{_gb(held_mem(j)):.1f} GB", j) for j in active]),
+                (IdleRule.CORES, job.cpus > free_cpus, f"{job.cpus} cores", [(j.cpus, f"{j.cpus} cores", j) for j in active]),
+            )
+        elif cpu_only and cpu_cap is not None and need_mem <= free_mem and job.cpus <= free_cpus:
+            idle = f"{free_cpus} cores free"
+            options = ((IdleRule.CPU_CORE_CAP, job.cpus + sum(j.cpus for j in in_cpu) > cpu_cap,
+                        f"{job.cpus} cores under the cpu cap of {cpu_cap}", [(j.cpus, f"{j.cpus} cores", j) for j in in_cpu]),)
+        else:
+            continue
         for rule, lacking, lacks, held in options:
             if lacking:
                 holders = [_holder(j, label) for amount, label, j in sorted(held, key=lambda h: -h[0])
                            if amount > 0 and j.job_id != job.job_id][:IDLE_HOLDERS]
-                found.append(IdleFinding(job.job_id, jobs_view.project_of(job.name), lacks, rule, holders, ", ".join(idle)))
+                found.append(IdleFinding(job.job_id, jobs_view.project_of(job.name), lacks, rule, holders, idle))
                 break
     return found
+
+
+#: Waiting jobs named on an idle summary line; the rest are counted.
+IDLE_JOBS_NAMED = 6
+_IDLE_WAITS_FOR = {IdleRule.MEMORY: "memory", IdleRule.CORES: "cores", IdleRule.CPU_CORE_CAP: "the cpu partition's core cap"}
+
+
+def idle_summary(found: list[dict[str, object]]) -> list[str]:
+    """The findings as one line per (what the jobs wait for, what is unused, who holds it), for the page and status.py."""
+    groups: dict[tuple[str, str, str], list[str]] = {}
+    for f in found:
+        holders = f.get("holders") if isinstance(f.get("holders"), list) else []
+        held = "; ".join(
+            f"#{h.get('job')} {h.get('project')} holds {h.get('amount')} ({h.get('job_class')}, "
+            f"{'can be moved' if h.get('movable') else 'cannot be moved'})" for h in holders if isinstance(h, dict)
+        ) or "nobody"
+        groups.setdefault((str(f.get("rule", "")), str(f.get("idle", "")), held), []).append(str(f.get("waiting", "?")))
+    lines = []
+    for (rule, idle, held), waiting in groups.items():
+        named = ", ".join(f"#{w}" for w in waiting[:IDLE_JOBS_NAMED])
+        more = f" and {len(waiting) - IDLE_JOBS_NAMED} more" if len(waiting) > IDLE_JOBS_NAMED else ""
+        jobs = f"Job {named}" if len(waiting) == 1 else f"{len(waiting)} jobs ({named}{more})"
+        verb = "waits" if len(waiting) == 1 else "wait"
+        lines.append(gpu_jobs.printable(
+            f"{jobs} {verb} for {_IDLE_WAITS_FOR.get(rule, rule)} with {idle}; held by {held}"))
+    return lines
 
 
 def read_idle(state_dir: Path | None = None) -> list[dict[str, object]]:

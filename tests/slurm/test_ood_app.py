@@ -59,7 +59,8 @@ class Fake:
             slurm_dir=Path("/slurm"),
             host=lambda: "box",
             keeper=lambda: {"blockers": []},
-            idle=lambda: [{"text": "Waiting: #596 needs all memory; #611 p holds 24.0 GB (restart, cannot be moved) <b>"}],
+            idle=lambda: [{"waiting": "596", "rule": "memory", "idle": "the GPU unreserved", "holders": [
+                {"job": "611", "project": "p<b>", "amount": "24.0 GB", "job_class": "restart", "movable": False}]}],
             live_memory=lambda _j: {"gpu": 3 * 1024**3},
             finished=lambda _j: None,
             now=lambda: datetime(2026, 10, 19, 12, 0),  # noqa: DTZ001 - local, like the times sacct prints
@@ -114,8 +115,19 @@ def test_every_get_route_answers(path: str) -> None:
     assert all(user == {"7": "alice", "8": "bob"}[job_id] for job_id, user in fake.asked)
     if path == "/":  # both jobs hold a GPU; a CPU-only job running beside them is not said to be on it
         assert "On the GPU now" in body and "on the GPU now" in body
-        assert "Waiting: #596 needs all memory; #611 p holds 24.0 GB (restart, cannot be moved) &lt;b&gt;" in body  # the agent's idle finding, escaped
+        assert "Job #596 waits for memory with the GPU unreserved; held by #611 p&lt;b&gt; holds 24.0 GB (restart, cannot be moved)" in body  # the agent's idle finding, escaped
         assert (app._running_note(2, 0), app._running_note(2, 1)) == ("none on the GPU", "1 on the GPU")
+        # the State cell lists each job waited on by name, one per line, its description on hover (2026-11-08)
+        waiting = gpu_jobs.QueuedJob("9", "normal", "PENDING", "Dependency", "p:restart:x", dependency="afterok:2203:2206")
+        upstream = gpu_jobs.QueuedJob("2203", "normal", "PENDING", "Resources", "tc:restart:store<b>")
+        waits = app._waits_on(waiting, {"2203": upstream}, {"2203": {"what": "put the <scores> in"}})
+        assert app._waits_cell(waits, "/r/") == (
+            '<div class="why">waits for these to finish:</div><ul class="waits">'
+            '<li><a href="/r/job/2203" title="put the &lt;scores&gt; in">store&lt;b&gt;</a> <span class="jobid">#2203</span></li>'
+            '<li><a href="/r/job/2206" title="">job 2206</a> <span class="jobid">#2206</span></li></ul>')
+        # more than three fold behind one line, kept open across the 10 s refresh by its key
+        assert app._waits_cell(waits * 2, "/r/", "9").startswith(
+            '<details class="waits" data-key="waits-9"><summary class="why">waits for 4 jobs to finish</summary>')
         # each resource as reserved by jobs (of what slurm can give) beside really in use (of the whole machine), in GB
         assert "Reserved by jobs" in body and "1 of 1" in body and "37%" in body
         assert "8 of 20" in body and "3.0 of 20" in body and "12 left to reserve" in body

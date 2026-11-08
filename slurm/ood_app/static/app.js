@@ -17,10 +17,13 @@ async function refreshLive() {
       location.reload();
       return;
     }
+    // a list the viewer opened (details with data-key) stays open across the swap
+    const open = new Set([...document.querySelectorAll("details[data-key][open]")].map((d) => d.dataset.key));
     for (const part of document.querySelectorAll("[data-live]")) {
       const next = fresh.querySelector('[data-live="' + part.dataset.live + '"]');
       if (next) part.replaceChildren(...next.childNodes);
     }
+    for (const d of document.querySelectorAll("details[data-key]")) if (open.has(d.dataset.key)) d.open = true;
     if (note) note.textContent = "Updated " + new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }) + " · refreshes every 10 s";
   } catch (_) {
     if (note) note.textContent = "Could not refresh; retrying in 10 s";

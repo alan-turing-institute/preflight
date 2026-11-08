@@ -678,7 +678,7 @@ def test_a_whole_box_job_waiting_beside_a_restart_cpu_job_is_found_noticed_hourl
     world.totals = world.totals.replace("CPUAlloc=2", "CPUAlloc=4").replace("AllocMem=22888", "AllocMem=99000")
     world.t += agent_module.IDLE_EVERY_S
     assert world.step()["idle"] == []
-    # a shard job waits for shards: the card holds no GPU reservation, yet it is not "a GPU unreserved"
+    # a card shared out in full is busy, not idle: a shard job waiting for shards is no finding (D40)
     world.totals = ("CPUTot=4 CPUAlloc=2 RealMemory=100000 AllocMem=1000 State=MIXED Partitions=normal,cpu "
                     "CfgTRES=cpu=4,gres/gpu=1,gres/shard=12 AllocTRES=gres/shard=12")
     world.queue = [
@@ -686,19 +686,37 @@ def test_a_whole_box_job_waiting_beside_a_restart_cpu_job_is_found_noticed_hourl
         gpu_jobs.QueuedJob("701", "normal", "RUNNING", "None", "p:resume:hold", user="b", shards=12, cpus=2, mem_mb=1000),
     ]
     world.t += agent_module.IDLE_EVERY_S
-    [shard_finding] = world.step()["idle"]
-    assert shard_finding["rule"] == "shards" and "needs 4 shards" in shard_finding["text"]
-    assert [h["job"] for h in shard_finding["holders"]] == ["701"] and "GPU unreserved" not in shard_finding["idle"]
-    # 2026-11-04 (job 1902): a drained part-time machine's idle cores are no room for a cpu job, so its 8-core wait is still named
-    world.totals = "CPUTot=20 CPUAlloc=20 RealMemory=100000 AllocMem=1000 State=MIXED Partitions=normal,cpu"
-    world.lent = "CPUTot=16 CPUEfctv=8 RealMemory=31494 AllocMem=0 CPUAlloc=0 State=IDLE+DRAIN Partitions=part_time"
-    world.queue = [gpu_jobs.QueuedJob("9", "cpu", "PENDING", "Resources", "p:restart:x", user="a", cpus=8, mem_mb=1000)]
+    assert world.step()["idle"] == []
+    # 2026-11-08: every core of the job's own node taken, memory spare there, a part-time machine's cores idle but not
+    # open to the job: packing, not idle; the page showed 25 such lines (D40)
+    world.totals = "CPUTot=20 CPUAlloc=20 RealMemory=100000 AllocMem=40000 State=MIXED Partitions=normal,cpu,cpu_fill"
+    world.lent = "CPUTot=16 CPUEfctv=8 RealMemory=31494 AllocMem=0 CPUAlloc=0 State=IDLE Partitions=part_time"
+    world.queue = [gpu_jobs.QueuedJob("9", "cpu_fill", "PENDING", "Resources", "p:resume:x", user="a", cpus=4, mem_mb=1000),
+                   gpu_jobs.QueuedJob("8", "cpu_fill", "RUNNING", "None", "p:resume:y", user="b", cpus=20, mem_mb=40000)]
     world.t += agent_module.IDLE_EVERY_S
-    assert [f["rule"] for f in world.step()["idle"]] == ["cores"]
-    # and an awake part-time machine is room only for jobs of its own partition: a cpu job does not count its cores either
-    world.lent = world.lent.replace("IDLE+DRAIN", "IDLE")
-    world.t += agent_module.IDLE_EVERY_S
-    assert [f["rule"] for f in world.step()["idle"]] == ["cores"]
-    world.queue = [dataclasses.replace(world.queue[0], partition="cpu_fill,part_time")]
-    world.t += agent_module.IDLE_EVERY_S
-    assert world.step()["idle"] == []  # a cpu_fill job may run there: the 8 lent cores are its room
+    assert world.step()["idle"] == []
+
+
+def test_idle_findings_count_an_idle_gpu_or_cores_idled_by_the_cap_only() -> None:
+    """D40: what counts is hardware a waiting job could use that moving a job would put to work."""
+    def total(cpus_used: int, mem_used: int, gpus_used: int = 1, shards_used: int = 0) -> dict[str, int]:
+        return {"cpus": 20, "cpus_used": cpus_used, "mem_mb": 100000, "mem_used_mb": mem_used, "gpus": 1,
+                "gpus_used": gpus_used, "shards": 12, "shards_used": shards_used}
+    cpu_job = gpu_jobs.QueuedJob("9", "cpu", "PENDING", "Resources", "p:restart:x", user="a", cpus=4, mem_mb=1000)
+    in_cpu = gpu_jobs.QueuedJob("5", "cpu", "RUNNING", "None", "q:restart:y", user="b", cpus=8, mem_mb=1000)
+    # 2026-11-04 (job 1902): cores free beside the cpu partition's full cap is a finding naming the cap's holder
+    [cap] = agent_module.idle_findings([cpu_job, in_cpu], total(8, 2000), 8)
+    assert (cap.rule, cap.idle, [h.job for h in cap.holders]) == ("cpu_core_cap", "12 cores free", ["5"])
+    # spare memory beside full cores is not
+    assert agent_module.idle_findings([cpu_job, in_cpu], total(20, 2000), 8) == []
+    # a shard job waiting for cores while the card is unreserved is
+    shard_job = gpu_jobs.QueuedJob("7", "normal", "PENDING", "Resources", "p:resume:s", user="a", shards=2, cpus=4, mem_mb=1000)
+    [gpu] = agent_module.idle_findings([shard_job, in_cpu], total(20, 2000, gpus_used=0), 8)
+    assert (gpu.rule, gpu.idle) == ("cores", "the GPU unreserved")
+    # the page and status.py show one line per cause, naming the jobs that share it
+    twin = dataclasses.replace(shard_job, job_id="6")
+    found = [dataclasses.asdict(f) for f in agent_module.idle_findings([shard_job, twin, in_cpu], total(20, 2000, 0), 8)]
+    assert agent_module.idle_summary(found) == [
+        "2 jobs (#7, #6) wait for cores with the GPU unreserved; held by #5 q holds 8 cores (restart, cannot be moved)"]
+    assert agent_module.idle_summary([{"waiting": "1", "rule": "cores", "idle": "x", "holders": []}]) == [
+        "Job #1 waits for cores with x; held by nobody"]

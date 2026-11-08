@@ -63,7 +63,7 @@ def lines(queue: list[gpu_jobs.QueuedJob] | None) -> list[str]:
             f" | {record.get('mem') or 'default mem'}, {_pauses(job)}"
             f" | {record.get('what', '(no sidecar)')}{f' | {why}' if why else ''}"
         ))
-    out += [gpu_jobs.printable(f"[idle] {f['text']}") for f in agent.read_idle() if f.get("text")]
+    out += [f"[idle] {line}" for line in agent.idle_summary(agent.read_idle())]
     out += audit.report(audit.unregistered())
     return out
 

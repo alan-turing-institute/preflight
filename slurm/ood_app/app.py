@@ -275,6 +275,7 @@ def job_rows(backend: Backend) -> list[dict[str, object]]:
                 "description": str(record.get("what") or ""),
                 "state": job.state,
                 "waiting": jobs_view.waiting_reason(job, by_id, records, events),
+                "waits_on": _waits_on(job, by_id, records),
                 "elapsed": elapsed.get(job.job_id, ""),
                 "gpus": job.gpus,
                 "cpus": job.cpus,
@@ -366,6 +367,31 @@ def _hours(value: float) -> str:
 def _why(text: str) -> str:
     """A waiting reason with each `job 259 (project:class:name)` shortened to `#259 name`."""
     return re.sub(r"job (\d+) \(([^)]*)\)", lambda m: f"#{m[1]} {_short(m[2])}", text)
+
+
+def _waits_on(job: gpu_jobs.QueuedJob, by_id: dict[str, gpu_jobs.QueuedJob],
+              records: dict[str, dict[str, object]]) -> list[dict[str, str]]:
+    """The jobs a job waits on to finish (slurm's dependency), each with its short name and its description."""
+    if job.reason != gpu_jobs.Reason.DEPENDENCY:
+        return []
+    return [{"id": dep, "short": _short(by_id[dep].name if dep in by_id else str(records.get(dep, {}).get("name") or "")),
+             "what": str(records.get(dep, {}).get("what") or "")} for dep in job.depends_on]
+
+
+#: Jobs waited on listed open in the State cell; a longer list folds behind one line to click.
+WAITS_SHOWN = 3
+
+
+def _waits_cell(waits_on: list[dict[str, str]], root: str, job_id: str = "") -> str:
+    """The State cell's list of jobs waited on: one per line, its name linked to its page, its description on hover;
+    more than WAITS_SHOWN fold behind "waits for N jobs to finish" (2026-11-08: a run-on sentence of names filled it)."""
+    items = "".join(
+        f'<li><a href="{root}job/{esc(d["id"])}" title="{esc(d["what"] or d["short"])}">{esc(d["short"] or "job " + d["id"])}</a>'
+        f' <span class="jobid">#{esc(d["id"])}</span></li>' for d in waits_on
+    )
+    if len(waits_on) > WAITS_SHOWN:
+        return f'<details class="waits" data-key="waits-{esc(job_id)}"><summary class="why">waits for {len(waits_on)} jobs to finish</summary><ul class="waits">{items}</ul></details>'
+    return f'<div class="why">waits for {"these" if len(waits_on) > 1 else "this"} to finish:</div><ul class="waits">{items}</ul>'
 
 
 def _exit_words(exit_code: str) -> str:
@@ -532,8 +558,9 @@ def _now_card(rows: list[dict[str, object]], keeper: Mapping[str, object], backe
 
 
 def _idle_card(backend: Backend) -> str:
-    """What the agent found unused while jobs wait (Part C2), under the now card; nothing when there is no finding."""
-    texts = [str(f["text"]) for f in backend.idle() if f.get("text")]
+    """What the agent found idle while jobs wait (D23 C2, D40), under the now card: one line per group of waiting jobs
+    with the same cause; nothing when there is no finding."""
+    texts = agent.idle_summary(backend.idle())
     if not texts:
         return ""
     lines = "".join(f'<div class="now-desc">{esc(t)}</div>' for t in texts)
@@ -541,7 +568,7 @@ def _idle_card(backend: Backend) -> str:
         '<section class="card now" aria-label="Idle resources">'
         '<div class="now-icon blocked"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">'
         '<path d="M12 8v5M12 16h.01"/><circle cx="12" cy="12" r="9"/></svg></div>'
-        f'<div><div class="now-label">Resources idle while jobs wait</div>{lines}</div></section>'
+        f'<div><div class="now-label">Idle while jobs wait</div>{lines}</div></section>'
     )
 
 
@@ -714,7 +741,9 @@ def _queue_table(rows: list[dict[str, object]], root: str, now: datetime) -> str
         return head.format("empty") + '<div class="empty"><strong>Nothing queued</strong>The GPU takes the next job submitted with slurm/submit.py.</div>'
     body = []
     for position, r in enumerate(rows, 1):
-        why = f'<div class="why">{esc(_why(str(r["waiting"])))}</div>' if r["waiting"] else ""
+        waits_on = r.get("waits_on") or []
+        why = (_waits_cell(waits_on, root, str(r["id"])) if waits_on  # type: ignore[arg-type]
+               else f'<div class="why">{esc(_why(str(r["waiting"])))}</div>' if r["waiting"] else "")
         why += _node_line(str(r["node"]))
         body.append(
             "<tr>"
@@ -722,7 +751,7 @@ def _queue_table(rows: list[dict[str, object]], root: str, now: datetime) -> str
             f'<td class="lead"><a class="title" href="{root}job/{esc(r["id"])}">{esc(r["short"])}</a> <span class="jobid">#{esc(r["id"])}</span>'
             f'{f"<div class=\"desc\">{esc(r["description"])}</div>" if r["description"] else ""}</td>'
             f"<td class=\"inline\">{_project(str(r['project']))}</td>"
-            f'<td class="inline">{_badge(str(r["kind"]), str(r["state_label"]))}{why}</td>'
+            f'<td class="inline state">{_badge(str(r["kind"]), str(r["state_label"]))}{why}</td>'
             f'<td class="inline" data-k="level">{_level_pill(r["level"])}</td>'
             + _running_cell(r)
             + _queued_cell(r, now)

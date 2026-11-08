@@ -393,6 +393,11 @@ on, and `dgx/` to `install_dir/dgx/` when `dgx_gate` is on), and installs one sm
 site file copy `/etc/gpujobs/site.toml`, the group `admin_group`, and the state directories (section 8). Every
 5 seconds it does: boot re-registration, giving each waiting job its place (level, then job id), releasing held jobs after
 urgent work, failure notices (slurm's accounting is asked at most every 30 s), and a heartbeat (`agent/agent.json`). Enabled and started by `apply`.
+Every 10 minutes it also looks for jobs waiting beside hardware they could use: the GPU unreserved while a job that
+wants it waits for memory or cores, or cores free while a CPU-only job waits only for the `cpu` partition's core cap,
+both judged on the machines the job may run on. Spare memory while every core is busy is not reported, since moving a
+job would only change who uses the cores. Each finding names the running jobs holding what the waiting job lacks; the
+jobs page and `status.py` show them one line per cause, and the site's `notify_command` is told once an hour per pair.
 
 **`lease`** (only when `[lease]` is present). `slurm-gpu-lease-keeper.service`, a systemd **user** unit of
 `keeper_user`, written to `/etc/systemd/user/` and enabled through that user's manager (nothing is written in the
