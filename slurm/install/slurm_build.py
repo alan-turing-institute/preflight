@@ -39,12 +39,13 @@ RPM_TOOLS = ["dnf", "install", "-y", "rpm-build", "dnf-plugins-core", "tar", "bz
 #: SchedMD's spec builds cgroupv2 only when asked: without it slurmd cannot start on a cgroup v2 system (Fedora is one:
 #: "cannot create cgroup context for cgroup/v2", found joining the laptop). `dnf builddep` of the spec as it stands does
 #: not list its development packages. json-c gives `scontrol --json` and `squeue --json` (the health check and our tools
-#: read them); yaml, curl, http-parser and lz4 match the Debian build. NOT hwloc: on the laptop's hybrid Intel CPU
+#: read them); yaml, curl and lz4 match the Debian build. No http-parser: the spec needs one only for slurmrestd,
+#: which is not built (and Fedora 45 dropped http-parser-devel, 2026-11-09). NOT hwloc: on the laptop's hybrid Intel CPU
 #: (6 performance cores of 2 threads, 10 efficiency cores of 1) slurm with hwloc sees only 12 of its 22 CPUs and the
 #: controller drains the node "Low CPUs"; without it slurm describes all 22.
 RPM_WITH = ["--with", "cgroupv2", "--with", "yaml", "--with", "libcurl"]
 RPM_EXTRA_DEVEL = ["dnf", "install", "-y", "dbus-devel", "kernel-headers", "libbpf-devel", "json-c-devel",
-                   "libyaml-devel", "libcurl-devel", "http-parser-devel", "lz4-devel"]
+                   "libyaml-devel", "libcurl-devel", "lz4-devel"]
 DEB_TOOLS = ["apt-get", "install", "-y", "build-essential", "fakeroot", "devscripts", "equivs"]
 
 Download = Callable[[str, Path], None]
