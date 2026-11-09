@@ -189,6 +189,7 @@ def test_sharing_card_renders_shard_lines_and_the_unshared_site_has_none():
     assert "\nAutoDetect=off\nNodeName=n1 Name=gpu Type=gb10 File=/dev/nvidia0 Cores=10-19\n" in gres
     assert "NodeName=n1 Name=shard Count=12 File=/dev/nvidia0 Cores=10-19\n" in gres
     layout = bound[render.CORE_KINDS_XML].content
+    assert "<!--" not in layout  # hwloc's built-in parser (no libxml2) refuses a comment, and slurmd then stops
     pus = [int(x) for x in re.findall(r'type="PU" os_index="(\d+)"', layout)]
     assert pus == [0, 1, 2, 3, 4, 10, 11, 12, 13, 14, 5, 6, 7, 8, 9, 15, 16, 17, 18, 19]  # package 0 slow, package 1 fast
     assert "Environment=HWLOC_XMLFILE=/etc/slurm/core_kinds.xml\n" in bound[render.CORE_KINDS_DROPIN].content

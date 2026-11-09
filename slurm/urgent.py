@@ -64,10 +64,14 @@ def free_on_nodes() -> tuple[int, int] | None:
 
 
 def free_fast_cores(queue: list[gpu_jobs.QueuedJob], node: site_config.Node) -> int:
-    """The fast cores (D46) of `node` no running job holds: what a job bound to them can start on."""
+    """The fast cores (D46) of `node` no job on cores holds: what a job bound to them can start on."""
+    return node.fast_cores - sum(fast_cores_held(job, node) for job in queue if job.state in gpu_jobs.ON_CORES)
+
+
+def fast_cores_held(job: gpu_jobs.QueuedJob, node: site_config.Node) -> int:
+    """How many of `node`'s fast cores (D46) `job` holds."""
     fast = f"{node.name}:{node.fast_socket}:"
-    held = sum(1 for job in queue if job.state == gpu_jobs.State.RUNNING for core in job.cores if core.startswith(fast))
-    return node.fast_cores - held
+    return sum(1 for core in job.cores if core.startswith(fast))
 
 
 def _asked_mb(job: gpu_jobs.QueuedJob) -> int:
@@ -237,7 +241,9 @@ def run(argv: list[str]) -> int:
     victims = [v for v in victims if v not in cpu_victims]
     if cpu_victims and free is not None:  # short: only if the normal ones cannot free enough
         enough_memory = not memory_short or sum(_asked_mb(by_id[v]) for v in victims) >= mem_mb(arguments.mem) - free[0]
-        enough_cores = not cores_short or sum(by_id[v].cpus for v in victims) >= arguments.cpus - free[1]
+        node = site_config.gpu_node(site)  # a bound job gains only the fast cores a victim gives back
+        freed = sum(fast_cores_held(by_id[v], node) if bound else by_id[v].cpus for v in victims)
+        enough_cores = not cores_short or freed >= arguments.cpus - free[1]
         if enough_memory and enough_cores:
             cpu_victims = []
     if free is not None:

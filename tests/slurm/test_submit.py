@@ -374,7 +374,8 @@ def test_a_gpu_job_on_a_fast_cpus_node_keeps_its_cores_and_is_bound_to_the_fast_
     monkeypatch.setattr(gpu_jobs, "STATE_DIR", tmp_path)
     monkeypatch.setattr(cores.CoreSpeeds, "read", classmethod(lambda cls, root=None: cls(
         {**dict.fromkeys(range(10), 2_800_000), **dict.fromkeys(range(10, 20), 3_900_000)})))
-    monkeypatch.setattr(gpu_jobs, "measured_cores", lambda job_name: (1.0, 3))
+    monkeypatch.setattr(gpu_jobs, "measured_run_cores", lambda name: (1.0, 3))  # the wrapper's own use, command time only
+    monkeypatch.setattr(gpu_jobs, "measured_cores", lambda job_name: (9.0, 3))  # sacct's, diluted for GPU jobs: CPU jobs only
     gpu = site_config.Gpu(0, "GPU-a", "/dev/nvidia0", "gb10")
     node = site_config.Node("n", 20, 100000, (gpu,), cores_per_gpu=12, fast_cpus="10-19")
     fake_site(monkeypatch, lease=None, dgx_gate=False, nodes=(node,), cpus_from_history=site_config.CoresFromHistory.ENFORCE)
@@ -393,6 +394,11 @@ def test_a_gpu_job_on_a_fast_cpus_node_keeps_its_cores_and_is_bound_to_the_fast_
     assert f"{DIRECTIVE} --cpus-per-task=2" in script and "--gres-flags=enforce-binding" in script
     script, _ = job("--name", "n")  # a CPU-only job is never bound
     assert "--ntasks" not in script and "--gres-flags" not in script
+    # copies sharing the card hold its 12 held cores together, more than the 10 fast ones: each is bound only softly
+    assert submit.binding(3, 0, 3, site_config.load()) == ()
+    assert "copies sharing the card hold 12 cores together" in capsys.readouterr().out
+    fake_site(monkeypatch, lease=None, dgx_gate=False, nodes=(dataclasses.replace(node, cores_per_gpu=8),))
+    assert submit.binding(3, 0, 3, site_config.load()) == submit.FAST_CORE_BINDING  # 8 held cores fit in the fast ones
 
 
 def test_a_cpu_job_over_the_cpu_cap_is_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

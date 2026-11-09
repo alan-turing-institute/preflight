@@ -384,7 +384,7 @@ def _check_fast_cpus(node: Node, where: str) -> None:
         raise SiteError(f"site file: [{where}] fast_cpus binds the GPU to the fast cores: it needs a full node with GPUs, "
                         "and no keep_cpus or cores_per_socket")
     ids = node.fast_cpu_ids
-    if ids[-1] >= node.cpus or len(ids) * CORE_KINDS != node.cpus:
+    if not ids or ids[-1] >= node.cpus or len(ids) * CORE_KINDS != node.cpus:
         raise SiteError(f"site file: [{where}] fast_cpus = {node.fast_cpus!r}; expected exactly half of the node's {node.cpus} CPUs, "
                         "each below cpus (slurm gives every socket the same number of cores); `slurm/cores.py` lists the kinds, "
                         "or leave fast_cpus out")

@@ -99,13 +99,15 @@ def _mask(cpus: list[int]) -> str:
 
 def core_kinds_xml(node: Node) -> str:
     """An hwloc 2 layout of `node` with one package per core kind, each core keeping its OS number, so slurm sees the
-    kinds as sockets and its own core numbers run socket by socket (slurmd builds its CPU map from this tree)."""
+    kinds as sockets and its own core numbers run socket by socket (slurmd builds its CPU map from this tree). No XML
+    comment: hwloc's built-in parser, used where libhwloc-plugins (libxml2) is absent, fails on one, and slurmd then
+    stops ("Failed to detect hardware correctly"); the drop-in that points slurmd here says what it is."""
     fast = node.fast_cpu_ids
     kinds = sorted([[cpu for cpu in range(node.cpus) if cpu not in fast], fast])  # hwloc orders packages by lowest CPU
     every = _mask(list(range(node.cpus)))
     sets = 'nodeset="0x1" complete_nodeset="0x1"'
     out = ['<?xml version="1.0" encoding="UTF-8"?>', '<!DOCTYPE topology SYSTEM "hwloc2.dtd">',
-           f"<!-- {RENDERED_MARK}: the core kinds of {node.name} as sockets (D46). -->", '<topology version="2.0">',
+           '<topology version="2.0">',
            f'<object type="Machine" os_index="0" cpuset="{every}" complete_cpuset="{every}" allowed_cpuset="{every}" {sets} allowed_nodeset="0x1" gp_index="1">',
            f'<object type="NUMANode" os_index="0" cpuset="{every}" complete_cpuset="{every}" {sets} gp_index="2" '
            f'local_memory="{node.real_memory_mb * BYTES_PER_SLURM_MB}"/>']

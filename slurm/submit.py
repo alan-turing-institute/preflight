@@ -422,9 +422,18 @@ FAST_CORE_BINDING = ("--ntasks=1", "--gres-flags=enforce-binding")
 def binding(cpus: int, gpus: int, shards: int, site: site_config.Site, said: str = "[submit]") -> tuple[str, ...]:
     """The directives for a GPU or shard job on a GPU node with `fast_cpus` (D46): `FAST_CORE_BINDING` when its cores
     fit in the fast ones, so it gets only fast cores (and waits for them, or pre-empts a `cpu_fill` job holding them);
-    none above that, where slurm hands it the card's fast cores first and slow ones after. Prints which."""
+    none above that, or for a shard job when the cores held for the card (which its copies share) exceed the fast
+    ones: slurm then hands it the fast cores first and slow ones after. Prints which.
+
+    Strict binding can wait behind a `cpu` or `service` job that started on fast cores while the slow ones were full
+    (slurm never pre-empts those). Accepted (D46): such `cpu` jobs ran 3.6 min at the median, 36 min at the 90th
+    percentile over 14 days, while a GPU job left on slow cores is slow for its whole run."""
     node = site_config.gpu_node(site)
     if not (gpus or shards) or node is None or not node.fast_cpus:
+        return ()
+    if shards and node.gpu_cores > node.fast_cores:  # copies sharing a card hold its cores together: each bound alone,
+        print(f"{said} cores: {cpus}, fast cores first (copies sharing the card hold {node.gpu_cores} cores together, "
+              f"more than its {node.fast_cores} fast ones, so the binding cannot be strict)")  # the last would wait
         return ()
     if cpus <= node.fast_cores:
         print(f"{said} cores: {cpus} fast cores, bound to the GPU (D46)")
@@ -448,7 +457,8 @@ def cores_from_history(arguments: argparse.Namespace, named: str | None, hand_se
     gpu_sized = bool(arguments.gpus) and node is not None and bool(node.fast_cpus) and not shards
     if mode is site_config.CoresFromHistory.OFF or (arguments.gpus and not gpu_sized) or named is None:
         return None
-    measured = gpu_jobs.measured_cores(f"{arguments.project}:{arguments.job_class}:{named}")
+    measured = (gpu_jobs.measured_run_cores(named) if gpu_sized
+                else gpu_jobs.measured_cores(f"{arguments.project}:{arguments.job_class}:{named}"))
     if measured is None:
         return None
     average, runs = measured

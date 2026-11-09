@@ -840,9 +840,16 @@ to 92% busy. Two ways to make sure of it, chosen by the site file:
   `AutoDetect=off` (NVML's detection fails under a layout file; every GPU is listed by hand anyway). A GPU or shard job whose cores fit in the
   fast socket is submitted with `--ntasks=1 --gres-flags=enforce-binding`: it gets exactly its cores, all fast, and waits for them (or pre-empts
   a `cpu_fill` job holding them) rather than run on slow ones. `--ntasks=1` matters: without it slurm 26.05.5 gave a 2-core job the whole socket.
-  A GPU job asking more cores than the fast socket has is not bound strictly; slurm gives it the fast cores first. CPU jobs, placed lowest core
-  first, fill the slow socket first. `--cpus` is used as given, and a named GPU job is offered its cores from its runs like a CPU job
-  (`cpus_from_history`). Turning `fast_cpus` on or off renumbers slurm's cores under running jobs, so apply it with no job running on the node
+  A GPU job asking more cores than the fast socket has is not bound strictly; slurm gives it the fast cores first. Nor is a shard job when
+  the cores held for the card (which the copies sharing it hold together) exceed the fast ones: bound one by one, the last copy would wait.
+  CPU jobs, placed lowest core first, fill the slow socket first. A bound GPU job can still wait for a `cpu` or `service` job that started
+  on fast cores while the slow ones were full, since slurm never pre-empts those: accepted, as such `cpu` jobs ran 3.6 minutes at the
+  median and 36 at the 90th percentile (14 days, this box), while a GPU job left on slow cores is slow for its whole run. `--cpus` is used
+  as given, and a named GPU job is offered its cores from its own runs (`cpus_from_history`), from the wrapper's report of each run,
+  which times the command alone: slurm's elapsed time also holds the wait for the card. The installer refuses `fast_cpus` that are not
+  all faster than the node's other cores, that are set on another machine's node, or with a slurmd built without hwloc (which ignores
+  the layout file); `install.py check` exits 1 on any refusal. The layout file carries no comment: hwloc's own reader, used where
+  libhwloc-plugins is not installed, refuses one, and slurmd then stops. Turning `fast_cpus` on or off renumbers slurm's cores under running jobs, so apply it with no job running on the node
   (the installer's apply refuses otherwise). `slurmd -C` run by hand still prints the real one-socket layout: only the slurmd service reads the file.
 - **Without it, on a host whose cores differ (D33).** Slurm may give a job only slow cores, but a job holding more cores than the host has slow ones
   always has a fast one, and Linux moves the busy threads onto it. So `submit.py` and `urgent.py` raise a whole-card GPU job below `slow cores + 1`

@@ -143,6 +143,7 @@ def test_example_loads_and_minimal_file_gets_every_default(tmp_path: Path) -> No
         (EIGHT_CORES + "fast_cpus = '4-7'\n", "it needs a full node with GPUs"),
         (EIGHT_CORES + "fast_cpus = '4-6'\n" + GPU, "exactly half of the node's 8 CPUs"),  # kinds of unequal size
         (EIGHT_CORES + "fast_cpus = '6-9'\n" + GPU, "exactly half of the node's 8 CPUs"),  # a CPU the node lacks
+        (EIGHT_CORES + "fast_cpus = '5-4'\n" + GPU, "exactly half of the node's 8 CPUs"),  # a reversed range names none
         (MINIMAL + "address = 'a'\n", "apply only with part_time = true"),
         (MINIMAL + "jobs_memory_gb = 9\n", "jobs_memory_gb = 9"),  # a full node's reserve is checked as a part-time one's
         (MINIMAL + "close_below_gb = 4\npush_back_below_gb = 5\n", "push_back_below_gb must not exceed"),

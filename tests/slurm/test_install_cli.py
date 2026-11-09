@@ -706,20 +706,31 @@ def test_shared_state_copies_nothing_back_and_installs_nothing_for_it(tmp_path, 
     assert not any("rrsync" in c or "ssh-keygen" in c or ".ssh" in c for c in flat)
 
 
-def test_fast_cpus_must_be_the_hosts_fastest_cores_and_an_unset_two_kind_gpu_node_is_told(capsys):
-    """D46: the layout binds the GPU to `fast_cpus`, so a list that is not this host's fastest cores is refused."""
+def test_fast_cpus_must_be_the_hosts_fastest_cores_and_an_unset_two_kind_gpu_node_is_told(capsys, monkeypatch):
+    """D46: the layout binds the GPU to `fast_cpus`, so a list that is not this host's fastest cores, a list set on
+    another machine's node, or a slurmd that cannot read a layout file is refused."""
     halves = cli.cores.CoreSpeeds({cpu: 2808000 if cpu % 10 < 5 else 3900000 for cpu in range(20)})
     gpu = {"index": 0, "uuid": "GPU-0", "device": "/dev/nvidia0", "type": "gb10"}
     raw = {"name": "s", "nodes": [{"name": "n1", "cpus": 20, "real_memory_mb": 100000, "gpus": [gpu], "fast_cpus": "5-9,15-19"}]}
     site = cli.site_config.parse(raw)
+    reads: list[bool | None] = [True]
+    monkeypatch.setattr(cli, "_slurmd_reads_layouts", lambda: reads[0])
     assert cli.core_kind_refusals(site, halves, "n1") == []
-    assert "fast_cpus 5-9,15-19 matches this host's fastest cores" in capsys.readouterr().out
-    assert cli.core_kind_refusals(site, halves, "elsewhere") == []  # another machine's node is not judged here
+    shown = capsys.readouterr().out
+    assert "fast_cpus 5-9,15-19 are this host's fastest cores" in shown and "slurmd is built with hwloc" in shown
+    reads[0] = False  # a slurm built without hwloc ignores the layout and would bind the GPU to the wrong cores
+    (no_hwloc,) = cli.core_kind_refusals(site, halves, "n1")
+    assert "built with hwloc" in no_hwloc
+    reads[0] = True
+    (elsewhere,) = cli.core_kind_refusals(site, halves, "other")  # the layout is installed for this machine's slurmd
+    assert "set on node n1, but this is other" in elsewhere
+    binned = cli.cores.CoreSpeeds({**halves.khz, 19: 4000000})  # a favoured core inside the fast kind still passes
+    assert cli.core_kind_refusals(site, binned, "n1") == []
     raw["nodes"][0]["fast_cpus"] = "0-4,10-14"  # the slow kind
     (wrong,) = cli.core_kind_refusals(cli.site_config.parse(raw), halves, "n1")
-    assert "this host's fastest cores are 5-9,15-19" in wrong
+    assert "are not all faster than its other cores (2808 MHz: 0-4,10-14; 3900 MHz: 5-9,15-19" in wrong
     alike = cli.cores.CoreSpeeds(dict.fromkeys(range(20), 3900000))
-    assert "none (all cores alike)" in cli.core_kind_refusals(cli.site_config.parse(raw), alike, "n1")[0]
+    assert "not all faster" in cli.core_kind_refusals(cli.site_config.parse(raw), alike, "n1")[0]
     del raw["nodes"][0]["fast_cpus"]
     unset = cli.site_config.parse(raw)
     (hint,) = cli.core_kind_warnings(unset, halves, "n1")

@@ -976,6 +976,29 @@ def measured_cores(job_name: str) -> tuple[float, int] | None:
     return (max(average for _, average in newest), len(newest)) if newest else None
 
 
+def measured_run_cores(name: str) -> tuple[float, int] | None:
+    """(the HIGHEST average cores in use, how many runs) over this user's `HISTORY_RUNS` newest clean runs called `name`,
+    from the job wrapper's own report (D37 `usage.cores_avg`, timed around the command alone). For GPU jobs (D46):
+    slurm's elapsed time also holds the in-job wait for the card, which `measured_cores` would count as idle cores."""
+    found: list[tuple[int, float]] = []
+    for record in own_records(name):
+        if record.get("kind") == SHARING_PROBE:
+            continue
+        legs = []
+        for leg in record_legs(record):
+            usage = leg.get("usage")
+            if not _clean(leg) or not isinstance(usage, dict) or usage.get("cores_avg") is None:
+                continue
+            try:
+                legs.append((int(leg.get("ended_at") or 0), float(usage["cores_avg"])))
+            except (TypeError, ValueError):
+                continue
+        if legs:  # one run, however many legs
+            found.append((max(e for e, _ in legs), max(c for _, c in legs)))
+    newest = sorted(found, reverse=True)[:HISTORY_RUNS]
+    return (max(c for _, c in newest), len(newest)) if newest else None
+
+
 def run_slurm(command: list[str]) -> int:
     """Run a slurm command; on failure print slurm's own message. Returns its exit status."""
     done = subprocess.run(command, capture_output=True, text=True, check=False)

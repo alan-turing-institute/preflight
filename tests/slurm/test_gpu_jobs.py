@@ -132,6 +132,12 @@ def test_the_peak_for_mem_auto_comes_from_clean_finished_legs_only(tmp_path: Pat
     assert gpu_jobs.measured_peak_bytes("m", clean=False) == 2048 * 1024**2
     (tmp_path / "jobs" / "2.json").write_text(json.dumps({"name": "n", "legs": 5, "last_leg": {"peak_gpu_mib": "x", "exit": 0}}))
     assert gpu_jobs.measured_peak_bytes("n") == 1024 * 1024**2  # wrong types inside a valid record are skipped
+    # D46: a GPU job's cores come from the wrapper's own use (command time only), clean legs only, highest of the runs
+    (tmp_path / "jobs" / "3.json").write_text(json.dumps({"name": "g", "legs": [
+        {**done, "usage": {"cores_avg": 1.2}}, {**crashed, "usage": {"cores_avg": 7.0}}]}))
+    (tmp_path / "jobs" / "4.json").write_text(json.dumps({"name": "g", "legs": [{**done, "ended_at": 5, "usage": {"cores_avg": 2.5}}]}))
+    assert gpu_jobs.measured_run_cores("g") == (2.5, 2)
+    assert gpu_jobs.measured_run_cores("n") is None  # runs without a usage report say nothing
     monkeypatch.setattr(gpu_jobs, "current_user", lambda: "somebody-else")  # the file is not theirs
     assert gpu_jobs.measured_peak_bytes("n") is None
 

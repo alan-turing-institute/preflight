@@ -1641,6 +1641,113 @@ def stage_shards_reconfigure() -> None:
     clear_queue()
 
 
+# -- stage: fast_cores ------------------------------------------------------------------------------------------
+
+FAST_SITE = "/tmp/fast_cores.site.toml"
+#: The host's core kinds as the container sees them (it shares the host's CPUs and /sys): the box this harness runs on
+#: has slow cores 0-4,10-14 and fast 5-9,15-19 (D46). On another host the installer refuses, and the stage says so.
+FAST_CPUS, SLOW_CPUS = "5-9,15-19", "0-4,10-14"
+HOST_CPUS = 20
+CORES_SEEN = r"""
+import os, subprocess, sys
+job = sys.argv[1]
+rows = subprocess.run(["scontrol", "listpids", job], capture_output=True, text=True).stdout.splitlines()[1:]
+pids = [row.split()[0] for row in rows if row.split()]
+for pid in pids:
+    try:
+        allowed = [l.split()[1] for l in open(f"/proc/{pid}/status") if l.startswith("Cpus_allowed_list")][0]
+        env = open(f"/proc/{pid}/environ", "rb").read().split(b"\0")
+    except OSError:
+        continue
+    print(allowed, any(e.startswith(b"HWLOC_XMLFILE=") for e in env))
+    break
+"""
+CORES_PARSE = """
+import sys
+sys.dont_write_bytecode = True
+sys.path.insert(0, %r)
+import gpu_jobs
+print(sorted((j.job_id, sorted(j.cores)) for j in gpu_jobs.read_queue() or []))
+"""
+
+
+def cores_of(job: str) -> tuple[set[int], bool]:
+    """(the OS CPUs a running job's processes may use, whether HWLOC_XMLFILE is in their environment)."""
+    if not wait_state(job, "RUNNING", 60):
+        return set(), False
+    put("/tmp/cores_seen.py", CORES_SEEN)
+    out = str(wait_for(lambda: sh(f"python3 -I /tmp/cores_seen.py {job}").out.strip(), 30) or "")
+    allowed, _, leaked = out.partition(" ")
+    return (set(site_cpu_ids(allowed)) if allowed else set()), leaked == "True"
+
+
+def site_cpu_ids(spec: str) -> list[int]:
+    ids: list[int] = []
+    for part in spec.split(","):
+        low, _, high = part.partition("-")
+        ids += range(int(low), int(high or low) + 1)
+    return ids
+
+
+def stage_fast_cores() -> None:
+    section("fast_cores: the GPU bound to the fast cores through slurmd's layout file (D46), then switched back")
+    clear_queue()
+    site = sh(f"cat {SITE}").out.replace("cpus = 4\n", f'cpus = {HOST_CPUS}\nfast_cpus = "{FAST_CPUS}"\n', 1)
+    put(FAST_SITE, site)
+    applied = sh(f"{INSTALL} --site {FAST_SITE} apply --component slurm --component agent", timeout=900)
+    if not check("apply with fast_cpus succeeds (the installer checks them against this host's fastest cores)",
+                 applied.rc == 0, applied.text[-400:]):
+        sh(f"{INSTALL} --site {SITE} apply --component slurm --component agent", timeout=900)
+        return
+    wait_for(lambda: "State=IDLE" in nodes_alloc(), 90, 3)
+    node = nodes_alloc()
+    daemon = sh("tr '\\0' '\\n' < /proc/$(pidof slurmd)/environ | grep -c '^HWLOC_XMLFILE=/etc/slurm/core_kinds.xml$'").out.strip()
+    check("F1: slurmd reads the layout: the node has 2 sockets of 10 cores, idle, and slurmd's environment names the file",
+          "Sockets=2" in node and "CoresPerSocket=10" in node and "State=IDLE" in node and daemon == "1", f"{node[:300]} | env {daemon}")
+    fast, slow = set(site_cpu_ids(FAST_CPUS)), set(site_cpu_ids(SLOW_CPUS))
+    gpu = submit("alice", "fast-gpu", 600, "--gpu", "--cpus", "2")
+    gpu_cpus, leaked = cores_of(gpu)
+    check("F2: a 2-core GPU job is held to exactly 2 fast cores, and slurmd's HWLOC_XMLFILE does not reach the job",
+          len(gpu_cpus) == 2 and gpu_cpus <= fast and not leaked, f"job {gpu}: {sorted(gpu_cpus)} leaked={leaked} {jobinfo(gpu).get('NumCPUs')}")
+    cpu = submit("bob", "slow-cpu", 600, "--cpus", "3")
+    cpu_cpus, _ = cores_of(cpu)
+    check("F3: a 3-core CPU job is placed on slow cores (slurm fills the slow socket first)",
+          len(cpu_cpus) == 3 and cpu_cpus <= slow, f"job {cpu}: {sorted(cpu_cpus)}")
+    put("/tmp/cores_parse.py", CORES_PARSE % "/opt/gpujobs/slurm")
+    parsed = sh("python3 -I -B /tmp/cores_parse.py").out
+    check("F5: the job layer reads the GPU job's cores on socket 1 and the CPU job's on socket 0",
+          f"('{gpu}', ['testnode:1:" in parsed and f"('{cpu}', ['testnode:0:" in parsed, parsed[:300])
+    clear_queue()
+    # F4: a resume CPU job holding fast cores is requeued (not killed) for a GPU job bound to them, though slow cores are free
+    filler = submit("bob", "fill-slow", 900, "--cpus", "8")  # slow 0-7 of slurm's numbering
+    holder = submit("bob", "hold-fast", 900, "--cpus", "10")  # 2 slow + 8 fast
+    wait_state(holder, "RUNNING", 60)
+    bound = submit("alice", "bound-gpu", 600, "--gpu", "--cpus", "4")
+    bound_cpus, _ = cores_of(bound)
+    info = jobinfo(holder)
+    check("F4: the bound GPU job starts on 4 fast cores by requeueing the resume job holding them",
+          len(bound_cpus) == 4 and bound_cpus <= fast and (info.get("Restarts") not in (None, "0") or info.get("JobState") == "PENDING"),
+          f"gpu {bound}: {sorted(bound_cpus)}; holder {holder}: {info.get('JobState')} restarts={info.get('Restarts')}; "
+          f"filler {filler}: {state(filler)}")
+    clear_queue()
+    # F7 (recorded, the accepted cost in D46): a cpu job (never pre-empted) placed on fast cores while the slow ones were
+    # full keeps a bound GPU job waiting, though slow cores are free
+    filler = submit("bob", "fill-slow-resume", 900, "--cpus", "10")  # cpu_fill: slow 0-9 of slurm's numbering
+    wait_state(filler, "RUNNING", 60)
+    restart = submit("bob", "cpu-on-fast", 900, "--cpus", "8", cls="restart")  # `cpu`: lands on fast cores
+    restart_cpus, _ = cores_of(restart)
+    waiting = submit("alice", "bound-waits", 600, "--gpu", "--cpus", "3")
+    reason = wait_for(lambda: jobinfo(waiting).get("Reason") if state(waiting) == "PENDING" else None, 30)
+    note(f"F7: cpu job {restart} on {sorted(restart_cpus)} (fast: {restart_cpus <= fast}); bound GPU job {waiting}: "
+         f"{state(waiting)} {reason or ''}; cpu_fill job {filler}: {state(filler)}")
+    clear_queue()
+    back = sh(f"{INSTALL} --site {SITE} apply --component slurm --component agent", timeout=900)
+    wait_for(lambda: "State=IDLE" in nodes_alloc(), 90, 3)
+    gone = sh("tr '\\0' '\\n' < /proc/$(pidof slurmd)/environ | grep -c '^HWLOC_XMLFILE=' || true").out.strip()
+    check("F6: taking fast_cpus out again gives one socket and a slurmd without the layout file",
+          back.rc == 0 and "Sockets=1" in nodes_alloc() and gone == "0", f"{back.text[-200:]} | {nodes_alloc()[:200]} | env {gone}")
+
+
 # -- stage: memory_guard ---------------------------------------------------------------------------------------
 
 GUARD_SITE = "/tmp/memory_guard.site.toml"
@@ -1844,6 +1951,7 @@ STAGES: dict[str, Callable[[], None]] = {
     "sharing": stage_sharing,
     "sched_switch": stage_sched_switch,
     "shards_reconfigure": stage_shards_reconfigure,
+    "fast_cores": stage_fast_cores,
     "memory_guard": stage_memory_guard,
     "upgrade": stage_upgrade,
 }

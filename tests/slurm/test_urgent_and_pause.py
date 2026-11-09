@@ -123,8 +123,9 @@ def test_free_room_is_counted_only_on_nodes_the_urgent_partition_can_start_a_job
     node = urgent.site_config.Node("n", 20, 1000, (urgent.site_config.Gpu(0, "u", "/dev/nvidia0", "t"),), fast_cpus="5-9,15-19")
     queue = [gpu_jobs.QueuedJob("1", "cpu_fill", "RUNNING", "None", "p:x:1", cores=frozenset({"n:1:0", "n:1:1", "n:0:0"})),
              gpu_jobs.QueuedJob("2", "cpu", "PENDING", "Resources", "p:x:2", cores=frozenset({"n:1:2"})),
-             gpu_jobs.QueuedJob("3", "cpu", "RUNNING", "None", "p:x:3", cores=frozenset({"other:1:3"}))]
-    assert urgent.free_fast_cores(queue, node) == 8
+             gpu_jobs.QueuedJob("3", "cpu", "RUNNING", "None", "p:x:3", cores=frozenset({"other:1:3"})),
+             gpu_jobs.QueuedJob("4", "cpu_fill", "COMPLETING", "None", "p:x:4", cores=frozenset({"n:1:4"}))]  # still on its cores
+    assert urgent.free_fast_cores(queue, node) == 7
 
 
 def test_memory_notation() -> None:
@@ -270,6 +271,17 @@ def test_site_admin_check_multi_gpu_plan_and_request_file(
         calls.clear()
         assert urgent.run([*argv[:-4], "--mem", "2G", "--cpus", "4", "--", "true"]) == 0
         assert (["scontrol", "requeue", "3"] in calls) is requeued, held_cores
+    # D46, bound to the fast cores: only the fast cores a victim gives back count. The normal job's 12 are all slow, so
+    # the cpu job on 8 of the 10 fast cores is requeued although 12 cores would be freed
+    (tmp_path / "site.toml").write_text(
+        'name = "t"\nadmin_group = "admins"\n[[nodes]]\nname = "n1"\ncpus = 20\nreal_memory_mb = 1000\nfast_cpus = "5-9,15-19"\n'
+        '[[nodes.gpus]]\nindex = 0\nuuid = "GPU-x"\ndevice = "/dev/nvidia0"\ntype = "gb10"\n', encoding="utf-8")
+    queue[0] = gpu_jobs.QueuedJob("5", "normal", "RUNNING", "None", "p:resume:5", cpus=12,
+                                  cores=frozenset(f"n1:0:{c}" for c in range(10)) | {"n1:1:8", "n1:1:9"})
+    queue[1] = gpu_jobs.QueuedJob("3", "cpu", "RUNNING", "None", "p:resume:3", cpus=8, cores=frozenset(f"n1:1:{c}" for c in range(8)))
+    calls.clear()
+    assert urgent.run([*argv[:-4], "--mem", "2G", "--gpu", "--cpus", "4", "--", "true"]) == 0
+    assert ["scontrol", "requeue", "3"] in calls
 
 
 def test_entry_runs_the_gate_before_anything_is_held_and_mem_auto_sizes_the_job(
@@ -326,6 +338,17 @@ def test_entry_runs_the_gate_before_anything_is_held_and_mem_auto_sizes_the_job(
     peak["bytes"] = None
     assert urgent.run([*argv, "--", "true"]) == 0
     assert "--mem=0" in Path(calls[-1][-1]).read_text(encoding="utf-8") and "--exclusive" in Path(calls[-1][-1]).read_text(encoding="utf-8")
+
+    # D46: on a node with fast_cpus a job that fits in the fast cores is bound to them; the whole box never is
+    site = (tmp_path / "site.toml").read_text(encoding="utf-8").replace("cores_per_gpu = 12\n", 'cores_per_gpu = 12\nfast_cpus = "5-9,15-19"\n')
+    (tmp_path / "site.toml").write_text(site, encoding="utf-8")
+    peak["bytes"] = 20 * 1024**3
+    assert urgent.run([*argv, "--cpus", "2", "--", "true"]) == 0
+    bound = Path(calls[-1][-1]).read_text(encoding="utf-8")
+    assert "--cpus-per-task=2" in bound and "--ntasks=1\n" in bound and "--gres-flags=enforce-binding\n" in bound
+    peak["bytes"] = None
+    assert urgent.run([*argv, "--cpus", "2", "--", "true"]) == 0
+    assert "--gres-flags" not in Path(calls[-1][-1]).read_text(encoding="utf-8")
 
 
 class FakeSlurm:

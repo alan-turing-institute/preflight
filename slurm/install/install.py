@@ -193,19 +193,42 @@ def _this_host() -> str:
     return socket.gethostname().split(".")[0]
 
 
+def _slurmd_reads_layouts() -> bool | None:
+    """Whether this machine's slurmd is built with hwloc, the only way it reads a layout file (`HWLOC_XMLFILE`); without
+    hwloc it takes its cores from /proc/cpuinfo and the GPU would be bound to the wrong ones. None: no slurmd yet."""
+    slurmd = shutil.which("slurmd")
+    return None if slurmd is None else "libhwloc" in (components.run(["ldd", slurmd]).stdout or "")
+
+
 def core_kind_refusals(site, speeds: cores.CoreSpeeds | None = None, here: str | None = None) -> list[str]:
-    """`fast_cpus` (D46) on this machine's node must be the cores this host reports fastest: the layout file binds the
-    GPU to them, so a wrong list would hold GPU jobs to slow cores. Prints the match when it holds."""
-    node = next((n for n in site.full_nodes if n.fast_cpus and n.name == (here or _this_host())), None)
-    if node is None:
-        return []
-    speeds = speeds or cores.CoreSpeeds.read()
-    fastest = list(speeds.groups().values())[-1] if speeds.mixed else []
-    if fastest != node.fast_cpu_ids:
-        return [f"site file: {node.name}'s fast_cpus = {node.fast_cpus!r}, but this host's fastest cores are "
-                f"{cores.cpu_list(fastest) if fastest else 'none (all cores alike)'} (`slurm/cores.py`): correct fast_cpus, or leave it out"]
-    print(f"ok       fast_cpus {node.fast_cpus} matches this host's fastest cores")
-    return []
+    """`fast_cpus` (D46) must describe this machine (the layout file is read by the slurmd it is installed beside),
+    name cores every one of which is faster than every core outside it, and meet a slurmd built with hwloc. Prints
+    each check that holds."""
+    here = here or _this_host()
+    out = []
+    for node in (n for n in site.full_nodes if n.fast_cpus):
+        if node.name != here:
+            out.append(f"site file: fast_cpus is set on node {node.name}, but this is {here}: the layout file is installed for "
+                       "this machine's slurmd, so set fast_cpus only on this machine's own node entry")
+            continue
+        khz = (speeds or cores.CoreSpeeds.read()).khz
+        fast, others = node.fast_cpu_ids, [cpu for cpu in range(node.cpus) if cpu not in node.fast_cpu_ids]
+        known = all(cpu in khz for cpu in range(node.cpus))
+        if not known or min(khz[cpu] for cpu in fast) <= max(khz[cpu] for cpu in others):
+            groups = cores.CoreSpeeds(khz).groups()
+            seen = "; ".join(f"{mhz} MHz: {cores.cpu_list(g)}" for mhz, g in groups.items()) or "no core reports a top speed"
+            out.append(f"site file: {node.name}'s fast_cpus = {node.fast_cpus!r} are not all faster than its other cores "
+                       f"({seen}; `slurm/cores.py`): correct fast_cpus, or leave it out")
+            continue
+        print(f"ok       fast_cpus {node.fast_cpus} are this host's fastest cores")
+        reads = _slurmd_reads_layouts()
+        if reads is False:
+            out.append("site file: fast_cpus needs a slurmd built with hwloc to read its layout file, and this machine's slurmd "
+                       "is not (`ldd $(command -v slurmd)` names no libhwloc): leave fast_cpus out")
+        else:
+            print("ok       slurmd is built with hwloc" if reads else
+                  "note     no slurmd yet: run `install.py check` after apply to confirm it is built with hwloc")
+    return out
 
 
 def core_kind_warnings(site, speeds: cores.CoreSpeeds | None = None, here: str | None = None) -> list[str]:
@@ -266,7 +289,8 @@ def cmd_check(site, args, modules) -> int:
     _warn_portal_secrets(site, modules)
     for warning in platform_warnings(site):
         print(f"WARNING  {warning}")
-    for problem in [*kernel_refusals(), *platform_refusals(site, modules)]:
+    refused = [*kernel_refusals(), *platform_refusals(site, modules)]
+    for problem in refused:
         print(f"REFUSED  {problem}")
     files = _all(modules, site, "files")
     with tempfile.TemporaryDirectory() as tmp:
@@ -280,7 +304,7 @@ def cmd_check(site, args, modules) -> int:
         print(f"DIFFERS  {d}")
     if not diff:
         print("ok       installed files match the rendered ones")
-    return 1 if diff or kernel_refusals() else 0
+    return 1 if diff or refused else 0
 
 
 def apt_install_commands(modules, site) -> list[list[str]]:
