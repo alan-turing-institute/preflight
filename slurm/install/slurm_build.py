@@ -39,8 +39,10 @@ RPM_TOOLS = ["dnf", "install", "-y", "rpm-build", "dnf-plugins-core", "tar", "bz
 #: SchedMD's spec builds cgroupv2 only when asked: without it slurmd cannot start on a cgroup v2 system (Fedora is one:
 #: "cannot create cgroup context for cgroup/v2", found joining the laptop). `dnf builddep` of the spec as it stands does
 #: not list its development packages. json-c gives `scontrol --json` and `squeue --json` (the health check and our tools
-#: read them); yaml, curl and lz4 match the Debian build. No http-parser: the spec needs one only for slurmrestd,
-#: which is not built (and Fedora 45 dropped http-parser-devel, 2026-11-09). NOT hwloc: on the laptop's hybrid Intel CPU
+#: read them); yaml, curl and lz4 match the Debian build. No http-parser (Fedora 45 dropped http-parser-devel,
+#: 2026-11-09): the spec needs one only for slurmrestd, which is not built, and without one the daemons skip their
+#: optional HTTP listener (MetricsType, unset in our slurm.conf): slurmd logs "cannot create http_parser context" at
+#: start and runs on. NOT hwloc: on the laptop's hybrid Intel CPU
 #: (6 performance cores of 2 threads, 10 efficiency cores of 1) slurm with hwloc sees only 12 of its 22 CPUs and the
 #: controller drains the node "Low CPUs"; without it slurm describes all 22.
 RPM_WITH = ["--with", "cgroupv2", "--with", "yaml", "--with", "libcurl"]
