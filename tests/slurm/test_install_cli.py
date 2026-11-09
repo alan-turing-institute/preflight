@@ -45,6 +45,7 @@ class Fake:
         self.sinfo = ""  # what `sinfo -V` prints ("" = no slurm installed)
         self.dbd_active = False  # `systemctl is-active slurmdbd`
         self.held = []  # (argv, whether policy-rc.d stood) for each package install or removal
+        self.rpms = ""  # what `rpm -qa --qf '%{NAME}\n'` lists, one name a line
 
     def __call__(self, argv):
         self.calls.append(argv)
@@ -59,6 +60,8 @@ class Fake:
             return subprocess.CompletedProcess(argv, 0 if self.dbd_active else 3, "active" if self.dbd_active else "inactive", "")
         if argv[:2] == ["systemctl", "is-active"]:
             return subprocess.CompletedProcess(argv, self.ctld_rc, "", "")
+        if argv[:2] == ["rpm", "-qa"]:
+            return subprocess.CompletedProcess(argv, 0, self.rpms, "")
         if argv[:1] == ["dpkg-query"]:
             return subprocess.CompletedProcess(argv, 1, self.distro_slurm, "")
         if argv[:2] == ["apt-cache", "policy"]:
@@ -306,10 +309,14 @@ def test_slurm_table_installs_the_built_packages_in_place_of_the_distros(env, mo
     assert marks == [["apt-mark", "unhold", "slurm-smd"], ["apt-mark", "hold", "slurm-smd", "slurm-smd-slurmdbd"]]
     assert fake.calls.index(marks[0]) < fake.calls.index(installs[-1]) < fake.calls.index(marks[1])
     # rpms: Fedora's own slurm has the names, version and release of a build made there, which `dnf install` leaves in place
-    rpms = [tmp / "slurm-26.05.5-1.fc45.x86_64.rpm", tmp / "slurm-slurmd-26.05.5-1.fc45.x86_64.rpm"]
-    files = [str(r) for r in rpms]
+    # and Fedora's `slurm-libs`, which SchedMD's build does not make, goes first (its libslurm is in ours: a file conflict)
+    rpms = [tmp / "slurm-26.05.5-1.fc45.x86_64.rpm", tmp / "slurm-slurmd-26.05.5-1.fc45.x86_64.rpm",
+            tmp / "slurm-devel-26.05.5-1.fc45.x86_64.rpm"]  # made, not installed, and not foreign when installed
+    files = [str(r) for r in rpms[:2]]
+    fake.rpms = "slurm\nslurm-libs\nslurm-slurmd\nslurm-devel\n"
     assert slurm_component.install_commands(rpms) == [
         ["dnf", "install", "-y", "dnf-command(versionlock)"], ["dnf", "versionlock", "delete", "slurm", "slurm-slurmd"],
+        ["dnf", "remove", "-y", "--setopt=clean_requirements_on_remove=False", "slurm-libs"],
         ["dnf", "install", "-y", *files], ["dnf", "reinstall", "-y", *files], ["dnf", "versionlock", "add", "slurm", "slurm-slurmd"]]
     # no package command ran without policy-rc.d, which keeps the packages' scripts from starting a daemon
     assert [on for _, on in fake.held] == [True, True, True]

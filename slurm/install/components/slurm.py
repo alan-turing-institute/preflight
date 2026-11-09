@@ -87,10 +87,17 @@ def install_commands(built: list[Path]) -> list[list[str]]:
         raise slurm_build.SlurmBuildError("the build left none of the packages that get installed (slurm_build.DEB_INSTALL, RPM_INSTALL)")
     names = [slurm_build.package_name(Path(p)) for p in wanted]
     if not wanted[0].endswith(".deb"):
-        # A build has the name, version and release of the distribution's own package of that version (Fedora ships
-        # slurm under the same names), and `dnf install` then keeps the installed files and reports success (container
-        # test 2026-11-09); `reinstall` puts ours in. `dnf-command(versionlock)` is dnf5 itself, or dnf4's plugin.
+        # The distribution's slurm shares SchedMD's package names but splits some out (Fedora's `slurm-libs` holds the
+        # libslurm that SchedMD's `slurm` also ships, so installing over it is a file conflict, found 2026-11-09): any
+        # installed slurm package the build does not make goes first, taking the distribution's that need it with it,
+        # but not their unrelated dependencies. A build otherwise has the name, version and release of the
+        # distribution's package, and `dnf install` then keeps the installed files and reports success (container test
+        # 2026-11-09); `reinstall` puts ours in. `dnf-command(versionlock)` is dnf5 itself, or dnf4's plugin.
+        made = {slurm_build.package_name(p) for p in built}
+        installed = (components.run(["rpm", "-qa", "--qf", "%{NAME}\\n", "slurm*"]).stdout or "").split()
+        foreign = sorted(set(installed) - made)
         return [["dnf", "install", "-y", "dnf-command(versionlock)"], lock("dnf", names, False),
+                *([["dnf", "remove", "-y", "--setopt=clean_requirements_on_remove=False", *foreign]] if foreign else []),
                 ["dnf", "install", "-y", *wanted], ["dnf", "reinstall", "-y", *wanted], lock("dnf", names, True)]
     installed = _installed_debs([*DISTRO_SLURM, *names])
     distro, ours = [n for n in installed if n in DISTRO_SLURM], [n for n in installed if n in names]
