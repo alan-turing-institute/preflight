@@ -36,7 +36,9 @@ Vertical Pod Autoscaler's rule), and prints `[submit] memory: ...` saying so.
 CORES (D35, site field `cpus_from_history`): a CPU-only job given `--name` and no `--cpus` is offered the cores its
 3 newest completed runs of the same `project:class:name` used: the highest average (core time over wall time) times
 1.25, rounded up, within the cores the job may have. The line `[submit] cores: ...` shows it; `recommend` (the
-default) only prints it, `enforce` asks for it. A `--cpus` above twice it warns.
+default) only prints it, `enforce` asks for it. A `--cpus` above twice it warns. On a GPU node with `fast_cpus`
+(D46) a whole-card GPU job is offered its cores the same way, and a GPU or shard job that fits in the fast cores is
+held to them (`--ntasks=1 --gres-flags=enforce-binding`); a larger one gets the fast cores first and slow ones after.
 
 LEVEL (D18): where the job waits among the others, `normal` by default; `high` goes ahead of normal and low, `low`
 behind them. Open to everyone. It orders the waiting line only: a running job is never stopped for a higher level.
@@ -355,7 +357,7 @@ def resolve_packing(arguments: argparse.Namespace, named: str | None, site: site
     """Share the card with other copies of a named job, as far as its measurements allow (D27-D30). Only one card of a
     site whose card has shards is ever shared (`--gpus` above 1 never is), and only a job given `--name`: the default
     name is shared by unrelated jobs. Prints the decision, and a warning when the job has outgrown its measurement."""
-    node = next((n for n in site.nodes if n.gpus), None)
+    node = site_config.gpu_node(site)
     if arguments.gpus != 1 or node is None or not node.gpus[0].shards:
         return gpu_jobs.Packing()
     asked, arguments.max_jobs = arguments.max_jobs, 1  # the level is settled here: the wrapper's declared-sharing flag is for sites without shards
@@ -381,16 +383,17 @@ def resolve_packing(arguments: argparse.Namespace, named: str | None, site: site
 def resolve_cpus(asked: int | None, gpus: int, site: site_config.Site, shared_cores: int = 0,
                  speeds: cores.CoreSpeeds | None = None) -> int:
     """`--cpus`, else for a GPU job the cores the site holds for its GPUs (`cores_per_gpu`) or, unset, its GPUs'
-    share of the GPU node's cores, else DEFAULT_CPUS. On a host whose cores differ (`speeds`), a whole-card GPU job
-    is raised to the fewest cores that always include a fast one.
+    share of the GPU node's cores, else DEFAULT_CPUS. On a host whose cores differ (`speeds`) and whose GPU node has no
+    `fast_cpus`, a whole-card GPU job is raised to the fewest cores that always include a fast one (D33); with
+    `fast_cpus` slurm binds it to the fast cores instead (`binding`, D46), so it keeps what it asked for.
 
     A GPU job given the old flat 4 cores was CPU-bound: the same inference timing ran 2-14x slower than with all 20
     (slurm jobs 254 and 258, 2026-10-19), while the other cores sat idle behind the one GPU.
     """
     cpus = asked if asked is not None else _default_cpus(gpus, site, shared_cores)
-    node = next((n for n in site.nodes if n.gpus), None)
-    if not gpus or shared_cores or node is None or speeds is None or len(speeds.khz) != node.cpus:
-        return cpus  # no GPU, a shard job (its share of the held cores is fixed), or speeds that are not this node's
+    node = site_config.gpu_node(site)
+    if not gpus or shared_cores or node is None or node.fast_cpus or speeds is None or len(speeds.khz) != node.cpus:
+        return cpus  # no GPU, a shard job (its share of the held cores is fixed), bound to the fast cores, or speeds not this node's
     floor = min(speeds.fast_core_floor(), node.cpus)
     if cpus < floor:
         warn(f"a GPU job with {cpus} cores can run every one of them on this host's {node.cpus - floor + 1} slower cores, "
@@ -403,7 +406,7 @@ def resolve_cpus(asked: int | None, gpus: int, site: site_config.Site, shared_co
 def _default_cpus(gpus: int, site: site_config.Site, shared_cores: int) -> int:
     if shared_cores:
         return shared_cores  # a shard job: its share of the cores held for the card
-    node = next((n for n in site.nodes if n.gpus), None)
+    node = site_config.gpu_node(site)
     if not gpus or node is None:
         return min(DEFAULT_CPUS, site.cpu_job_cap or DEFAULT_CPUS)  # a CPU-only job's default fits under the cap
     if node.cores_per_gpu:
@@ -411,21 +414,48 @@ def _default_cpus(gpus: int, site: site_config.Site, shared_cores: int) -> int:
     return max(1, node.cpus * min(gpus, len(node.gpus)) // len(node.gpus))
 
 
+#: The directives that hold a GPU job to the fast cores its card is bound to (D46). Without `--ntasks` slurm 26.05.5
+#: gave a 1- or 2-core job every core of the bound socket (private proof, 2026-11-09).
+FAST_CORE_BINDING = ("--ntasks=1", "--gres-flags=enforce-binding")
+
+
+def binding(cpus: int, gpus: int, shards: int, site: site_config.Site, said: str = "[submit]") -> tuple[str, ...]:
+    """The directives for a GPU or shard job on a GPU node with `fast_cpus` (D46): `FAST_CORE_BINDING` when its cores
+    fit in the fast ones, so it gets only fast cores (and waits for them, or pre-empts a `cpu_fill` job holding them);
+    none above that, where slurm hands it the card's fast cores first and slow ones after. Prints which."""
+    node = site_config.gpu_node(site)
+    if not (gpus or shards) or node is None or not node.fast_cpus:
+        return ()
+    if cpus <= node.fast_cores:
+        print(f"{said} cores: {cpus} fast cores, bound to the GPU (D46)")
+        return FAST_CORE_BINDING
+    print(f"{said} cores: {cpus}; the GPU's {node.fast_cores} fast cores first, the rest may be slow (above "
+          f"{node.fast_cores} the binding cannot be strict)")
+    return ()
+
+
 def cores_from_history(arguments: argparse.Namespace, named: str | None, hand_set: bool,
-                       site: site_config.Site) -> dict[str, object] | None:
+                       site: site_config.Site, shards: int = 0) -> dict[str, object] | None:
     """D35: the cores a CPU-only job given `--name` would ask for from its own completed runs (`gpu_jobs.measured_cores`
     of `project:class:name`): the highest average in use times `CORES_MARGIN`, rounded up, from 1 to the cores the job
     may have. Prints the line; under `enforce` a job without `--cpus` asks for them; a `--cpus` more than
-    `CORES_OVER_ASK` times them warns. Returns what is kept in the job's record (for comparing proposals with use
-    before `enforce`), None when nothing was proposed (`off`, a GPU job, no `--name`, no completed run)."""
+    `CORES_OVER_ASK` times them warns. A whole-card GPU job is included when the GPU node has `fast_cpus` (D46: its
+    cores are then fast whatever their number); a shard job never is (its cores are its shards). Returns what is kept
+    in the job's record (for comparing proposals with use before `enforce`), None when nothing was proposed (`off`, a
+    GPU job elsewhere, no `--name`, no completed run)."""
     mode = site.cpus_from_history
-    if mode is site_config.CoresFromHistory.OFF or arguments.gpus or named is None:
+    node = site_config.gpu_node(site)
+    gpu_sized = bool(arguments.gpus) and node is not None and bool(node.fast_cpus) and not shards
+    if mode is site_config.CoresFromHistory.OFF or (arguments.gpus and not gpu_sized) or named is None:
         return None
     measured = gpu_jobs.measured_cores(f"{arguments.project}:{arguments.job_class}:{named}")
     if measured is None:
         return None
     average, runs = measured
-    cap = site.service.cores if arguments.service else site.cpu_job_cap or max((n.cpus for n in site.nodes), default=None)
+    if gpu_sized:
+        cap = node.cpus
+    else:
+        cap = site.service.cores if arguments.service else site.cpu_job_cap or max((n.cpus for n in site.nodes), default=None)
     proposal = max(1, math.ceil(average * CORES_MARGIN))
     proposal = min(proposal, cap) if cap else proposal
     asking = arguments.cpus
@@ -576,7 +606,8 @@ def submit(argv: list[str]) -> str:
         msg = (f"--cpus {arguments.cpus}: a job without GPUs may use at most {site.cpu_job_cap} cores here; the rest "
                "are held for GPU jobs (cores_per_gpu in the site file)")
         raise Refused(msg)
-    history_cores = cores_from_history(arguments, named, named_cpus is not None, site)
+    history_cores = cores_from_history(arguments, named, named_cpus is not None, site, packing.shards)
+    bound = binding(arguments.cpus, arguments.gpus, packing.shards, site)
     stamp = time.strftime("%Y%m%d-%H%M%S")
     log = arguments.log or gpu_jobs.STATE_DIR / "logs" / f"{arguments.name}-{stamp}.log"
     gated = bool(arguments.entry) and site.dgx_gate
@@ -588,6 +619,7 @@ def submit(argv: list[str]) -> str:
         gpu_jobs.JobClass(arguments.job_class), arguments.gpus, service=arguments.service, part_time=included
     )
     barred = (f"--exclude={','.join(placed.excluded)}",) if included and placed.excluded else ()
+    barred += bound
     script = sbatch_script(
         arguments, mem=mem, log=log, manifest=manifest, node_python=site.node_python, partition=partition, extra=barred,
         requirements=placed.requirements if included else (), shards=packing.shards,

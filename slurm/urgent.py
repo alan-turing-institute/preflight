@@ -63,6 +63,13 @@ def free_on_nodes() -> tuple[int, int] | None:
     return total["mem_mb"] - total["mem_used_mb"], total["cpus"] - total["cpus_used"]
 
 
+def free_fast_cores(queue: list[gpu_jobs.QueuedJob], node: site_config.Node) -> int:
+    """The fast cores (D46) of `node` no running job holds: what a job bound to them can start on."""
+    fast = f"{node.name}:{node.fast_socket}:"
+    held = sum(1 for job in queue if job.state == gpu_jobs.State.RUNNING for core in job.cores if core.startswith(fast))
+    return node.fast_cores - held
+
+
 def _asked_mb(job: gpu_jobs.QueuedJob) -> int:
     """The memory a job holds (slurm's request, else its sidecar's); 0 when unknown, the whole box or unreadable, which
     counts as freeing nothing, so a CPU job is requeued rather than the urgent job left waiting."""
@@ -214,6 +221,9 @@ def run(argv: list[str]) -> int:
         print("[urgent] REFUSED: slurm does not answer (controller down); see slurm/status.py", file=sys.stderr)
         return 1
     free = None if whole_box else free_on_nodes()
+    bound = () if whole_box else submit.binding(arguments.cpus, arguments.gpus, 0, site, said="[urgent]")
+    if bound and free is not None:  # held to the fast cores: the slow ones free are no room for it
+        free = (free[0], min(free[1], free_fast_cores(queue, site_config.gpu_node(site))))
     memory_short = free is not None and mem_mb(arguments.mem) > free[0]
     cores_short = free is not None and arguments.cpus > free[1]
     lines, victims, steady, wait_only = plan(
@@ -233,7 +243,7 @@ def run(argv: list[str]) -> int:
     if free is not None:
         print(f"[urgent] memory: needs {mem_mb(arguments.mem)} MB, slurm has {free[0]} MB unallocated"
               + ("; jobs will be pre-empted to make room" if memory_short else "; it fits beside what runs"))
-        print(f"[urgent] cores: needs {arguments.cpus}, slurm has {free[1]} unallocated"
+        print(f"[urgent] cores: needs {arguments.cpus}{' fast' if bound else ''}, slurm has {free[1]} unallocated"
               + ("; jobs will be pre-empted to make room" if cores_short else "; they fit beside what runs"))
     print("\n".join(map(gpu_jobs.printable, lines)))  # descriptions and lease names are what other users wrote
     print(f"[urgent] expected start: slurm's own {SLURM_START_S[0]}-{SLURM_START_S[1]} s after the pre-empted jobs "
@@ -246,7 +256,7 @@ def run(argv: list[str]) -> int:
         return 1
     stamp = time.strftime("%Y%m%d-%H%M%S")
     log = arguments.log or gpu_jobs.STATE_DIR / "logs" / f"{arguments.name}-{stamp}.log"
-    extra = [f"--time={arguments.time}"] + (["--exclusive"] if whole_box else [])
+    extra = [f"--time={arguments.time}"] + (["--exclusive"] if whole_box else []) + list(bound)
     mem = "0" if whole_box else arguments.mem  # --mem=0: all of the node's memory
     gated = bool(arguments.entry) and site.dgx_gate
     manifest = gpu_jobs.STATE_DIR / "manifests" / f"{arguments.name}-{stamp}.json" if gated else None

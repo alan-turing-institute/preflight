@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import signal
@@ -10,6 +11,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import gpu_jobs
 import job_wrapper
@@ -482,6 +484,14 @@ def test_the_end_of_run_report_measures_from_the_cgroup_and_advises_the_next_req
     assert lines() == ["[job] used: memory peak 9.4 GB of 42.9 GB asked (22%); cores 1.7 on average of 8 held (21%)",
                        "[job] for the same work next time: --mem 10G --cpus 3"]  # peak + 10%; ceil(1.7 x 1.25)
     assert lines(gpu=True)[1].endswith("--mem 10G")  # a GPU job's cores are held for the card: no --cpus advice
+    gpu_node = job_wrapper.site_config.Node("n", 20, 1000, (job_wrapper.site_config.Gpu(0, "u", "/dev/nvidia0", "t"),),
+                                            cores_per_gpu=12, fast_cpus="5-9,15-19")
+    site = SimpleNamespace(nodes=(gpu_node,), service=None, cpu_job_cap=8)
+    assert job_wrapper.cores_advice(site, card=True, shard=False, service=False) == (False, 20)  # D46: bound, so advised
+    assert job_wrapper.cores_advice(site, card=False, shard=True, service=False) == (True, 8)  # its cores are its shards
+    site.nodes = (dataclasses.replace(gpu_node, fast_cpus=None),)
+    assert job_wrapper.cores_advice(site, card=True, shard=False, service=False) == (True, 8)  # held for the card (D33)
+    assert job_wrapper.cores_advice(site, card=False, shard=False, service=False) == (False, 8)
     assert lines(avg=20.0)[1].endswith("--cpus 8")  # within the cores the job may have
     assert lines(peak=5e6)[0].startswith("[job] used: memory peak 5 MB") and "--mem 1G" in lines(peak=5e6)[1]
     assert "--mem 1G" in lines(peak=0)[1]  # never 0G: slurm reads --mem 0 as the whole box

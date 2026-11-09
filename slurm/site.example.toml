@@ -57,6 +57,12 @@ real_memory_mb = 64000       # RealMemory in MB slurm may hand out (required)
 # --reserve` prints the figure (real memory less the 99th percentile of use outside jobs less close_below_gb). On a
 # part-time machine it is what its owner lends. Default: no reserve (jobs may be given all of real_memory_mb). Optional.
 # jobs_memory_gb = 48
+# A GPU node whose cores come in two kinds of equal number (Arm big.LITTLE): the OS CPUs of the fast kind, as
+# `slurm/cores.py` lists them. slurmd is then shown each kind as a socket (a layout file) and the GPU is bound to the
+# fast one, so a GPU job holds only the cores it asks for and they are fast (README "Fast and slow cores"). The
+# installer refuses a list that is not this host's fastest cores. Switching it on or off renumbers slurm's cores: do
+# it with no job running on the node. Default: unset (a GPU job is raised to slow cores + 1 on such a host). Optional.
+# fast_cpus = "4-7"
 
 # A part-time node is someone's own machine lent to the cluster when idle (needs a full node to run slurmctld on).
 # It has no GPUs. A CPU-only `resume` job goes to its `part_time` partition when submit.py finds the job portable to it

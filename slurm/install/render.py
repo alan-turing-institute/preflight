@@ -65,8 +65,9 @@ def _node_line(node: Node) -> str:
     address = f" NodeAddr={node.address}" if node.part_time else ""
     spec = f" CpuSpecList={node.keep_cpus}" if node.keep_cpus else ""
     spec += f" MemSpecLimit={node.mem_spec_limit_mb}" if node.mem_spec_limit_mb is not None else ""
+    sockets, per_socket = node.sockets
     return (
-        f"NodeName={node.name}{address} CPUs={node.cpus} Boards=1 SocketsPerBoard=1 CoresPerSocket={node.cores_per_socket or node.cpus} "
+        f"NodeName={node.name}{address} CPUs={node.cpus} Boards=1 SocketsPerBoard={sockets} CoresPerSocket={per_socket} "
         f"ThreadsPerCore=1 RealMemory={node.real_memory_mb}{spec}{gres} State=UNKNOWN\n"
     )
 
@@ -75,12 +76,60 @@ def _gres_lines(site: Site) -> str:
     """gres.conf lines: one per GPU with its Type (gres.conf(5) example: "Name=gpu Type=tesla File=/dev/nvidia1 COREs=2,3"),
     and for a sharing card a `Name=shard Count=<its shards>` line on the same device file (slurm copies Type and Cores)."""
     lines = ""
+    if any(n.fast_cpus for n in site.nodes):  # NVML's GPU detection fails under a layout file; every GPU is listed below
+        lines += "# The GPUs are listed by hand: detecting them through NVML fails when slurmd reads a layout file (D46).\nAutoDetect=off\n"
     for n in site.nodes:
+        cores = f" Cores={n.fast_socket_cores}" if n.fast_cpus else ""  # D46: the card is bound to the fast cores
         for g in n.gpus:
-            lines += f"NodeName={n.name} Name=gpu Type={g.type} File={g.device}\n"
+            lines += f"NodeName={n.name} Name=gpu Type={g.type} File={g.device}{cores}\n"
             if g.shards:
-                lines += f"NodeName={n.name} Name=shard Count={g.shards} File={g.device}\n"
+                lines += f"NodeName={n.name} Name=shard Count={g.shards} File={g.device}{cores}\n"
     return lines
+
+
+#: The hwloc layout slurmd reads on a node with `fast_cpus` (D46), and the slurmd drop-in that points it there.
+CORE_KINDS_XML = "/etc/slurm/core_kinds.xml"
+CORE_KINDS_DROPIN = "/etc/systemd/system/slurmd.service.d/20-core-kinds.conf"
+BYTES_PER_SLURM_MB = 2**20
+
+
+def _mask(cpus: list[int]) -> str:
+    return hex(sum(1 << cpu for cpu in cpus))
+
+
+def core_kinds_xml(node: Node) -> str:
+    """An hwloc 2 layout of `node` with one package per core kind, each core keeping its OS number, so slurm sees the
+    kinds as sockets and its own core numbers run socket by socket (slurmd builds its CPU map from this tree)."""
+    fast = node.fast_cpu_ids
+    kinds = sorted([[cpu for cpu in range(node.cpus) if cpu not in fast], fast])  # hwloc orders packages by lowest CPU
+    every = _mask(list(range(node.cpus)))
+    sets = 'nodeset="0x1" complete_nodeset="0x1"'
+    out = ['<?xml version="1.0" encoding="UTF-8"?>', '<!DOCTYPE topology SYSTEM "hwloc2.dtd">',
+           f"<!-- {RENDERED_MARK}: the core kinds of {node.name} as sockets (D46). -->", '<topology version="2.0">',
+           f'<object type="Machine" os_index="0" cpuset="{every}" complete_cpuset="{every}" allowed_cpuset="{every}" {sets} allowed_nodeset="0x1" gp_index="1">',
+           f'<object type="NUMANode" os_index="0" cpuset="{every}" complete_cpuset="{every}" {sets} gp_index="2" '
+           f'local_memory="{node.real_memory_mb * BYTES_PER_SLURM_MB}"/>']
+    index = 2
+    for package, cpus in enumerate(kinds):
+        index += 1
+        out.append(f'<object type="Package" os_index="{package}" cpuset="{_mask(cpus)}" complete_cpuset="{_mask(cpus)}" {sets} gp_index="{index}">')
+        for cpu in cpus:
+            one = _mask([cpu])
+            out += [f'<object type="Core" os_index="{cpu}" cpuset="{one}" complete_cpuset="{one}" {sets} gp_index="{index + 1}">',
+                    f'<object type="PU" os_index="{cpu}" cpuset="{one}" complete_cpuset="{one}" {sets} gp_index="{index + 2}"/>',
+                    "</object>"]
+            index += 2
+        out.append("</object>")
+    return "\n".join([*out, "</object>", "</topology>", ""])
+
+
+def core_kinds_dropin(site: Site) -> str:
+    """slurmd's environment: the layout file when this site's node has `fast_cpus`, else nothing (always installed, so
+    taking the field out clears it on the next apply)."""
+    head = "# D46: slurmd reads the core kinds as sockets from a layout file, so the GPU can be bound to the fast cores.\n[Service]\n"
+    if not any(n.fast_cpus for n in site.full_nodes):
+        return head + "# Not used here: no node has fast_cpus in the site file.\n"
+    return head + f"Environment=HWLOC_XMLFILE={CORE_KINDS_XML}\nEnvironment=HWLOC_THISSYSTEM=1\n"
 
 
 def part_time_nodes_conf(site: Site) -> str:
@@ -202,6 +251,10 @@ def _slurm(site: Site, extra: dict[str, str]) -> dict[str, FileSpec]:
         ),
         JOB_CONTAINERS_EPILOG: FileSpec(job_containers_epilog(), EXEC_MODE, "root"),
     }
+    out[CORE_KINDS_DROPIN] = FileSpec(core_kinds_dropin(site), FILE_MODE, "root")
+    for node in site.full_nodes:  # the one full node (the controller): the layout describes it and no other machine
+        if node.fast_cpus:
+            out[CORE_KINDS_XML] = FileSpec(core_kinds_xml(node), FILE_MODE, "root")
     if site.part_time_nodes:  # owned by SlurmUser: the agent, which runs as it, rewrites the file in place
         out[PART_TIME_CONF_PATH] = FileSpec(part_time_nodes_conf(site), FILE_MODE, SLURM_USER)
     dropin = _template("slurm", DROPIN).substitute(values)

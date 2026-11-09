@@ -822,19 +822,32 @@ and read the log's "Reserved machine CPU IDs"; then run a job given all its CPUs
 
 **Fast and slow cores.** On a host whose cores differ (Arm big.LITTLE, Intel performance and efficiency cores) the same job runs several times
 slower on some cores: measured on an Arm host, one thread of a small torch fit took 6 to 8 s on a 3.9 GHz Cortex-X925 core and 27 to 43 s on a
-2.8 GHz Cortex-A725 core. Slurm hands out the lowest free cores and cannot be told to prefer a kind: a node feature belongs to the whole node, and a
+2.8 GHz Cortex-A725 core. Slurm hands out the lowest free cores and cannot be told to prefer a kind by a request alone: a node feature belongs to the whole node, and a
 counted resource tied to sockets did not keep a request on the right cores in slurm 26.05.5 (`design notes`,
-section 10). What the tools do instead is report the fact. `python3 slurm/cores.py` prints the cores of each top speed (from cpufreq's
+section 10); binding the GPU to a socket of fast cores does (below). The tools also report the fact. `python3 slurm/cores.py` prints the cores of each top speed (from cpufreq's
 `cpuinfo_max_freq`, which separates the kinds; `cpu_capacity` does not), `slurm/install/detect.py` puts the same lines in its draft site file, and
 on such a host every run's record (`jobs/<id>.json`, in each leg) has `cores`: the cores that leg was allowed and how many ran at each top speed, e.g.
 `{"cpus": "0-3,8-11", "cores_by_max_mhz": {"2808": 6, "3900": 2}}`. A host whose cores are alike records nothing.
 
-**The one rule that follows: a GPU job always holds a fast core.** A GPU job's host threads (launching kernels, feeding data) decide how busy the card is. Slurm may
-give a job only slow cores, but if the job holds more cores than the host has slow ones, any set it is given contains a fast core and Linux moves the busy threads onto
-it by itself. Measured 2026-11-04 on this host (10 slow, 10 fast cores): an LSTM job on 4 slow cores kept the GPU about 45% busy; the same job on 12 cores (two of them
-fast) kept it 86 to 92% busy. So `submit.py` and `urgent.py` raise a whole-card GPU job below `slow cores + 1` to that number and print a warning saying so; the number comes from
-`slurm/cores.py` on the host the job runs on (11 here and on the Turing box, 0 on a host whose cores are alike), never from a figure written in a site file. It is not
-applied to a shard job (its share of the cores held for the card is fixed by sharing), to a CPU-only job, or when the detected cores are not the GPU node's own.
+**A GPU job holds a fast core.** A GPU job's host threads (launching kernels, feeding data) decide how busy the card is. Measured 2026-11-04 on
+this host (10 slow, 10 fast cores): an LSTM job on 4 slow cores kept the GPU about 45% busy; the same job on 12 cores (two of them fast) kept it 86
+to 92% busy. Two ways to make sure of it, chosen by the site file:
+
+- **With `fast_cpus` on the GPU node (D46, the proper way).** Slurm takes a node's core layout from hwloc, and hwloc can read it from a file. The
+  installer writes `/etc/slurm/core_kinds.xml`, one package per core kind (slow first when the slow kind holds CPU 0), and a slurmd drop-in
+  (`slurmd.service.d/20-core-kinds.conf`) that points slurmd there (`HWLOC_XMLFILE`). Slurm then sees two real sockets, the node line says
+  `SocketsPerBoard=2`, and `gres.conf` binds the GPU and its shards to the fast socket (`Cores=`, slurm's own GPU-to-socket affinity), with
+  `AutoDetect=off` (NVML's detection fails under a layout file; every GPU is listed by hand anyway). A GPU or shard job whose cores fit in the
+  fast socket is submitted with `--ntasks=1 --gres-flags=enforce-binding`: it gets exactly its cores, all fast, and waits for them (or pre-empts
+  a `cpu_fill` job holding them) rather than run on slow ones. `--ntasks=1` matters: without it slurm 26.05.5 gave a 2-core job the whole socket.
+  A GPU job asking more cores than the fast socket has is not bound strictly; slurm gives it the fast cores first. CPU jobs, placed lowest core
+  first, fill the slow socket first. `--cpus` is used as given, and a named GPU job is offered its cores from its runs like a CPU job
+  (`cpus_from_history`). Turning `fast_cpus` on or off renumbers slurm's cores under running jobs, so apply it with no job running on the node
+  (the installer's apply refuses otherwise). `slurmd -C` run by hand still prints the real one-socket layout: only the slurmd service reads the file.
+- **Without it, on a host whose cores differ (D33).** Slurm may give a job only slow cores, but a job holding more cores than the host has slow ones
+  always has a fast one, and Linux moves the busy threads onto it. So `submit.py` and `urgent.py` raise a whole-card GPU job below `slow cores + 1`
+  to that number and warn; the number comes from `slurm/cores.py` on the host (11 here, 0 where cores are alike). Not applied to a shard job, a
+  CPU-only job, or when the detected cores are not the GPU node's own.
 
 **Where a part-time job's records go.** The job wrapper runs on the machine, so a job's record (`jobs/<id>.json`, with
 its legs and peaks), its events (a pushed-back job's `push_back`) and its log are written to the machine's own state

@@ -63,6 +63,7 @@ import cores  # noqa: E402 - path set just above
 import gpu_jobs  # noqa: E402
 import memory_guard  # noqa: E402
 import portability  # noqa: E402
+import site_config  # noqa: E402
 from gpu_jobs import (  # audit.py imports gpu_mib_by_pid from here
     CGROUP_ROOT,
     DOCKER_SOCKETS,
@@ -439,8 +440,8 @@ def measure_usage(cgroup: Path | None, outcome: dict[str, object], before: tuple
 def usage_lines(u: Usage, *, gpu_job: bool, cores_cap: int | None, most_mb: int | None) -> list[str]:
     """The run's report (D37): what it used against what it asked for and, when anything is known, the request for the
     same work next time: memory at its peak plus `AUTO_MARGIN`, or after a memory kill at least `bumped_mem_mb` of what
-    it was given and of its peak (the whole box, `0`, when no node gives that much, as for a run that had the whole box); cores, for a job without GPUs
-    only (a GPU job's are held for the card, D17/D33), its average times `CORES_MARGIN` within `cores_cap`."""
+    it was given and of its peak (the whole box, `0`, when no node gives that much, as for a run that had the whole box); cores, unless
+    `gpu_job` (`cores_advice` decides), its average times `CORES_MARGIN` within `cores_cap`."""
     if u.mem_peak_bytes is None:
         memory = "memory peak unknown"
     else:
@@ -470,6 +471,17 @@ def usage_lines(u: Usage, *, gpu_job: bool, cores_cap: int | None, most_mb: int 
     if flags:
         lines.append(f"[job] for the same work next time: {' '.join(flags)}")
     return lines
+
+
+def cores_advice(site: site_config.Site, *, card: bool, shard: bool, service: bool) -> tuple[bool, int | None]:
+    """(no cores advice, the cores the advice may name) for the run's report. A GPU or shard job gets none: its cores
+    are held for the card (D17/D33), except a whole-card job on a GPU node with `fast_cpus`, whose cores are fast
+    whatever their number (D46), within the node's cores. Others: within the service or CPU-job cap."""
+    node = site_config.gpu_node(site)
+    if card and not shard and node is not None and node.fast_cpus:
+        return False, node.cpus
+    cap = site.service.cores if service else site.cpu_job_cap or max((n.cpus for n in site.nodes), default=None)
+    return card or shard, cap
 
 
 def usage_record(u: Usage, lines: list[str]) -> dict[str, object]:
@@ -651,11 +663,8 @@ def main() -> int:
     killed = stopped or (None if outcome["signals"] else guard_kill(job_id, started, ended, int(outcome["pid"])))  # type: ignore[call-overload]
     usage = measure_usage(cgroup, outcome, before, after, wall_s, guard_killed=killed is not None, unified=site.unified_memory)
     in_service = os.environ.get("SLURM_JOB_PARTITION") == gpu_jobs.Partition.SERVICE and site.service is not None
-    report = usage_lines(
-        usage, gpu_job=arguments.needs_card or SHARDS_ENV in os.environ,
-        cores_cap=site.service.cores if in_service else site.cpu_job_cap or max((n.cpus for n in site.nodes), default=None),
-        most_mb=max((n.jobs_mb for n in site.nodes), default=None),
-    )
+    gpu_job, cores_cap = cores_advice(site, card=arguments.needs_card, shard=SHARDS_ENV in os.environ, service=in_service)
+    report = usage_lines(usage, gpu_job=gpu_job, cores_cap=cores_cap, most_mb=max((n.jobs_mb for n in site.nodes), default=None))
     outcome.update(leg=restart, started_at=started, ended_at=ended, **({"killed_by": killed} if killed else {}),
                    **({"cores": received} if received else {}), usage=usage_record(usage, report))
     # the local record only: legs copied back from a part-time machine must never be written into a user's own sidecar

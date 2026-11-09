@@ -24,6 +24,7 @@ import platform
 import pwd
 import re
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -40,6 +41,7 @@ for path in (HERE, HERE.parent, HERE.parents[1] / "machine" / "earlyoom"):
         sys.path.insert(0, str(path))
 
 import components  # noqa: E402 - paths set just above
+import cores  # noqa: E402
 import components.agent as agent_component  # noqa: E402
 import components.part_time as part_time  # noqa: E402
 import components.slurm as slurm_component  # noqa: E402
@@ -187,10 +189,46 @@ def package_manager(site) -> str:
     return "apt-get"
 
 
+def _this_host() -> str:
+    return socket.gethostname().split(".")[0]
+
+
+def core_kind_refusals(site, speeds: cores.CoreSpeeds | None = None, here: str | None = None) -> list[str]:
+    """`fast_cpus` (D46) on this machine's node must be the cores this host reports fastest: the layout file binds the
+    GPU to them, so a wrong list would hold GPU jobs to slow cores. Prints the match when it holds."""
+    node = next((n for n in site.full_nodes if n.fast_cpus and n.name == (here or _this_host())), None)
+    if node is None:
+        return []
+    speeds = speeds or cores.CoreSpeeds.read()
+    fastest = list(speeds.groups().values())[-1] if speeds.mixed else []
+    if fastest != node.fast_cpu_ids:
+        return [f"site file: {node.name}'s fast_cpus = {node.fast_cpus!r}, but this host's fastest cores are "
+                f"{cores.cpu_list(fastest) if fastest else 'none (all cores alike)'} (`slurm/cores.py`): correct fast_cpus, or leave it out"]
+    print(f"ok       fast_cpus {node.fast_cpus} matches this host's fastest cores")
+    return []
+
+
+def core_kind_warnings(site, speeds: cores.CoreSpeeds | None = None, here: str | None = None) -> list[str]:
+    """A GPU node whose cores come in two equal kinds and has no `fast_cpus`: its GPU jobs are raised to the fewest
+    cores that always include a fast one (D33) instead of holding only what they ask for (D46)."""
+    node = next((n for n in site.full_nodes if n.gpus and not n.fast_cpus and n.name == (here or _this_host())), None)
+    if node is None:
+        return []
+    kinds = list((speeds or cores.CoreSpeeds.read()).groups().values())
+    if len(kinds) != site_config.CORE_KINDS or len(kinds[0]) != len(kinds[1]) or len(kinds[0]) * site_config.CORE_KINDS != node.cpus:
+        return []
+    return [f"{node.name}'s cores come in two kinds; with fast_cpus = \"{cores.cpu_list(kinds[-1])}\" in its site file entry, "
+            "a GPU job holds only the cores it asks for, all fast ones (D46, README \"Fast and slow cores\")"]
+
+
 def platform_refusals(site, modules) -> list[str]:
-    """What would make an apply fail on this machine, found before anything is touched: no package manager to install
-    the packages with, or an apt whose slurm is older than this build supports (not asked when the site builds its
-    own slurm: `[slurm]`)."""
+    """What would make an apply fail on this machine, found before anything is touched: a `fast_cpus` that is not
+    this host's fastest cores, no package manager to install the packages with, or an apt whose slurm is older than
+    this build supports (not asked when the site builds its own slurm: `[slurm]`)."""
+    return [*core_kind_refusals(site), *_package_refusals(site, modules)]
+
+
+def _package_refusals(site, modules) -> list[str]:
     if not apt_install_commands(modules, site):
         return []
     built = getattr(site, "slurm_build", None)
@@ -221,7 +259,7 @@ def platform_warnings(site, os_release: Path = OS_RELEASE) -> list[str]:
         out.append(f"untested architecture {platform.machine()}: the build is tested on {TESTED_ARCH} only")
     if len(site.nodes) > 1:
         out.append(f"the site file lists {len(site.nodes)} nodes: only one-machine sites have been tested")
-    return out
+    return out + core_kind_warnings(site)
 
 
 def cmd_check(site, args, modules) -> int:

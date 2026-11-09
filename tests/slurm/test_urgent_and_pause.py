@@ -119,6 +119,12 @@ def test_free_room_is_counted_only_on_nodes_the_urgent_partition_can_start_a_job
     assert urgent.free_on_nodes() == (6, 5) and asked == [gpu_jobs.Partition.URGENT]
     monkeypatch.setattr(gpu_jobs, "capacity", lambda *_a, **_k: {"nodes": 0})  # every node down: unknown, never "plenty"
     assert urgent.free_on_nodes() is None
+    # D46: a job bound to the fast cores (socket 1 here) counts only those; slow cores and waiting jobs free none of them
+    node = urgent.site_config.Node("n", 20, 1000, (urgent.site_config.Gpu(0, "u", "/dev/nvidia0", "t"),), fast_cpus="5-9,15-19")
+    queue = [gpu_jobs.QueuedJob("1", "cpu_fill", "RUNNING", "None", "p:x:1", cores=frozenset({"n:1:0", "n:1:1", "n:0:0"})),
+             gpu_jobs.QueuedJob("2", "cpu", "PENDING", "Resources", "p:x:2", cores=frozenset({"n:1:2"})),
+             gpu_jobs.QueuedJob("3", "cpu", "RUNNING", "None", "p:x:3", cores=frozenset({"other:1:3"}))]
+    assert urgent.free_fast_cores(queue, node) == 8
 
 
 def test_memory_notation() -> None:

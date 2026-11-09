@@ -45,6 +45,14 @@ def test_cores_that_differ_are_listed_by_top_speed_and_alike_cores_are_not(tmp_p
     assert "top speed" not in text_from("gb10", cpu_root=fake_cpus(tmp_path / "alike", {"0": "3900000", "1": "3900000"}))
     assert "top speed" not in text_from("gb10")  # a host that reports no speeds (no cpufreq)
     assert tomllib.loads(text)["nodes"][0]["name"] == "testbox"  # the note is a comment: the draft still parses
+    assert "fast_cpus" not in text  # three cores in kinds of 1 and 2 cannot be two sockets
+    halves = {str(cpu): "2808000" if cpu % 10 < 5 else "3900000" for cpu in range(20)}  # slow 0-4,10-14; fast 5-9,15-19
+    two_kinds = text_from("gb10", cpu_root=fake_cpus(tmp_path / "halves", halves))
+    assert 'fast_cpus = "5-9,15-19"' in two_kinds  # D46, and the draft loads as a site file
+    assert detect.site_config.parse(tomllib.loads(two_kinds)).nodes[0].fast_socket_cores == "10-19"
+    assert "fast_cpus" not in text_from(None, cpu_root=tmp_path / "halves")  # no GPU: nothing to bind
+    uneven = {str(cpu): "2808000" if cpu < 12 else "3900000" for cpu in range(20)}  # 12 slow, 8 fast: no equal sockets
+    assert "fast_cpus" not in text_from("gb10", cpu_root=fake_cpus(tmp_path / "uneven", uneven))
 
 
 def test_gb10_is_unified_with_one_gpu():

@@ -15,6 +15,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # slurm/, a standalone driver like footprint.py
 
 import cores  # noqa: E402 - path set just above
+import site_config  # noqa: E402
 import host_memory  # noqa: E402 - path set just above
 
 DEFAULT_RESERVE_MB = 12288  # the host memory guard's 12 GiB
@@ -95,7 +96,11 @@ def render(
     ]
     for mhz, group in (core_groups or {}).items():  # only given when the cores differ
         lines.append(f"# top speed {mhz} MHz: {len(group)} cores ({cores.cpu_list(group)})")
-    if core_groups:
+    kinds = list((core_groups or {}).values())
+    if gpus and len(kinds) == site_config.CORE_KINDS and len(kinds[0]) == len(kinds[1]) and sum(map(len, kinds)) == cpus:
+        lines += ["# the GPU is bound to the fast cores, and a GPU job holds only the cores it asks for (D46)",
+                  f"fast_cpus = {quote(cores.cpu_list(kinds[-1]))}"]
+    elif core_groups:
         lines.append("# slurm hands cores out without telling these apart; `slurm/cores.py` lists them, each run records which it got")
     if not gpus:
         lines.append("# no GPUs detected (nvidia-smi missing or listed none)")

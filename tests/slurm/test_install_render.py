@@ -3,6 +3,7 @@ import difflib
 import importlib
 import importlib.util
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -124,6 +125,7 @@ def test_golden_matches_tracked_files_except_the_planned_lines():
     files = render.render(site, "slurm")
     epilog = files.pop(render.JOB_CONTAINERS_EPILOG)  # D45: on every site, newer than the golden files
     assert (epilog.mode, epilog.owner) == (0o755, "root") and epilog.content.startswith("#!/bin/sh\n")
+    assert "Environment" not in files.pop(render.CORE_KINDS_DROPIN).content  # D46: no fast_cpus, no layout file
     assert set(files) == set(TRACKED)
     for target, name in TRACKED.items():
         got = _changed_lines((GOLDEN / name).read_text(), files[target].content)
@@ -178,6 +180,21 @@ def test_sharing_card_renders_shard_lines_and_the_unshared_site_has_none():
     conf, gres = shared["/etc/slurm/slurm.conf"].content, shared["/etc/slurm/gres.conf"].content
     assert "\nGresTypes=gpu,shard\n" in conf and "Gres=gpu:gb10:1,shard:12 " in conf and "\nAccountingStorageTRES=gres/gpu,gres/shard\n" in conf
     assert "NodeName=n1 Name=shard Count=12 File=/dev/nvidia0\n" in gres
+    assert render.CORE_KINDS_XML not in shared and "Cores=" not in gres and "SocketsPerBoard=1 CoresPerSocket=20 " in conf
+    # D46: the same card bound to the fast kind of cores, which slurmd sees as socket 1 through the layout file
+    raw["nodes"][0]["fast_cpus"] = "5-9,15-19"
+    bound = render.render(site_config.parse(raw), "slurm")
+    conf, gres = bound["/etc/slurm/slurm.conf"].content, bound["/etc/slurm/gres.conf"].content
+    assert "SocketsPerBoard=2 CoresPerSocket=10 " in conf
+    assert "\nAutoDetect=off\nNodeName=n1 Name=gpu Type=gb10 File=/dev/nvidia0 Cores=10-19\n" in gres
+    assert "NodeName=n1 Name=shard Count=12 File=/dev/nvidia0 Cores=10-19\n" in gres
+    layout = bound[render.CORE_KINDS_XML].content
+    pus = [int(x) for x in re.findall(r'type="PU" os_index="(\d+)"', layout)]
+    assert pus == [0, 1, 2, 3, 4, 10, 11, 12, 13, 14, 5, 6, 7, 8, 9, 15, 16, 17, 18, 19]  # package 0 slow, package 1 fast
+    assert "Environment=HWLOC_XMLFILE=/etc/slurm/core_kinds.xml\n" in bound[render.CORE_KINDS_DROPIN].content
+    raw["nodes"][0]["fast_cpus"] = "0-9"  # a fast kind holding CPU 0 is socket 0
+    assert "Cores=0-9\n" in render.render(site_config.parse(raw), "slurm")["/etc/slurm/gres.conf"].content
+    del raw["nodes"][0]["fast_cpus"]
     raw["nodes"][0]["gpus"] = [gpu]  # the same site, card not shared: no trace of shards
     plain = render.render(site_config.parse(raw), "slurm")
     assert "shard" not in plain["/etc/slurm/slurm.conf"].content + plain["/etc/slurm/gres.conf"].content

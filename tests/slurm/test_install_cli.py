@@ -186,11 +186,11 @@ def test_apply_refuses_with_a_busy_queue_or_without_the_lease_client(env, monkey
     release = tmp / "os-release"
     release.write_text('PRETTY_NAME="Debian GNU/Linux 12"\nID=debian\nVERSION_ID="12"\n')
     monkeypatch.setattr(cli.platform, "machine", lambda: "x86_64")
-    warnings = cli.platform_warnings(SimpleNamespace(nodes=[1, 2]), release)
+    warnings = cli.platform_warnings(SimpleNamespace(nodes=[1, 2], full_nodes=()), release)
     assert [w.split()[:2] for w in warnings] == [["untested", "operating"], ["untested", "architecture"], ["the", "site"]]
     release.write_text('PRETTY_NAME="Ubuntu 24.04.3 LTS"\nID=ubuntu\nVERSION_ID="24.04"\n')
     monkeypatch.setattr(cli.platform, "machine", lambda: "aarch64")
-    assert cli.platform_warnings(SimpleNamespace(nodes=[1]), release) == []
+    assert cli.platform_warnings(SimpleNamespace(nodes=[1], full_nodes=()), release) == []
     taken = tmp / "taken"  # a machine whose slurm someone else set up: never replaced unasked
     (taken / "etc/slurm").mkdir(parents=True)
     (taken / "etc/slurm/slurm.conf").write_text("ClusterName=theirs\n")
@@ -326,7 +326,7 @@ def test_slurm_table_installs_the_built_packages_in_place_of_the_distros(env, mo
     modules = components.load(cli.site_config.load(site), ["slurm"])
     assert cli.apt_install_commands(modules, cli.site_config.load(site)) == [["dnf", "install", "-y", "mariadb-server", "munge"]]
     assert cli.platform_refusals(cli.site_config.load(site), modules) == []
-    assert cli.platform_refusals(SimpleNamespace(slurm_build=None), modules)
+    assert cli.platform_refusals(SimpleNamespace(slurm_build=None, full_nodes=()), modules)
     fake.calls.clear()  # dnf systems mask the daemons around the install, and unmask them
     with slurm_component.daemons_held("dnf"):
         fake.calls.append(["install"])
@@ -704,3 +704,24 @@ def test_shared_state_copies_nothing_back_and_installs_nothing_for_it(tmp_path, 
     flat = [" ".join(c) for c in fake.calls]
     assert ["apt-get", "install", "-y", "munge"] in fake.calls and len(sent) == 1  # only the munge key
     assert not any("rrsync" in c or "ssh-keygen" in c or ".ssh" in c for c in flat)
+
+
+def test_fast_cpus_must_be_the_hosts_fastest_cores_and_an_unset_two_kind_gpu_node_is_told(capsys):
+    """D46: the layout binds the GPU to `fast_cpus`, so a list that is not this host's fastest cores is refused."""
+    halves = cli.cores.CoreSpeeds({cpu: 2808000 if cpu % 10 < 5 else 3900000 for cpu in range(20)})
+    gpu = {"index": 0, "uuid": "GPU-0", "device": "/dev/nvidia0", "type": "gb10"}
+    raw = {"name": "s", "nodes": [{"name": "n1", "cpus": 20, "real_memory_mb": 100000, "gpus": [gpu], "fast_cpus": "5-9,15-19"}]}
+    site = cli.site_config.parse(raw)
+    assert cli.core_kind_refusals(site, halves, "n1") == []
+    assert "fast_cpus 5-9,15-19 matches this host's fastest cores" in capsys.readouterr().out
+    assert cli.core_kind_refusals(site, halves, "elsewhere") == []  # another machine's node is not judged here
+    raw["nodes"][0]["fast_cpus"] = "0-4,10-14"  # the slow kind
+    (wrong,) = cli.core_kind_refusals(cli.site_config.parse(raw), halves, "n1")
+    assert "this host's fastest cores are 5-9,15-19" in wrong
+    alike = cli.cores.CoreSpeeds(dict.fromkeys(range(20), 3900000))
+    assert "none (all cores alike)" in cli.core_kind_refusals(cli.site_config.parse(raw), alike, "n1")[0]
+    del raw["nodes"][0]["fast_cpus"]
+    unset = cli.site_config.parse(raw)
+    (hint,) = cli.core_kind_warnings(unset, halves, "n1")
+    assert 'fast_cpus = "5-9,15-19"' in hint
+    assert cli.core_kind_warnings(unset, alike, "n1") == []

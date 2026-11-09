@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import dataclasses
 import json
-import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -338,7 +337,7 @@ def test_a_gpu_job_gets_its_gpus_share_of_the_cores(site_cpus: int | None, held:
     monkeypatch.setattr(gpu_jobs, "STATE_DIR", tmp_path)
     if site_cpus is not None:
         gpus = (site_config.Gpu(0, "GPU-a", "/dev/nvidia0", "gb10"),) * (4 if "--gpus" in argv else 1)
-        node = SimpleNamespace(cpus=site_cpus, gpus=gpus, cores_per_gpu=held)
+        node = SimpleNamespace(cpus=site_cpus, gpus=gpus, cores_per_gpu=held, fast_cpus=None)
         fake_site(monkeypatch, lease=None, dgx_gate=False, nodes=(node,))
     script = dry("--project", "p", "--what", "w", "--class", "restart", "--mem", "4G", *argv, "--", "x")
     assert f"{DIRECTIVE} --cpus-per-task={cpus}" in script
@@ -361,10 +360,39 @@ def test_a_gpu_job_on_mixed_cores_always_holds_a_fast_core(khz: dict[int, int], 
                                                            tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(gpu_jobs, "STATE_DIR", tmp_path)
     monkeypatch.setattr(cores.CoreSpeeds, "read", classmethod(lambda cls, root=None: cls(khz)))
-    node = SimpleNamespace(cpus=node_cpus, gpus=(site_config.Gpu(0, "GPU-a", "/dev/nvidia0", "gb10"),), cores_per_gpu=6)
+    node = SimpleNamespace(cpus=node_cpus, gpus=(site_config.Gpu(0, "GPU-a", "/dev/nvidia0", "gb10"),), cores_per_gpu=6, fast_cpus=None)
     fake_site(monkeypatch, lease=None, dgx_gate=False, nodes=(node,))
     script = dry("--project", "p", "--what", "w", "--class", "restart", "--mem", "4G", "--gpu", *argv, "--", "x")
     assert f"{DIRECTIVE} --cpus-per-task={cpus}" in script
+
+
+def test_a_gpu_job_on_a_fast_cpus_node_keeps_its_cores_and_is_bound_to_the_fast_ones(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """D46: no raise to 11; a GPU job that fits in the fast cores is held to them, a larger one is not; a named GPU job
+    is sized from its runs like a CPU job."""
+    monkeypatch.setattr(gpu_jobs, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(cores.CoreSpeeds, "read", classmethod(lambda cls, root=None: cls(
+        {**dict.fromkeys(range(10), 2_800_000), **dict.fromkeys(range(10, 20), 3_900_000)})))
+    monkeypatch.setattr(gpu_jobs, "measured_cores", lambda job_name: (1.0, 3))
+    gpu = site_config.Gpu(0, "GPU-a", "/dev/nvidia0", "gb10")
+    node = site_config.Node("n", 20, 100000, (gpu,), cores_per_gpu=12, fast_cpus="10-19")
+    fake_site(monkeypatch, lease=None, dgx_gate=False, nodes=(node,), cpus_from_history=site_config.CoresFromHistory.ENFORCE)
+
+    def job(*argv: str) -> tuple[str, str]:
+        capsys.readouterr()
+        script = dry("--project", "p", "--what", "w", "--class", "restart", "--mem", "4G", *argv, "--", "x")
+        return script, capsys.readouterr().out
+
+    script, out = job("--gpu", "--cpus", "2")
+    assert f"{DIRECTIVE} --cpus-per-task=2" in script and "[submit] cores: 2 fast cores, bound to the GPU" in out
+    assert f"{DIRECTIVE} --ntasks=1\n" in script and f"{DIRECTIVE} --gres-flags=enforce-binding\n" in script
+    script, out = job("--gpu", "--cpus", "12")  # more than the 10 fast cores: fast first, never strict
+    assert f"{DIRECTIVE} --cpus-per-task=12" in script and "--ntasks" not in script and "10 fast cores first" in out
+    script, out = job("--gpu", "--name", "n")  # sized from its runs: ceil(1.0 x 1.25)
+    assert f"{DIRECTIVE} --cpus-per-task=2" in script and "--gres-flags=enforce-binding" in script
+    script, _ = job("--name", "n")  # a CPU-only job is never bound
+    assert "--ntasks" not in script and "--gres-flags" not in script
 
 
 def test_a_cpu_job_over_the_cpu_cap_is_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

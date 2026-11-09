@@ -23,7 +23,8 @@ real_memory_mb = 1000
 """
 SHA = "ab" * 32
 GPU = "[[nodes.gpus]]\nindex = 0\nuuid = 'u'\ndevice = 'd'\ntype = 't'\n"
-SHARING_NODE = MINIMAL.replace("cpus = 2", "cpus = 8") + "cores_per_gpu = 6\n" + GPU  # a node holding 6 cores for its one card
+EIGHT_CORES = MINIMAL.replace("cpus = 2", "cpus = 8")
+SHARING_NODE = EIGHT_CORES + "cores_per_gpu = 6\n" + GPU  # a node holding 6 cores for its one card
 
 
 def write(tmp_path: Path, text: str) -> Path:
@@ -138,6 +139,10 @@ def test_example_loads_and_minimal_file_gets_every_default(tmp_path: Path) -> No
         (MINIMAL + "close_below_gb = nan\n", "close_below_gb = nan"),
         (MINIMAL + "close_below_gb = inf\n", "close_below_gb = inf"),
         (MINIMAL + PART_TIME + "address = 'a'\nkeep_cpus = '0-'\n", "keep_cpus = '0-'"),
+        (EIGHT_CORES + "fast_cpus = '4-'\n" + GPU, "fast_cpus = '4-'"),
+        (EIGHT_CORES + "fast_cpus = '4-7'\n", "it needs a full node with GPUs"),
+        (EIGHT_CORES + "fast_cpus = '4-6'\n" + GPU, "exactly half of the node's 8 CPUs"),  # kinds of unequal size
+        (EIGHT_CORES + "fast_cpus = '6-9'\n" + GPU, "exactly half of the node's 8 CPUs"),  # a CPU the node lacks
         (MINIMAL + "address = 'a'\n", "apply only with part_time = true"),
         (MINIMAL + "jobs_memory_gb = 9\n", "jobs_memory_gb = 9"),  # a full node's reserve is checked as a part-time one's
         (MINIMAL + "close_below_gb = 4\npush_back_below_gb = 5\n", "push_back_below_gb must not exceed"),

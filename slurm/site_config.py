@@ -26,6 +26,17 @@ SLURM_MB_PER_GB = 1e9 / 2**20  # slurm's "MB" (`real_memory_mb`, MemSpecLimit) i
 #: Health-check thresholds in GB when a node names none, by `part_time`: (close below, push back below).
 _DEFAULT_THRESHOLDS_GB = {False: (16, 10), True: (6, 2)}
 _CPU_SPEC_LIST = re.compile(r"\d+(-\d+)?(,\d+(-\d+)?)*")
+#: Core kinds on a node with `fast_cpus`: slurm is shown one socket per kind (D46), and CoresPerSocket is one number.
+CORE_KINDS = 2
+
+
+def cpu_ids(spec: str) -> list[int]:
+    """CPU numbers from a slurm/taskset list such as "0-4,10-14", sorted (the inverse of `cores.cpu_list`)."""
+    ids: set[int] = set()
+    for part in spec.split(","):
+        low, _, high = part.partition("-")
+        ids.update(range(int(low), int(high or low) + 1))
+    return sorted(ids)
 
 
 class MetricsMode(StrEnum):
@@ -90,6 +101,7 @@ class Node:
     push_back_below_gb: float | None = None  # health check: requeue a resume job below this much free memory
     cores_per_socket: int | None = None  # CoresPerSocket as `slurmd -C` prints it, when that is not `cpus` (hybrid Intel CPUs); None: cpus
     default_jobs: bool = True  # part-time: false keeps the node opt-in (`submit.py --anywhere`); true lets portable jobs go there unasked
+    fast_cpus: str | None = None  # GPU node with two equal core kinds: OS CPUs of the fast kind, e.g. "5-9,15-19" (D46)
 
     @property
     def gpu_cores(self) -> int:
@@ -121,11 +133,37 @@ class Node:
     @property
     def cores_lent(self) -> int:
         """Cores slurm hands to jobs: its abstract cores (`cores_per_socket`, else `cpus`) less the ids in `keep_cpus`."""
-        kept = 0
-        for part in (self.keep_cpus or "").split(","):
-            low, _, high = part.partition("-")
-            kept += int(high or low) - int(low) + 1 if part else 0
-        return (self.cores_per_socket or self.cpus) - kept
+        return (self.cores_per_socket or self.cpus) - (len(cpu_ids(self.keep_cpus)) if self.keep_cpus else 0)
+
+    @property
+    def sockets(self) -> tuple[int, int]:
+        """(sockets, cores per socket) as slurmd sees the node: one socket per core kind with `fast_cpus`, whose layout
+        file shows the kinds as packages (D46), else one socket of `cores_per_socket` or `cpus`."""
+        if self.fast_cpus:
+            return CORE_KINDS, self.cpus // CORE_KINDS
+        return 1, self.cores_per_socket or self.cpus
+
+    @property
+    def fast_cpu_ids(self) -> list[int]:
+        """The OS CPUs of the fast kind (`fast_cpus`); empty when unset."""
+        return cpu_ids(self.fast_cpus) if self.fast_cpus else []
+
+    @property
+    def fast_cores(self) -> int:
+        """Cores of the fast kind: the most a GPU job may ask for and still be held to them (D46); 0 when unset."""
+        return len(self.fast_cpu_ids)
+
+    @property
+    def fast_socket(self) -> int:
+        """The socket slurm numbers the fast kind under the layout file: hwloc orders packages by their lowest CPU."""
+        slow = [cpu for cpu in range(self.cpus) if cpu not in self.fast_cpu_ids]
+        return 0 if self.fast_cpu_ids and min(self.fast_cpu_ids) < min(slow) else 1
+
+    @property
+    def fast_socket_cores(self) -> str:
+        """Slurm's own (abstract) numbers of the fast socket's cores, as gres.conf's `Cores=` wants them: "10-19"."""
+        first = self.fast_socket * self.fast_cores
+        return f"{first}-{first + self.fast_cores - 1}"
 
     @property
     def jobs_mb(self) -> int:
@@ -247,6 +285,11 @@ class Site:
         return tuple(n for n in self.nodes if not n.part_time)
 
 
+def gpu_node(site: Site) -> Node | None:
+    """The node holding the GPUs (one-GPU-node sites, D44); None without GPUs."""
+    return next((n for n in site.nodes if n.gpus), None)
+
+
 def _cpu_job_cap(nodes: tuple[Node, ...]) -> int | None:
     """Cores a CPU-only job may use per node (its partitions' MaxCPUsPerNode): every node's cores less those held
     for its GPUs, at the tightest node; None when no node holds cores. slurm 23.11 has no per-node form, so a
@@ -314,13 +357,14 @@ def _parse_node(raw: Any, i: int) -> Node:
     t = _table(raw, where, {"name", "cpus", "real_memory_mb"}, {
         "gpus": [], "cores_per_gpu": None, "part_time": False, "address": None, "keep_cpus": None,
         "jobs_memory_gb": None, "mains_only": None, "close_below_gb": None, "push_back_below_gb": None,
-        "cores_per_socket": None, "default_jobs": True,
+        "cores_per_socket": None, "default_jobs": True, "fast_cpus": None,
     })
     gpus = tuple(_parse_gpu(g, f"{where}.gpus[{j}]", t["cores_per_gpu"]) for j, g in enumerate(t["gpus"]))
     node = Node(t["name"], t["cpus"], t["real_memory_mb"], gpus, t["cores_per_gpu"], t["part_time"], t["address"],
                 t["keep_cpus"], t["jobs_memory_gb"], t["mains_only"], t["close_below_gb"], t["push_back_below_gb"],
-                t["cores_per_socket"], t["default_jobs"])
+                t["cores_per_socket"], t["default_jobs"], t["fast_cpus"])
     _check_part_time(node, where)
+    _check_fast_cpus(node, where)
     if node.cores_per_socket is not None and not (type(node.cores_per_socket) is int and 1 <= node.cores_per_socket <= node.cpus):
         raise SiteError(f"site file: [{where}] cores_per_socket = {node.cores_per_socket!r}; expected a whole number from 1 to cpus ({node.cpus})")
     if node.cores_per_gpu is not None and not (
@@ -329,6 +373,21 @@ def _parse_node(raw: Any, i: int) -> Node:
         raise SiteError(f"site file: [{where}] cores_per_gpu must be a whole number of at least 1, needs GPUs, and must leave CPU-only jobs a core "
                         f"({node.cores_per_gpu} x {len(gpus)} GPU(s) of {node.cpus} cores)")
     return node
+
+
+def _check_fast_cpus(node: Node, where: str) -> None:
+    if node.fast_cpus is None:
+        return
+    if not (isinstance(node.fast_cpus, str) and _CPU_SPEC_LIST.fullmatch(node.fast_cpus)):
+        raise SiteError(f"site file: [{where}] fast_cpus = {node.fast_cpus!r}; expected CPU numbers and ranges such as \"5-9,15-19\"")
+    if not node.gpus or node.part_time or node.keep_cpus is not None or node.cores_per_socket is not None:
+        raise SiteError(f"site file: [{where}] fast_cpus binds the GPU to the fast cores: it needs a full node with GPUs, "
+                        "and no keep_cpus or cores_per_socket")
+    ids = node.fast_cpu_ids
+    if ids[-1] >= node.cpus or len(ids) * CORE_KINDS != node.cpus:
+        raise SiteError(f"site file: [{where}] fast_cpus = {node.fast_cpus!r}; expected exactly half of the node's {node.cpus} CPUs, "
+                        "each below cpus (slurm gives every socket the same number of cores); `slurm/cores.py` lists the kinds, "
+                        "or leave fast_cpus out")
 
 
 def _check_part_time(node: Node, where: str) -> None:
