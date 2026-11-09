@@ -43,9 +43,10 @@ RUN apt-get update \
     else apt-get install -y --no-install-recommends slurm-wlm slurmdbd ; fi \
  && rm -rf /var/lib/apt/lists/*
 # The built debs stay where slurm_build.py caches them, so the installer's `[slurm]` step finds them instead of building.
+# The folder is slurm_build.build_dir(): family, os-release ID and VERSION_ID, machine.
 RUN if [ -n "$SLURM_VERSION" ]; then \
-      install -d "/var/cache/gpujobs/slurm/$SLURM_VERSION/deb-$(uname -m)" \
-      && cp /debs/*.deb "/var/cache/gpujobs/slurm/$SLURM_VERSION/deb-$(uname -m)/" ; \
+      dir="/var/cache/gpujobs/slurm/$SLURM_VERSION/deb-$(. /etc/os-release && echo "$ID$VERSION_ID")-$(uname -m)" \
+      && install -d "$dir" && cp /debs/*.deb "$dir/" ; \
     fi \
  && rm -rf /debs
 

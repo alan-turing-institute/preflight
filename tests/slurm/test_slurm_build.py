@@ -47,21 +47,22 @@ class Fakes:
             (target / self.leaves).write_bytes(b"pkg")
 
 
-@pytest.mark.parametrize("text, fam, leaves, install", [
-    ('ID=ubuntu\nID_LIKE=debian\n', sb.Family.DEB, "slurm-smd_26.05.5_arm64.deb", sb.DEB_TOOLS),
-    ('ID=debian\n', sb.Family.DEB, "slurm-smd_26.05.5_arm64.deb", sb.DEB_TOOLS),
-    ('ID=fedora\n', sb.Family.RPM, "slurm-26.05.5.rpm", None),
+@pytest.mark.parametrize("text, fam, leaves, install, folder", [
+    ('ID=ubuntu\nVERSION_ID="24.04"\nID_LIKE=debian\n', sb.Family.DEB, "slurm-smd_26.05.5_arm64.deb", sb.DEB_TOOLS, "deb-ubuntu24.04"),
+    ('ID=debian\nVERSION_ID="13"\n', sb.Family.DEB, "slurm-smd_26.05.5_arm64.deb", sb.DEB_TOOLS, "deb-debian13"),
+    ('ID=fedora\nVERSION_ID=45\n', sb.Family.RPM, "slurm-26.05.5.rpm", None, "rpm-fedora45"),
 ])
-def test_build_downloads_checks_builds_and_reuses_the_cache(tmp_path, text, fam, leaves, install):
+def test_build_downloads_checks_builds_and_reuses_the_cache(tmp_path, text, fam, leaves, install, folder):
     fakes, cache = Fakes(leaves), tmp_path / "cache"
     kwargs = {"download": fakes.download, "run": fakes.run, "os_release": release(tmp_path, text)}
     packages = sb.build("26.05.5", SHA, cache, **kwargs)
     assert fakes.urls == [URL]
     assert [p.name for p in packages] == [leaves]
-    assert packages[0].is_relative_to(cache / "26.05.5" / f"{fam}-{platform.machine()}")
+    workdir = cache / "26.05.5" / f"{folder}-{platform.machine()}"  # one build per release: it links that release's libraries
+    assert packages[0].is_relative_to(workdir)
     names = [argv[0] for argv, _ in fakes.ran]
     if fam is sb.Family.DEB:
-        source = cache / "26.05.5" / f"deb-{platform.machine()}" / "slurm-26.05.5"
+        source = workdir / "slurm-26.05.5"
         assert fakes.ran[0][0] == install
         assert (["mk-build-deps", "-i", "-r", "-t", sb.MK_BUILD_DEPS_TOOL, "debian/control"], source) in fakes.ran
         assert (["debuild", "-b", "-uc", "-us"], source) in fakes.ran
@@ -71,7 +72,6 @@ def test_build_downloads_checks_builds_and_reuses_the_cache(tmp_path, text, fam,
         built = fakes.ran[-1][0]
         assert built[1] == "-ta" and sb.RPM_WITH == built[3:3 + len(sb.RPM_WITH)] and "hwloc" not in built  # without cgroupv2 slurmd cannot start on Fedora
         assert fakes.ran[2][0][:3] == ["dnf", "builddep", "-y"] and {"dbus-devel", "json-c-devel"} <= set(fakes.ran[3][0])
-    workdir = cache / "26.05.5" / f"{fam}-{platform.machine()}"
     assert (workdir / sb.MARKER).read_text().strip() == SHA  # written once the build finished
     assert sb.build("26.05.5", SHA, cache, **kwargs) == packages  # the second call builds and downloads nothing
     assert len(fakes.urls) == 1 and len(fakes.ran) == len(names)
@@ -85,6 +85,11 @@ def test_build_downloads_checks_builds_and_reuses_the_cache(tmp_path, text, fam,
         before = len(fakes.ran)
         assert [p.name for p in sb.build("26.05.5", SHA, cache, **kwargs)] == [leaves] and not stale.exists()
         assert len(fakes.ran) == before + len(names) and len(fakes.urls) == 1
+    # the next release of the system (Fedora 44 -> 45) builds again: the old build would be put back by a reinstall
+    before, newer = len(fakes.ran), tmp_path / "os-release-next"
+    newer.write_text(text.replace("VERSION_ID=", "VERSION_ID=9"))
+    assert not sb.build("26.05.5", SHA, cache, **{**kwargs, "os_release": newer})[0].is_relative_to(workdir)
+    assert len(fakes.ran) == before + len(names) and len(fakes.urls) == 1
     assert fakes.unlocked == []
 
 

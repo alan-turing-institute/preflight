@@ -62,17 +62,41 @@ def install_release(version: str, sha256: str) -> list[list[str]]:
     return install_commands(slurm_build.build(version, sha256))
 
 
+def lock(manager: str, names: list[str], locked: bool) -> list[str]:
+    """Keep the package manager from replacing our slurm packages (`locked`), or let it (only around our own installs).
+    SchedMD's upgrade guide: keep slurm out of routine updates. Measured 2026-11-08: a Fedora 44 -> 45 upgrade put the
+    distribution's slurm of the same version (built with hwloc) in place of ours, which then saw 12 of a hybrid CPU's 22
+    CPUs, and the controller marked the node invalid. A dnf versionlock holds through a release upgrade (container
+    test 2026-11-09, `distro-sync --releasever`); apt-mark hold is apt's equivalent."""
+    if manager == "apt-get":
+        return ["apt-mark", "hold" if locked else "unhold", *names]
+    return ["dnf", "versionlock", "add" if locked else "delete", *names]
+
+
+def _installed_debs(names: list[str]) -> list[str]:
+    status = components.run(["dpkg-query", "-W", "-f=${db:Status-Abbrev} ${Package}\\n", *names]).stdout or ""
+    # the second letter is the state: `ii` installed, `hi` installed and held (as `lock` leaves ours), `rc` removed
+    return [fields[1] for line in status.splitlines() if len(fields := line.split()) == DPKG_FIELDS and fields[0][1:] == "i"]
+
+
 def install_commands(built: list[Path]) -> list[list[str]]:
     """Install the allowlisted packages among `built` (`slurm_build.installable`), after removing the distribution's
-    slurm packages when installed. Run them under `daemons_held`."""
+    slurm packages when installed, and `lock` them. Run them under `daemons_held`."""
     wanted = [str(p) for p in slurm_build.installable(built)]
     if not wanted:
         raise slurm_build.SlurmBuildError("the build left none of the packages that get installed (slurm_build.DEB_INSTALL, RPM_INSTALL)")
+    names = [slurm_build.package_name(Path(p)) for p in wanted]
     if not wanted[0].endswith(".deb"):
-        return [["dnf", "install", "-y", *wanted]]
-    status = components.run(["dpkg-query", "-W", "-f=${db:Status-Abbrev} ${Package}\\n", *DISTRO_SLURM]).stdout or ""
-    installed = [fields[1] for line in status.splitlines() if len(fields := line.split()) == DPKG_FIELDS and fields[0] == "ii"]
-    return [*([["apt-get", "remove", "-y", *installed]] if installed else []), ["apt-get", "install", "-y", *wanted]]
+        # A build has the name, version and release of the distribution's own package of that version (Fedora ships
+        # slurm under the same names), and `dnf install` then keeps the installed files and reports success (container
+        # test 2026-11-09); `reinstall` puts ours in. `dnf-command(versionlock)` is dnf5 itself, or dnf4's plugin.
+        return [["dnf", "install", "-y", "dnf-command(versionlock)"], lock("dnf", names, False),
+                ["dnf", "install", "-y", *wanted], ["dnf", "reinstall", "-y", *wanted], lock("dnf", names, True)]
+    installed = _installed_debs([*DISTRO_SLURM, *names])
+    distro, ours = [n for n in installed if n in DISTRO_SLURM], [n for n in installed if n in names]
+    return [*([["apt-get", "remove", "-y", *distro]] if distro else []),
+            *([lock("apt-get", ours, False)] if ours else []),  # apt-mark refuses a package it does not know
+            ["apt-get", "install", "-y", *wanted], lock("apt-get", names, True)]
 
 
 #: Packages start their daemons when installed (SchedMD's debs, Ubuntu's, and the rpms'): a new slurmdbd started that
@@ -372,12 +396,14 @@ def restore_text(folder: Path, state_save: str, previous: str, manager: str, par
     stopped again before the files come back; `partitions` are the states they had before the upgrade closed them."""
     cached = slurm_build.DEFAULT_CACHE / re.search(r"\d+\.\d+\.\d+", previous)[0]  # as printed: the directory is 25.05.9
     apt = manager == "apt-get"
+    ours = slurm_build.DEB_INSTALL if apt else slurm_build.RPM_INSTALL
+    unlock = f"{' '.join(lock(manager, ours, False))} || true"  # the upgrade locked the new release's packages
     if previous.startswith("slurm-wlm"):
-        reinstall = f"{manager} install -y {'--allow-downgrades ' if apt else ''}slurm-wlm slurmdbd"
+        reinstall = [f"{manager} install -y {'--allow-downgrades ' if apt else ''}slurm-wlm slurmdbd"]
     else:
-        names = slurm_build.DEB_INSTALL if apt else slurm_build.RPM_INSTALL  # only these, as the upgrade installs
-        files = [f"{cached}/*/{n}_*.deb" if apt else f"{cached}/*/rpmbuild/RPMS/*/{n}-[0-9]*.rpm" for n in names]
-        reinstall = f"{manager} install -y {' '.join(files)}"
+        built = cached / slurm_build.build_dir()  # this system release's build, never an older release's
+        files = [f"{built}/{n}_*.deb" if apt else f"{built}/rpmbuild/RPMS/*/{n}-[0-9]*.rpm" for n in ours]  # as the upgrade installs
+        reinstall = [f"{manager} install -y {' '.join(files)}", " ".join(lock(manager, ours, True))]
     policy = f"/{POLICY_RC_D}"
     hold, release = ([f"mv -n {policy} {policy}.gpujobs-saved 2>/dev/null; printf '#!/bin/sh\\nexit 101\\n' > {policy}; chmod 755 {policy}"],
                      [f"rm -f {policy}; mv {policy}.gpujobs-saved {policy} 2>/dev/null; true"]) if apt else (
@@ -385,8 +411,9 @@ def restore_text(folder: Path, state_save: str, previous: str, manager: str, par
     stop = "systemctl stop slurmctld slurmd slurmdbd"
     lines = [stop,
              *hold,
+             unlock,
              f"{manager} remove -y 'slurm-smd*'" if apt else "dnf remove -y 'slurm*'",
-             reinstall,
+             *reinstall,
              *release,
              stop,  # the packages' scripts may have started one
              "mariadb -e 'DROP DATABASE IF EXISTS slurm_acct_db; CREATE DATABASE slurm_acct_db'",

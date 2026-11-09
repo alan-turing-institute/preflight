@@ -66,10 +66,22 @@ def tarball_url(version: str) -> str:
     return URL.format(dashed=version.replace(".", "-"), version=version)
 
 
+def _os_fields(os_release: Path) -> dict[str, str]:
+    text = os_release.read_text(encoding="utf-8", errors="replace") if os_release.exists() else ""
+    return dict(re.findall(r'^(\w+)="?([^"\n]*)"?$', text, re.MULTILINE))
+
+
+def os_key(os_release: Path = OS_RELEASE) -> str:
+    """`ID` and `VERSION_ID` from os-release, e.g. `fedora45`: a build links the libraries of the release it was made on,
+    and an rpm carries that release in its name (`.fc44`), so a build is reused only on the same release (a Fedora 44
+    build reinstalled on Fedora 45 would be the old one)."""
+    fields = _os_fields(os_release)
+    return f"{fields.get('ID', 'unknown')}{fields.get('VERSION_ID', '')}"
+
+
 def family(os_release: Path = OS_RELEASE) -> Family:
     """Debs on Debian and its derivatives, rpms on Fedora and RHEL ones, by `ID` and `ID_LIKE` in os-release."""
-    text = os_release.read_text(encoding="utf-8", errors="replace") if os_release.exists() else ""
-    fields = dict(re.findall(r'^(\w+)="?([^"\n]*)"?$', text, re.MULTILINE))
+    fields = _os_fields(os_release)
     ids = f"{fields.get('ID', '')} {fields.get('ID_LIKE', '')}".split()
     if "debian" in ids:
         return Family.DEB
@@ -134,6 +146,11 @@ def commands(fam: Family, version: str, tarball: Path, source: Path) -> list[tup
             (["rpmbuild", "-ta", str(tarball), *RPM_WITH, "--define", f"_topdir {workdir / 'rpmbuild'}"], workdir)]
 
 
+def build_dir(os_release: Path = OS_RELEASE) -> str:
+    """The folder of a version's cache that holds the build for this machine: `rpm-fedora45-x86_64`."""
+    return f"{family(os_release)}-{os_key(os_release)}-{platform.machine()}"
+
+
 def build(version: str, sha256: str, cache_root: Path = DEFAULT_CACHE, *, download: Download = _download,
           run: Run = _run, os_release: Path = OS_RELEASE) -> list[Path]:
     """The package files for `version`, built from the tarball whose sha256 is `sha256` unless already built (a finished
@@ -141,7 +158,7 @@ def build(version: str, sha256: str, cache_root: Path = DEFAULT_CACHE, *, downlo
     url = tarball_url(version)
     fam = family(os_release)
     base = cache_root / version
-    workdir = base / f"{fam}-{platform.machine()}"
+    workdir = base / build_dir(os_release)
     marker = workdir / MARKER
     base.mkdir(parents=True, exist_ok=True)
     with (base / LOCK).open("a") as lock:

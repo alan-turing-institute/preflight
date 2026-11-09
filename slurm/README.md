@@ -294,6 +294,18 @@ and a machine without `apt-get` may use `dnf`. The packages' own scripts start t
 install and removal here runs under a temporary `/usr/sbin/policy-rc.d` that forbids it (an existing one is put back
 afterwards), or, on `dnf` systems, with `slurmdbd`, `slurmctld` and `slurmd` masked until it is over.
 
+Builds are kept per system release (`/var/cache/gpujobs/slurm/VERSION/rpm-fedora45-x86_64`): a build links the libraries
+of the release it was made on. After the install the packages are **locked** (`apt-mark hold`, or `dnf versionlock`,
+which also holds through a release upgrade), and the lock is lifted only around the installer's own installs, so a
+routine update or an operating-system upgrade cannot put the distribution's slurm in their place (SchedMD's upgrade
+guide says the same; measured 2026-11-08: a Fedora 44 to 45 upgrade put Fedora's slurm of the same version, built with
+hwloc, in place of ours and the node was marked invalid). On `dnf` systems the install is followed by `dnf reinstall`,
+because a build made there has the same name, version and release as the distribution's package, which `dnf install`
+then leaves in place. **After an operating-system upgrade** run `apply` again: it builds for the new release and
+installs that build (the lock may instead make the upgrade report that the old build's libraries are missing; then lift
+it with `dnf versionlock delete slurm\*` or `apt-mark unhold 'slurm-smd*'`, upgrade, and run `apply`). An `apply` that
+fails between lifting and restoring the lock leaves it off until the next `apply` that succeeds.
+
 **Upgrading.** `apply` never changes the slurm release: it refuses when slurm is installed and its version differs from
 `version`. A release is installed with `sudo install.py upgrade-slurm`, which takes it from the running one to `version`
 through `steps` (slurm supports upgrades within a compatibility window: 23.11 to 25.05 is inside it, 23.11 to 26.05 is

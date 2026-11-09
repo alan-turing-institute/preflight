@@ -281,7 +281,7 @@ def test_slurm_table_installs_the_built_packages_in_place_of_the_distros(env, mo
     names = ["slurm-smd-dbgsym", "slurm-smd-dev", "slurm-smd-slurmdbd", "slurm-smd-doc", "slurm-smd", "slurm-smd-sview"]
     debs = [tmp / f"{n}_26.05.5_arm64.deb" for n in names]
     monkeypatch.setattr(slurm_component.slurm_build, "build", lambda v, s: built.append((v, s)) or debs)
-    fake.distro_slurm = "ii  slurm-wlm\nii  slurmd\nrc  slurmdbd\n"
+    fake.distro_slurm = "ii  slurm-wlm\nii  slurmd\nrc  slurmdbd\nhi  slurm-smd\n"  # and one of ours, held by an earlier install
     fake.policy = "  Candidate: 21.08.5-2ubuntu1\n"  # an old distro slurm no longer matters: it is not installed
     root = tmp / "root"
     policy = root / "usr/sbin/policy-rc.d"
@@ -300,6 +300,17 @@ def test_slurm_table_installs_the_built_packages_in_place_of_the_distros(env, mo
                         ["apt-get", "remove", "-y", "slurm-wlm", "slurmd"],  # only what is installed
                         # only the daemons, the client and the base package, not -dev, -doc, sview or debug symbols
                         ["apt-get", "install", "-y", str(debs[4]), str(debs[2])]]
+    # ours are locked against the distribution's after the install; unlocked first only where installed (apt-mark
+    # refuses a package it does not know)
+    marks = [c for c in fake.calls if c[:1] == ["apt-mark"]]
+    assert marks == [["apt-mark", "unhold", "slurm-smd"], ["apt-mark", "hold", "slurm-smd", "slurm-smd-slurmdbd"]]
+    assert fake.calls.index(marks[0]) < fake.calls.index(installs[-1]) < fake.calls.index(marks[1])
+    # rpms: Fedora's own slurm has the names, version and release of a build made there, which `dnf install` leaves in place
+    rpms = [tmp / "slurm-26.05.5-1.fc45.x86_64.rpm", tmp / "slurm-slurmd-26.05.5-1.fc45.x86_64.rpm"]
+    files = [str(r) for r in rpms]
+    assert slurm_component.install_commands(rpms) == [
+        ["dnf", "install", "-y", "dnf-command(versionlock)"], ["dnf", "versionlock", "delete", "slurm", "slurm-slurmd"],
+        ["dnf", "install", "-y", *files], ["dnf", "reinstall", "-y", *files], ["dnf", "versionlock", "add", "slurm", "slurm-slurmd"]]
     # no package command ran without policy-rc.d, which keeps the packages' scripts from starting a daemon
     assert [on for _, on in fake.held] == [True, True, True]
     assert policy.read_text() == "someone's own\n" and not policy.with_name("policy-rc.d.gpujobs-saved").exists()
@@ -461,10 +472,15 @@ def test_a_failed_step_prints_the_restore_commands_and_goes_no_further(upgrade, 
                    "systemctl stop slurmctld slurmd slurmdbd", "DROP DATABASE", "tar -xzf", "systemctl restart slurmdbd slurmctld slurmd",
                    "scontrol update PartitionName=gpu State=UP"):
         at = err.index(needle, at + 1)
-    # SchedMD's packages come back from the cache, only the ones the upgrade installs
+    # SchedMD's packages come back from this system release's build in the cache, only the ones the upgrade installs,
+    # with the lock the upgrade put on the new ones lifted first and put back on the old ones after
+    here = slurm_component.slurm_build.build_dir()
     smd = slurm_component.restore_text(Path("/b"), "/s", "slurm 25.05.9", "apt-get", {})
-    assert "/slurm/25.05.9/*/slurm-smd-slurmdbd_*.deb" in smd and "slurm-smd*.deb" not in smd
-    assert "/slurm/25.05.9/*/rpmbuild/RPMS/*/slurm-slurmdbd-[0-9]*.rpm" in slurm_component.restore_text(Path("/b"), "/s", "slurm 25.05.9", "dnf", {})
+    assert f"/slurm/25.05.9/{here}/slurm-smd-slurmdbd_*.deb" in smd and "slurm-smd*.deb" not in smd
+    assert smd.index("apt-mark unhold slurm-smd ") < smd.index("apt-get remove") < smd.index("apt-mark hold slurm-smd ")
+    rpm = slurm_component.restore_text(Path("/b"), "/s", "slurm 25.05.9", "dnf", {})
+    assert f"/slurm/25.05.9/{here}/rpmbuild/RPMS/*/slurm-slurmdbd-[0-9]*.rpm" in rpm
+    assert rpm.index("dnf versionlock delete slurm ") < rpm.index("dnf install") < rpm.index("dnf versionlock add slurm ")
 
 
 def test_a_slurmdbd_still_converting_is_left_running_and_nothing_is_restored(upgrade, capsys):
