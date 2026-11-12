@@ -72,7 +72,8 @@ def test_waiting_reason_sentences() -> None:
     records = {"300": {"mem": "100000M"}}
     pause = Event("300", EventAction.PAUSE, "user1", 1_792_400_000 * 10**9)
     other = Event("301", EventAction.PAUSE, "someone", 1_792_500_000 * 10**9)
-    urgent = Event("300", EventAction.URGENT_HOLD, "root", 1_792_500_000 * 10**9)
+    urgent = Event("300", EventAction.URGENT_HOLD, "root", 1_792_500_000 * 10**9, {"urgent": "timing: time 3 models"})
+    released = Event("300", EventAction.RELEASE, "slurm", 1_792_600_000 * 10**9)
     jobs = (
         queued("Priority", job_id="1", priority=9, name="a"),
         queued("Priority", job_id="2", priority=5, name="b"),
@@ -86,6 +87,8 @@ def test_waiting_reason_sentences() -> None:
         "newest": jobs_view.waiting_reason(queued("JobHeldUser"), {}, records, [pause, urgent]),
         "nobody": jobs_view.waiting_reason(queued("JobHeldUser"), {}, records, [other]),
         "admin": jobs_view.waiting_reason(queued("JobHeldAdmin"), {}, records, []),
+        "urgent": jobs_view.waiting_reason(queued("JobHeldAdmin"), {}, records, [pause, urgent, other]),
+        "released": jobs_view.waiting_reason(queued("JobHeldAdmin"), {}, records, [urgent, released]),
         "resources": jobs_view.waiting_reason(queued("Resources", gpus=1), {}, records, []),
         # slurm's request wins over the record submit.py wrote (`scontrol update MinMemoryNode=` changes only slurm's)
         "updated": jobs_view.waiting_reason(queued("Resources", gpus=1, mem_mb=61440), {}, records, []),
@@ -102,6 +105,9 @@ def test_waiting_reason_sentences() -> None:
         "newest": "paused by root at 2026-10-20 12:40 UTC; resume: resume.py 300",
         "nobody": "paused; resume: resume.py 300",
         "admin": "held by an admin (requeue limit or admin hold)",
+        "urgent": "held since 2026-10-20 12:40 UTC while urgent work (timing: time 3 models) runs, so the jobs it "
+                  "pushed out start first; released automatically",
+        "released": "held by an admin (requeue limit or admin hold)",  # an old urgent hold, released since
         "resources": "waiting for 1 GPU(s) / 104.9 GB memory to free",
         "updated": "waiting for 1 GPU(s) / 64.4 GB memory to free",
         "whole": "waiting for all of the box's memory to free",

@@ -484,6 +484,7 @@ def test_restore_order_ignores_a_non_admin_then_releases_for_an_admin_once_the_u
     world.step()  # victim 2 never stopped, and still does not keep job 7 held
     placed = ["update", "jobid=7", f"priority={levels.priority_for(gpu_jobs.Level.NORMAL, '7', 1)}"]
     assert world.writes == [["release", "7"], placed] and not path.exists()
+    assert [e.action for e in gpu_jobs.events("7")] == [gpu_jobs.EventAction.RELEASE]  # the page stops showing the hold
     path = world.request("10", ["3"], ["8", "11"])
     world.queue = [job("3", "PENDING", "JobHeldAdmin", 0), job("8", "PENDING", "JobHeldUser", 0, gpu_jobs.Level.LOW),
                    job("11", "PENDING", "JobHeldUser", 0, gpu_jobs.Level.HIGH)]

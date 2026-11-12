@@ -1157,6 +1157,10 @@ class Agent:
             if call(self.scontrol, ["scontrol", "release", job_id]).returncode:
                 ok = False  # slurm refuses a job it no longer knows, or one not held: the rest still go
                 continue
+            try:  # the job's history ends its hold there, so the page stops calling it held for urgent work
+                gpu_jobs.write_event(job_id, gpu_jobs.EventAction.RELEASE)
+            except OSError as error:
+                errors.append(f"job {job_id}'s history misses its release ({error})")
             if job_id in jobs:
                 self._place(jobs[job_id], errors)  # held in this queue read: priority 0, never its target
         return ok

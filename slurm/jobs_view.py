@@ -55,6 +55,7 @@ class Bucket(StrEnum):
 
 
 _PAUSE_ACTIONS = {EventAction.PAUSE, EventAction.URGENT_HOLD}
+_HOLD_ACTIONS = _PAUSE_ACTIONS | {EventAction.RESUME, EventAction.RELEASE}  # the newest says whether a hold is urgent's
 
 
 @dataclass(frozen=True)
@@ -181,6 +182,12 @@ def waiting_reason(
         by = f" by {paused[-1].actor} at {_when(paused[-1].at)}" if paused else ""
         return f"paused{by}; resume: resume.py {job.job_id}"
     if reason == Reason.HELD_ADMIN:
+        holds = [e for e in events if e.job == job.job_id and e.action in _HOLD_ACTIONS]
+        if holds and holds[-1].action == EventAction.URGENT_HOLD:
+            urgent = holds[-1].fields.get("urgent")
+            work = f" ({urgent})" if urgent else ""
+            return (f"held since {_when(holds[-1].at)} while urgent work{work} runs, so the jobs it pushed out start "
+                    "first; released automatically")
         return "held by an admin (requeue limit or admin hold)"
     if reason == Reason.RESOURCES:
         needs = [f"{job.gpus} GPU(s)"] if job.gpus else []
