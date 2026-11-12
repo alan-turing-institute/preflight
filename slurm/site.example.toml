@@ -18,6 +18,13 @@ state_dir = "/var/lib/gpujobs"
 # Cores for a CPU-only job given --name and no --cpus, from its last 3 completed runs (their highest average cores in use
 # x 1.25, rounded up): "off", "recommend" (print the figure, ask as before) or "enforce" (ask for it). Default: recommend
 # cpus_from_history = "recommend"
+# Memory for a job given --size COUNT UNIT and no --mem, from the project's earlier runs of that unit (README,
+# 'Memory from a declared size'): "off", "recommend" (print the figure, ask as before) or "enforce" (ask for it;
+# a whole-box figure is printed, never applied). Default: recommend
+# memory_from_size = "recommend"
+# A submission stating neither --check nor --no-check (README, 'Checks before queuing'): "off" (accept it),
+# "recommend" (accept it with a warning) or "enforce" (refuse it). Default: recommend
+# require_check = "recommend"
 # Where the code is installed. Default: /opt/gpujobs
 install_dir = "/opt/gpujobs"
 # Unix group of admins: they may act on anyone's jobs and submit urgent work. Default: gpujobs-admin

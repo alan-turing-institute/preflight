@@ -173,6 +173,8 @@ TOML. Tables: the top level, `[[nodes]]` with `[[nodes.gpus]]`, `[lease]` with `
 | `notify_command` | `[]` | Command (list of arguments, no shell, 30 s limit) the agent runs once per notice, with the notice in its environment. Every notice: `GPUJOBS_EVENT` (`failed`: a job ended FAILED, OUT_OF_MEMORY, TIMEOUT or NODE_FAIL; `idle`: a waste finding; `over_ask`: a running job holds at least 1 GB more memory, host plus card, than it asked for, once per run, unified-memory nodes only; `memory_stop`: the memory guard stopped a job, see "Memory on unified-memory nodes"), `GPUJOBS_JOB` (the job the notice is about), its `GPUJOBS_NAME`, `GPUJOBS_PROJECT` (the name's first `:` field) and `GPUJOBS_USER`, and `GPUJOBS_MESSAGE`, one plain sentence ready to send. A failure adds `GPUJOBS_STATE`; a memory stop adds `GPUJOBS_ENDED` (`by_wrapper`, `by_scancel` or `not_ended`). An idle finding is sent to both sides, at most once an hour per pair: `GPUJOBS_ROLE` is `waiting` (the job that waits) or `holding` (a running job holding what it lacks), and `GPUJOBS_OTHER_JOB` and `GPUJOBS_OTHER_PROJECT` name the other side. Names are whatever their submitter typed, with control characters shown as `?`: quote them wherever they go into a shell command or a mail header. Empty means no notification. `slurm/notify_mail.py` is a working example that mails each notice to the job's user through `sendmail` (`["/usr/bin/python3", "/opt/gpujobs/slurm/notify_mail.py", "--domain", "example.org"]`); any other channel is a script reading the same variables. |
 | `sharing_memory_fraction` | absent | Only for sites that share a card (`shards`, below). A number above 0 and at most 1: the share of a node's jobs memory that the jobs sharing a card may fill together, counted at their measured peaks. It tightens two gates alike: `sharing.py measure` drops any level whose peak memory in use passes it (of the box's total memory), and `submit.py` caps the copies by it (of the node's jobs memory). Absent: they may fill all of it. |
 | `cpus_from_history` | `recommend` | Cores for a CPU-only job given `--name` and no `--cpus` (section 7). `off`: nothing. `recommend`: `submit` prints the cores the job's 3 newest completed runs of the same `project:class:name` justify and asks as before. `enforce`: it asks for them. The figure is their highest average cores in use (core time over wall time, from `sacct`) times 1.25, rounded up, from 1 to the cores the job may have. |
+| `memory_from_size` | `recommend` | Memory for a job given `--size COUNT UNIT` and no `--mem` (section 7, "Memory from a declared size"). `off`: nothing. `recommend`: `submit` prints the memory the project's earlier runs of that unit justify and asks as before. `enforce`: it asks for the larger of that figure and the name's own measured one, except a figure as large as the whole box, which is printed and never applied. |
+| `require_check` | `recommend` | A submission that states neither `--check` nor `--no-check` (section 7, "Checks before queuing"). `off`: accepted silently. `recommend`: accepted with a warning. `enforce`: refused, with the two flags named. |
 | `nodes` | required | One `[[nodes]]` table per compute node; at least one. |
 | `lease` | absent | Optional table; leave it out when no other service shares the GPU through the lease. Without it the `lease` component is not installed. |
 | `metrics` | all defaults below | Table. |
@@ -584,6 +586,91 @@ the job may have); after a memory kill (the job's cap killed a process, or the h
 1.2 times what the run was given and its peak plus 10 percent (the rule `submit --mem auto` applies); `--mem 0` (the whole box) when that is more than any node gives jobs. GPU jobs get no
 `--cpus` advice. The report is per job, never per user, and changes nothing by itself: the project decides its next
 request. A figure that cannot be read shows as unknown.
+
+### Why a job waits
+
+`gpujobs-status`, the job page, `gpujobs-submit` and `gpujobs-urgent` explain a job's room node by node. Free room is
+never summed across nodes, since a job runs on one node. Each node the job may start on (a node of one of its
+partitions that is not down, draining or barred with `--exclude`) gets one line: free memory out of the memory slurm
+hands to jobs there, free cores out of the node's cores, and what the job lacks. A job can lack memory, cores, fast
+cores (a GPU job bound to them), cores under its partition's cap (`cpu` and `service` have one), GPUs or shards. A
+card is lent either whole or as shards, never both at once. The line then names the running jobs that hold most of
+the missing resource, at most three, each with its project, class and running time, and says who can move it:
+
+    [submit] room: n1: 10.5 GB of 31.5 GB and 18 of 20 cores free; it lacks 15.3 GB memory, held by #11 myproj 21.0 GB (restart, running 2 h 5 min, only its owner or an admin can move it)
+
+"slurm pre-empts it for this job" marks a holder whose partition requeues its jobs and ranks below the waiting job's
+partition (both read live from `scontrol show partition`). Slurm then makes the room itself. A queued job whose
+figures show room gets the sentence "the figures show room on n1, yet slurm has not started it". Such a job waits for
+a limit these figures leave out, such as a reservation or a QOS limit. A job without `--mem` asks for slurm's default
+memory, which the line names and does not count. No line estimates a start time. `submit` prints its lines as
+information. `urgent` prints the same lines and decides from them whether any node lacks memory or cores.
+
+### Memory from a declared size
+
+A project whose steps grow with a count it knows (detectors, files, epochs) states that count with
+`--size COUNT UNIT`, for example `--size 30 detectors`. COUNT is a positive number and UNIT one word, compared without
+case. Runs count as comparable when they share the project, the unit, and whether they use a card. The project makes
+that declaration, and nothing is inferred from job names, so a project gives each kind of step its own unit. The
+figure comes from this user's clean runs of that project and unit:
+
+- Some earlier run had a count at or above the new one. The figure is the highest peak among the runs up to the
+  smallest such count (each count judged by its 3 newest runs), so a larger count never asks below a smaller one.
+- Every earlier count is smaller, and the new count is at most twice the largest. The peak of the largest count is
+  scaled in proportion to the new count, and never asks below any measured peak. Proportional scaling is an upper
+  bound for memory that grows at most linearly with the count, and no further than twice the measured range is
+  assumed.
+- The new count is more than twice the largest measured one. No figure is given, and the job asks as before.
+
+The figure gets the same 10 percent margin and rounding as `--mem auto`. A run of the unit killed for memory at
+this count or above, with no clean run since, raises it as a memory kill raises `--mem auto` (section 7). The site
+field `memory_from_size` (section 4) decides what happens next:
+
+    [submit] memory from size: would ask 26G (30 detectors, scaled from myproj 'detectors' runs: 25 -> 21.1 GB peak)
+
+Under `recommend` the line ends there and the job asks as before. Under `enforce` the job asks for the larger of this
+figure and its name's own measured figure, unless the figure is the whole box, which is printed and never applied. A
+hand-set `--mem` is used as given and warns when below the measured peak. The job's record keeps the count, the unit,
+the policy, the figure, and whether the figure was applied.
+
+### Checks before queuing
+
+A fault that a job meets in its first minute costs the whole queue wait when it surfaces only once the job starts.
+Every submission therefore states how it was checked before it was queued:
+
+    gpujobs-submit ... --check 'python train.py --dry-run' -- python train.py
+    gpujobs-submit ... --no-check 'the job is itself a measurement; there is nothing smaller to try'
+
+`--check` runs its command on this machine before anything is queued. The command runs in the job's `--workdir` with
+no input, with the GPU hidden (`CUDA_VISIBLE_DEVICES` and `HIP_VISIBLE_DEVICES` empty), and with `GPUJOBS_CHECK=1`
+set. A submission made from inside a check is refused. The command is split like a shell line but runs without a
+shell, so a check that needs pipes is a script. A non-zero exit refuses the job, and nothing is queued. The check
+gets at most 240 s. After that limit its whole process group gets SIGTERM, then SIGKILL 5 s later, and the job is
+refused. The check is the first process the kernel's memory killer takes, and it dies with `submit`. The job's
+record and page keep the command, its exit, its time and the peak memory of its largest process. A check whose
+peak passes 8 GB warns, since work that size belongs in slurm.
+
+A good check is the pipeline's own dry run or stub run on the real inputs: it loads the configuration and the data,
+builds the model, and takes a step or two on the CPU, in seconds and under 4 minutes. A script that calls
+`submit` with a check allows it at least 300 s. When no check is possible, `--no-check` gives the reason, which
+the record and page keep. A sweep submits the same check many times: a pass of the same command from the same
+folder by the same user counts for 10 minutes. Parallel submissions of one check run it once, and the rest reuse
+its pass. `gpujobs-urgent` takes the same two flags. A `--site` submission runs its check here, before the code is
+sent.
+
+The site field `require_check` (section 4) decides what happens when a submission states neither flag: nothing
+(`off`), a warning (`recommend`), or a refusal naming both flags (`enforce`).
+
+### Chains
+
+`--after JOBID` starts a job once that job has finished successfully. When the job would become step 3 or later of a chain of
+steps with the same project, class, GPUs and shards, `submit` warns:
+
+    [submit] warning: this is step 3 of a chain of same-shape jobs (#10 -> #11 -> this): each step waits in the queue again and is sized alone; ...
+
+Each step of a chain waits in the queue again and is sized alone. One job that runs the steps in order usually holds
+its memory once and fails in one place. The warning is information only. A GPU step followed by CPU steps changes
+shape and never warns.
 
 ### Sharing a card
 
