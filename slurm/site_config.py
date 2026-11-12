@@ -266,8 +266,8 @@ class Site:
     requeue_delay_s: int = 60  # slurm.conf AuthInfo=cred_expire: how long a requeued job waits before it may start again
     sharing_memory_fraction: float | None = None  # a site's own tightening of the share of a node's jobs memory that co-running shard jobs may fill
     cpus_from_history: Policy = Policy.RECOMMEND  # cores for a named CPU-only job without --cpus (D35)
-    memory_from_size: Policy = Policy.RECOMMEND  # memory for a named job without --memory, from its input size (D48)
-    require_check: Policy = Policy.RECOMMEND  # a job must pass its pre-queue check before it is queued (D47)
+    memory_from_size: Policy = Policy.RECOMMEND  # memory for a job given --size, from runs of its project and unit (D48)
+    require_check: Policy = Policy.RECOMMEND  # every submission states --check or --no-check REASON (D47)
 
     @property
     def cpu_job_cap(self) -> int | None:
