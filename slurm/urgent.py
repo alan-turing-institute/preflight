@@ -63,6 +63,13 @@ def free_on_nodes() -> tuple[int, int] | None:
     return total["mem_mb"] - total["mem_used_mb"], total["cpus"] - total["cpus_used"]
 
 
+def room_now(need: jobs_view.Need, by_id: dict[str, gpu_jobs.QueuedJob],
+             site: site_config.Site) -> list[jobs_view.NodeRoom] | None:
+    """`jobs_view.room` for `need` over slurm's node figures now (D48); None when slurm does not answer."""
+    rows = gpu_jobs.node_capacity()
+    return None if rows is None else jobs_view.room(need, by_id, rows, site, gpu_jobs.partition_tiers(), time.time())
+
+
 def _asked_mb(job: gpu_jobs.QueuedJob) -> int:
     """The memory a job holds (slurm's request, else its sidecar's); 0 when unknown, the whole box or unreadable, which
     counts as freeing nothing, so a CPU job is requeued rather than the urgent job left waiting."""
@@ -217,8 +224,16 @@ def run(argv: list[str]) -> int:
     bound = () if whole_box else submit.binding(arguments.cpus, arguments.gpus, 0, site, said="[urgent]")
     if bound and free is not None:  # held to the fast cores: the slow ones free are no room for it
         free = (free[0], min(free[1], jobs_view.free_fast_cores(queue, site_config.gpu_node(site))))
-    memory_short = free is not None and mem_mb(arguments.mem) > free[0]
-    cores_short = free is not None and arguments.cpus > free[1]
+    need = jobs_view.Need(None if whole_box else mem_mb(arguments.mem), arguments.cpus, arguments.gpus, 0, bool(bound),
+                          gpu_jobs.Partition.URGENT.value)
+    rooms = None if whole_box else room_now(need, {job.job_id: job for job in queue}, site)
+    if rooms is not None:  # per node (D48): short only when no node has room, then whatever a node lacks is in the way
+        fits = any(not r.lacks for r in rooms)
+        memory_short = not fits and any(jobs_view.Lack.MEMORY in r.lacks for r in rooms)
+        cores_short = not fits and any({jobs_view.Lack.CORES, jobs_view.Lack.FAST_CORES} & set(r.lacks) for r in rooms)
+    else:  # slurm's node figures unread: the summed ones, as before
+        memory_short = free is not None and mem_mb(arguments.mem) > free[0]
+        cores_short = free is not None and arguments.cpus > free[1]
     lines, victims, steady, wait_only = plan(
         queue, gpu=arguments.gpu, whole_box=whole_box, leases=other_leases(), unregistered=audit.unregistered(),
         memory_short=memory_short, cores_short=cores_short, services=services,
@@ -235,7 +250,11 @@ def run(argv: list[str]) -> int:
         enough_cores = not cores_short or freed >= arguments.cpus - free[1]
         if enough_memory and enough_cores:
             cpu_victims = []
-    if free is not None:
+    if rooms is not None:
+        print("\n".join(f"[urgent] room: {line}" for line in jobs_view.room_text(rooms, need, queued=False)))
+        if memory_short or cores_short:
+            print("[urgent] no node has room: jobs will be pre-empted to make room")
+    elif free is not None:
         print(f"[urgent] memory: needs {mem_mb(arguments.mem)} MB, slurm has {free[0]} MB unallocated"
               + ("; jobs will be pre-empted to make room" if memory_short else "; it fits beside what runs"))
         print(f"[urgent] cores: needs {arguments.cpus}{' fast' if bound else ''}, slurm has {free[1]} unallocated"

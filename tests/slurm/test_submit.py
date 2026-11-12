@@ -33,6 +33,7 @@ def default_site(monkeypatch: pytest.MonkeyPatch) -> None:
     """Default: a site with a lease and the DGX gate, so a submission checks both; accounting knows no job."""
     fake_site(monkeypatch, lease=object(), dgx_gate=True)
     monkeypatch.setattr(gpu_jobs, "_sacct_jobs", lambda *_selection, **_flags: [])
+    monkeypatch.setattr(gpu_jobs, "node_capacity", lambda *_a, **_k: None)  # never the live cluster's room
     alike = cores.CoreSpeeds({})  # these tests do not depend on the machine they run on having fast and slow cores
     monkeypatch.setattr(cores.CoreSpeeds, "read", classmethod(lambda cls, root=None: alike))
 
@@ -619,3 +620,18 @@ def test_search_roots_reach_the_gate(tmp_path: Path, monkeypatch: pytest.MonkeyP
     cmd = seen[0]
     assert cmd[cmd.index("--search") : cmd.index("--search") + 4] == ["--search", "d1", "--search", "d2"]
     assert cmd.index("--search") < cmd.index("--")
+
+
+def test_a_dry_run_says_where_the_job_has_room_and_who_holds_the_rest(monkeypatch: pytest.MonkeyPatch,
+                                                                      capsys: pytest.CaptureFixture[str]) -> None:
+    """D48: before queuing, the job's need against each node's free memory and cores, naming the holder."""
+    row = {"name": "n1", "state": "MIXED", "partitions": "cpu,steady", "cpus": 20, "cpus_used": 2, "mem_mb": 30000,
+           "mem_used_mb": 20000, "gpus": 0, "gpus_used": 0, "shards": 0, "shards_used": 0}
+    holding = gpu_jobs.QueuedJob("11", "steady", "RUNNING", "None", "q:restart:m", mem_mb=20000, cpus=2, node="n1")
+    monkeypatch.setattr(gpu_jobs, "node_capacity", lambda *_a, **_k: [row])
+    monkeypatch.setattr(gpu_jobs, "read_queue", lambda: [holding])
+    monkeypatch.setattr(gpu_jobs, "partition_tiers", lambda *_a, **_k: None)
+    dry("--project", "p", "--what", "w", "--class", "restart", "--mem", "24G", "--name", "n", "--", "true")
+    assert "[submit] room: n1: 10.5 GB of 31.5 GB and 18 of 20 cores free; it lacks 15.3 GB memory, held by #11 q 21.0 GB" in capsys.readouterr().out
+    dry("--project", "p", "--what", "w", "--class", "restart", "--mem", "4G", "--name", "n", "--", "true")
+    assert "[submit] room: fits now on n1" in capsys.readouterr().out

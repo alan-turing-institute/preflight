@@ -10,6 +10,7 @@ import signal
 import sys
 from datetime import date, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from wsgiref.util import setup_testing_defaults
 
 import gpu_jobs
@@ -71,6 +72,7 @@ class Fake:
             capacity=lambda: {"cpus": 20, "cpus_used": 8, "mem_mb": 102400, "mem_used_mb": 65536, "gpus": 1, "gpus_used": 1,
                               "nodes": 1, "here": 1},
             node_capacity=lambda: [],  # one machine: never the live cluster's
+            partition_tiers=lambda: None,  # never the live cluster's
             machine=lambda: {"mem_total": 120 * 1024**3, "mem_used": 110 * 1024**3, "cores": 20, "cores_busy": 3.0},
             gpu_busy=lambda: 0.37,
         )
@@ -163,6 +165,21 @@ def test_every_get_route_answers(path: str) -> None:
         assert 'data-k="ended">Today 11:00</td>' in app._finished_rows([row], "/", noon)  # when it finished, beside Started
         never = dataclasses.replace(row, state="CANCELLED", start=None, elapsed_s=0)
         assert "(queued for 2 h 00 min)" in app._finished_rows([never], "/", noon)
+        # D48: a finished job's memory is accounting's (an `scontrol update` never reaches the record's 4G), and a job
+        # waiting for room is told, per node, what it lacks and who holds it
+        gone = jobs_view.HistoryRow("12", "proj:normal:train", "proj", "alice", "normal", "COMPLETED", "0:0", at(9, 0),
+                                    at(9, 5), at(10, 0), 3300, 1, 30 * 1024**3)
+        backend = fake.backend
+        fake.application = app.make_application(dataclasses.replace(backend, finished=lambda _j: gone))
+        assert f"<dt>Memory asked</dt><dd>{app.esc(app._size(30 * 1024**3))}</dd>" in call(fake, "/job/12")[1]
+        waiting_job = dataclasses.replace(queued("13", "alice"), state="PENDING", reason="Resources", node="", mem_mb=20000)
+        row = {"name": "gpu-node-1", "state": "MIXED", "partitions": "normal", "cpus": 20, "cpus_used": 4, "mem_mb": 70000,
+               "mem_used_mb": 61440, "gpus": 1, "gpus_used": 1, "shards": 0, "shards_used": 0}
+        fake.application = app.make_application(dataclasses.replace(
+            backend, queue=lambda: [queued("7", "alice"), waiting_job], node_capacity=lambda: [row],
+            site=lambda: SimpleNamespace(nodes=[], cpu_job_cap=None, service=None)))
+        assert "it lacks 12.0 GB memory and 1 GPU, held by #7 proj 64.4 GB" in call(fake, "/job/13")[1]
+        fake.application = app.make_application(backend)
         assert "<th scope=\"col\">Running for</th><th scope=\"col\">Queued at</th>" in body
         # nvidia-smi and /proc read the portal's own host: no in-use bar unless that host is slurm's one node
         elsewhere = app._resource_tiles({"cpus": 1, "cpus_used": 0, "mem_mb": 1024, "mem_used_mb": 0, "gpus": 1, "gpus_used": 1,

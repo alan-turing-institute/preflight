@@ -251,7 +251,7 @@ def _holder_text(h: Holder) -> str:
     parts = [h.job_class]
     if h.running_s:
         hours, minutes = divmod(h.running_s // SECONDS_PER_MINUTE, SECONDS_PER_MINUTE)
-        parts.append(f"running {hours} h {minutes} min")
+        parts.append(f"running {hours} h {minutes} min" if hours else f"running {minutes} min")
     if h.slurm_moves_it is not None:
         parts.append("slurm pre-empts it for this job" if h.slurm_moves_it else "only its owner or an admin can move it")
     return f"#{h.job} {h.project} {h.amount} ({', '.join(parts)})"
@@ -398,8 +398,10 @@ def waiting_reason(
     queue: Mapping[str, QueuedJob],
     records: Mapping[str, Mapping[str, object]],
     events: Sequence[Event],
+    rooms: Callable[[Need], list[NodeRoom]] | None = None,
 ) -> str:
-    """A plain sentence for why a queued job is not running, "" when nothing holds it."""
+    """A plain sentence for why a queued job is not running, "" when nothing holds it. With `rooms` (the caller's
+    `room` over slurm's node figures), a job waiting for resources gets the per-node explanation of `room_text`."""
     reason = job.reason
     if reason in {Reason.NONE, ""}:
         return ""
@@ -418,6 +420,9 @@ def waiting_reason(
             return (f"held since {_when(holds[-1].at)} while urgent work{work} runs, so the jobs it pushed out start "
                     "first; released automatically")
         return "held by an admin (requeue limit or admin hold)"
+    if reason == Reason.RESOURCES and rooms is not None:
+        need = Need.of_job(job, records.get(job.job_id, {}))
+        return "; ".join(room_text(rooms(need), need, queued=True))
     if reason == Reason.RESOURCES:
         needs = [f"{job.gpus} GPU(s)"] if job.gpus else []
         mb = requested_mem_mb(job, records.get(job.job_id, {}))

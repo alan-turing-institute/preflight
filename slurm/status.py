@@ -9,6 +9,7 @@ import math
 import statistics
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -48,6 +49,15 @@ def _memory(job: gpu_jobs.QueuedJob, record: dict) -> str:
     return "default mem" if mb is None else f"{jobs_view.memory_text(mb)} mem"
 
 
+def _rooms(by_id: dict[str, gpu_jobs.QueuedJob]) -> Callable[[jobs_view.Need], list[jobs_view.NodeRoom]] | None:
+    """`jobs_view.room` over slurm's node figures read once (D48); None when slurm does not answer."""
+    rows = gpu_jobs.node_capacity()
+    if rows is None:
+        return None
+    site, tiers, now = gpu_jobs.load_site(), gpu_jobs.partition_tiers(), time.time()
+    return lambda need: jobs_view.room(need, by_id, rows, site, tiers, now)
+
+
 def lines(queue: list[gpu_jobs.QueuedJob] | None) -> list[str]:
     out = [f"[status] node: {gpu_jobs.node_state()}"]
     if gpu_jobs.LEASE_DIR is not None:  # a site without a [lease] table has no keeper to report
@@ -64,9 +74,10 @@ def lines(queue: list[gpu_jobs.QueuedJob] | None) -> list[str]:
     records = all_sidecars({job.job_id: job.user for job in queue})
     by_id = {job.job_id: job for job in queue}
     events = gpu_jobs.events()
+    rooms = _rooms(by_id)
     for job in queue:
         record = records.get(job.job_id, {})
-        why = jobs_view.waiting_reason(job, by_id, records, events)
+        why = jobs_view.waiting_reason(job, by_id, records, events, rooms)
         out.append(gpu_jobs.printable(  # names and descriptions are what their submitters typed
             f"[status] {job.job_id} {job.state:<10} {job.user or '?':<10} {job.level:<6} {f'{job.shards} shards' if job.shards else f'{job.gpus} GPU'} {job.name}"
             f"{f' on {job.node}' if job.node else ''}"

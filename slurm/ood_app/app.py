@@ -225,6 +225,7 @@ class Backend:
     project_order: Callable[[], list[str]] = lambda: _project_order()
     capacity: Callable[[], Mapping[str, int]] = gpu_jobs.capacity
     node_capacity: Callable[[], list[dict[str, int | str]] | None] = gpu_jobs.node_capacity
+    partition_tiers: Callable[[], Mapping[str, gpu_jobs.PartitionTier] | None] = gpu_jobs.partition_tiers
     machine: Callable[[], Mapping[str, float]] = gpu_jobs.machine_use
     gpu_busy: Callable[[], float | None] = gpu_jobs.gpu_busy
     run: Run = run_tool
@@ -235,6 +236,15 @@ class Backend:
     requests_dir: Path = field(default_factory=lambda: gpu_jobs.STATE_DIR / "requests")
     maintenance_status: Callable[[str], Mapping[str, object] | None] = lambda path: gpu_jobs.read_json(Path(path))
     can_write: Callable[[str], bool] = lambda path: os.access(path, os.W_OK)
+
+
+def _rooms(backend: Backend, by_id: Mapping[str, QueuedJob]) -> Callable[[jobs_view.Need], list[jobs_view.NodeRoom]] | None:
+    """`jobs_view.room` over slurm's node figures read once (D48); None when slurm or the site file does not answer."""
+    rows, site = backend.node_capacity(), backend.site()
+    if not rows or site is None:
+        return None
+    tiers, now = backend.partition_tiers(), backend.now().timestamp()
+    return lambda need: jobs_view.room(need, by_id, rows, site, tiers, now)
 
 
 def esc(value: object) -> str:
@@ -1087,7 +1097,7 @@ def job_page(backend: Backend, job_id: str, root: str = "") -> str | None:
     project = str(record.get("project") or jobs_view.project_of(name))
     if job is not None:
         kind, label = _queue_state(job)
-        why = jobs_view.waiting_reason(job, by_id, records, backend.events(None))
+        why = jobs_view.waiting_reason(job, by_id, records, backend.events(None), _rooms(backend, by_id))
     elif row is not None:
         (kind, label), why = _result(row.state), ""
     else:
@@ -1103,7 +1113,10 @@ def job_page(backend: Backend, job_id: str, root: str = "") -> str | None:
         ("Level", _level_pill(job.level if job else "")),
         ("Partition", esc((job.partition if job else row.partition if row else "") or "—")),
         ("GPUs", esc(record.get("gpus") or (job.gpus if job else row.gpus if row else "") or "—")),
-        ("Memory asked", esc(_asked_memory(asked_mb) if asked_mb is not None else _size(row.req_mem_bytes) if row else "—")),
+        # a job slurm still holds: its live request; a finished one: what accounting says it was given (an
+        # `scontrol update` after submission never reaches the record, D48)
+        ("Memory asked", esc(_size(row.req_mem_bytes) if job is None and row and row.req_mem_bytes
+                             else _asked_memory(asked_mb) if asked_mb is not None else _size(row.req_mem_bytes) if row else "—")),
     ]
     if name and name != _short(name):
         facts.append(("Slurm name", f'<span class="mono">{esc(name)}</span>'))

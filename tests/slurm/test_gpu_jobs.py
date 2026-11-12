@@ -97,6 +97,7 @@ def test_a_hostile_or_foreign_record_is_ignored_and_never_blocks(tmp_path: Path,
     monkeypatch.setattr(status.audit, "unregistered", list)
     monkeypatch.setattr(status.audit, "report", lambda _u: [])
     monkeypatch.setattr(status.gpu_jobs, "known_containers", list)  # never this machine's map or docker
+    monkeypatch.setattr(status.gpu_jobs, "node_capacity", lambda *_a, **_k: None)  # never the live cluster's
     assert not any("forged" in line for line in status.lines([job]))
     named = QueuedJob("8", "normal", "PENDING", "None", "p:resume:\x1b]0;forged\x07")
     assert all(line.isprintable() for line in status.lines([named]))  # a terminal shows a name, never acts on it
@@ -105,6 +106,14 @@ def test_a_hostile_or_foreign_record_is_ignored_and_never_blocks(tmp_path: Path,
     assert " p:resume:n on laptop |" in "\n".join(status.lines([running]))  # a running job says where it is
     raised = QueuedJob("10", "steady", "PENDING", "Resources", "p:restart:n", mem_mb=28672)
     assert "| 30.1 GB mem," in "\n".join(status.lines([raised]))  # slurm's live request, not the submit record
+    row = {"name": "n1", "state": "MIXED", "partitions": "steady", "cpus": 20, "cpus_used": 2, "mem_mb": 30000,
+           "mem_used_mb": 20000, "gpus": 0, "gpus_used": 0, "shards": 0, "shards_used": 0}
+    holding = QueuedJob("11", "steady", "RUNNING", "None", "q:restart:m", mem_mb=20000, cpus=2, node="n1")
+    monkeypatch.setattr(status.gpu_jobs, "node_capacity", lambda *_a, **_k: [row])
+    monkeypatch.setattr(status.gpu_jobs, "partition_tiers", lambda *_a, **_k: None)
+    monkeypatch.setattr(status.gpu_jobs, "load_site", lambda: types.SimpleNamespace(nodes=[], cpu_job_cap=None, service=None))
+    said = "\n".join(status.lines([raised, holding]))  # D48: the per-node room, naming the holder
+    assert "| n1: 10.5 GB of 31.5 GB and 18 of 20 cores free; it lacks 19.6 GB memory, held by #11 q 21.0 GB" in said
     keeper = any(line.startswith("[status] keeper:") for line in status.lines([named]))
     monkeypatch.setattr(status.gpu_jobs, "LEASE_DIR", None)  # a site without a lease (Turing box) has no keeper line
     assert keeper and not any(line.startswith("[status] keeper:") for line in status.lines([named]))

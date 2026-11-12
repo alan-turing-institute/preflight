@@ -82,6 +82,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import audit  # noqa: E402 - path set just above
 import cores
 import gpu_jobs  # noqa: E402
+import jobs_view
 import portability
 import remote
 import site_config
@@ -198,6 +199,17 @@ def warn_memory(mem: str | None, name: str | None, gpu: bool) -> None:
     elif asked_mb * 1024**2 < peak:
         warn(f"--mem {mem} ({_gb(asked_mb)}) is below the {peak / 1e9:.1f} GB {name!r} peaked at on one of its last "
              f"{gpu_jobs.HISTORY_RUNS} clean runs; the memory floor may kill the job")
+
+
+def print_room(need: jobs_view.Need, site: site_config.Site) -> None:
+    """D48: what the job needs against what each node it may use has free now, and which running jobs hold the rest
+    (`jobs_view.room`). Information only; nothing when slurm does not answer."""
+    queue, rows = gpu_jobs.read_queue(), gpu_jobs.node_capacity()
+    if queue is None or rows is None:
+        return
+    rooms = jobs_view.room(need, {job.job_id: job for job in queue}, rows, site, gpu_jobs.partition_tiers(), time.time())
+    for line in jobs_view.room_text(rooms, need, queued=False):
+        print(gpu_jobs.printable(f"[submit] room: {line}"))  # names and projects are what their submitters typed
 
 
 def warn_device(arguments: argparse.Namespace) -> None:
@@ -634,6 +646,12 @@ def submit(argv: list[str]) -> str:
         arguments, mem=mem, log=log, manifest=manifest, node_python=site.node_python, partition=partition, extra=barred,
         requirements=placed.requirements if included else (), shards=packing.shards,
     )
+    try:
+        need_mb = None if mem is None else gpu_jobs.mem_mb(mem)
+    except (ValueError, IndexError):
+        need_mb = None  # not slurm notation: sbatch reports it
+    print_room(jobs_view.Need(need_mb, arguments.cpus, 0 if packing.shards else arguments.gpus, packing.shards,
+                              bool(bound), partition, frozenset(placed.excluded) if included else frozenset()), site)
     warn_device(arguments)
     if arguments.dry_run:
         if arguments.service:
@@ -734,7 +752,11 @@ def service_room(site: site_config.Site, cpus: int, memory_mb: int, consent: fro
     if free_mb is None:
         why = "a job holds the whole machine's memory (or one of unknown size runs); suspending frees no memory"
     elif memory_mb > free_mb:
-        why = f"memory: it needs {memory_mb} MB and {free_mb} MB are free; suspending frees no memory"
+        rows = gpu_jobs.node_capacity()  # D48: the shared per-node sentence, naming who holds the memory
+        need = jobs_view.Need(memory_mb, cpus, partitions=gpu_jobs.Partition.SERVICE.value)
+        held = (jobs_view.room_text(jobs_view.room(need, by_id, rows, site, gpu_jobs.partition_tiers(), time.time()),
+                                    need, queued=False) if rows else [f"it needs {memory_mb} MB and {free_mb} MB are free"])
+        why = f"memory: {'; '.join(held)}; suspending frees no memory"
     elif cpus > service_free:
         why = f"other service jobs use {service.cores - service_free} of the service partition's {service.cores} cores"
     elif cpus > free_cores:

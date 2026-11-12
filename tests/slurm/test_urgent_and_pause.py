@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 import gpu_jobs
+import jobs_view
 import kill
 import pause
 import pytest
@@ -23,6 +24,12 @@ def sidecars(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(urgent, "elapsed", lambda _job: "1:00")
     for job_id, gpu in [("1", True), ("2", True), ("3", True), ("4", True)]:  # what slurm grants decides, not this flag
         gpu_jobs.update_sidecar(job_id, gpu=gpu, what=f"job {job_id}")
+
+
+@pytest.fixture(autouse=True)
+def _no_live_room(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Never slurm's live node figures: a test that wants per-node room sets `urgent.room_now` itself."""
+    monkeypatch.setattr(urgent, "room_now", lambda *_a: None)
 
 
 def test_classes_of_what_is_in_the_way() -> None:
@@ -264,6 +271,15 @@ def test_site_admin_check_multi_gpu_plan_and_request_file(
         calls.clear()
         assert urgent.run([*argv[:-4], "--mem", "2G", "--", "true"]) == 0
         assert (["scontrol", "requeue", "3"] in calls) is requeued, asked
+    # D48: the decision is per node: short of memory on n1 but room on n2 pre-empts nothing for memory
+    def node_room(name: str, lacks: tuple[jobs_view.Lack, ...]) -> jobs_view.NodeRoom:
+        return jobs_view.NodeRoom(name, 2000, 1000, 20, 10, 0, 0, None, None, lacks, ())
+    monkeypatch.setattr(urgent, "room_now", lambda *_a: [node_room("n1", (jobs_view.Lack.MEMORY,)), node_room("n2", ())])
+    gpu_jobs.update_sidecar("5", mem="512M")
+    calls.clear()
+    assert urgent.run([*argv[:-4], "--mem", "2G", "--", "true"]) == 0
+    assert ["scontrol", "requeue", "3"] not in calls
+    monkeypatch.setattr(urgent, "room_now", lambda *_a: None)
     # cores short (the memory fits): the same rule with the cores the normal job holds; needs 4, slurm has 1 left
     monkeypatch.setattr(urgent, "free_on_nodes", lambda: (10**6, 1))
     for held_cores, requeued in ((12, False), (2, True)):
