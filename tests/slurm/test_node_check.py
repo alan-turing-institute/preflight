@@ -324,6 +324,9 @@ def test_a_launch_refusal_bars_the_node_from_the_pending_job_of_the_events_owner
     os.utime(waiting, (1, 1))
     box.run(slurm)
     assert not waiting.exists() and len(slurm.updates()) == before  # no exclusion for a job that is not waiting
+    # slurm failing to expand a host list is an error (the run fails closed), never "not covered"
+    with pytest.raises(RuntimeError, match="show hostnames 'n\\[1,3\\],x' failed"):
+        node_check.exclusion(lambda command: subprocess.CompletedProcess(command, 1, "", "boom"), "n[1,3],x", NODE)
 
 
 def test_free_mb_is_memavailable_in_decimal_megabytes_and_refuses_a_file_without_it(tmp_path: Path) -> None:

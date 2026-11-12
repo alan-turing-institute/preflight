@@ -221,15 +221,20 @@ def push_victim(running: list[Running]) -> Running | None:
     return max(candidates, key=lambda r: r.started, default=None)
 
 
+def _asking(run: Runner) -> Callable[..., subprocess.CompletedProcess]:
+    """`run` in the shape `gpu_jobs` readers call (keyword options ignored: `run` carries its own timeout)."""
+    return lambda command, **_options: run(command)
+
+
 def exclusion(run: Runner, existing: str, node: str) -> str | None:
     """`ExcNodeList` value that adds `node` to a job's `existing` one (a slurm host list, joined raw, never split on
     commas: `n[1,3]` is one entry); None when it already covers `node`."""
     if not existing:
         return node
-    done = run(["scontrol", "show", "hostnames", existing])
-    if done.returncode != 0:
-        raise RuntimeError(f"show hostnames {existing!r} failed: {done.stderr.strip()}")
-    return None if node in done.stdout.split() else f"{existing},{node}"
+    names = gpu_jobs.hostnames(existing, _asking(run))
+    if names is None:
+        raise RuntimeError(f"show hostnames {existing!r} failed")
+    return None if node in names else f"{existing},{node}"
 
 
 def has_other_node(run: Runner, job_id: str, node: str) -> bool:
@@ -243,10 +248,10 @@ def has_other_node(run: Runner, job_id: str, node: str) -> bool:
         listed = re.search(r"\bNodes=(\S+)", (shown := run(["scontrol", "show", "partition", partition, "-o"])).stdout)
         if shown.returncode != 0 or not listed:
             raise RuntimeError(f"show partition {partition!r} failed: {shown.stderr.strip() or 'no Nodes'}")
-        names = run(["scontrol", "show", "hostnames", listed[1]])
-        if names.returncode != 0:
-            raise RuntimeError(f"show hostnames {listed[1]!r} failed: {names.stderr.strip()}")
-        if any(name != node for name in names.stdout.split()):
+        names = gpu_jobs.hostnames(listed[1], _asking(run))
+        if names is None:
+            raise RuntimeError(f"show hostnames {listed[1]!r} failed")
+        if any(name != node for name in names):
             return True
     return False
 

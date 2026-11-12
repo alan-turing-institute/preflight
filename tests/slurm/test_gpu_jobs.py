@@ -194,7 +194,8 @@ def test_parse_squeue_reads_json_so_a_name_cannot_forge_a_row() -> None:
     text = squeue_json(
         {"job_id": 12, "job_state": ["RUNNING"], "priority": {"set": True, "number": 4001}, "tres_per_node": "gres/gpu:2",
          "name": forged, "qos": "high", "nodes": "gpu-node-1", "memory_per_node": {"set": True, "number": 61440},
-         "submit_time": {"set": True, "infinite": False, "number": 1792838841}},
+         "submit_time": {"set": True, "infinite": False, "number": 1792838841}, "flags": ["GRES_BINDING_ENFORCED"],
+         "excluded_nodes": "n2"},
         {"job_id": 13, "job_state": ["COMPLETED"]},  # squeue --json ignored -t: finished jobs are dropped here
         {"job_id": 14, "priority": {"set": False, "number": 7}, "state_reason": "JobHeldUser", "qos": "staff",
          "cpus": {"number": 4}, "memory_per_node": {"set": False, "number": 0}, "memory_per_cpu": {"set": True, "number": 2048}},
@@ -209,6 +210,7 @@ def test_parse_squeue_reads_json_so_a_name_cannot_forge_a_row() -> None:
     # slurm's memory request as it stands (a later `scontrol update` shows), per cpu times cores, None when it gave none
     assert (running.mem_mb, held.mem_mb, paused.mem_mb) == (61440, 8192, None)
     assert (running.submitted, held.submitted) == (1792838841, 0)
+    assert (running.bound, running.excluded, held.bound, held.excluded) == (True, "n2", False, "")
     assert (running.node, held.node) == ("gpu-node-1", "")  # only a running job has a node
     assert [(j.job_id, j.state, j.active) for j in (paused, killed)] == [("15", "COMPLETING", True), ("16", "COMPLETING", True)]
     # slurm 26.05.5's own output (`squeue --json` of a running job, saved from the container trial)
@@ -585,6 +587,37 @@ def test_memory_kill_reads_the_stop_gaps_event_and_ignores_a_forged_one(tmp_path
     assert kill is not None and (kill.used_mb, kill.by, kill.asked_mb) == (4, "the memory stop-gap", 8192)
     monkeypatch.setattr(gpu_jobs, "SLURM_USER", "somebody-else")  # the job's own user wrote it: a forgery
     assert gpu_jobs.memory_kill("n") is None
+    # what it was given: accounting's allocated memory first, the record's --mem only when accounting does not say
+    monkeypatch.setattr(gpu_jobs, "SLURM_USER", gpu_jobs.current_user())
+    monkeypatch.setattr(gpu_jobs, "_sacct_jobs", lambda *_a, **_k: [
+        {"job_id": 5, "state": {"current": ["OUT_OF_MEMORY"]}, "tres": {"allocated": [{"type": "mem", "count": 28672}]}}])
+    monkeypatch.setattr(gpu_jobs, "agent_notices", lambda *_a: [])
+    sized = {**record, "mem": "16G", "size": {"count": 2.5}}
+    kill = gpu_jobs.memory_kill_in([sized])
+    assert kill is not None and (kill.asked_mb, kill.count) == (28672, 2.5)
+    monkeypatch.setattr(gpu_jobs, "_sacct_jobs", lambda *_a, **_k: [{"job_id": 5, "state": {"current": ["OUT_OF_MEMORY"]}}])
+    kill = gpu_jobs.memory_kill_in([{**record, "mem": "16G"}])
+    assert kill is not None and (kill.asked_mb, kill.count) == (16384, None)
+
+
+def test_hostnames_partition_tiers_and_run_peaks() -> None:
+    def never(*_a: object, **_k: object) -> subprocess.CompletedProcess[str]:
+        raise AssertionError("a plain name needs no slurm")
+
+    def answer(out: str, code: int = 0) -> Callable[..., subprocess.CompletedProcess[str]]:
+        return lambda argv, **_k: subprocess.CompletedProcess(argv, code, out, "")
+
+    assert (gpu_jobs.hostnames("", never), gpu_jobs.hostnames("n1", never)) == ([], ["n1"])
+    assert gpu_jobs.hostnames("n[1-2]", answer("n1\nn2\n")) == ["n1", "n2"]
+    assert gpu_jobs.hostnames("n[1-2]", answer("", 1)) is None
+    lines = ("PartitionName=a AllowGroups=ALL PriorityTier=2 PreemptMode=REQUEUE\n"
+             "PartitionName=b AllowGroups=ALL PriorityTier=1 PreemptMode=OFF\n")
+    assert gpu_jobs.partition_tiers(answer(lines)) == {"a": gpu_jobs.PartitionTier(2, True), "b": gpu_jobs.PartitionTier(1, False)}
+    assert gpu_jobs.partition_tiers(answer("", 1)) is None
+    clean = {"peak_gpu_mib": 1, "exit": 0, "ended_at": 9}
+    record = {"name": "n", "legs": [clean, {**clean, "peak_gpu_mib": 3, "ended_at": 7}]}
+    probe = {**record, "kind": gpu_jobs.SHARING_PROBE}
+    assert [(p.ended, p.total) for p in gpu_jobs.run_peaks([record, probe], clean=True)] == [(9, 3 * 1024**2)]
 
 
 def test_container_label_never_waits_on_a_hung_docker(monkeypatch: pytest.MonkeyPatch) -> None:

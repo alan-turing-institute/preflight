@@ -24,7 +24,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
@@ -187,6 +187,8 @@ class QueuedJob:
     node: str = ""  # the node a running job is on (squeue's `nodes`); "" while it waits
     sluid: str = ""  # 26.05 names the job's cgroup by this (`step_id.sluid`) instead of `job_<id>`; "" on 23.11
     start: int = 0  # epoch seconds slurm started the running job (`start_time`); 0 when it has not started
+    bound: bool = False  # slurm enforces the job's GPU binding (`--gres-flags=enforce-binding`): its cores must be the card's
+    excluded: str = ""  # the raw `excluded_nodes` host list (`--exclude`); "" for none
 
     @property
     def uses_card(self) -> bool:
@@ -264,6 +266,10 @@ def _memory_mb(raw: dict[str, object], cpus: int) -> int | None:
     return per_cpu * cpus if per_cpu is not None else None
 
 
+#: The `flags` entry of `squeue --json` that marks a job submitted with `--gres-flags=enforce-binding`.
+BINDING_FLAG = "GRES_BINDING_ENFORCED"
+
+
 def parse_squeue(text: str) -> list[QueuedJob]:
     """The unfinished jobs in `squeue --json` output; raises ValueError when it is not that.
 
@@ -295,6 +301,7 @@ def parse_squeue(text: str) -> list[QueuedJob]:
                 int(submitted.get("number", 0)) if submitted.get("set") else 0,
                 str(raw.get("nodes") or ""), _sluid(raw),
                 _number(raw.get("start_time")) or 0 if state in ACTIVE_STATES else 0,
+                BINDING_FLAG in (raw.get("flags") or []), str(raw.get("excluded_nodes") or ""),
             )
         )
     return jobs
@@ -817,18 +824,23 @@ UNCLEAN_MIN_S = 600
 SHARING_PROBE = "sharing_probe"
 
 
-def own_records(name: str) -> Iterable[dict[str, object]]:
-    """This user's sidecar records of jobs called `name`, legs copied back from part-time machines merged in. Another
-    user's file with the name is ignored (it could understate a peak or forge a sharing level)."""
+def own_records_where(match: Callable[[Mapping[str, object]], bool]) -> Iterator[dict[str, object]]:
+    """This user's sidecar records that satisfy `match`, legs copied back from part-time machines merged in. Another
+    user's file is ignored (it could understate a peak or forge a sharing level)."""
     me = current_user()
     remote = {job_id: path for path, job_id, owner in remote_files("jobs", "*.json") if owner == me}
     for path in (STATE_DIR / "jobs").glob("*.json"):
         record = read_json(path, me) or {}
-        if record.get("name") != name:
+        if not match(record):
             continue
         if path.stem in remote and (copied := read_json(remote[path.stem])):
             record = merge_remote(record, copied)
         yield record
+
+
+def own_records(name: str) -> Iterable[dict[str, object]]:
+    """This user's sidecar records of jobs called `name` (see `own_records_where`)."""
+    return own_records_where(lambda record: record.get("name") == name)
 
 
 def measured_sharing(name: str) -> dict[str, object] | None:
@@ -857,10 +869,29 @@ def measured_peak_bytes(name: str, *, clean: bool = True) -> int | None:
     but far closer than the whole box a re-queued job otherwise asks for (2026-10-25: a re-queue after a crash asked
     for the whole box and sat idle beside a 27 GB job with 75 GB free).
     """
-    found: list[tuple[int, int]] = []  # (ended, total): one per run when clean, one per leg otherwise
-    for record in own_records(name):
+    peaks = run_peaks(own_records(name), clean=clean)
+    newest = sorted(peaks, key=lambda peak: (peak.ended, peak.total), reverse=True)[:HISTORY_RUNS] if clean else peaks
+    return max((peak.total for peak in newest), default=None)
+
+
+@dataclass(frozen=True)
+class RunPeak:
+    """One run's (clean) or one leg's (unclean) footprint: when it ended, GPU plus CPU side bytes, and its record."""
+
+    ended: int
+    total: int
+    record: Mapping[str, object]
+
+
+def run_peaks(records: Iterable[Mapping[str, object]], *, clean: bool) -> list[RunPeak]:
+    """The footprints in `records`, as `measured_peak_bytes` reads them: a sharing probe is skipped (its total is over
+    several copies at once and must never size a real job); with `clean` one per record, the highest total and latest
+    end of its clean legs (a job requeued after one clean leg is still one run); otherwise one per leg that ran
+    `UNCLEAN_MIN_S` or longer."""
+    found: list[RunPeak] = []
+    for record in records:
         if record.get("kind") == SHARING_PROBE:
-            continue  # a probe's total is over several copies at once: it must never size a real job
+            continue
         legs: list[tuple[int, int]] = []
         for leg in record_legs(record):
             if "peak_gpu_mib" not in leg or (clean and not _clean(leg)):
@@ -874,11 +905,10 @@ def measured_peak_bytes(name: str, *, clean: bool = True) -> int | None:
                 continue
             if clean or ran >= UNCLEAN_MIN_S:
                 legs.append((ended, total))
-        if clean and legs:  # a job whose clean legs are several (requeued after one) is still one run of the window
+        if clean and legs:
             legs = [(max(e for e, _ in legs), max(total for _, total in legs))]
-        found += legs
-    newest = sorted(found, reverse=True)[:HISTORY_RUNS] if clean else found
-    return max((total for _, total in newest), default=None)
+        found += [RunPeak(e, total, record) for e, total in legs]
+    return found
 
 
 @dataclass(frozen=True)
@@ -889,6 +919,7 @@ class MemoryKill:
     asked_mb: int | None  # the memory it was given, in slurm MB (2^20 bytes); 0: the whole box (`--mem 0`); None: unknown
     by: str  # what killed it, for the line `submit.py` prints
     used_mb: int | None = None  # what it held when the stop-gap stopped it, in slurm MB; None for any other kill
+    count: float | None = None  # the killed run's `size.count` (its declared size) when its record has one
 
 
 class MemoryStopEnd(StrEnum):
@@ -900,14 +931,21 @@ class MemoryStopEnd(StrEnum):
 
 
 def memory_kill(name: str) -> MemoryKill | None:
-    """The newest run called `name` killed for memory, when no clean run of the name ended after it (D35: the next ask
+    """The newest run called `name` killed for memory (see `memory_kill_in`)."""
+    return memory_kill_in(list(own_records(name)))
+
+
+def memory_kill_in(records: list[Mapping[str, object]]) -> MemoryKill | None:
+    """The newest run among `records` killed for memory, when no clean run of the name ended after it (D35: the next ask
     is then bumped above what it was given); None otherwise. Only this user's own records count, as for
     `measured_peak_bytes`. The newest kill decides, whatever it was given: an older kill with less never stands in.
 
     The guard's kills are in the job's legs; slurm's own (the job's memory limit) only in accounting, asked once for
     the runs that ended after the newest clean one and did not finish cleanly. What it was given is the record's
-    `--mem`, else what accounting says slurm allocated (no `--mem`: slurm's default)."""
-    records = [r for r in own_records(name) if r.get("kind") != SHARING_PROBE and r.get("job_id")]
+    what accounting says slurm allocated, else the record's `--mem`. A whole-box job (`--mem 0`) therefore reads as the
+    node's memory that slurm allocated, not 0, so `resolve_mem`'s whole-box branch no longer fires for a kill (harmless:
+    the ask is bumped from the real figure)."""
+    records = [r for r in records if r.get("kind") != SHARING_PROBE and r.get("job_id")]
 
     def ended(record: Mapping[str, object]) -> int:
         times = [leg.get("ended_at") for leg in record_legs(record)] + [record.get("submitted_at")]
@@ -938,13 +976,15 @@ def memory_kill(name: str) -> MemoryKill | None:
     if not kills:
         return None
     _, job_id, by, used_mb = max(kills, key=lambda kill: kill[:2])
-    asked, job = unclean[job_id].get("mem"), accounting.get(job_id, {})
+    record, job = unclean[job_id], accounting.get(job_id, {})
+    allocated = next((t.get("count") for t in job.get("tres", {}).get("allocated", []) if t.get("type") == "mem"), None)
     try:
-        asked_mb = mem_mb(str(asked)) if asked is not None else next(
-            int(t["count"]) for t in job.get("tres", {}).get("allocated", []) if t.get("type") == "mem")
-    except (ValueError, IndexError, KeyError, TypeError, StopIteration):
+        asked_mb = int(allocated) if allocated is not None else mem_mb(str(record["mem"])) if record.get("mem") is not None else None
+    except (ValueError, KeyError, TypeError):
         asked_mb = None  # not slurm notation, or accounting does not say
-    return MemoryKill(job_id, asked_mb, by, used_mb)
+    size = record.get("size")
+    count = size.get("count") if isinstance(size, dict) else None
+    return MemoryKill(job_id, asked_mb, by, used_mb, float(count) if isinstance(count, int | float) else None)
 
 
 #: The earliest start time sacct accepts: its window bounds which jobs are searched, and history is wanted whole.
@@ -1480,6 +1520,10 @@ def starts_jobs_in(node: Mapping[str, int | str], partition: str) -> bool:
     return partition in str(node["partitions"]).split(",") and not set(str(node["state"]).split("+")) & set(NodeFlag)
 
 
+#: How long a read-only `scontrol` query may take before slurm counts as not answering.
+SLURM_QUERY_S = 30
+
+
 def node_capacity(
     runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
 ) -> list[dict[str, int | str]] | None:
@@ -1510,6 +1554,47 @@ def node_capacity(
         held = fields.get("MemSpecLimit", "")
         node["mem_mb"] = int(node["mem_mb"]) - (int(held) if held.isdigit() else 0)
         found.append(node)
+    return found
+
+
+def hostnames(hostlist: str, run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run) -> list[str] | None:
+    """The node names in a slurm host list (`n[1-2],x`): [] for "", the name itself when it has no range or comma
+    (nothing is run), else `scontrol show hostnames`. None when slurm does not answer."""
+    if not hostlist:
+        return []
+    if "[" not in hostlist and "," not in hostlist:
+        return [hostlist]
+    try:
+        done = run(["scontrol", "show", "hostnames", hostlist], capture_output=True, text=True, timeout=SLURM_QUERY_S, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return done.stdout.split() if done.returncode == 0 else None
+
+
+@dataclass(frozen=True)
+class PartitionTier:
+    """A partition's `PriorityTier` and whether jobs pre-empted in it are requeued (`PreemptMode` has REQUEUE)."""
+
+    tier: int
+    requeues: bool
+
+
+def partition_tiers(
+    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> dict[str, PartitionTier] | None:
+    """Each partition's `PartitionTier` (`scontrol show partition -o`); None when slurm does not answer."""
+    try:
+        done = run(["scontrol", "show", "partition", "-o"], capture_output=True, text=True, timeout=SLURM_QUERY_S, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if done.returncode != 0:
+        return None
+    found: dict[str, PartitionTier] = {}
+    for line in done.stdout.splitlines():
+        fields = dict(part.split("=", 1) for part in line.split() if "=" in part)
+        tier = fields.get("PriorityTier", "")
+        if fields.get("PartitionName") and tier.isdigit():
+            found[fields["PartitionName"]] = PartitionTier(int(tier), "REQUEUE" in fields.get("PreemptMode", ""))
     return found
 
 
