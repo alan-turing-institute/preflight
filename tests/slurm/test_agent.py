@@ -625,6 +625,17 @@ def test_room_for_a_service_job_comes_from_the_newest_cpu_jobs_and_is_given_back
     assert plan([full[0], unknown, frozen[2]], {"3"}) == ([], [])
 
 
+def test_the_service_planner_counts_the_jobs_memory_not_the_real_memory(world: World) -> None:
+    """A node keeping memory back (MemSpecLimit) lends 523 of its 1,000 MB: a service job asking 600 cannot start there, so
+    no cpu job is held or suspended for it."""
+    node = dataclasses.replace(world.agent.site.nodes[0], jobs_memory_gb=0.5)
+    assert node.jobs_mb < 600 < node.real_memory_mb
+    world.agent.site = dataclasses.replace(world.agent.site, nodes=[node], service=site_config.Service(2, "svc"))
+    world.queue = [q("1", "normal", gpus=1), q("2", "cpu"), q("9", "service", "PENDING", mem=600, reason="Resources")]
+    world.step()
+    assert [w for w in world.writes if w[0] in {"hold", "suspend"}] == []
+
+
 def test_the_agent_holds_waiting_cpu_jobs_one_at_a_time_before_suspending_and_undoes_it_all_after(
     world: World, monkeypatch: pytest.MonkeyPatch
 ) -> None:

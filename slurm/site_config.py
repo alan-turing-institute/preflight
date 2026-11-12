@@ -59,12 +59,12 @@ class AuthMode(StrEnum):
     SSH = "ssh"  # no sign-in page: each person's own ssh forward to the relay names them (D19, see portal.py)
 
 
-class CoresFromHistory(StrEnum):
-    """`cpus_from_history` (D35): what `submit.py` does with the cores a CPU-only job used on its last completed runs."""
+class Policy(StrEnum):
+    """One closed set for every off/recommend/enforce site field (`cpus_from_history`, `memory_from_size`, `require_check`)."""
 
-    OFF = "off"  # nothing: no accounting query, no line
-    RECOMMEND = "recommend"  # print the cores it would ask for; ask as before
-    ENFORCE = "enforce"  # ask for them when --cpus is not given
+    OFF = "off"  # do nothing: no query, no line
+    RECOMMEND = "recommend"  # print what it would do; act as before
+    ENFORCE = "enforce"  # do it (or refuse)
 
 
 SHARDS_FROM_CORES = "cores"  # `shards = "cores"`: one shard per core the node holds for the card
@@ -265,7 +265,9 @@ class Site:
     remotes: dict[str, Remote] = field(default_factory=dict)  # `[remote.NAME]` tables
     requeue_delay_s: int = 60  # slurm.conf AuthInfo=cred_expire: how long a requeued job waits before it may start again
     sharing_memory_fraction: float | None = None  # a site's own tightening of the share of a node's jobs memory that co-running shard jobs may fill
-    cpus_from_history: CoresFromHistory = CoresFromHistory.RECOMMEND  # cores for a named CPU-only job without --cpus (D35)
+    cpus_from_history: Policy = Policy.RECOMMEND  # cores for a named CPU-only job without --cpus (D35)
+    memory_from_size: Policy = Policy.RECOMMEND  # memory for a named job without --memory, from its input size (D48)
+    require_check: Policy = Policy.RECOMMEND  # a job must pass its pre-queue check before it is queued (D47)
 
     @property
     def cpu_job_cap(self) -> int | None:
@@ -601,7 +603,9 @@ def parse(raw: dict[str, Any]) -> Site:
             "node_python": "/usr/bin/python3",
             "requeue_delay_s": 60,
             "sharing_memory_fraction": None,
-            "cpus_from_history": CoresFromHistory.RECOMMEND.value,
+            "cpus_from_history": Policy.RECOMMEND.value,
+            "memory_from_size": Policy.RECOMMEND.value,
+            "require_check": Policy.RECOMMEND.value,
             "hostguard": False,
             "dgx_gate": False,
             "constrain_devices": True,
@@ -690,7 +694,9 @@ def parse(raw: dict[str, Any]) -> Site:
         remotes=_parse_remotes(top["remote"]),
         requeue_delay_s=top["requeue_delay_s"],
         sharing_memory_fraction=None if fraction is None else float(fraction),
-        cpus_from_history=_enum(CoresFromHistory, top["cpus_from_history"], "cpus_from_history"),
+        cpus_from_history=_enum(Policy, top["cpus_from_history"], "cpus_from_history"),
+        memory_from_size=_enum(Policy, top["memory_from_size"], "memory_from_size"),
+        require_check=_enum(Policy, top["require_check"], "require_check"),
     )
 
 

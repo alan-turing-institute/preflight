@@ -20,7 +20,7 @@ DIRECTIVE = "#S" + "BATCH"  # spelled in two halves so a text-matching guard doe
 def fake_site(monkeypatch: pytest.MonkeyPatch, *, lease: object, dgx_gate: bool, nodes: tuple = (),
               cpu_job_cap: int | None = None, service: object = None, part_time_nodes: tuple = (),
               node_python: str = "/usr/bin/python3", sharing_memory_fraction: float | None = None,
-              cpus_from_history: site_config.CoresFromHistory = site_config.CoresFromHistory.OFF) -> None:
+              cpus_from_history: site_config.Policy = site_config.Policy.OFF) -> None:
     """`load` returns just the fields submit.py reads."""
     site = SimpleNamespace(lease=lease, dgx_gate=dgx_gate, nodes=nodes, cpu_job_cap=cpu_job_cap, service=service,
                            part_time_nodes=part_time_nodes, node_python=node_python,
@@ -378,7 +378,7 @@ def test_a_gpu_job_on_a_fast_cpus_node_keeps_its_cores_and_is_bound_to_the_fast_
     monkeypatch.setattr(gpu_jobs, "measured_cores", lambda job_name: (9.0, 3))  # sacct's, diluted for GPU jobs: CPU jobs only
     gpu = site_config.Gpu(0, "GPU-a", "/dev/nvidia0", "gb10")
     node = site_config.Node("n", 20, 100000, (gpu,), cores_per_gpu=12, fast_cpus="10-19")
-    fake_site(monkeypatch, lease=None, dgx_gate=False, nodes=(node,), cpus_from_history=site_config.CoresFromHistory.ENFORCE)
+    fake_site(monkeypatch, lease=None, dgx_gate=False, nodes=(node,), cpus_from_history=site_config.Policy.ENFORCE)
 
     def job(*argv: str) -> tuple[str, str]:
         capsys.readouterr()
@@ -414,7 +414,7 @@ def test_a_cpu_job_over_the_cpu_cap_is_refused(tmp_path: Path, monkeypatch: pyte
     service = ("--project", "p", "--what", "w", "--class", "restart", "--mem", "12G", "--service")
     with pytest.raises(submit.Refused, match="no service partition"):
         dry(*service, "--", "x")
-    node = SimpleNamespace(cpus=8, real_memory_mb=20000, gpus=())
+    node = SimpleNamespace(cpus=8, real_memory_mb=20000, jobs_mb=20000, gpus=())
     fake_site(monkeypatch, lease=None, dgx_gate=False, nodes=(node,), cpu_job_cap=2,
               service=SimpleNamespace(cores=3, group="svc"))
     monkeypatch.setattr(gpu_jobs, "read_queue", list)  # an empty machine
@@ -442,9 +442,9 @@ def test_a_named_cpu_job_is_offered_the_cores_its_completed_runs_used(
 ) -> None:
     measured: dict[str, tuple[float, int] | None] = {}
     monkeypatch.setattr(gpu_jobs, "measured_cores", lambda job_name: measured.setdefault(job_name, (1.7, 3)))
-    mode = site_config.CoresFromHistory
+    mode = site_config.Policy
 
-    def cpus(history: site_config.CoresFromHistory, *argv: str) -> str:
+    def cpus(history: site_config.Policy, *argv: str) -> str:
         fake_site(monkeypatch, lease=None, dgx_gate=False, cpu_job_cap=8, cpus_from_history=history)
         capsys.readouterr()
         script = dry("--project", "p", "--what", "w", "--class", "restart", "--mem", "4G", *argv, "--", "x")
@@ -487,7 +487,7 @@ def test_the_service_dry_run_names_the_jobs_it_would_suspend_with_their_owners_c
 ) -> None:
     monkeypatch.setattr(gpu_jobs, "STATE_DIR", tmp_path)
     monkeypatch.setattr(site_config, "may_submit_service", lambda _site, _user: True)
-    node = SimpleNamespace(cpus=8, real_memory_mb=40000, gpus=())  # 32,000 MB free beside the two jobs
+    node = SimpleNamespace(cpus=8, real_memory_mb=40000, jobs_mb=40000, gpus=())  # 32,000 MB free beside the two jobs
     fake_site(monkeypatch, lease=None, dgx_gate=False, nodes=(node,), service=SimpleNamespace(cores=4, group="s"))
     me = gpu_jobs.current_user()  # a record counts only when the job's own user wrote it
     queue = [gpu_jobs.QueuedJob("1", "normal", "RUNNING", "None", "r:resume:gpu", user=me, gpus=1, cpus=6, mem_mb=4000),
@@ -501,6 +501,9 @@ def test_the_service_dry_run_names_the_jobs_it_would_suspend_with_their_owners_c
     assert refused["starts"] == "waits" and refused["why"].startswith("cores: 0 free")
     queue.pop()  # job 2 has ended: two cores free
     assert room(capsys, "--no-suspend") == {"starts": "now", "suspends": [], "why": "it fits beside what runs"}
+    node.jobs_mb = 12000  # slurm keeps the rest back (MemSpecLimit): 8,000 MB free beside job 1 though 36,000 of the real memory are
+    assert room(capsys)["starts"] == "waits" and room(capsys)["why"].startswith("memory: it needs")
+    node.jobs_mb = 40000
     queue[0] = dataclasses.replace(queue[0], mem_mb=0)  # the GPU job holds the whole machine's memory
     assert room(capsys)["starts"] == "waits"
 

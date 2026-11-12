@@ -455,7 +455,7 @@ def cores_from_history(arguments: argparse.Namespace, named: str | None, hand_se
     mode = site.cpus_from_history
     node = site_config.gpu_node(site)
     gpu_sized = bool(arguments.gpus) and node is not None and bool(node.fast_cpus) and not shards
-    if mode is site_config.CoresFromHistory.OFF or (arguments.gpus and not gpu_sized) or named is None:
+    if mode is site_config.Policy.OFF or (arguments.gpus and not gpu_sized) or named is None:
         return None
     measured = (gpu_jobs.measured_run_cores(named) if gpu_sized
                 else gpu_jobs.measured_cores(f"{arguments.project}:{arguments.job_class}:{named}"))
@@ -469,7 +469,7 @@ def cores_from_history(arguments: argparse.Namespace, named: str | None, hand_se
     proposal = max(1, math.ceil(average * CORES_MARGIN))
     proposal = min(proposal, cap) if cap else proposal
     asking = arguments.cpus
-    applied = mode is site_config.CoresFromHistory.ENFORCE and not hand_set
+    applied = mode is site_config.Policy.ENFORCE and not hand_set
     if applied:
         arguments.cpus = proposal
     said = f"[submit] cores: measured {average:.1f} avg over {runs} completed runs; "
@@ -721,14 +721,14 @@ def service_room(site: site_config.Site, cpus: int, memory_mb: int, consent: fro
     node, service = site.nodes[0], site.service
     asking = gpu_jobs.QueuedJob(_ASKING, gpu_jobs.Partition.SERVICE, gpu_jobs.State.PENDING, gpu_jobs.Reason.RESOURCES,
                                 "asking", priority=2**32, cpus=cpus, mem_mb=memory_mb)
-    room = gpu_jobs.plan_room([*queue, asking], set(), node.cpus, node.real_memory_mb, service.cores, {_ASKING: consent})
+    room = gpu_jobs.plan_room([*queue, asking], set(), node.cpus, node.jobs_mb, service.cores, {_ASKING: consent})
     by_id = {job.job_id: job for job in queue}
     if room.helping == _ASKING:
         return {"starts": "after_suspending", "why": "cores are short; these cpu jobs are suspended until it has gone",
                 "suspends": [{"job": j, "user": by_id[j].user, "name": by_id[j].name,
                               "what": str((gpu_jobs.read_sidecar(j, by_id[j].user) or {}).get("what") or "")}
                              for j in room.suspend]}
-    free_cores, free_mb = gpu_jobs.free_room(queue, node.cpus, node.real_memory_mb)
+    free_cores, free_mb = gpu_jobs.free_room(queue, node.cpus, node.jobs_mb)
     service_free = service.cores - sum(j.cpus for j in queue
                                        if j.partition == gpu_jobs.Partition.SERVICE and j.state in gpu_jobs.ON_CORES)
     if free_mb is None:

@@ -823,7 +823,7 @@ class Agent:
         service = self.site.service
         node = self.site.nodes[0]  # site_config allows [service] on one node only
         room = gpu_jobs.plan_room(
-            queue, set(s.suspended), node.cpus, node.real_memory_mb, service.cores if service else 0,
+            queue, set(s.suspended), node.cpus, node.jobs_mb, service.cores if service else 0,
             {j.job_id: may_suspend(j) for j in queue if j.partition == gpu_jobs.Partition.SERVICE},
             frozenset(s.given_up),
         )
