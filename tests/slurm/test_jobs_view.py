@@ -14,6 +14,7 @@ from collections.abc import Iterator
 import dataclasses
 from datetime import date, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import gpu_jobs
 import jobs_view
@@ -262,3 +263,55 @@ def test_can_act_owner_or_admin() -> None:
     assert not jobs_view.can_act(job, "other", admin=False)
     assert jobs_view.can_act(job, "other", admin=True)
     assert not jobs_view.can_act(queued("None"), "", admin=False)  # an unknown owner never matches an empty name
+
+
+def test_room_per_node_names_what_is_short_and_who_holds_it() -> None:
+    """D48 Part A: per node, never summed; a partition's core cap, one card as a GPU or shards (never both), a whole-box
+    holder sized as the node's jobs memory, excluded and draining nodes dropped, and the holder's mover from tiers."""
+    now = 1_800_000_000.0
+
+    def row(name: str, *, state: str = "MIXED", partitions: str = "cpu,cpu_fill,normal", mem: int = 82000, mem_used: int = 76000,
+            cpus_used: int = 6, gpus: int = 0, gpus_used: int = 0, shards: int = 0, shards_used: int = 0) -> dict[str, int | str]:
+        return {"name": name, "state": state, "partitions": partitions, "cpus": 20, "cpus_used": cpus_used, "mem_mb": mem,
+                "mem_used_mb": mem_used, "gpus": gpus, "gpus_used": gpus_used, "shards": shards, "shards_used": shards_used}
+
+    def job(job_id: str, partition: str, *, mem: int | None = 1000, cpus: int = 2, gpus: int = 0, shards: int = 0,
+            state: str = "RUNNING", start: float = now - 3600) -> QueuedJob:
+        return QueuedJob(job_id, partition, state, "None", f"p{job_id}:resume:x", mem_mb=mem, cpus=cpus, gpus=gpus,
+                         shards=shards, node="n1", start=int(start))
+
+    site = SimpleNamespace(nodes=[SimpleNamespace(name="n1", fast_cpus="")], cpu_job_cap=8, service=None)
+    tiers = {"cpu": gpu_jobs.PartitionTier(1, False), "cpu_fill": gpu_jobs.PartitionTier(1, True),
+             "normal": gpu_jobs.PartitionTier(2, True)}
+    big, small = job("1", "cpu_fill", mem=60000), job("2", "normal", mem=16000, start=0)
+    queue = {j.job_id: j for j in (big, small)}
+    need = jobs_view.Need(24000, 4, partitions="cpu")
+    (only,) = jobs_view.room(need, queue, [row("n1")], site, tiers, now)
+    assert only.lacks == (jobs_view.Lack.MEMORY,) and [h.job for h in only.holders] == ["1", "2"]
+    assert (only.holders[0].running_s, only.holders[0].slurm_moves_it, only.holders[1].running_s) == (3600, False, 0)
+    assert jobs_view.room(dataclasses.replace(need, partitions="normal"), queue, [row("n1")], site, tiers, now)[0] \
+        .holders[0].slurm_moves_it  # a tier-2 job may pre-empt a requeuing tier-1 job
+    text = jobs_view.room_text([only], need, queued=True)[0]
+    assert text.startswith("n1: 6.3 GB of 86.0 GB and 14 of 20 cores free; it lacks 18.9 GB memory, held by #1 p1 62.9 GB")
+    assert "running 1 h 0 min, only its owner or an admin can move it" in text
+
+    whole = {"9": job("9", "normal", mem=0)}  # a whole-box job holds the node's jobs memory, not 0
+    assert jobs_view.room(need, whole, [row("n1")], site)[0].holders[0].amount == "86.0 GB"
+
+    capped = {str(i): job(str(i), "cpu", mem=100, cpus=4) for i in (3, 4)}  # the cpu partition's 8 cores are taken
+    (cap,) = jobs_view.room(jobs_view.Need(100, 2, partitions="cpu"), capped, [row("n1", mem_used=200)], site)
+    assert cap.lacks == (jobs_view.Lack.PARTITION_CORES,) and cap.free_cpus == 14 and len(cap.holders) == 2
+    assert not jobs_view.room(jobs_view.Need(100, 2, partitions="cpu_fill"), capped, [row("n1", mem_used=200)], site)[0].lacks
+
+    card = row("n1", mem_used=0, gpus=1, shards=12, shards_used=2)  # one card, 2 of its 12 shards out
+    shard_job = {"5": job("5", "normal", mem=0, shards=2)}
+    assert jobs_view.room(jobs_view.Need(100, 2, gpus=1, partitions="normal"), shard_job, [card], site)[0].lacks == (jobs_view.Lack.GPUS,)
+    held_card = row("n1", mem_used=0, gpus=1, gpus_used=1, shards=12)
+    assert jobs_view.room(jobs_view.Need(100, 2, shards=2, partitions="normal"), {}, [held_card], site)[0].lacks == (jobs_view.Lack.SHARDS,)
+
+    nodes = [row("n1"), row("n2", state="IDLE+DRAIN"), row("n3", mem_used=0)]
+    assert [r.node for r in jobs_view.room(dataclasses.replace(need, excluded=frozenset({"n3"})), {}, nodes, site)] == ["n1"]
+    fits = jobs_view.room(need, {}, [row("n3", mem_used=0)], site)
+    assert jobs_view.room_text(fits, need, queued=True)[0].startswith("the figures show room on n3, yet slurm has not started it")
+    assert jobs_view.room_text(fits, need, queued=False) == ["fits now on n3"]
+    assert jobs_view.room_text([], need, queued=False) == ["no node in cpu can take it now (down, draining or excluded)"]

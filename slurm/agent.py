@@ -143,12 +143,8 @@ RESUME_PROTECTED = frozenset({gpu_jobs.Partition.URGENT, gpu_jobs.Partition.SERV
 #: The idle check (Part C2) looks this often, and tells one project about one holder at most this often.
 IDLE_EVERY_S = 600.0
 IDLE_NOTICE_EVERY_S = 3600.0
-#: Holders named per finding (and told per look), largest first.
-IDLE_HOLDERS = 3
 #: Waiting for room, as opposed to a dependency, a hold or a begin time.
 IDLE_WAITING_REASONS = frozenset({gpu_jobs.Reason.RESOURCES, gpu_jobs.Reason.PRIORITY})
-#: Partitions whose `resume` jobs slurm requeues for a waiting job; a `cpu` (restart) job is never moved.
-MOVABLE_PARTITIONS = frozenset({gpu_jobs.Partition.NORMAL, gpu_jobs.Partition.CPU_FILL, gpu_jobs.Partition.PART_TIME})
 
 
 class NotifyEvent(StrEnum):
@@ -260,26 +256,12 @@ def notify_run(argv: list[str], env: dict[str, str]) -> None:
 
 
 @dataclass
-class Holder:
-    job: str
-    project: str
-    amount: str  # with its unit: "24.0 GB", "8 cores", "1 GPU"
-    job_class: str
-    movable: bool
-
-    @property
-    def text(self) -> str:
-        return (f"#{self.job} {self.project} holds {self.amount} "
-                f"({self.job_class}, {'can be moved' if self.movable else 'cannot be moved'})")
-
-
-@dataclass
 class IdleFinding:
     waiting: str
     project: str
     lacks: str
     rule: IdleRule
-    holders: list[Holder]
+    holders: list[jobs_view.Holder]
     idle: str  # what is unused meanwhile
     since: int = 0
 
@@ -292,12 +274,6 @@ class IdleFinding:
 def _gb(mb: float) -> float:
     """Slurm's MB (binary) as decimal GB."""
     return mb * 1048576 / 1e9
-
-
-def _holder(job: gpu_jobs.QueuedJob, amount: str) -> Holder:
-    cls = job.job_class
-    movable = cls is gpu_jobs.JobClass.RESUME and job.partition in MOVABLE_PARTITIONS
-    return Holder(job.job_id, jobs_view.project_of(job.name), amount, cls.value if cls else "unknown class", movable)
 
 
 def idle_findings(queue: list[gpu_jobs.QueuedJob], total: dict[str, int], cpu_cap: int | None,
@@ -336,8 +312,8 @@ def idle_findings(queue: list[gpu_jobs.QueuedJob], total: dict[str, int], cpu_ca
             continue
         for rule, lacking, lacks, held in options:
             if lacking:
-                holders = [_holder(j, label) for amount, label, j in sorted(held, key=lambda h: -h[0])
-                           if amount > 0 and j.job_id != job.job_id][:IDLE_HOLDERS]
+                holders = [jobs_view.holder(j, label) for amount, label, j in sorted(held, key=lambda h: -h[0])
+                           if amount > 0 and j.job_id != job.job_id][:jobs_view.HOLDERS_NAMED]
                 found.append(IdleFinding(job.job_id, jobs_view.project_of(job.name), lacks, rule, holders, idle))
                 break
     return found

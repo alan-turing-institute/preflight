@@ -125,7 +125,7 @@ def test_free_room_is_counted_only_on_nodes_the_urgent_partition_can_start_a_job
              gpu_jobs.QueuedJob("2", "cpu", "PENDING", "Resources", "p:x:2", cores=frozenset({"n:1:2"})),
              gpu_jobs.QueuedJob("3", "cpu", "RUNNING", "None", "p:x:3", cores=frozenset({"other:1:3"})),
              gpu_jobs.QueuedJob("4", "cpu_fill", "COMPLETING", "None", "p:x:4", cores=frozenset({"n:1:4"}))]  # still on its cores
-    assert urgent.free_fast_cores(queue, node) == 7
+    assert urgent.jobs_view.free_fast_cores(queue, node) == 7
 
 
 def test_memory_notation() -> None:
