@@ -987,6 +987,76 @@ def memory_kill_in(records: list[Mapping[str, object]]) -> MemoryKill | None:
     return MemoryKill(job_id, asked_mb, by, used_mb, float(count) if isinstance(count, int | float) else None)
 
 
+#: Scaling a peak in proportion to a declared size bounds it only when memory grows no faster than linearly with the
+#: size; beyond twice the largest measured size that is too much to assume, so no figure is given (D48).
+SIZE_EXTRAPOLATION_LIMIT = 2
+
+
+@dataclass(frozen=True)
+class SizeFigure:
+    """Memory from a declared size (D48): the peak to size from (None: no figure), how it was found, and the newest
+    memory kill at the size or above with no clean run since (its bump applies, as `memory_kill`'s does by name)."""
+
+    base_bytes: int | None
+    line: str
+    kill: MemoryKill | None = None
+
+
+def declared_size(record: Mapping[str, object]) -> tuple[float, str] | None:
+    """A record's `--size` (count, unit), None when it has none or it is malformed."""
+    size = record.get("size")
+    if not isinstance(size, dict):
+        return None
+    count, unit = size.get("count"), size.get("unit")
+    if isinstance(count, int | float) and math.isfinite(count) and count > 0 and isinstance(unit, str) and unit:
+        return float(count), unit
+    return None
+
+
+def uses_card(record: Mapping[str, object]) -> bool:
+    """Whether a record's job used a card (a shard job is recorded with `gpus` 1)."""
+    gpus = record.get("gpus")
+    return isinstance(gpus, int) and gpus > 0
+
+
+def size_memory(project: str, unit: str, card: bool, count: float) -> SizeFigure | None:
+    """D48: the peak a job of `project` declaring `count` of `unit` should be sized from, from this user's clean runs of
+    the same project, unit and card use (the project declares them comparable; nothing is inferred from names).
+
+    P(c) is the highest peak of the `HISTORY_RUNS` newest runs at count c. When a measured count c* >= `count` exists
+    (the smallest such), the base is the highest P(c) for c <= c*: an upper bound when peak does not fall as the count
+    grows, and never below a smaller measured count when the data say otherwise. Above every measured count, within
+    `SIZE_EXTRAPOLATION_LIMIT` times the largest (cmax), it is max(P(cmax) * count / cmax, every P): an upper bound when
+    peak(c) = a + b*c with a, b >= 0. Beyond that, no figure. None when no run of the unit is known at all."""
+    records = list(own_records_where(lambda r: r.get("project") == project and uses_card(r) == card
+                                     and (declared_size(r) or (0.0, ""))[1] == unit))
+    if not records:
+        return None
+    by_count: dict[float, list[RunPeak]] = {}
+    for peak in run_peaks(records, clean=True):
+        size = declared_size(peak.record)
+        if size is not None:
+            by_count.setdefault(size[0], []).append(peak)
+    highest = {c: max(p.total for p in sorted(peaks, key=lambda p: (p.ended, p.total), reverse=True)[:HISTORY_RUNS])
+               for c, peaks in by_count.items()}
+    kill = memory_kill_in(records)
+    kill = kill if kill is not None and kill.count is not None and kill.count >= count else None
+    said = f"{project} {unit!r} runs"
+    if not highest:
+        return SizeFigure(None, f"no clean {said} yet", kill)
+    above = [c for c in highest if c >= count]
+    if above:
+        at = min(above)
+        base = max(total for c, total in highest.items() if c <= at)
+        return SizeFigure(base, f"{count:g} {unit}; {said}: {at:g} -> {highest[at] / GB:.1f} GB peak", kill)
+    largest = max(highest)
+    if count > SIZE_EXTRAPOLATION_LIMIT * largest:
+        return SizeFigure(None, f"{count:g} {unit} is more than {SIZE_EXTRAPOLATION_LIMIT} times the largest of the "
+                                f"{said} ({largest:g}), too far to scale", kill)
+    base = max(math.ceil(highest[largest] * count / largest), *highest.values())
+    return SizeFigure(base, f"{count:g} {unit}, scaled from {said}: {largest:g} -> {highest[largest] / GB:.1f} GB peak", kill)
+
+
 #: The earliest start time sacct accepts: its window bounds which jobs are searched, and history is wanted whole.
 _SACCT_EPOCH = "1970-01-01T00:00:00"
 

@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import cores
 import gpu_jobs
 import portability
+import remote
 import pytest
 import site_config
 import submit
@@ -20,11 +21,13 @@ DIRECTIVE = "#S" + "BATCH"  # spelled in two halves so a text-matching guard doe
 def fake_site(monkeypatch: pytest.MonkeyPatch, *, lease: object, dgx_gate: bool, nodes: tuple = (),
               cpu_job_cap: int | None = None, service: object = None, part_time_nodes: tuple = (),
               node_python: str = "/usr/bin/python3", sharing_memory_fraction: float | None = None,
-              cpus_from_history: site_config.Policy = site_config.Policy.OFF) -> None:
+              cpus_from_history: site_config.Policy = site_config.Policy.OFF,
+              memory_from_size: site_config.Policy = site_config.Policy.RECOMMEND) -> None:
     """`load` returns just the fields submit.py reads."""
     site = SimpleNamespace(lease=lease, dgx_gate=dgx_gate, nodes=nodes, cpu_job_cap=cpu_job_cap, service=service,
                            part_time_nodes=part_time_nodes, node_python=node_python,
-                           sharing_memory_fraction=sharing_memory_fraction, cpus_from_history=cpus_from_history)
+                           sharing_memory_fraction=sharing_memory_fraction, cpus_from_history=cpus_from_history,
+                           memory_from_size=memory_from_size)
     monkeypatch.setattr(site_config, "load", lambda *_p: site)
 
 
@@ -635,3 +638,34 @@ def test_a_dry_run_says_where_the_job_has_room_and_who_holds_the_rest(monkeypatc
     assert "[submit] room: n1: 10.5 GB of 31.5 GB and 18 of 20 cores free; it lacks 15.3 GB memory, held by #11 q 21.0 GB" in capsys.readouterr().out
     dry("--project", "p", "--what", "w", "--class", "restart", "--mem", "4G", "--name", "n", "--", "true")
     assert "[submit] room: fits now on n1" in capsys.readouterr().out
+
+
+def test_size_sizes_memory_from_the_projects_runs_of_the_unit(monkeypatch: pytest.MonkeyPatch,
+                                                               capsys: pytest.CaptureFixture[str]) -> None:
+    """D48: --size is checked, recommend prints the figure, enforce asks the larger figure, the whole box is never
+    applied from a size, and the size is forwarded to another site."""
+    monkeypatch.setattr(gpu_jobs, "own_records_where", lambda _match: iter(()))  # no job records but the test's
+    argv = ("--project", "p", "--what", "w", "--class", "restart", "--name", "n")
+    for bad in (("inf", "detectors"), ("0", "detectors"), ("3", "two words")):
+        with pytest.raises(submit.Refused, match="--size"):
+            dry(*argv, "--size", *bad, "--", "true")
+    base = gpu_jobs.SizeFigure(20 * 10**9, "30 detectors; p 'detectors' runs: 30 -> 20.0 GB peak")
+    monkeypatch.setattr(gpu_jobs, "size_memory", lambda *_a: base)
+    node = SimpleNamespace(cpus=8, real_memory_mb=100000, jobs_mb=60000, gpus=())
+    fake_site(monkeypatch, lease=None, dgx_gate=False, nodes=(node,))
+    assert "--mem=" not in dry(*argv, "--size", "30", "Detectors", "--", "true")  # recommend: asks as before
+    assert "would ask 21G (30 detectors" in capsys.readouterr().out  # 20 GB x 1.1 = 20.5 GiB -> 21G
+    fake_site(monkeypatch, lease=None, dgx_gate=False, nodes=(node,), memory_from_size=site_config.Policy.ENFORCE)
+    assert "--mem=21G" in dry(*argv, "--size", "30", "detectors", "--", "true")
+    monkeypatch.setattr(gpu_jobs, "measured_peak_bytes", lambda *_a, **_k: 30 * 1024**3)  # the name's own runs: larger
+    assert "--mem=33G" in dry(*argv, "--size", "30", "detectors", "--", "true")  # 30 GiB x 1.1
+    assert "asking 33G, the name's own measured figure, larger" in capsys.readouterr().out
+    monkeypatch.setattr(gpu_jobs, "measured_peak_bytes", lambda *_a, **_k: None)
+    monkeypatch.setattr(gpu_jobs, "size_memory", lambda *_a: gpu_jobs.SizeFigure(90 * 10**9, "huge"))
+    capsys.readouterr()
+    assert "--mem=" not in dry(*argv, "--size", "30", "detectors", "--", "true")  # more than the node lends
+    assert "the whole box is never applied from a size" in capsys.readouterr().out
+    assert "--mem=8G" in dry(*argv, "--mem", "8G", "--size", "30", "detectors", "--", "true")  # typed: used, warned
+    assert "is below the 90.0 GB peak" in capsys.readouterr().err
+    forwarded = remote.forwarded(submit.parser().parse_args([*argv, "--size", "30", "detectors", "--", "true"]))
+    assert forwarded[-3:] == ["--size", "30", "detectors"]

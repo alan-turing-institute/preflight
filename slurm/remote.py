@@ -140,6 +140,8 @@ def forwarded(arguments: argparse.Namespace) -> list[str]:
         out += ["--after", job]
     if arguments.resume_ok:
         out.append("--resume-ok")
+    if getattr(arguments, "size", None):  # sized there, from that site's own runs (D48)
+        out += ["--size", *arguments.size]
     return out
 
 

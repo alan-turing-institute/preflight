@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import itertools
 import json
+import math
 import os
 import pwd
 import signal
@@ -714,3 +715,32 @@ def test_status_reserve_recommends_jobs_memory_from_two_weeks_of_outside_use(tmp
     assert status.reserve_lines(site, record(3), "n1", 0) == ["[reserve] n1: not enough data (3 days; at least 7)"]
     assert "run this on n1" in status.reserve_lines(site, tmp_path / "outside-8", "elsewhere", 0)[1]
     assert status.reserve_lines(site, tmp_path / "none", "n1", 0)[0].startswith("[reserve] no record")
+
+
+def test_size_memory_brackets_from_above_scales_within_twice_and_finds_kills_by_unit(monkeypatch: pytest.MonkeyPatch) -> None:
+    """D48 Part B: the bound from the smallest measured count at or above the request (never below a smaller count's
+    peak), proportional scaling up to twice the largest count, kills of the unit, and card use kept apart."""
+    gb = 10**9
+
+    def run(job_id: str, count: float, peak: float, *, gpus: int = 0, ended: int = 100, clean: bool = True) -> dict[str, object]:
+        leg = {"peak_gpu_mib": 0, "peak_mem_bytes": int(peak * gb), "exit": 0 if clean else 137, "ended_at": ended,
+               "started_at": ended - 1000}
+        return {"job_id": job_id, "project": "p", "gpus": gpus, "size": {"count": count, "unit": "detectors"}, "legs": [leg]}
+
+    records: list[dict[str, object]] = []
+    monkeypatch.setattr(gpu_jobs, "own_records_where", lambda match: (r for r in records if match(r)))
+    monkeypatch.setattr(gpu_jobs, "_sacct_jobs", lambda *_a, **_k: [])
+    monkeypatch.setattr(gpu_jobs, "agent_notices", lambda *_a: [])
+    assert gpu_jobs.size_memory("p", "detectors", False, 30) is None  # no run of the unit at all
+    records[:] = [run("1", 20, 25), run("2", 30, 20)]  # more detectors, less memory: never ask below the smaller count
+    assert gpu_jobs.size_memory("p", "detectors", False, 25).base_bytes == 25 * gb
+    records[:] = [run("3", 25, 21.1)]
+    assert gpu_jobs.size_memory("p", "detectors", False, 30).base_bytes == math.ceil(21.1 * gb * 30 / 25)
+    beyond = gpu_jobs.size_memory("p", "detectors", False, 60)
+    assert beyond.base_bytes is None and "more than 2 times" in beyond.line
+    assert gpu_jobs.size_memory("p", "detectors", True, 30) is None  # a GPU step never sizes from a CPU step
+    records.append({**run("4", 30, 30, ended=200, clean=False), "mem": "24G"})  # killed at 30, no clean run since
+    monkeypatch.setattr(gpu_jobs, "_sacct_jobs", lambda *_a, **_k: [{"job_id": 4, "state": {"current": ["OUT_OF_MEMORY"]}}])
+    kill = gpu_jobs.size_memory("p", "detectors", False, 30).kill
+    assert kill is not None and (kill.job_id, kill.asked_mb, kill.count) == ("4", 24576, 30.0)
+    assert gpu_jobs.size_memory("p", "detectors", False, 40).kill is None  # a kill at a smaller count says nothing for 40

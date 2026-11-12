@@ -182,6 +182,72 @@ def _gb(megabytes: float) -> str:
     return f"{megabytes * 1024**2 / 1e9:.1f} GB"
 
 
+_UNIT = re.compile(r"[\w-]+")
+
+
+def parse_size(raw: list[str] | None) -> tuple[float, str] | None:
+    """`--size COUNT UNIT` as (count, unit): a finite count above 0, one word for the unit (case folded)."""
+    if raw is None:
+        return None
+    count_text, unit = raw[0], raw[1].strip().casefold()
+    try:
+        count = float(count_text)
+    except ValueError:
+        count = math.nan
+    if not (math.isfinite(count) and count > 0):
+        msg = f"--size {count_text!r} {raw[1]!r}: the count must be a number above 0"
+        raise Refused(msg)
+    if not _UNIT.fullmatch(unit):
+        msg = f"--size {count_text} {raw[1]!r}: the unit must be one word (letters, digits, - or _)"
+        raise Refused(msg)
+    return count, unit
+
+
+def memory_from_size(project: str, size: tuple[float, str], mem: str | None, resolved: str | None, gpu: bool,
+                     site: site_config.Site) -> tuple[str | None, dict[str, object]]:
+    """D48: the `--mem` to ask for a job declaring `size`, and what is kept in its record. `mem` is what was typed,
+    `resolved` what `resolve_mem` made of it. `recommend` prints the figure and asks as before; `enforce` asks the larger
+    of it and the name's own measured figure, unless `--mem` was typed (which only warns when below the size's peak) or
+    the figure is the whole box (printed, never applied: it would wait for every other job); `off` says nothing."""
+    policy = site.memory_from_size
+    record: dict[str, object] = {"policy": str(policy), "figure": None, "applied": False}
+    if policy is site_config.Policy.OFF:
+        return resolved, record
+    count, unit = size
+    figure = gpu_jobs.size_memory(project, unit, gpu, count)
+    if figure is None:
+        print(f"[submit] memory from size: no earlier run of {project} declared {unit!r}; asking as before")
+        return resolved, record
+    kill = figure.kill
+    bump_mb = gpu_jobs.bumped_mem_mb(kill.asked_mb, kill.used_mb) if kill is not None and kill.asked_mb else 0.0
+    if figure.base_bytes is None and not bump_mb:
+        print(f"[submit] memory from size: {figure.line}; asking as before")
+        return resolved, record
+    want_mb = max((figure.base_bytes or 0) * (1 + AUTO_MARGIN) / gpu_jobs.SLURM_MB, bump_mb)
+    option = gpu_jobs.mem_option(want_mb, max((node.jobs_mb for node in site.nodes), default=None))
+    record["figure"] = option
+    said = figure.line + (f"; run {kill.job_id} at this size or above was killed for memory" if bump_mb else "")
+    if mem not in (None, "auto"):
+        try:
+            typed_mb = gpu_jobs.mem_mb(mem)
+        except (ValueError, IndexError):
+            typed_mb = None
+        if figure.base_bytes and typed_mb and typed_mb * gpu_jobs.SLURM_MB < figure.base_bytes:
+            warn(f"--mem {mem} is below the {figure.base_bytes / gpu_jobs.GB:.1f} GB peak of {said}")
+        return resolved, record
+    whole = option == WHOLE_BOX
+    named_mb = None if resolved in (None, WHOLE_BOX) else gpu_jobs.mem_mb(resolved)  # the whole box is no measurement
+    if policy is site_config.Policy.ENFORCE and not whole:
+        chosen = option if named_mb is None or gpu_jobs.mem_mb(option) >= named_mb else resolved
+        record["applied"] = chosen == option
+        print(f"[submit] memory from size: asking {chosen} ({said})" if chosen == option else
+              f"[submit] memory from size: {option} ({said}); asking {chosen}, the name's own measured figure, larger")
+        return chosen, record
+    print(f"[submit] memory from size: would ask {option} ({said})"
+          + ("; the whole box is never applied from a size" if whole else ""))
+    return resolved, record
+
+
 def warn_memory(mem: str | None, name: str | None, gpu: bool) -> None:
     """C1: a job named `name` with a measured footprint that states `--mem` by hand warns when it is below the peak (the
     memory floor may kill it) or `0` (the whole box: it waits for every other job). Warnings only, never a refusal."""
@@ -204,7 +270,8 @@ def warn_memory(mem: str | None, name: str | None, gpu: bool) -> None:
 def print_room(need: jobs_view.Need, site: site_config.Site) -> None:
     """D48: what the job needs against what each node it may use has free now, and which running jobs hold the rest
     (`jobs_view.room`). Information only; nothing when slurm does not answer."""
-    queue, rows = gpu_jobs.read_queue(), gpu_jobs.node_capacity()
+    rows = gpu_jobs.node_capacity()
+    queue = None if rows is None else gpu_jobs.read_queue()
     if queue is None or rows is None:
         return
     rooms = jobs_view.room(need, {job.job_id: job for job in queue}, rows, site, gpu_jobs.partition_tiers(), time.time())
@@ -547,6 +614,9 @@ def parser() -> argparse.ArgumentParser:
                         "DIR/gpe/x lands at data_root/gpe/x there (default: its own name)")
     p.add_argument("--data-env", default=None, metavar="NAME",
                    help="with --site: run the command with NAME set to the site's data_root (e.g. AUTOCAST_DATASETS)")
+    p.add_argument("--size", nargs=2, default=None, metavar=("COUNT", "UNIT"),
+                   help="the job's size in a unit of the project's choosing (e.g. 30 detectors): memory is then sized from "
+                        "earlier runs of this project that declared the same unit (D48, site field memory_from_size)")
     p.add_argument("--dry-run", action="store_true", help="print the sbatch script and submit nothing")
     p.add_argument("command", nargs=argparse.REMAINDER)
     return p
@@ -589,6 +659,10 @@ def submit(argv: list[str]) -> str:
     seconds(arguments.wait_limit)
     mem = resolve_mem(arguments.mem, named, arguments.gpu)
     warn_memory(arguments.mem, named, arguments.gpu)
+    size = parse_size(arguments.size)
+    sized = None
+    if size is not None:
+        mem, sized = memory_from_size(arguments.project, size, arguments.mem, mem, arguments.gpu, site)
     named_cpus = arguments.cpus
     packing = resolve_packing(arguments, named, site)
     arguments.max_jobs = arguments.max_jobs or 1  # from here on: the level asked for, 1 when none
@@ -697,6 +771,7 @@ def submit(argv: list[str]) -> str:
         **({"may_suspend": None if consent is None else sorted(consent)} if arguments.service else {}),
         **({"part_time": {v.node: v.reason or "included" for v in placed.verdicts}} if placed else {}),
         **({"cores_from_history": history_cores} if history_cores else {}),
+        **({"size": {"count": size[0], "unit": size[1]}, "size_memory": sized} if size else {}),
     )
     pauses = {
         gpu_jobs.ANYWHERE_PARTITIONS: "requeued for urgent work or when a part-time machine's owner needs it back; "
