@@ -1039,7 +1039,11 @@ def size_memory(project: str, unit: str, card: bool, count: float) -> SizeFigure
     (the smallest such), the base is the highest P(c) for c <= c*: an upper bound when peak does not fall as the count
     grows, and never below a smaller measured count when the data say otherwise. Above every measured count, within
     `SIZE_EXTRAPOLATION_LIMIT` times the largest (cmax), it is max(P(cmax) * count / cmax, every P): an upper bound when
-    peak(c) = a + b*c with a, b >= 0. Beyond that, no figure. None when no run of the unit is known at all."""
+    peak(c) = a + b*c with a, b >= 0. Beyond that, no figure. None when no run of the unit is known at all.
+
+    `kill` is the newest run of the unit killed for memory at a count at most `count`, with no clean run of the unit
+    ended since: when peak does not fall as the count grows, a run killed at c says peak(n) passed its ask for every
+    n >= c, and says nothing for a smaller n (D48, kill rule corrected by the owner 2026-11-12)."""
     records = list(own_records_where(lambda r: r.get("project") == project and record_uses_card(r) == card
                                      and (declared_size(r) or (0.0, ""))[1] == unit))
     if not records:
@@ -1050,8 +1054,8 @@ def size_memory(project: str, unit: str, card: bool, count: float) -> SizeFigure
         if size is not None:
             by_count.setdefault(size[0], []).append(peak)
     highest = {c: max(p.total for p in newest_peaks(peaks)) for c, peaks in by_count.items()}
-    kill = memory_kill_in(records)
-    kill = kill if kill is not None and kill.count is not None and kill.count >= count else None
+    kill = memory_kill_in([r for r in records if any(_clean(leg) for leg in record_legs(r))  # every clean run counts
+                           or (declared_size(r) or (math.inf, ""))[0] <= count])  # against a kill at a count <= n
     said = f"{project} {unit!r} runs"
     if not highest:
         return SizeFigure(None, f"no clean {said} yet", kill)

@@ -229,7 +229,7 @@ def memory_from_size(project: str, size: tuple[float, str], mem: str | None, res
     want_mb = max((figure.base_bytes or 0) * (1 + AUTO_MARGIN) / gpu_jobs.SLURM_MB, bump_mb)
     option = gpu_jobs.mem_option(want_mb, max((node.jobs_mb for node in site.nodes), default=None))
     record["figure"] = option
-    said = figure.line + (f"; run {kill.job_id} at this size or above was killed for memory" if bump_mb else "")
+    said = figure.line + (f"; run {kill.job_id} at {kill.count:g} {unit} was killed for memory" if bump_mb else "")
     if mem not in (None, "auto"):
         typed_mb = gpu_jobs.mem_mb_or_none(mem)
         if figure.base_bytes and typed_mb and typed_mb * gpu_jobs.SLURM_MB < figure.base_bytes:

@@ -622,8 +622,9 @@ figure comes from this user's clean runs of that project and unit:
   assumed.
 - The new count is more than twice the largest measured one. No figure is given, and the job asks as before.
 
-The figure gets the same 10 percent margin and rounding as `--mem auto`. A run of the unit killed for memory at
-this count or above, with no clean run since, raises it as a memory kill raises `--mem auto` (section 7). The site
+The figure gets the same 10 percent margin and rounding as `--mem auto`. The newest run of the unit killed for
+memory at this count or a smaller one, with no clean run of the unit since, raises it as a memory kill raises
+`--mem auto` (section 7): a run that ran out of memory at a smaller count shows that a larger count needs more. The site
 field `memory_from_size` (section 4) decides what happens next:
 
     [submit] memory from size: would ask 26G (30 detectors, scaled from myproj 'detectors' runs: 25 -> 21.1 GB peak)

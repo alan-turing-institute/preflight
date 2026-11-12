@@ -743,4 +743,10 @@ def test_size_memory_brackets_from_above_scales_within_twice_and_finds_kills_by_
     monkeypatch.setattr(gpu_jobs, "_sacct_jobs", lambda *_a, **_k: [{"job_id": 4, "state": {"current": ["OUT_OF_MEMORY"]}}])
     kill = gpu_jobs.size_memory("p", "detectors", False, 30).kill
     assert kill is not None and (kill.job_id, kill.asked_mb, kill.count) == ("4", 24576, 30.0)
-    assert gpu_jobs.size_memory("p", "detectors", False, 40).kill is None  # a kill at a smaller count says nothing for 40
+    assert gpu_jobs.size_memory("p", "detectors", False, 40).kill.job_id == "4"  # 40 needs more than 30 was given
+    assert gpu_jobs.size_memory("p", "detectors", False, 20).kill is None  # a kill at a larger count says nothing for 20
+    records.append({**run("5", 50, 45, ended=300, clean=False), "mem": "40G"})  # a newer kill, at a count above 40
+    monkeypatch.setattr(gpu_jobs, "_sacct_jobs", lambda *_a, **_k: [{"job_id": j, "state": {"current": ["OUT_OF_MEMORY"]}}
+                                                                     for j in (4, 5)])
+    assert gpu_jobs.size_memory("p", "detectors", False, 40).kill.job_id == "4"  # the newest kill at a count <= 40
+    assert gpu_jobs.size_memory("p", "detectors", False, 50).kill.job_id == "5"
