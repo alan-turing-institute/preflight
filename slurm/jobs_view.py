@@ -15,6 +15,7 @@ import os
 import re
 import stat
 import subprocess
+import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
@@ -43,10 +44,7 @@ def requested_mem_mb(job: QueuedJob | None, record: Mapping[str, object]) -> int
     `scontrol update MinMemoryNode=` shows; else the `--mem` submit.py recorded. None when neither says."""
     if job is not None and job.mem_mb is not None:
         return job.mem_mb
-    try:
-        return gpu_jobs.mem_mb(str(record["mem"])) if record.get("mem") else None
-    except (ValueError, IndexError):
-        return None
+    return gpu_jobs.mem_mb_or_none(str(record["mem"])) if record.get("mem") else None
 
 
 def memory_text(mb: int) -> str:
@@ -115,6 +113,11 @@ class Lack(StrEnum):
     FAST_CORES = "fast cores"
     GPUS = "GPUs"
     SHARDS = "shards"
+
+    @property
+    def unit(self) -> str:
+        """What an amount of it is counted in."""
+        return "cores" if self is Lack.PARTITION_CORES else self.value
 
 
 @dataclass(frozen=True)
@@ -193,7 +196,7 @@ def room(need: Need, queue: Mapping[str, QueuedJob], rows: list[dict[str, int | 
         node = nodes.get(name)
         free_fast = free_fast_cores(on_cores, node) if need.fast and node is not None and node.fast_cpus else None
         free_capped = None if capped is None else capped - sum(job.cpus for job in on_cores if job.partition == wanted[0])
-        need_mb = jobs_mb if need.mem_mb == 0 else need.mem_mb
+        need_mb = _on_node(need.mem_mb, jobs_mb)
         lacks = tuple(lack for lack, short in (
             (Lack.MEMORY, need_mb is not None and need_mb > free_mb),
             (Lack.CORES, need.cpus > free_cpus),
@@ -213,6 +216,24 @@ def room(need: Need, queue: Mapping[str, QueuedJob], rows: list[dict[str, int | 
     return out
 
 
+Rooms = Callable[[Need], list[NodeRoom]]
+
+
+def rooms_now(queue: Mapping[str, QueuedJob], site: site_config.Site) -> Rooms | None:
+    """`room` over slurm's node figures and partition tiers read once now, for any number of needs; None when slurm
+    does not answer."""
+    rows = gpu_jobs.node_capacity()
+    if rows is None:
+        return None
+    tiers, now = gpu_jobs.partition_tiers(), time.time()
+    return lambda need: room(need, queue, rows, site, tiers, now)
+
+
+def _on_node(mb: int | None, jobs_mb: int) -> int | None:
+    """A memory request on a node: the whole box (0) is the node's jobs memory."""
+    return jobs_mb if mb == 0 else mb
+
+
 def _count(n: int, unit: str) -> str:
     return f"{n} {unit}" if n != 1 or not unit.endswith("s") else f"1 {unit[:-1]}"
 
@@ -221,30 +242,27 @@ def _held(job: QueuedJob, lack: Lack, jobs_mb: int, per_card: int, node: site_co
           wanted: list[str]) -> tuple[int, str]:
     """How much of `lack` `job` holds on the node, as (amount to order by, text with its unit); (0, "") for none."""
     if lack is Lack.MEMORY:
-        mb = jobs_mb if job.mem_mb == 0 else job.mem_mb or 0
+        mb = _on_node(job.mem_mb, jobs_mb) or 0
         return mb, memory_text(mb)
     if lack in {Lack.CORES, Lack.PARTITION_CORES}:
         holds = job.state in gpu_jobs.ON_CORES and (lack is Lack.CORES or job.partition == wanted[0])
-        return (job.cpus, _count(job.cpus, "cores")) if holds else (0, "")
+        return (job.cpus, _count(job.cpus, lack.unit)) if holds else (0, "")
     if lack is Lack.FAST_CORES:
         n = fast_cores_held(job, node) if node is not None and job.state in gpu_jobs.ON_CORES else 0
-        return n, _count(n, "fast cores")
+        return n, _count(n, lack.unit)
     if job.gpus:  # GPUs or shards: a whole card blocks either
-        return job.gpus * max(per_card, 1), _count(job.gpus, "GPUs")
-    return job.shards, _count(job.shards, "shards")
+        return job.gpus * max(per_card, 1), _count(job.gpus, Lack.GPUS.unit)
+    return job.shards, _count(job.shards, Lack.SHARDS.unit)
 
 
 def _lacking(need: Need, r: NodeRoom, lack: Lack) -> str:
     """How much of `lack` the need is short of on the node, with its unit."""
     if lack is Lack.MEMORY:
-        need_mb = r.jobs_mb if need.mem_mb == 0 else need.mem_mb or 0
-        return f"{memory_text(need_mb - r.free_mb)} memory"
+        return f"{memory_text((_on_node(need.mem_mb, r.jobs_mb) or 0) - r.free_mb)} memory"
     short = {Lack.CORES: need.cpus - r.free_cpus, Lack.PARTITION_CORES: need.cpus - (r.free_partition_cores or 0),
              Lack.FAST_CORES: need.cpus - (r.free_fast or 0), Lack.GPUS: need.gpus - r.free_gpus,
              Lack.SHARDS: need.shards - r.free_shards}[lack]
-    unit = {Lack.CORES: "cores", Lack.PARTITION_CORES: "cores", Lack.FAST_CORES: "fast cores", Lack.GPUS: "GPUs",
-            Lack.SHARDS: "shards"}[lack]
-    return _count(short, unit) + (" under the partition's cap" if lack is Lack.PARTITION_CORES else "")
+    return _count(short, lack.unit) + (" under the partition's cap" if lack is Lack.PARTITION_CORES else "")
 
 
 def _holder_text(h: Holder) -> str:

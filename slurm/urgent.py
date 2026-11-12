@@ -67,8 +67,8 @@ def free_on_nodes() -> tuple[int, int] | None:
 def room_now(need: jobs_view.Need, by_id: dict[str, gpu_jobs.QueuedJob],
              site: site_config.Site) -> list[jobs_view.NodeRoom] | None:
     """`jobs_view.room` for `need` over slurm's node figures now (D48); None when slurm does not answer."""
-    rows = gpu_jobs.node_capacity()
-    return None if rows is None else jobs_view.room(need, by_id, rows, site, gpu_jobs.partition_tiers(), time.time())
+    rooms = jobs_view.rooms_now(by_id, site)
+    return None if rooms is None else rooms(need)
 
 
 def _asked_mb(job: gpu_jobs.QueuedJob) -> int:

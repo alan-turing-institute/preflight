@@ -253,6 +253,14 @@ def mem_mb(text: str) -> int:
     return int(float(text[:-1]) * scale[unit]) if unit in scale else int(text)
 
 
+def mem_mb_or_none(text: str | None) -> int | None:
+    """`mem_mb`, or None when there is no text or it is not slurm notation (sbatch reports that itself)."""
+    try:
+        return None if text is None else mem_mb(text)
+    except (ValueError, IndexError):
+        return None
+
+
 def _number(value: object) -> int | None:
     """A slurm JSON number (`{"set": true, "number": N}`); None when it is not set."""
     return int(value.get("number") or 0) if isinstance(value, dict) and value.get("set") else None
@@ -870,8 +878,12 @@ def measured_peak_bytes(name: str, *, clean: bool = True) -> int | None:
     for the whole box and sat idle beside a 27 GB job with 75 GB free).
     """
     peaks = run_peaks(own_records(name), clean=clean)
-    newest = sorted(peaks, key=lambda peak: (peak.ended, peak.total), reverse=True)[:HISTORY_RUNS] if clean else peaks
-    return max((peak.total for peak in newest), default=None)
+    return max((peak.total for peak in (newest_peaks(peaks) if clean else peaks)), default=None)
+
+
+def newest_peaks(peaks: Iterable[RunPeak]) -> list[RunPeak]:
+    """The `HISTORY_RUNS` newest runs (ties broken by the larger peak): the window a size is judged on (D35)."""
+    return sorted(peaks, key=lambda peak: (peak.ended, peak.total), reverse=True)[:HISTORY_RUNS]
 
 
 @dataclass(frozen=True)
@@ -1013,7 +1025,7 @@ def declared_size(record: Mapping[str, object]) -> tuple[float, str] | None:
     return None
 
 
-def uses_card(record: Mapping[str, object]) -> bool:
+def record_uses_card(record: Mapping[str, object]) -> bool:
     """Whether a record's job used a card (a shard job is recorded with `gpus` 1)."""
     gpus = record.get("gpus")
     return isinstance(gpus, int) and gpus > 0
@@ -1028,7 +1040,7 @@ def size_memory(project: str, unit: str, card: bool, count: float) -> SizeFigure
     grows, and never below a smaller measured count when the data say otherwise. Above every measured count, within
     `SIZE_EXTRAPOLATION_LIMIT` times the largest (cmax), it is max(P(cmax) * count / cmax, every P): an upper bound when
     peak(c) = a + b*c with a, b >= 0. Beyond that, no figure. None when no run of the unit is known at all."""
-    records = list(own_records_where(lambda r: r.get("project") == project and uses_card(r) == card
+    records = list(own_records_where(lambda r: r.get("project") == project and record_uses_card(r) == card
                                      and (declared_size(r) or (0.0, ""))[1] == unit))
     if not records:
         return None
@@ -1037,8 +1049,7 @@ def size_memory(project: str, unit: str, card: bool, count: float) -> SizeFigure
         size = declared_size(peak.record)
         if size is not None:
             by_count.setdefault(size[0], []).append(peak)
-    highest = {c: max(p.total for p in sorted(peaks, key=lambda p: (p.ended, p.total), reverse=True)[:HISTORY_RUNS])
-               for c, peaks in by_count.items()}
+    highest = {c: max(p.total for p in newest_peaks(peaks)) for c, peaks in by_count.items()}
     kill = memory_kill_in(records)
     kill = kill if kill is not None and kill.count is not None and kill.count >= count else None
     said = f"{project} {unit!r} runs"

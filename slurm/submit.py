@@ -231,10 +231,7 @@ def memory_from_size(project: str, size: tuple[float, str], mem: str | None, res
     record["figure"] = option
     said = figure.line + (f"; run {kill.job_id} at this size or above was killed for memory" if bump_mb else "")
     if mem not in (None, "auto"):
-        try:
-            typed_mb = gpu_jobs.mem_mb(mem)
-        except (ValueError, IndexError):
-            typed_mb = None
+        typed_mb = gpu_jobs.mem_mb_or_none(mem)
         if figure.base_bytes and typed_mb and typed_mb * gpu_jobs.SLURM_MB < figure.base_bytes:
             warn(f"--mem {mem} is below the {figure.base_bytes / gpu_jobs.GB:.1f} GB peak of {said}")
         return resolved, record
@@ -257,9 +254,8 @@ def warn_memory(mem: str | None, name: str | None, gpu: bool) -> None:
     peak = None if name is None or mem in (None, "auto") else gpu_jobs.measured_peak_bytes(name)
     if peak is None:
         return
-    try:
-        asked_mb = gpu_jobs.mem_mb(mem)
-    except (ValueError, IndexError):
+    asked_mb = gpu_jobs.mem_mb_or_none(mem)
+    if asked_mb is None:
         return  # not slurm notation: sbatch reports it
     if asked_mb == 0:
         auto = resolve_mem(None, name, gpu)
@@ -283,26 +279,21 @@ def settle_check(arguments: argparse.Namespace, site: site_config.Site, *, dry_r
     return outcome
 
 
-def print_room(need: jobs_view.Need, site: site_config.Site) -> None:
+def print_room(need: jobs_view.Need, site: site_config.Site, queue: list[gpu_jobs.QueuedJob] | None) -> None:
     """D48: what the job needs against what each node it may use has free now, and which running jobs hold the rest
     (`jobs_view.room`). Information only; nothing when slurm does not answer."""
-    rows = gpu_jobs.node_capacity()
-    queue = None if rows is None else gpu_jobs.read_queue()
-    if queue is None or rows is None:
+    rooms = None if queue is None else jobs_view.rooms_now({job.job_id: job for job in queue}, site)
+    if rooms is None:
         return
-    rooms = jobs_view.room(need, {job.job_id: job for job in queue}, rows, site, gpu_jobs.partition_tiers(), time.time())
-    for line in jobs_view.room_text(rooms, need, queued=False):
+    for line in jobs_view.room_text(rooms(need), need, queued=False):
         print(gpu_jobs.printable(f"[submit] room: {line}"))  # names and projects are what their submitters typed
 
 
-def warn_device(arguments: argparse.Namespace) -> None:
+def warn_device(arguments: argparse.Namespace, queue: list[gpu_jobs.QueuedJob] | None) -> None:
     """C4: a CPU-only job told `--device cpu` while no GPU job runs or waits: the GPU is free and may finish it far sooner."""
     command = arguments.command
     on_cpu = "--device=cpu" in command or any(a == "--device" and b == "cpu" for a, b in itertools.pairwise(command))
-    if arguments.gpus or not on_cpu:
-        return
-    queue = gpu_jobs.read_queue()
-    if queue is None:
+    if arguments.gpus or not on_cpu or queue is None:
         return
     reserved = any(j.uses_card and j.state in (gpu_jobs.State.RUNNING, gpu_jobs.State.PENDING) for j in queue)
     if not reserved:
@@ -352,14 +343,13 @@ def chain_warning(after: list[str], shape: Shape, queue: Mapping[str, gpu_jobs.Q
             "place (README, 'Chains')")
 
 
-def warn_chain(arguments: argparse.Namespace, shards: int) -> None:
+def warn_chain(arguments: argparse.Namespace, card_gpus: int, shards: int, queue: list[gpu_jobs.QueuedJob] | None) -> None:
     """Print `chain_warning` for this submission; nothing without `--after` or when slurm does not answer."""
-    queue = gpu_jobs.read_queue() if arguments.after else None
-    if queue is None:
+    if not arguments.after or queue is None:
         return
     by_id = {job.job_id: job for job in queue}
     records = wait.all_sidecars({job.job_id: job.user for job in queue})  # a queued job's record counts only from its user
-    shape = (arguments.project, arguments.job_class, 0 if shards else arguments.gpus, shards)
+    shape = (arguments.project, arguments.job_class, card_gpus, shards)
     line = chain_warning(arguments.after, shape, by_id, records)
     if line:
         warn(gpu_jobs.printable(line))
@@ -798,14 +788,12 @@ def submit(argv: list[str]) -> str:
         arguments, mem=mem, log=log, manifest=manifest, node_python=site.node_python, partition=partition, extra=barred,
         requirements=placed.requirements if included else (), shards=packing.shards,
     )
-    try:
-        need_mb = None if mem is None else gpu_jobs.mem_mb(mem)
-    except (ValueError, IndexError):
-        need_mb = None  # not slurm notation: sbatch reports it
-    print_room(jobs_view.Need(need_mb, arguments.cpus, 0 if packing.shards else arguments.gpus, packing.shards,
-                              bool(bound), partition, frozenset(placed.excluded) if included else frozenset()), site)
-    warn_device(arguments)
-    warn_chain(arguments, packing.shards)
+    card_gpus = 0 if packing.shards else arguments.gpus  # a shard job holds shards of a card, no whole GPU
+    queue = gpu_jobs.read_queue()  # once: the room, device and chain lines all describe the same moment
+    print_room(jobs_view.Need(gpu_jobs.mem_mb_or_none(mem), arguments.cpus, card_gpus, packing.shards, bool(bound),
+                              partition, frozenset(placed.excluded) if included else frozenset()), site, queue)
+    warn_device(arguments, queue)
+    warn_chain(arguments, card_gpus, packing.shards, queue)
     if arguments.dry_run:
         settle_check(arguments, site, dry_run=True)
         if arguments.service:
@@ -910,10 +898,10 @@ def service_room(site: site_config.Site, cpus: int, memory_mb: int, consent: fro
     if free_mb is None:
         why = "a job holds the whole machine's memory (or one of unknown size runs); suspending frees no memory"
     elif memory_mb > free_mb:
-        rows = gpu_jobs.node_capacity()  # D48: the shared per-node sentence, naming who holds the memory
+        rooms = jobs_view.rooms_now(by_id, site)  # D48: the shared per-node sentence, naming who holds the memory
         need = jobs_view.Need(memory_mb, cpus, partitions=gpu_jobs.Partition.SERVICE.value)
-        held = (jobs_view.room_text(jobs_view.room(need, by_id, rows, site, gpu_jobs.partition_tiers(), time.time()),
-                                    need, queued=False) if rows else [f"it needs {memory_mb} MB and {free_mb} MB are free"])
+        held = (jobs_view.room_text(rooms(need), need, queued=False) if rooms
+                else [f"it needs {memory_mb} MB and {free_mb} MB are free"])
         why = f"memory: {'; '.join(held)}; suspending frees no memory"
     elif cpus > service_free:
         why = f"other service jobs use {service.cores - service_free} of the service partition's {service.cores} cores"
