@@ -246,9 +246,11 @@ def core_kind_warnings(site, speeds: cores.CoreSpeeds | None = None, here: str |
 
 def platform_refusals(site, modules) -> list[str]:
     """What would make an apply fail on this machine, found before anything is touched: a `fast_cpus` that is not
-    this host's fastest cores, no package manager to install the packages with, or an apt whose slurm is older than
-    this build supports (not asked when the site builds its own slurm: `[slurm]`)."""
-    return [*core_kind_refusals(site), *_package_refusals(site, modules)]
+    this host's fastest cores (asked only when the slurm component, which installs the layout file, is applied: a
+    part-time machine takes only the tools), no package manager to install the packages with, or an apt whose slurm is
+    older than this build supports (not asked when the site builds its own slurm: `[slurm]`)."""
+    lays_out = any(m.NAME == slurm_component.NAME for m in modules)
+    return [*(core_kind_refusals(site) if lays_out else []), *_package_refusals(site, modules)]
 
 
 def _package_refusals(site, modules) -> list[str]:

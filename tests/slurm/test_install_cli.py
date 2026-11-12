@@ -724,6 +724,11 @@ def test_fast_cpus_must_be_the_hosts_fastest_cores_and_an_unset_two_kind_gpu_nod
     reads[0] = True
     (elsewhere,) = cli.core_kind_refusals(site, halves, "other")  # the layout is installed for this machine's slurmd
     assert "set on node n1, but this is other" in elsewhere
+    monkeypatch.setattr(cli, "_this_host", lambda: "other")
+    monkeypatch.setattr(cli, "_package_refusals", lambda *_: [])
+    tools = cli.components.load(site, ["tools"])  # a part-time machine: no layout file is installed there
+    assert cli.platform_refusals(site, tools) == []
+    assert cli.platform_refusals(site, [*tools, cli.slurm_component]) == [elsewhere]
     binned = cli.cores.CoreSpeeds({**halves.khz, 19: 4000000})  # a favoured core inside the fast kind still passes
     assert cli.core_kind_refusals(site, binned, "n1") == []
     raw["nodes"][0]["fast_cpus"] = "0-4,10-14"  # the slow kind
