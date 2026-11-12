@@ -42,6 +42,12 @@ def _pauses(job: gpu_jobs.QueuedJob) -> str:
     return PAUSES.get(job.partition, job.partition)
 
 
+def _memory(job: gpu_jobs.QueuedJob, record: dict) -> str:
+    """slurm's request as it stands (an `scontrol update MinMemoryNode=` shows), else what submit.py recorded."""
+    mb = jobs_view.requested_mem_mb(job, record)
+    return "default mem" if mb is None else f"{jobs_view.memory_text(mb)} mem"
+
+
 def lines(queue: list[gpu_jobs.QueuedJob] | None) -> list[str]:
     out = [f"[status] node: {gpu_jobs.node_state()}"]
     if gpu_jobs.LEASE_DIR is not None:  # a site without a [lease] table has no keeper to report
@@ -64,7 +70,7 @@ def lines(queue: list[gpu_jobs.QueuedJob] | None) -> list[str]:
         out.append(gpu_jobs.printable(  # names and descriptions are what their submitters typed
             f"[status] {job.job_id} {job.state:<10} {job.user or '?':<10} {job.level:<6} {f'{job.shards} shards' if job.shards else f'{job.gpus} GPU'} {job.name}"
             f"{f' on {job.node}' if job.node else ''}"
-            f" | {record.get('mem') or 'default mem'}, {_pauses(job)}"
+            f" | {_memory(job, record)}, {_pauses(job)}"
             f" | {record.get('what', '(no sidecar)')}{f' | {why}' if why else ''}"
         ))
     out += [f"[idle] {line}" for line in agent.idle_summary(agent.read_idle())]

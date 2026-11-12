@@ -103,6 +103,8 @@ def test_a_hostile_or_foreign_record_is_ignored_and_never_blocks(tmp_path: Path,
     assert "[status] 8 PENDING    ?          normal 0 GPU" in "\n".join(status.lines([named]))  # the level after the user
     running = QueuedJob("9", "part_time", "RUNNING", "None", "p:resume:n", node="laptop")
     assert " p:resume:n on laptop |" in "\n".join(status.lines([running]))  # a running job says where it is
+    raised = QueuedJob("10", "steady", "PENDING", "Resources", "p:restart:n", mem_mb=28672)
+    assert "| 30.1 GB mem," in "\n".join(status.lines([raised]))  # slurm's live request, not the submit record
     keeper = any(line.startswith("[status] keeper:") for line in status.lines([named]))
     monkeypatch.setattr(status.gpu_jobs, "LEASE_DIR", None)  # a site without a lease (Turing box) has no keeper line
     assert keeper and not any(line.startswith("[status] keeper:") for line in status.lines([named]))

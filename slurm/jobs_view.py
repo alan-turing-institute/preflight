@@ -47,6 +47,11 @@ def requested_mem_mb(job: QueuedJob | None, record: Mapping[str, object]) -> int
         return None
 
 
+def memory_text(mb: int) -> str:
+    """A slurm memory request (MB of 2^20 bytes; 0 is slurm's "all of the node's memory") in decimal GB."""
+    return "all of the box's" if mb == 0 else f"{mb * 1024**2 / gpu_jobs.GB:.1f} GB"
+
+
 class Bucket(StrEnum):
     """How `project_usage` groups time."""
 
@@ -193,7 +198,7 @@ def waiting_reason(
         needs = [f"{job.gpus} GPU(s)"] if job.gpus else []
         mb = requested_mem_mb(job, records.get(job.job_id, {}))
         if mb is not None:  # --mem=0 is slurm's "all of the node's memory"
-            needs.append("all of the box's memory" if mb == 0 else f"{mb * 1024**2 / 10**9:.1f} GB memory")  # slurm MB: 2^20 bytes
+            needs.append(f"{memory_text(mb)} memory")
         return f"waiting for {' / '.join(needs)} to free" if needs else "waiting for resources to free"
     if reason == Reason.PRIORITY:
         return f"queued behind {_queued_ahead(job, queue)} job(s)"
