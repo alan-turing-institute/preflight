@@ -35,9 +35,11 @@ import os
 import shlex
 import signal
 import subprocess
+import sys
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from types import FrameType
 
@@ -123,7 +125,11 @@ def settle(check: str | None, no_check: str | None, policy: Policy, workdir: Pat
                     f"queue wait ({HOW_TO})")
             return Outcome({"policy": str(policy)}, (said,))
         return Outcome({"policy": str(policy)})
-    argv = shlex.split(check)
+    try:
+        argv = shlex.split(check)
+    except ValueError as error:  # an unclosed quote
+        msg = f"--check {check!r} cannot be split into a command: {error} ({HOW_TO})"
+        raise CheckRefused(msg) from None
     if not argv:
         msg = f"--check is empty: give the command to run ({HOW_TO})"
         raise CheckRefused(msg)
@@ -181,12 +187,15 @@ def _remember(folder: Path, key: str, now: float) -> None:
     gpu_jobs.write_json(folder / "checks.json", {**kept, key: now})
 
 
-def _child_setup() -> None:
-    """In the check's process before it runs: the first victim under memory pressure, and killed with its parent."""
+def _child_setup(parent: int) -> None:
+    """In the check's process before it runs: the first victim under memory pressure, and killed with its parent. A
+    parent that died before the death signal was set leaves the check orphaned, so the check stops at once."""
     with contextlib.suppress(OSError):
         Path("/proc/self/oom_score_adj").write_text(str(OOM_SCORE_ADJ_FIRST), encoding="ascii")
     with contextlib.suppress(OSError, AttributeError):
         ctypes.CDLL(None, use_errno=True).prctl(PR_SET_PDEATHSIG, signal.SIGKILL)
+    if os.getppid() != parent:
+        os._exit(1)
 
 
 def _kill_group(pid: int, sig: signal.Signals) -> None:
@@ -200,13 +209,20 @@ def run(argv: list[str], workdir: Path, timeout_s: float = CHECK_TIMEOUT_S,
     single process of it as the kernel reports for a reaped child). Its process group is killed whatever happens."""
     env = {**os.environ, "CUDA_VISIBLE_DEVICES": "", "HIP_VISIBLE_DEVICES": "", IN_CHECK: "1"}
     started = time.monotonic()
-    child = subprocess.Popen(argv, cwd=workdir, stdin=subprocess.DEVNULL, env=env, start_new_session=True,
-                             preexec_fn=_child_setup)  # noqa: PLW1509 - the submitting tool is single-threaded
-    stopping = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
-    previous = {sig: signal.getsignal(sig) for sig in stopping}
+    try:
+        child = subprocess.Popen(argv, cwd=workdir, stdin=subprocess.DEVNULL, env=env, start_new_session=True,
+                                 preexec_fn=partial(_child_setup, os.getpid()))  # noqa: PLW1509 - the submitting tool is single-threaded
+    except OSError as error:  # no such command, or no such folder
+        msg = f"the check `{shlex.join(argv)}` could not start in {workdir}: {error.strerror}; nothing was queued ({HOW_TO})"
+        raise CheckRefused(msg) from None
+    # a signal the caller ignores (nohup's SIGHUP, a background shell's SIGINT) stays ignored, and the check runs on
+    previous = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+    stopping = [sig for sig, handler in previous.items() if handler is not signal.SIG_IGN]
 
     def stop(signum: int, _frame: FrameType | None) -> None:
         _kill_group(child.pid, signal.SIGKILL)
+        print(f"check: stopped by {signal.Signals(signum).name}; the check was killed and nothing was queued",
+              file=sys.stderr)
         raise SystemExit(128 + signum)
 
     code: int | None = None

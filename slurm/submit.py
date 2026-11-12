@@ -207,7 +207,7 @@ def parse_size(raw: list[str] | None) -> tuple[float, str] | None:
 
 
 def memory_from_size(project: str, size: tuple[float, str], mem: str | None, resolved: str | None, gpu: bool,
-                     site: site_config.Site) -> tuple[str | None, dict[str, object]]:
+                     site: site_config.Site, name: str | None = None) -> tuple[str | None, dict[str, object]]:
     """D48: the `--mem` to ask for a job declaring `size`, and what is kept in its record. `mem` is what was typed,
     `resolved` what `resolve_mem` made of it. `recommend` prints the figure and asks as before; `enforce` asks the larger
     of it and the name's own measured figure, unless `--mem` was typed (which only warns when below the size's peak) or
@@ -237,6 +237,11 @@ def memory_from_size(project: str, size: tuple[float, str], mem: str | None, res
         return resolved, record
     whole = option == WHOLE_BOX
     named_mb = None if resolved in (None, WHOLE_BOX) else gpu_jobs.mem_mb(resolved)  # the whole box is no measurement
+    if policy is site_config.Policy.ENFORCE and resolved == WHOLE_BOX and name and gpu_jobs.memory_kill(name):
+        # here the whole box is the name's own kill bump (more than any node lends), the larger figure: it stands
+        print(f"[submit] memory from size: {option} ({said}); asking the whole box: {name!r}'s last run was killed "
+              "for memory and needs more than any node gives jobs")
+        return resolved, record
     if policy is site_config.Policy.ENFORCE and not whole:
         chosen = option if named_mb is None or gpu_jobs.mem_mb(option) >= named_mb else resolved
         record["applied"] = chosen == option
@@ -710,9 +715,8 @@ def submit(argv: list[str]) -> str:
     if arguments.site:
         arguments.name = arguments.name or Path(arguments.command[0]).name
         local = gpu_jobs.load_site()
-        settle_check(arguments, local, dry_run=arguments.dry_run)  # here, before the sync: it checks the code being sent
-        try:
-            return remote.submit(arguments, local)
+        try:  # the check runs here, after remote's cheap refusals and before the sync: it checks the code being sent
+            return remote.submit(arguments, local, before_sync=lambda: settle_check(arguments, local, dry_run=arguments.dry_run))
         except remote.RemoteRefused as error:
             raise Refused(str(error)) from None
     site = gpu_jobs.load_site()
@@ -730,7 +734,7 @@ def submit(argv: list[str]) -> str:
     size = parse_size(arguments.size)
     sized = None
     if size is not None:
-        mem, sized = memory_from_size(arguments.project, size, arguments.mem, mem, arguments.gpu, site)
+        mem, sized = memory_from_size(arguments.project, size, arguments.mem, mem, arguments.gpu, site, named)
     named_cpus = arguments.cpus
     packing = resolve_packing(arguments, named, site)
     arguments.max_jobs = arguments.max_jobs or 1  # from here on: the level asked for, 1 when none

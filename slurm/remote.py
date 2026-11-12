@@ -14,6 +14,7 @@ import argparse
 import importlib.util
 import shlex
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 
 import site_config
@@ -145,7 +146,7 @@ def forwarded(arguments: argparse.Namespace) -> list[str]:
     return out
 
 
-def submit(arguments: argparse.Namespace, site: site_config.Site) -> str:
+def submit(arguments: argparse.Namespace, site: site_config.Site, before_sync: Callable[[], object] | None = None) -> str:
     remote = pick(site, arguments.site)
     repo, files, data, outside = plan(arguments, remote)
     root = project_root(remote, arguments.project)
@@ -158,6 +159,8 @@ def submit(arguments: argparse.Namespace, site: site_config.Site) -> str:
     command = f"cd {shlex.quote(inside)} && {line}"
     print(f"[remote] {len(files)} code file(s) and {len(data)} data folder(s) -> {remote.host}:{root}"
           + (f"; {len(outside)} outside it -> {remote.data_root}" if outside else ""))
+    if before_sync is not None:  # after every refusal above, before anything is copied
+        before_sync()
     if arguments.dry_run:
         return f"[remote] dry run: nothing copied or queued; would run on {remote.host}: {command}"
     changed = sync(remote, root, repo, files, data, outside)

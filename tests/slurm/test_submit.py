@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import signal
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -160,7 +161,13 @@ def test_size_is_checked_even_for_a_vouched_job_and_the_refusal_does_not_teach_t
 def test_a_job_for_another_site_makes_no_local_part_time_decision(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_site(monkeypatch, lease=None, dgx_gate=False, part_time_nodes=(pt_node(),))
     calls = fake_decide(monkeypatch, portability.Verdict("fedora", None))
-    monkeypatch.setattr(submit.remote, "submit", lambda *_a: "remote")
+    def no_such(_site: object, name: str) -> None:
+        raise remote.RemoteRefused(f"--site {name}: no such remote")
+
+    monkeypatch.setattr(submit.remote, "pick", no_such)
+    with pytest.raises(submit.Refused, match="no such remote"):  # remote's cheap refusals come before the check
+        submit.submit([*RESUME, "--site", "nosuch", "--check", "false", "--", "x"])
+    monkeypatch.setattr(submit.remote, "submit", lambda *_a, **_k: "remote")
     assert submit.submit([*RESUME, "--site", "turing", "--no-anywhere", "--", "x"]) == "remote" and calls == []
 
 
@@ -695,6 +702,14 @@ def test_size_sizes_memory_from_the_projects_runs_of_the_unit(monkeypatch: pytes
     assert "--mem=33G" in dry(*argv, "--size", "30", "detectors", "--", "true")  # 30 GiB x 1.1
     assert "asking 33G, the name's own measured figure, larger" in capsys.readouterr().out
     monkeypatch.setattr(gpu_jobs, "measured_peak_bytes", lambda *_a, **_k: None)
+    resolve_mem = submit.resolve_mem
+    monkeypatch.setattr(submit, "resolve_mem", lambda *_a: submit.WHOLE_BOX)
+    monkeypatch.setattr(gpu_jobs, "memory_kill", lambda _name: object())  # the whole box is the name's own kill bump
+    assert "--mem=0" in dry(*argv, "--size", "30", "detectors", "--", "true")
+    assert "last run was killed for memory" in capsys.readouterr().out
+    monkeypatch.setattr(gpu_jobs, "memory_kill", lambda _name: None)  # the whole box for want of a run: the size wins
+    assert "--mem=21G" in dry(*argv, "--size", "30", "detectors", "--", "true")
+    monkeypatch.setattr(submit, "resolve_mem", resolve_mem)
     monkeypatch.setattr(gpu_jobs, "size_memory", lambda *_a: gpu_jobs.SizeFigure(90 * 10**9, "huge"))
     capsys.readouterr()
     assert "--mem=" not in dry(*argv, "--size", "30", "detectors", "--", "true")  # more than the node lends
@@ -725,6 +740,14 @@ def test_the_check_runs_before_queuing_hidden_from_the_gpu_bounded_and_reused(tm
     assert "exit" in settle(f"sh -c 'env > {seen}'").record  # after the window it runs again
     with pytest.raises(checks.CheckRefused, match="failed \\(exit 3\\)"):
         settle("sh -c 'exit 3'")
+    for typo, why in (("sh -c 'unclosed", "cannot be split"), ("no-such-command-xyz", "could not start")):
+        with pytest.raises(checks.CheckRefused, match=why):  # a refusal with its remedy, never a traceback
+            settle(typo)
+    ignored = signal.signal(signal.SIGHUP, signal.SIG_IGN)  # as nohup leaves it: the hang-up stays ignored
+    try:
+        assert settle("sh -c 'kill -HUP $PPID; sleep 0.1'").record["exit"] == 0
+    finally:
+        signal.signal(signal.SIGHUP, ignored)
     left = tmp_path / "left.txt"
     started = time.monotonic()
     with pytest.raises(checks.CheckRefused, match="did not finish within"):

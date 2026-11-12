@@ -223,6 +223,14 @@ def run(argv: list[str]) -> int:
     arguments.name = named or Path(arguments.command[0]).name
     arguments.cpus = submit.resolve_cpus(arguments.cpus, arguments.gpus, site, speeds=cores.CoreSpeeds.read())
     arguments.job_class, arguments.after = "urgent", []
+    checked = None
+    if not arguments.dry_run:  # D47, before the queue is read: the plan then acts on what runs once the check has passed
+        try:
+            submit.require_keeper(site)
+            checked = submit.settle_check(arguments, site, dry_run=False, said="[urgent]")
+        except submit.Refused as refused:
+            print(f"[urgent] REFUSED: {refused}", file=sys.stderr)
+            return 1
     queue = gpu_jobs.read_queue()
     if queue is None:
         print("[urgent] REFUSED: slurm does not answer (controller down); see slurm/status.py", file=sys.stderr)
@@ -258,7 +266,8 @@ def run(argv: list[str]) -> int:
         if enough_memory and enough_cores:
             cpu_victims = []
     if rooms is not None:
-        print("\n".join(f"[urgent] room: {line}" for line in jobs_view.room_text(rooms, need, queued=False)))
+        print("\n".join(gpu_jobs.printable(f"[urgent] room: {line}")  # holders' names are what other users typed
+                        for line in jobs_view.room_text(rooms, need, queued=False)))
         if memory_short or cores_short:
             print("[urgent] no node has room: jobs will be pre-empted to make room")
     elif free is not None:
@@ -294,8 +303,6 @@ def run(argv: list[str]) -> int:
         print(script)
         return 0
     try:
-        submit.require_keeper(site)
-        checked = submit.settle_check(arguments, site, dry_run=False, said="[urgent]")  # D47: before anything is held or requeued
         if manifest:  # before anything is held or requeued: a refusal changes nothing
             submit.run_gate(arguments.repo.resolve(), arguments.entry, arguments.command, manifest, arguments.search)
     except submit.Refused as refused:
@@ -359,7 +366,7 @@ def run(argv: list[str]) -> int:
         job_id, "urgent", project=arguments.project, what=arguments.what, job_class="urgent", name=arguments.name,
         gpu=arguments.gpu, gpus=arguments.gpus, mem=mem, command=arguments.command, log=str(log), script=str(path), entry=arguments.entry,
         manifest=str(manifest) if manifest else None, after=[], preempts=victims, submitted_at=int(time.time()),
-        check=checked.record,
+        check=checked.record if checked else None,
     )
     print(f"[urgent] job {job_id} submitted; log {log}")
     return 0

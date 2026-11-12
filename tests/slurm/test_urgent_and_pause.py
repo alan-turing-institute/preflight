@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import checks
 import gpu_jobs
 import jobs_view
 import kill
@@ -84,11 +85,14 @@ def test_whole_box_puts_every_running_job_in_the_way() -> None:
 def test_stops_without_submitting_behind_a_wait_only_blocker_or_without_a_site_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    monkeypatch.setattr(gpu_jobs, "read_queue", lambda: [job("2", "steady")])
+    order: list[str] = []
+    monkeypatch.setattr(gpu_jobs, "read_queue", lambda: order.append("queue") or [job("2", "steady")])
     monkeypatch.setattr(urgent, "other_leases", list)
     monkeypatch.setattr(urgent.audit, "unregistered", list)
     monkeypatch.setattr(urgent, "free_on_nodes", lambda: None)
     monkeypatch.setattr(urgent.site_config, "is_admin", lambda _site, _user: True)
+    monkeypatch.setattr(urgent.submit, "keeper_running", lambda: True)  # the keeper is checked before the queue is read
+    monkeypatch.setattr(urgent.submit, "settle_check", lambda *_a, **_k: order.append("check") or checks.Outcome({}))
     submitted = []
     monkeypatch.setattr(urgent.subprocess, "run", lambda *a, **k: submitted.append(a))
     argv = ["--project", "p", "--what", "w", "--time", "0:10:00", "--", "true"]
@@ -100,6 +104,7 @@ def test_stops_without_submitting_behind_a_wait_only_blocker_or_without_a_site_f
     assert urgent.run(argv) == 1
     printed = capsys.readouterr()
     assert "STOPPED, nothing submitted" in printed.err
+    assert order == ["check", "queue"]  # the plan acts on the queue as it is after the check, not before
     assert "forged" in printed.out and printed.out.rstrip("\n").replace("\n", "").isprintable()
     assert submitted == []
 
@@ -274,11 +279,13 @@ def test_site_admin_check_multi_gpu_plan_and_request_file(
     # D48: the decision is per node: short of memory on n1 but room on n2 pre-empts nothing for memory
     def node_room(name: str, lacks: tuple[jobs_view.Lack, ...]) -> jobs_view.NodeRoom:
         return jobs_view.NodeRoom(name, 2000, 1000, 20, 10, 0, 0, None, None, lacks, ())
-    monkeypatch.setattr(urgent, "room_now", lambda *_a: [node_room("n1", (jobs_view.Lack.MEMORY,)), node_room("n2", ())])
+    monkeypatch.setattr(urgent, "room_now", lambda *_a: [node_room("n1\x1b[2J", (jobs_view.Lack.MEMORY,)), node_room("n2", ())])
     gpu_jobs.update_sidecar("5", mem="512M")
     calls.clear()
+    capsys.readouterr()
     assert urgent.run([*argv[:-4], "--mem", "2G", "--", "true"]) == 0
     assert ["scontrol", "requeue", "3"] not in calls
+    assert "\x1b" not in capsys.readouterr().out  # names in the room lines are what other users typed
     monkeypatch.setattr(urgent, "room_now", lambda *_a: None)
     # cores short (the memory fits): the same rule with the cores the normal job holds; needs 4, slurm has 1 left
     monkeypatch.setattr(urgent, "free_on_nodes", lambda: (10**6, 1))
