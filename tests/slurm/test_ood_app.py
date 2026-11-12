@@ -147,6 +147,10 @@ def test_every_get_route_answers(path: str) -> None:
         # where a running job is, as a small line inside the state cell; a pushed-back job's timeline says why it moved
         assert '<div class="why">on gpu-node-1</div>' in body
         job_page = call(fake, "/job/7")[1]
+        assert "<dt>Checked before queuing</dt><dd>—</dd>" in job_page  # a record from before D47
+        assert [app._checked(c) for c in ({"none": "one-off"}, {"command": "make check", "exit": 0, "seconds": 3.2},
+                                          {"command": "make check", "reused_from": 1.0}, {"policy": "off"})] == [
+            "no check: one-off", "`make check` passed in 3.2 s", "`make check` passed earlier (reused)", "not stated (policy off)"]
         assert "Pushed back: 7.3 GB free on laptop" in job_page
         assert "Idle finding: holds 8 cores" in job_page and "forged by alice" not in job_page  # only the agent's (D41)
         assert "Stopped for memory: held 9 GB" in job_page and "forged stop" not in job_page  # (D44)

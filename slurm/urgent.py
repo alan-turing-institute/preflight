@@ -37,6 +37,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import audit  # noqa: E402 - path set just above
+import checks  # noqa: E402
 import cores  # noqa: E402
 import gpu_jobs  # noqa: E402
 import jobs_view  # noqa: E402
@@ -182,6 +183,7 @@ def parser() -> argparse.ArgumentParser:
         "--max-jobs", type=int, default=1,
         help="GPU jobs allowed on the card, this one included; above 1 only against a measured sharing result",
     )
+    checks.add_arguments(p)
     p.add_argument("--dry-run", action="store_true", help="print the plan and the job script; change nothing")
     p.add_argument("command", nargs=argparse.REMAINDER)
     return p
@@ -189,6 +191,11 @@ def parser() -> argparse.ArgumentParser:
 
 def run(argv: list[str]) -> int:
     arguments = parser().parse_args(argv)
+    try:
+        checks.refuse_nested()
+    except checks.CheckRefused as refusal:
+        print(f"[urgent] REFUSED: {refusal}", file=sys.stderr)
+        return 1
     arguments.command = arguments.command[1:] if arguments.command[:1] == ["--"] else arguments.command
     if not arguments.command:
         print("[urgent] REFUSED: no command after --", file=sys.stderr)
@@ -279,10 +286,16 @@ def run(argv: list[str]) -> int:
         needs_lease=True,
     )
     if arguments.dry_run:
+        try:
+            submit.settle_check(arguments, site, dry_run=True, said="[urgent]")
+        except submit.Refused as refused:
+            print(f"[urgent] REFUSED: {refused}", file=sys.stderr)
+            return 1
         print(script)
         return 0
     try:
         submit.require_keeper(site)
+        checked = submit.settle_check(arguments, site, dry_run=False, said="[urgent]")  # D47: before anything is held or requeued
         if manifest:  # before anything is held or requeued: a refusal changes nothing
             submit.run_gate(arguments.repo.resolve(), arguments.entry, arguments.command, manifest, arguments.search)
     except submit.Refused as refused:
@@ -346,6 +359,7 @@ def run(argv: list[str]) -> int:
         job_id, "urgent", project=arguments.project, what=arguments.what, job_class="urgent", name=arguments.name,
         gpu=arguments.gpu, gpus=arguments.gpus, mem=mem, command=arguments.command, log=str(log), script=str(path), entry=arguments.entry,
         manifest=str(manifest) if manifest else None, after=[], preempts=victims, submitted_at=int(time.time()),
+        check=checked.record,
     )
     print(f"[urgent] job {job_id} submitted; log {log}")
     return 0

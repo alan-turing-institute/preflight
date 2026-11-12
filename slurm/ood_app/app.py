@@ -238,6 +238,22 @@ class Backend:
     can_write: Callable[[str], bool] = lambda path: os.access(path, os.W_OK)
 
 
+def _checked(check: object) -> str:
+    """D47: what a job's record says about its check before queuing; "—" for a job from before the field."""
+    if not isinstance(check, dict):
+        return "—"
+    if check.get("none"):
+        return f"no check: {check['none']}"
+    command = check.get("command")
+    if command and check.get("reused_from"):
+        return f"`{command}` passed earlier (reused)"
+    if command and "exit" in check:
+        return f"`{command}` passed in {check.get('seconds', '?')} s"
+    if command:
+        return f"`{command}` (a dry run: not run)"
+    return f"not stated (policy {check.get('policy', '?')})"
+
+
 def _rooms(backend: Backend, by_id: Mapping[str, QueuedJob]) -> Callable[[jobs_view.Need], list[jobs_view.NodeRoom]] | None:
     """`jobs_view.room` over slurm's node figures read once (D48); None when slurm or the site file does not answer."""
     rows, site = backend.node_capacity(), backend.site()
@@ -1120,6 +1136,7 @@ def job_page(backend: Backend, job_id: str, root: str = "") -> str | None:
     ]
     if name and name != _short(name):
         facts.append(("Slurm name", f'<span class="mono">{esc(name)}</span>'))
+    facts.append(("Checked before queuing", esc(_checked(record.get("check")))))
     if row and _exit_words(row.exit_code) and kind != Kind.CANCELLED:
         facts.insert(1, ("Ended with", f'<span class="exit-bad">{esc(_exit_words(row.exit_code))}</span>'))
     jobstats = (

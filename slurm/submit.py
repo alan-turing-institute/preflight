@@ -80,6 +80,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import audit  # noqa: E402 - path set just above
+import checks
 import cores
 import gpu_jobs  # noqa: E402
 import jobs_view
@@ -265,6 +266,19 @@ def warn_memory(mem: str | None, name: str | None, gpu: bool) -> None:
     elif asked_mb * 1024**2 < peak:
         warn(f"--mem {mem} ({_gb(asked_mb)}) is below the {peak / 1e9:.1f} GB {name!r} peaked at on one of its last "
              f"{gpu_jobs.HISTORY_RUNS} clean runs; the memory floor may kill the job")
+
+
+def settle_check(arguments: argparse.Namespace, site: site_config.Site, *, dry_run: bool,
+                 said: str = "[submit]") -> checks.Outcome:
+    """D47: the submission's check, settled under the site's `require_check`, its lines printed; `Refused` when it
+    fails or the policy refuses (nothing is queued)."""
+    try:
+        outcome = checks.settle(arguments.check, arguments.no_check, site.require_check, arguments.workdir, dry_run=dry_run)
+    except checks.CheckRefused as refusal:
+        raise Refused(str(refusal)) from None
+    for line in outcome.lines:
+        print(f"{said} check: {line}", file=sys.stderr if line.startswith("warning:") else sys.stdout)
+    return outcome
 
 
 def print_room(need: jobs_view.Need, site: site_config.Site) -> None:
@@ -617,6 +631,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--size", nargs=2, default=None, metavar=("COUNT", "UNIT"),
                    help="the job's size in a unit of the project's choosing (e.g. 30 detectors): memory is then sized from "
                         "earlier runs of this project that declared the same unit (D48, site field memory_from_size)")
+    checks.add_arguments(p)
     p.add_argument("--dry-run", action="store_true", help="print the sbatch script and submit nothing")
     p.add_argument("command", nargs=argparse.REMAINDER)
     return p
@@ -624,6 +639,10 @@ def parser() -> argparse.ArgumentParser:
 
 def submit(argv: list[str]) -> str:
     arguments = parser().parse_args(argv)
+    try:
+        checks.refuse_nested()
+    except checks.CheckRefused as refusal:
+        raise Refused(str(refusal)) from None
     arguments.command = arguments.command[1:] if arguments.command[:1] == ["--"] else arguments.command
     if not arguments.command:
         msg = "no command after --"
@@ -643,8 +662,10 @@ def submit(argv: list[str]) -> str:
         raise Refused(msg)
     if arguments.site:
         arguments.name = arguments.name or Path(arguments.command[0]).name
+        local = gpu_jobs.load_site()
+        settle_check(arguments, local, dry_run=arguments.dry_run)  # here, before the sync: it checks the code being sent
         try:
-            return remote.submit(arguments, gpu_jobs.load_site())
+            return remote.submit(arguments, local)
         except remote.RemoteRefused as error:
             raise Refused(str(error)) from None
     site = gpu_jobs.load_site()
@@ -728,6 +749,7 @@ def submit(argv: list[str]) -> str:
                               bool(bound), partition, frozenset(placed.excluded) if included else frozenset()), site)
     warn_device(arguments)
     if arguments.dry_run:
+        settle_check(arguments, site, dry_run=True)
         if arguments.service:
             print(f"[submit] service room: {json.dumps(service_room(site, arguments.cpus, gpu_jobs.mem_mb(mem), consent))}")
         return script
@@ -736,6 +758,7 @@ def submit(argv: list[str]) -> str:
         if not known_to_slurm(job_id):
             msg = f"--after {job_id}: slurm no longer knows that job (finished over a day ago, or never existed)"
             raise Refused(msg)
+    checked = settle_check(arguments, site, dry_run=False)  # after the cheap refusals, before the gate and the queue
     if gated:
         run_gate(arguments.repo.resolve(), arguments.entry, arguments.command, manifest, arguments.search)
     print("\n".join(audit.report(audit.unregistered())))
@@ -771,6 +794,7 @@ def submit(argv: list[str]) -> str:
         **({"may_suspend": None if consent is None else sorted(consent)} if arguments.service else {}),
         **({"part_time": {v.node: v.reason or "included" for v in placed.verdicts}} if placed else {}),
         **({"cores_from_history": history_cores} if history_cores else {}),
+        check=checked.record,
         **({"size": {"count": size[0], "unit": size[1]}, "size_memory": sized} if size else {}),
     )
     pauses = {

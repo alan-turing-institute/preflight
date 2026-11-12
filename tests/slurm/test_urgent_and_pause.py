@@ -339,6 +339,12 @@ def test_entry_runs_the_gate_before_anything_is_held_and_mem_auto_sizes_the_job(
     # a gate refusal holds, requeues and submits nothing
     assert urgent.run([*argv, "--entry", "refused.py", "--", "true"]) == 1
     assert calls == [] and "the DGX gate refused" in capsys.readouterr().err
+    # D47: under `require_check = "enforce"` a submission stating no check refuses before anything is held or requeued
+    site_file = tmp_path / "site.toml"
+    site_file.write_text('require_check = "enforce"\n' + site_file.read_text(encoding="utf-8"), encoding="utf-8")
+    assert urgent.run([*argv, "--", "true"]) == 1
+    assert calls == [] and "this site requires a check" in capsys.readouterr().err
+    site_file.write_text(site_file.read_text(encoding="utf-8").split("\n", 1)[1], encoding="utf-8")
 
     # the gate passes: its manifest copy goes to the job wrapper and the job's record; --mem auto is the measured peak plus 10%
     assert urgent.run([*argv, "--entry", "scripts/e.py", "--", "true"]) == 0

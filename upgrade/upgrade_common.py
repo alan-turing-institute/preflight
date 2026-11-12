@@ -72,6 +72,8 @@ def submit_and_wait(
         what,
         "--class",
         "restart",
+        "--no-check",
+        "the weekly upgrade's test job is itself the check",
         "--name",
         name,
         *(["--gpu"] if gpu else []),

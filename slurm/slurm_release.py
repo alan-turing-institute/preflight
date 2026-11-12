@@ -262,7 +262,8 @@ def check(site: site_config.Site, *, run: Run = subprocess.run, fetch: Callable[
         return 1
     argv = [sys.executable, str(checkout / "slurm" / "submit.py"), "--project", cfg.project, "--class", "resume",
             "--resume-ok", "--what", f"container test of slurm {to}", "--name", TEST_NAME, "--cpus", str(cores),
-            "--mem", f"{gib}G", "--", sys.executable, str(checkout / "slurm" / "slurm_release.py"), "test",
+            "--mem", f"{gib}G", "--no-check", "the release test job is itself the check", "--",
+            sys.executable, str(checkout / "slurm" / "slurm_release.py"), "test",
             "--from", text_of(running), "--to", to, "--sha256", chosen.sha256]
     done = run(argv, capture_output=True, text=True, check=False)
     print(f"{PREFIX} slurm {to} is newer than {text_of(running)}: test submitted ({(done.stdout or done.stderr).strip()[-200:]})")

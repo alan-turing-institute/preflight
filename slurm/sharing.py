@@ -242,7 +242,8 @@ def measure(arguments: argparse.Namespace) -> int:
     what = arguments.what or f"sharing level measurement of {arguments.name}"
     try:
         job_id = submit.submit(["--project", arguments.project, "--what", what, "--class", gpu_jobs.JobClass.RESTART.value,
-                                "--gpu", "--name", arguments.name, "--", *body])
+                                "--gpu", "--name", arguments.name,
+                                "--no-check", "the sharing probe is itself a measurement run", "--", *body])
     except submit.Refused as error:
         sys.exit(f"[sharing] REFUSED: {error}")
     print(f"[sharing] job {job_id} holds the whole card while it measures; read the result with: sharing.py show {arguments.name}")

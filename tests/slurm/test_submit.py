@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
+import checks
 import cores
 import gpu_jobs
 import portability
@@ -22,12 +24,13 @@ def fake_site(monkeypatch: pytest.MonkeyPatch, *, lease: object, dgx_gate: bool,
               cpu_job_cap: int | None = None, service: object = None, part_time_nodes: tuple = (),
               node_python: str = "/usr/bin/python3", sharing_memory_fraction: float | None = None,
               cpus_from_history: site_config.Policy = site_config.Policy.OFF,
-              memory_from_size: site_config.Policy = site_config.Policy.RECOMMEND) -> None:
+              memory_from_size: site_config.Policy = site_config.Policy.RECOMMEND,
+              require_check: site_config.Policy = site_config.Policy.OFF) -> None:
     """`load` returns just the fields submit.py reads."""
     site = SimpleNamespace(lease=lease, dgx_gate=dgx_gate, nodes=nodes, cpu_job_cap=cpu_job_cap, service=service,
                            part_time_nodes=part_time_nodes, node_python=node_python,
                            sharing_memory_fraction=sharing_memory_fraction, cpus_from_history=cpus_from_history,
-                           memory_from_size=memory_from_size)
+                           memory_from_size=memory_from_size, require_check=require_check)
     monkeypatch.setattr(site_config, "load", lambda *_p: site)
 
 
@@ -669,3 +672,48 @@ def test_size_sizes_memory_from_the_projects_runs_of_the_unit(monkeypatch: pytes
     assert "is below the 90.0 GB peak" in capsys.readouterr().err
     forwarded = remote.forwarded(submit.parser().parse_args([*argv, "--size", "30", "detectors", "--", "true"]))
     assert forwarded[-3:] == ["--size", "30", "detectors"]
+
+
+def test_the_check_runs_before_queuing_hidden_from_the_gpu_bounded_and_reused(tmp_path: Path,
+                                                                               monkeypatch: pytest.MonkeyPatch) -> None:
+    """D47: a passing check is recorded, a failing one refuses, the time limit kills its whole group, the GPU is hidden,
+    a pass is reused for 10 minutes only, --no-check keeps its reason, and the policy warns or refuses without either."""
+    policy, cache, clock = site_config.Policy.RECOMMEND, tmp_path / "cache", [1000.0]
+
+    def settle(check: str | None, no_check: str | None = None, **kw: object) -> checks.Outcome:
+        return checks.settle(check, no_check, kw.pop("policy", policy), tmp_path, dry_run=False, cache=cache,
+                             now=lambda: clock[0], **kw)
+
+    seen = tmp_path / "env.txt"
+    outcome = settle(f"sh -c 'env > {seen}'")
+    assert outcome.record["exit"] == 0 and outcome.record["command"] == f"sh -c 'env > {seen}'"
+    env = dict(line.split("=", 1) for line in seen.read_text().splitlines() if "=" in line)
+    assert (env["CUDA_VISIBLE_DEVICES"], env[checks.IN_CHECK]) == ("", "1")
+    assert "reused_from" in settle(f"sh -c 'env > {seen}'").record  # the same check from the same folder: not run again
+    clock[0] += checks.CHECK_REUSE_S + 1
+    assert "exit" in settle(f"sh -c 'env > {seen}'").record  # after the window it runs again
+    with pytest.raises(checks.CheckRefused, match="failed \\(exit 3\\)"):
+        settle("sh -c 'exit 3'")
+    left = tmp_path / "left.txt"
+    started = time.monotonic()
+    with pytest.raises(checks.CheckRefused, match="did not finish within"):
+        settle(f"sh -c '(sleep 0.4; touch {left}) & sleep 30'", timeout_s=0.2)
+    assert time.monotonic() - started < checks.CHECK_KILL_GRACE_S  # SIGTERM stopped it; no grace wait
+    time.sleep(0.5)
+    assert not left.exists()  # its background child died with the group
+    assert settle(None, "a one-off timing").record == {"policy": "recommend", "none": "a one-off timing"}
+    with pytest.raises(checks.CheckRefused, match="needs a reason"):
+        settle(None, "  ")
+    assert settle(None).lines[0].startswith("warning: no --check or --no-check")
+    assert settle(None, policy=site_config.Policy.OFF).record == {"policy": "off"}
+    with pytest.raises(checks.CheckRefused, match="this site requires a check"):
+        settle(None, policy=site_config.Policy.ENFORCE)
+    monkeypatch.setenv(checks.IN_CHECK, "1")
+    with pytest.raises(submit.Refused, match="must not queue jobs"):
+        dry("--project", "p", "--what", "w", "--class", "restart", "--no-check", "x", "--", "true")
+    monkeypatch.delenv(checks.IN_CHECK)
+    fake_site(monkeypatch, lease=None, dgx_gate=False, require_check=site_config.Policy.ENFORCE)
+    with pytest.raises(submit.Refused, match="this site requires a check"):
+        dry("--project", "p", "--what", "w", "--class", "restart", "--", "true")
+    assert "--job-name=p:restart:true" in dry("--project", "p", "--what", "w", "--class", "restart", "--check", "true",
+                                               "--", "true")  # a dry run names the check and runs nothing
