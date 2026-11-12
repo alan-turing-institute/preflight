@@ -75,6 +75,7 @@ import shutil
 import subprocess
 import sys
 import time
+from collections.abc import Mapping
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -87,6 +88,7 @@ import jobs_view
 import portability
 import remote
 import site_config
+import wait
 from gpu_jobs import (  # shared with the job wrapper's advice (D37)
     AUTO_MARGIN,
     CORES_MARGIN,
@@ -306,6 +308,61 @@ def warn_device(arguments: argparse.Namespace) -> None:
     if not reserved:
         warn("the command says --device cpu but no GPU job is running or waiting: the GPU is free, and the work may "
              "finish far sooner there (resubmit with --gpu)")
+
+
+#: Same-shape chained steps at which `--after` warns (D48 Part D): the proposal that asked for it named "2-3", and over
+#: 14 days 76 of 1,216 submissions reached 3, so the warning stays rare enough to be read.
+CHAIN_WARN = 3
+#: Upstream ids the chain warning names; a longer chain shows its first step and an ellipsis, so the line stays one line.
+CHAIN_IDS_SHOWN = 3
+
+Shape = tuple[str, str, int, int]
+
+
+def step_shape(job_id: str, queue: Mapping[str, gpu_jobs.QueuedJob], records: Mapping[str, Mapping[str, object]]) -> Shape | None:
+    """(project, class, GPUs, shards) of a chained step: slurm's view while it is queued, else its record (where a shard
+    job counts `gpus` 1 and keeps `shards`, so it reads as slurm shows it); None when neither says."""
+    job = queue.get(job_id)
+    if job is not None:
+        return jobs_view.project_of(job.name), str(job.job_class or ""), job.gpus, job.shards
+    record = records.get(job_id)
+    if not record:
+        return None
+    gpus, shards = record.get("gpus"), record.get("shards")
+    shards = shards if isinstance(shards, int) else 0
+    return (str(record.get("project") or ""), str(record.get("job_class") or ""),
+            0 if shards or not isinstance(gpus, int) else gpus, shards)
+
+
+def chain_warning(after: list[str], shape: Shape, queue: Mapping[str, gpu_jobs.QueuedJob],
+                  records: Mapping[str, Mapping[str, object]]) -> str | None:
+    """D48 Part D: the warning for a job that is step `CHAIN_WARN` or later of consecutive same-shape steps, walking
+    the first `--after` job's upstream side (`jobs_view.chain`: queue first, then the records' `after`). None below it."""
+    steps: list[str] = []  # nearest first
+    node = jobs_view.chain(after[0], queue, records) if after else None
+    while node is not None and step_shape(node.job_id, queue, records) == shape:
+        steps.append(node.job_id)
+        node = node.before[0] if node.before else None
+    if len(steps) + 1 < CHAIN_WARN:
+        return None
+    shown = [f"#{j}" for j in reversed(steps[:CHAIN_IDS_SHOWN])]
+    ids = " -> ".join([f"#{steps[-1]}", "...", *shown] if len(steps) > CHAIN_IDS_SHOWN else shown)
+    return (f"this is step {len(steps) + 1} of a chain of same-shape jobs ({ids} -> this): each step waits in the queue "
+            "again and is sized alone; one job running the steps in order usually holds memory once and fails in one "
+            "place (README, 'Chains')")
+
+
+def warn_chain(arguments: argparse.Namespace, shards: int) -> None:
+    """Print `chain_warning` for this submission; nothing without `--after` or when slurm does not answer."""
+    queue = gpu_jobs.read_queue() if arguments.after else None
+    if queue is None:
+        return
+    by_id = {job.job_id: job for job in queue}
+    records = wait.all_sidecars({job.job_id: job.user for job in queue})  # a queued job's record counts only from its user
+    shape = (arguments.project, arguments.job_class, 0 if shards else arguments.gpus, shards)
+    line = chain_warning(arguments.after, shape, by_id, records)
+    if line:
+        warn(gpu_jobs.printable(line))
 
 
 def comment(what: str) -> str:
@@ -748,6 +805,7 @@ def submit(argv: list[str]) -> str:
     print_room(jobs_view.Need(need_mb, arguments.cpus, 0 if packing.shards else arguments.gpus, packing.shards,
                               bool(bound), partition, frozenset(placed.excluded) if included else frozenset()), site)
     warn_device(arguments)
+    warn_chain(arguments, packing.shards)
     if arguments.dry_run:
         settle_check(arguments, site, dry_run=True)
         if arguments.service:
@@ -790,6 +848,7 @@ def submit(argv: list[str]) -> str:
         manifest=str(manifest) if manifest else None,
         after=arguments.after,
         max_jobs=arguments.max_jobs,
+        **({"shards": packing.shards} if packing.shards else {}),  # a chain's later step reads its shape (D48)
         submitted_at=int(time.time()),
         **({"may_suspend": None if consent is None else sorted(consent)} if arguments.service else {}),
         **({"part_time": {v.node: v.reason or "included" for v in placed.verdicts}} if placed else {}),

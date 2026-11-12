@@ -16,6 +16,7 @@ import remote
 import pytest
 import site_config
 import submit
+import wait
 
 DIRECTIVE = "#S" + "BATCH"  # spelled in two halves so a text-matching guard does not read a submission here
 
@@ -40,6 +41,7 @@ def default_site(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_site(monkeypatch, lease=object(), dgx_gate=True)
     monkeypatch.setattr(gpu_jobs, "_sacct_jobs", lambda *_selection, **_flags: [])
     monkeypatch.setattr(gpu_jobs, "node_capacity", lambda *_a, **_k: None)  # never the live cluster's room
+    monkeypatch.setattr(gpu_jobs, "read_queue", lambda: None)  # nor its queue
     alike = cores.CoreSpeeds({})  # these tests do not depend on the machine they run on having fast and slow cores
     monkeypatch.setattr(cores.CoreSpeeds, "read", classmethod(lambda cls, root=None: alike))
 
@@ -307,6 +309,35 @@ def test_device_cpu_with_the_gpu_unreserved_warns(
     monkeypatch.setattr(gpu_jobs, "read_queue", lambda: queue)
     dry("--project", "p", "--what", "w", "--class", "restart", "--", "x", *command)
     assert ("the GPU is free" in capsys.readouterr().err) is warns
+
+
+def _step(job_id: str, upstream: str = "", gpus: int = 0) -> gpu_jobs.QueuedJob:
+    dependency = f"afterok:{upstream}(unfulfilled)" if upstream else ""
+    return gpu_jobs.QueuedJob(job_id, "steady", "PENDING", "Dependency", f"p:restart:s{job_id}", dependency, gpus=gpus)
+
+
+@pytest.mark.parametrize(
+    ("queue", "records", "warning"),
+    [
+        ([_step("10"), _step("11", "10")], {}, "step 3 of a chain of same-shape jobs (#10 -> #11 -> this)"),
+        ([_step("10", gpus=1), _step("11", "10")], {}, None),  # a GPU step then CPU steps: not one shape
+        ([], {"10": {"project": "p", "job_class": "restart", "gpus": 0},  # finished steps: their records
+              "11": {"project": "p", "job_class": "restart", "gpus": 0, "after": ["10"]}}, "step 3"),
+        ([_step("10"), *(_step(str(i), str(i - 1)) for i in range(11, 15))], {},
+         "step 6 of a chain of same-shape jobs (#10 -> ... -> #12 -> #13 -> #14 -> this)"),
+    ],
+)
+def test_a_third_same_shape_step_of_a_chain_warns(queue: list, records: dict, warning: str | None,
+                                                   monkeypatch: pytest.MonkeyPatch,
+                                                   capsys: pytest.CaptureFixture[str]) -> None:
+    monkeypatch.setattr(gpu_jobs, "read_queue", lambda: queue)
+    monkeypatch.setattr(wait, "all_sidecars", lambda _users=None: records)
+    dry("--project", "p", "--what", "w", "--class", "restart", "--after", queue[-1].job_id if queue else "11", "--", "x")
+    err = capsys.readouterr().err
+    assert (warning in err) if warning else "chain" not in err
+    shard_record = {"project": "p", "job_class": "resume", "gpus": 1, "shards": 2}  # recorded as one GPU, as submit does
+    queued_shards = gpu_jobs.QueuedJob("5", "normal", "PENDING", "Resources", "p:resume:x", shards=2)
+    assert submit.step_shape("5", {}, {"5": shard_record}) == submit.step_shape("5", {"5": queued_shards}, {})
 
 
 def test_no_mem_reuses_the_last_measured_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
