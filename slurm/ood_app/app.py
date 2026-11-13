@@ -19,6 +19,7 @@ import stat
 import subprocess
 import sys
 import time
+from bisect import bisect_left, bisect_right
 from collections.abc import Callable, Iterable, Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
@@ -52,7 +53,7 @@ PRESET_DAYS = (7, 30, 90)
 HISTORY_PAGE = 50
 RECENT_ROWS = 8
 NO_MATCH = '<div class="empty"><strong>No jobs match</strong>Clear a filter or the search.</div>'
-PALETTE_SLOTS = 8  # the categorical slots c1..c8 in static/app.css; a ninth project and later are grey
+PALETTE_SLOTS = 8  # the categorical slots c1..c8 in static/app.css; the projects using the machine most hold them
 #: what each submit.py class means, shown when hovering its label
 CLASS_HELP = {
     "resume": "If paused or pre-empted it continues from its last checkpoint.",
@@ -224,7 +225,7 @@ class Backend:
     live_memory: Callable[[str], Mapping[str, int]] = lambda job_id: _live_memory(job_id)
     finished: Callable[[str], jobs_view.HistoryRow | None] = jobs_view.finished_job
     now: Callable[[], datetime] = datetime.now
-    project_order: Callable[[], list[str]] = lambda: _project_order()
+    project_slots: Callable[[], Mapping[str, int]] = lambda: _project_slots()
     capacity: Callable[[], Mapping[str, int]] = gpu_jobs.capacity
     node_capacity: Callable[[], list[dict[str, int | str]] | None] = gpu_jobs.node_capacity
     partition_tiers: Callable[[], Mapping[str, gpu_jobs.PartitionTier] | None] = gpu_jobs.partition_tiers
@@ -486,15 +487,48 @@ def _short(name: str) -> str:
     return parts[2] if len(parts) == len(("project", "class", "name")) and parts[2] else name
 
 
-def _project_order() -> list[str]:
-    """Every project in slurm's accounting, in the order each first ran: new projects only ever append, so a
-    project keeps its colour (`sacct -X -P`: only the name is used, and a name with `|` stays whole)."""
-    out = jobs_view.run_command(["sacct", "-a", "-n", "-X", "-P", "-S", "2000-01-01", "-o", "JobID,JobName"])
-    order: dict[str, None] = {}
+#: The grey segment of a stacked chart: every project without a colour of its own.
+OTHER_PROJECTS = "other projects"
+#: How often the colour replay looks again at who uses the machine most, and how far back it starts (see
+#: `project_slots`): a year of weekly steps keeps colours steady and the work bounded.
+SLOT_STEP, SLOT_REPLAY = timedelta(days=7), timedelta(days=365)
+
+
+def project_slots(jobs: Iterable[tuple[datetime, str, float]], now: datetime) -> dict[str, int]:
+    """Each project's palette slot from its jobs' (submitted, project, core-hours held). Replayed a week at a time over
+    the history: the projects with the most core-hours over the longest view (90 days) hold the eight colours; one
+    keeps its colour while it stays among them, one entering takes the lowest free colour, and `(other)` never takes
+    one. So a colour follows its project, never its rank, no two projects share one, and the rest are grey."""
+    window = timedelta(days=max(PRESET_DAYS))
+    jobs = sorted(j for j in jobs if j[1] != jobs_view.OTHER_PROJECT and j[0] >= now - SLOT_REPLAY - window)
+    if not jobs:
+        return {}
+    start, held, times = max(jobs[0][0], now - SLOT_REPLAY), {}, [j[0] for j in jobs]
+    moments = [start + SLOT_STEP * k for k in range(1, int((now - start) / SLOT_STEP) + 1)] + [now]
+    for moment in moments:
+        use: dict[str, float] = {}
+        for _when, project, hours in jobs[bisect_left(times, moment - window):bisect_right(times, moment)]:
+            use[project] = use.get(project, 0.0) + hours
+        top = sorted(use, key=lambda p: (-use[p], p))[:PALETTE_SLOTS]
+        held = {p: slot for p, slot in held.items() if p in top}
+        for project in (p for p in top if p not in held):
+            held[project] = min(set(range(PALETTE_SLOTS)) - set(held.values()))
+    return held
+
+
+def _project_slots() -> dict[str, int]:
+    """`project_slots` from slurm's accounting (`sacct -X -P`; a name with `|` stays whole: it is the last field)."""
+    now = datetime.now()  # noqa: DTZ005 - local, like the times sacct prints
+    since = (now - SLOT_REPLAY - timedelta(days=max(PRESET_DAYS))).strftime("%Y-%m-%dT%H:%M:%S")
+    out = jobs_view.run_command(["sacct", "-a", "-n", "-X", "-P", "-S", since, "-o", "Submit,ElapsedRaw,AllocCPUS,JobName"])
+    jobs = []
     for line in out.splitlines():
-        _, _, name = line.partition("|")
-        order.setdefault(jobs_view.project_of(name), None)
-    return list(order)
+        submit, elapsed, cpus, name = (line.split("|", 3) + ["", "", ""])[:4]
+        try:
+            jobs.append((datetime.fromisoformat(submit), jobs_view.project_of(name), int(elapsed or 0) * int(cpus or 0) / 3600))
+        except ValueError:
+            continue  # a field slurm left "Unknown"
+    return project_slots(jobs, now)
 
 
 def _colour(project: str) -> str:
@@ -1460,8 +1494,13 @@ def _nice_max(value: float) -> float:
 def _chart(rows: list[jobs_view.UsageRow], periods: list[date], projects: list[str], bucket: jobs_view.Bucket,
            value: Callable[[jobs_view.UsageRow], float] = lambda r: r.gpu_hours, unit: str = "GPU-hours") -> str:
     """Stacked columns of `value` (`unit`), one per period, one segment per project (largest at the base), with a 2 px
-    gap between."""
-    by = {(r.period, r.project): value(r) for r in rows}
+    gap between. Projects without a colour of their own share one grey segment, last: two grey blocks side by side
+    could not be told apart."""
+    by: dict[tuple[date, str], float] = {}
+    for r in rows:
+        key = (r.period, r.project if _colour(r.project) else OTHER_PROJECTS)
+        by[key] = by.get(key, 0.0) + value(r)
+    projects = [p for p in projects if _colour(p)] + ([OTHER_PROJECTS] if any(not _colour(p) for p in projects) else [])
     if not any(v > 0 for v in by.values()):
         return f'<div class="empty">No {esc(unit)} in this period.</div>'
     totals = [sum(by.get((p, proj), 0.0) for proj in projects) for p in periods]
@@ -1948,7 +1987,7 @@ def handle(backend: Backend, environ: Mapping[str, object]) -> tuple[str, str, b
     # Absolute links from the app's own mount point (Passenger's SCRIPT_NAME, /pun/sys/<app>): relative ones broke when
     # the page was opened without its trailing slash, which made the browser look for the stylesheet one level up.
     root = str(environ.get("SCRIPT_NAME") or "").rstrip("/") + "/"
-    _SLOTS.set({project: slot for slot, project in enumerate(backend.project_order())})
+    _SLOTS.set(backend.project_slots())
     query = parse_qs(str(environ.get("QUERY_STRING", "")))
     method = environ.get("REQUEST_METHOD")
     if path.startswith("/api/"):

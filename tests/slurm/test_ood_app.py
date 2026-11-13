@@ -69,7 +69,7 @@ class Fake:
             live_memory=lambda _j: {"gpu": 3 * 1024**3},
             finished=lambda _j: None,
             now=lambda: datetime(2026, 10, 19, 12, 0),  # noqa: DTZ001 - local, like the times sacct prints
-            project_order=lambda: ["proj"],
+            project_slots=lambda: {"proj": 0},
             capacity=lambda: {"cpus": 20, "cpus_used": 8, "mem_mb": 102400, "mem_used_mb": 65536, "gpus": 1, "gpus_used": 1,
                               "nodes": 1, "here": 1},
             node_capacity=lambda: [],  # one machine: never the live cluster's
@@ -446,3 +446,17 @@ def test_both_tables_sort_search_and_filter_from_the_address() -> None:
     card = both.split('data-live="recent">', 1)[1]
     assert card.index('jobid">#6') < card.index('jobid">#5')  # sorted by its own heading; the queue's user filter not applied
     assert 'name="fsort" value="took"' in both.split('aria-label="Queue search and filters"')[1].split("</form>")[0]
+
+
+def test_a_colour_follows_its_project_and_the_rest_share_one_grey() -> None:
+    day = lambda d: datetime(2026, 1, d)  # noqa: DTZ001, E731
+    jobs = [(day(1), "old", 100.0), (day(1), jobs_view.OTHER_PROJECT, 999.0), *((day(1), f"p{i}", float(i)) for i in range(1, 9))]
+    first = app.project_slots(jobs, day(2))
+    assert sorted(first.values()) == list(range(8)) and set(first) == {"old", *(f"p{i}" for i in range(2, 9))}  # most used
+    later = app.project_slots([*jobs, (day(20), "new", 50.0)], day(22))
+    assert {p: later[p] for p in first if p != "p2"} == {p: s for p, s in first.items() if p != "p2"}  # nobody repainted
+    assert later["new"] == first["p2"] and "p2" not in later  # the newcomer takes the colour the one it pushed out held
+    app._SLOTS.set({"old": 0})
+    rows = [jobs_view.UsageRow(day(1), p, 1.0, 1.0, 0.0, 0.0) for p in ("old", "p1", "p2")]
+    chart = app._chart(rows, [day(1)], ["old", "p1", "p2"], jobs_view.Bucket.DAY)
+    assert chart.count("other projects|") == 1 and "2.00 GPU-hours" in chart and "p1" not in chart  # one grey block
