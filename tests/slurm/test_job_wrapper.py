@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import pwd
 import signal
 import subprocess
 import sys
@@ -198,6 +199,8 @@ def test_sigterm_is_passed_to_the_child_which_saves_then_the_leg_is_recorded(
     assert saved.read_text() == "saved"
     record = json.loads((tmp_path / "state" / "jobs" / "77.json").read_text())
     assert record["last_leg"]["signals"] == ["SIGTERM"]
+    me = f"SIGTERM from pid {os.getpid()} (user {pwd.getpwuid(os.getuid()).pw_name}: "  # the sender is named
+    assert [s[:len(me)] for s in record["last_leg"]["senders"]] == [me]
     assert record["last_leg"]["exit"] == 0
     assert (tmp_path / "state" / "footprints" / "77.jsonl").exists()
 

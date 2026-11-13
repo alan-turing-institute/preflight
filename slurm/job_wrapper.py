@@ -14,8 +14,8 @@ sbatch script whose only line runs this wrapper. In order:
    so a file changed during the queue wait is caught before launch.
 3. RUN the command as a CHILD in its own process group, never `exec`: the wrapper must stay alive to
    sample it. On SIGTERM it passes the signal to the whole group (slurm signals only the job script's own
-   process: stage C test 3), records it, and keeps waiting while the child saves its checkpoint, until
-   `KillWait` ends.
+   process: stage C test 3), records it with who sent it (process id, user, command: a signal from outside
+   slurm leaves no other trace), and keeps waiting while the child saves its checkpoint, until `KillWait` ends.
 4. MEASURE every `--sample` s: GPU memory, over all the job's GPUs, of the processes in this job's cgroup
    and of docker containers labelled `slurm-job=<id>` (`nvidia-smi`), and the cgroup's `memory.current`/`memory.peak` (the CPU side; GPU memory is not charged to the cgroup on the
    GB10, trial B2), appended to `footprints/<job id>.jsonl`. The per-job node-exporter textfile
@@ -45,6 +45,7 @@ import contextlib
 import json
 import math
 import os
+import pwd
 import shutil
 import signal
 import subprocess
@@ -313,10 +314,44 @@ def carry_out_stop(job_id: str, pid: int, leg_started: float) -> dict[str, objec
     return request.kill_description(pid, now)
 
 
+#: Signals taken by `waited_signal`: SIGTERM to pass on, SIGCHLD only to wake when the command ends.
+WAITED = frozenset({signal.SIGTERM, signal.SIGCHLD})
+
+
+def waited_signal(timeout: float) -> signal.struct_siginfo | None:
+    """A SIGTERM or SIGCHLD that came while waiting up to `timeout` s, None after the timeout. Taken with
+    sigtimedwait, because a Python handler is never told who sent a signal; blocked only for the wait, so commands
+    started elsewhere inherit the usual mask, and a SIGTERM outside the wait still reaches the handler."""
+    old = signal.pthread_sigmask(signal.SIG_BLOCK, WAITED)
+    try:
+        return signal.sigtimedwait(WAITED, timeout)
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, old)
+
+
+def sender_text(info: signal.struct_siginfo) -> str:
+    """Who sent a signal: 'SIGTERM from pid 123 (user alice: kill 456)'. A signal from the kernel has no sender."""
+    name = signal.Signals(info.si_signo).name
+    if info.si_code > 0:  # SI_KERNEL and the fault codes: no process sent it
+        return f"{name} from the kernel (code {info.si_code})"
+    if info.si_pid == 0:  # sent from another pid namespace (a container): the kernel hides the sender's pid
+        return f"{name} from a process outside this machine's process list (uid {info.si_uid})"
+    try:
+        user = pwd.getpwuid(info.si_uid).pw_name
+    except KeyError:
+        user = f"uid {info.si_uid}"
+    try:  # read at once: the sender may be gone in a moment
+        command = Path(f"/proc/{info.si_pid}/cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace").strip()
+    except OSError:
+        command = ""
+    return f"{name} from pid {info.si_pid} (user {user}: {command[:200] or 'already gone'})"
+
+
 def run_and_measure(
     command: list[str], footprint: Path, cgroup: Path | None, sample_s: float, job_id: str = "", leg_started: float = 0.0
 ) -> dict[str, object]:
     received: list[int] = []
+    senders: list[str] = []  # who sent the signals taken while waiting (most of them; see waited_signal)
 
     # The command runs in its own process group, and SIGTERM is passed on to all of it. Measured 2026-10-16
     # (stage C test 3): on pre-emption slurm signals only the job script's own process when the job has no
@@ -328,6 +363,9 @@ def run_and_measure(
     missed: list[int] = []
 
     def forward(signum: int, _frame: object) -> None:
+        pass_on(signum)
+
+    def pass_on(signum: int) -> None:
         received.append(signum)
         if child is None:
             missed.append(signum)
@@ -349,11 +387,16 @@ def run_and_measure(
     out = best_effort("footprint", open_footprint, footprint)
     with out or contextlib.nullcontext():
         while True:
-            try:
-                status = child.wait(timeout=min(STOP_POLL_S, sample_s))
+            status = child.poll()
+            if status is None:
+                info = waited_signal(min(STOP_POLL_S, sample_s))
+                if info is not None and info.si_signo == signal.SIGTERM:
+                    senders.append(sender_text(info))
+                    print(f"[job] {senders[-1]}", file=sys.stderr, flush=True)
+                    pass_on(info.si_signo)
+                status = child.poll()
+            if status is not None:
                 break
-            except subprocess.TimeoutExpired:
-                pass
             if job_id and stopped is None:  # a run outside slurm never reads requests
                 stopped = carry_out_stop(job_id, child.pid, leg_started)
             if docker and received and not told:  # here, not in the handler: docker may take seconds
@@ -381,6 +424,7 @@ def run_and_measure(
         "exit": status,
         "pid": child.pid,
         "signals": [signal.Signals(s).name for s in received],
+        **({"senders": senders} if senders else {}),
         "peak_gpu_mib": peak_gpu,
         "peak_mem_bytes": max(peak_mem, final or 0),
         "peak_container_bytes": peak_ctr,
@@ -672,7 +716,8 @@ def main() -> int:
     earlier = record.get("legs")
     legs = [*(earlier if isinstance(earlier, list) else []), outcome]
     best_effort("sidecar", lambda: gpu_jobs.update_sidecar(job_id, legs=legs, last_leg=outcome))
-    print(f"[job] exit {outcome['exit']}; signals {outcome['signals']}; peak GPU {outcome['peak_gpu_mib']:.0f} MiB",
+    sent_by = f" sent by {outcome['senders']}" if outcome.get("senders") else ""
+    print(f"[job] exit {outcome['exit']}; signals {outcome['signals']}{sent_by}; peak GPU {outcome['peak_gpu_mib']:.0f} MiB",
           flush=True)
     print("\n".join(report), flush=True)  # what the run used, and what to ask for next time (D37)
     if outcome["signals"] and outcome["docker"]:  # slurm is ending the job: its containers get the rest of KillWait to stop
