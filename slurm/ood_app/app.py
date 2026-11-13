@@ -21,7 +21,7 @@ import sys
 import time
 from collections.abc import Callable, Iterable, Mapping
 from contextvars import ContextVar
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
@@ -51,6 +51,7 @@ PROJECTS_DEFAULT_DAYS = 7
 PRESET_DAYS = (7, 30, 90)
 HISTORY_PAGE = 50
 RECENT_ROWS = 8
+NO_MATCH = '<div class="empty"><strong>No jobs match</strong>Clear a filter or the search.</div>'
 PALETTE_SLOTS = 8  # the categorical slots c1..c8 in static/app.css; a ninth project and later are grey
 #: what each submit.py class means, shown when hovering its label
 CLASS_HELP = {
@@ -595,46 +596,108 @@ def _stamp(when: datetime | None) -> float | None:
     return when.timestamp() if when else None
 
 
-def _sorted(rows: list[Any], columns: Iterable[Column], query: Mapping[str, list[str]]) -> list[Any]:
-    """`rows` in the order the query names (`sort`: a column's key, `order`: asc or desc), as given otherwise; rows with
-    no value for that column last."""
-    value = {c.key: c.value for c in columns if c.key}.get(_first(query, "sort"))
-    if value is None:
-        return rows
-    have = [r for r in rows if value(r) is not None]
-    return sorted(have, key=value, reverse=_first(query, "order") == Order.DESC) + [r for r in rows if value(r) is None]
-
-
-def _head(columns: Iterable[Column], query: Mapping[str, list[str]] | None = None, base: str = "") -> str:
-    """A table's <thead>. With a query, each sortable heading links to the same view (search and filters kept) sorted by
-    it, and the current one the other way round; without, plain headings."""
-    current, order = (_first(query, "sort"), _first(query, "order")) if query is not None else ("", "")
-    keep = {k: v[0] for k, v in (query or {}).items() if v and v[0] and k not in ("sort", "order", "page")}
-    cells = []
-    for c in columns:
-        css = f' class="{c.css}"' if c.css else ""
-        if query is None or c.value is None:
-            cells.append(f'<th scope="col"{css}>{esc(c.label)}</th>')
-            continue
-        on, down = current == c.key, order == Order.DESC
-        flip = Order.ASC if on and down else Order.DESC if on else Order.ASC
-        href = f"{base}?{urlencode({**keep, 'sort': c.key, 'order': flip})}"
-        mark = f' aria-sort="{"descending" if down else "ascending"}"' if on else ""
-        arrow = f' <span aria-hidden="true">{"▼" if down else "▲"}</span>' if on else ""
-        cells.append(f'<th scope="col"{css}{mark}><a class="sort" href="{esc(href)}" title="Sort by {esc(c.label.lower())}">'
-                     f"{esc(c.label)}{arrow}</a></th>")
-    return f"<thead><tr>{''.join(cells)}</tr></thead>"
-
-
 def _matches(text: str, *fields: object) -> bool:
     """Whether every word of the search `text` appears in the fields, case ignored; an empty search matches all."""
     hay = " ".join(str(f) for f in fields if f).casefold()
     return all(word in hay for word in text.casefold().split())
 
 
-def _search_box(query: Mapping[str, list[str]]) -> str:
-    return (f'<label class="field">Search <input type="search" name="q" value="{esc(_first(query, "q"))}" '
-            'placeholder="name, number, node…"></label>')
+@dataclass(frozen=True)
+class Filter:
+    """A dropdown keeping the rows whose `value` is the one chosen; `shown` words a value in the list."""
+
+    name: str
+    label: str
+    every: str
+    value: Callable[[Any], str]
+    shown: Callable[[str], str] = str
+
+
+@dataclass(frozen=True)
+class TableView:
+    """How a table is sorted (its headings), searched and filtered. The settings live in the page address under
+    `prefix`, so two tables on one page keep apart, and a refresh or a bookmark keeps the view."""
+
+    columns: tuple[Column, ...]
+    filters: tuple[Filter, ...]
+    searched: Callable[[Any], Iterable[object]]  # the fields the search box looks in
+    prefix: str = ""
+
+    def setting(self, query: Mapping[str, list[str]], name: str) -> str:
+        return _first(query, self.prefix + name)
+
+    def chosen(self) -> frozenset[str]:
+        """The address names this view's form sets (its sort is set by the headings)."""
+        return frozenset(self.prefix + n for n in ("q", *(f.name for f in self.filters)))
+
+    def rows(self, rows: list[Any], query: Mapping[str, list[str]]) -> list[Any]:
+        """The rows the filters and the search keep, in the order the headings ask for (as given otherwise; rows with no
+        value for the sorted column last, whichever way round)."""
+        text = self.setting(query, "q")
+        kept = [r for r in rows
+                if all(not self.setting(query, f.name) or f.value(r) == self.setting(query, f.name) for f in self.filters)
+                and _matches(text, *self.searched(r))]
+        value = {c.key: c.value for c in self.columns if c.key}.get(self.setting(query, "sort"))
+        if value is None:
+            return kept
+        have = [r for r in kept if value(r) is not None]
+        down = self.setting(query, "order") == Order.DESC
+        return sorted(have, key=value, reverse=down) + [r for r in kept if value(r) is None]
+
+    def head(self, query: Mapping[str, list[str]] | None = None, base: str = "") -> str:
+        """The <thead>. With a query, each sortable heading links to the same page, everything else kept, sorted by it
+        (the current one the other way round); without, plain headings."""
+        sort, order = self.prefix + "sort", self.prefix + "order"
+        current, down = (self.setting(query, "sort"), self.setting(query, "order") == Order.DESC) if query is not None else ("", False)
+        keep = _kept(query or {}, {sort, order, "page"})
+        cells = []
+        for c in self.columns:
+            css = f' class="{c.css}"' if c.css else ""
+            if query is None or c.value is None:
+                cells.append(f'<th scope="col"{css}>{esc(c.label)}</th>')
+                continue
+            on = current == c.key
+            href = f"{base}?{urlencode({**keep, sort: c.key, order: Order.ASC if on and down else Order.DESC if on else Order.ASC})}"
+            mark = f' aria-sort="{"descending" if down else "ascending"}"' if on else ""
+            arrow = f' <span aria-hidden="true">{"▼" if down else "▲"}</span>' if on else ""
+            cells.append(f'<th scope="col"{css}{mark}><a class="sort" href="{esc(href)}" title="Sort by {esc(c.label.lower())}">'
+                         f"{esc(c.label)}{arrow}</a></th>")
+        return f"<thead><tr>{''.join(cells)}</tr></thead>"
+
+    def fields(self, rows: Iterable[Any], query: Mapping[str, list[str]]) -> str:
+        """The search box and a dropdown per filter, listing the values in `rows` (all of them, not only those shown)."""
+        rows = list(rows)
+        search = (f'<label class="field">Search <input type="search" name="{self.prefix}q" '
+                  f'value="{esc(self.setting(query, "q"))}" placeholder="name, number, node…"></label>')
+        return search + "".join(
+            f'<label class="field">{esc(f.label)} <select name="{self.prefix}{f.name}">'
+            f'{_options((v for r in rows if (v := f.value(r))), self.setting(query, f.name), f.every, f.shown)}</select></label>'
+            for f in self.filters)
+
+    def form(self, rows: Iterable[Any], query: Mapping[str, list[str]], action: str, label: str) -> str:
+        """A GET form of `fields` that keeps every other setting in the address, with a link clearing its own."""
+        others = _kept(query, self.chosen() | {"page"})
+        clear = (f'<a class="meta" href="{esc(action + "?" + urlencode(others))}">Clear</a>'
+                 if any(self.setting(query, n[len(self.prefix):]) for n in self.chosen()) else "")
+        return (f'<form method="get" action="{action}" class="toolbar" aria-label="{esc(label)}">{self.fields(rows, query)}'
+                f'{_hidden(others)}<button type="submit" class="primary">Apply</button>{clear}</form>')
+
+
+def _kept(query: Mapping[str, list[str]], drop: Iterable[str]) -> dict[str, str]:
+    """The query's settings (first value of each, empty ones left out) except those named in `drop`."""
+    drop = set(drop)
+    return {k: v[0] for k, v in query.items() if v and v[0] and k not in drop}
+
+
+def _hidden(settings: Mapping[str, str]) -> str:
+    return "".join(f'<input type="hidden" name="{esc(k)}" value="{esc(v)}">' for k, v in settings.items())
+
+
+def _card_head(heading: str, title: str, shown: int, every: int, link: str = "") -> str:
+    """A table card's heading with how many rows show ("3 of 24 job(s)" under a filter), and an optional link."""
+    counts = f"{shown} of {every} job(s)" if shown != every else f"{every} job(s)" if every else "none"
+    return (f'<div class="card-head"><h2 id="{heading}">{esc(title)}</h2>'
+            f'<span class="meta">{counts}{" · " + link if link else ""}</span></div>')
 
 
 # --- queue page ------------------------------------------------------------------------------------------------------
@@ -881,46 +944,22 @@ QUEUE_COLUMNS = (
     Column("Cores", "hide-sm", "cores", lambda r: _num(r["cpus"])),
     Column("User", "", "user", lambda r: str(r["user"]).casefold()),
 )
-#: (URL name, row field, label, the "no filter" choice) of the queue's filters
-QUEUE_FILTERS = (("project", "project", "Project", "Every project"), ("user", "user", "User", "Every user"),
-                 ("state", "state_label", "State", "Every state"), ("level", "level", "Level", "Every level"),
-                 ("class", "class", "Class", "Every class"))
-
-
-def _queue_shown(rows: list[dict[str, object]], query: Mapping[str, list[str]]) -> list[dict[str, object]]:
-    """The queue's rows the query's filters and search keep, in the order it asks for (slurm's, numbered #, by default)."""
-    text = _first(query, "q")
-    kept = [
-        r for r in rows
-        if all(not _first(query, name) or str(r[field]) == _first(query, name) for name, field, _l, _e in QUEUE_FILTERS)
-        and _matches(text, r["id"], r["name"], r["project"], r["user"], r["state_label"], r["description"], r["node"])
-    ]
-    return _sorted(kept, QUEUE_COLUMNS, query)
-
-
-def _queue_tools(rows: list[dict[str, object]], query: Mapping[str, list[str]], root: str) -> str:
-    """The queue's search and filters: a plain GET form, so the view is in the address (the 10 s refresh keeps it)."""
-    selects = "".join(
-        f'<label class="field">{esc(label)} <select name="{name}">'
-        f'{_options((str(r[field]) for r in rows if r[field]), _first(query, name), every)}</select></label>'
-        for name, field, label, every in QUEUE_FILTERS
-    )
-    hidden = "".join(f'<input type="hidden" name="{k}" value="{esc(_first(query, k))}">' for k in ("sort", "order") if _first(query, k))
-    clear = f'<a class="meta" href="{root}">Clear</a>' if any(_first(query, k) for k in ("q", *(f[0] for f in QUEUE_FILTERS))) else ""
-    return (f'<form method="get" action="{root}" class="toolbar" aria-label="Queue search and filters">{_search_box(query)}'
-            f'{selects}{hidden}<button type="submit" class="primary">Apply</button>{clear}</form>')
-
-
-def _queue_head(shown: int, every: int) -> str:
-    counts = "empty" if not every else f"{shown} of {every} job(s)" if shown != every else f"{every} job(s)"
-    return f'<div class="card-head"><h2 id="h-queue">Queue</h2><span class="meta">{counts}</span></div>'
+QUEUE_VIEW = TableView(
+    QUEUE_COLUMNS,
+    (Filter("project", "Project", "Every project", lambda r: str(r["project"])),
+     Filter("user", "User", "Every user", lambda r: str(r["user"])),
+     Filter("state", "State", "Every state", lambda r: str(r["state_label"])),
+     Filter("level", "Level", "Every level", lambda r: str(r["level"])),
+     Filter("class", "Class", "Every class", lambda r: str(r["class"]))),
+    lambda r: (r["id"], r["name"], r["project"], r["user"], r["state_label"], r["description"], r["node"]),
+)
 
 
 def _queue_table(rows: list[dict[str, object]], root: str, now: datetime, query: Mapping[str, list[str]] | None = None,
                  every: int | None = None) -> str:
     """The queue's table of `rows` (already filtered and ordered); `every`: how many jobs are queued in all."""
     if not rows:
-        return ('<div class="empty"><strong>No jobs match</strong>Clear a filter or the search.</div>' if every
+        return (NO_MATCH if every
                 else '<div class="empty"><strong>Nothing queued</strong>The GPU takes the next job submitted with slurm/submit.py.</div>')
     body = []
     for r in rows:
@@ -945,7 +984,7 @@ def _queue_table(rows: list[dict[str, object]], root: str, now: datetime, query:
             f'<td class="inline" data-k="user">{esc(r["user"])}</td>'
             "</tr>"
         )
-    return (f'<div class="table-wrap"><table class="stack">{_head(QUEUE_COLUMNS, query, root)}'
+    return (f'<div class="table-wrap"><table class="stack">{QUEUE_VIEW.head(query, root)}'
             f"<tbody>{''.join(body)}</tbody></table></div>")
 
 
@@ -992,7 +1031,7 @@ def _described(backend: Backend) -> Callable[[jobs_view.HistoryRow], str]:
     return lambda r: str((backend.record(r.job_id, user=r.user) or {}).get("what") or "")
 
 
-HISTORY_COLUMNS = (
+FINISHED_COLUMNS = (
     Column("Job", "", "job", lambda r: _short(r.name).casefold()),
     Column("Project", "", "project", lambda r: r.project.casefold()),
     Column("Result", "", "result", lambda r: _result(r.state)[1].casefold()),
@@ -1007,11 +1046,21 @@ HISTORY_COLUMNS = (
 )
 
 
+HISTORY_VIEW = TableView(
+    FINISHED_COLUMNS,
+    (Filter("project", "Project", "Every project", lambda r: r.project),
+     Filter("user", "User", "Every user", lambda r: r.user),
+     Filter("state", "Result", "Every result", lambda r: r.state, lambda s: _result(s)[1])),
+    lambda r: (r.job_id, r.name, r.project, r.user, _result(r.state)[1], r.node),
+)
+RECENT_VIEW = replace(HISTORY_VIEW, prefix="f")  # the queue page's finished card, beside the queue's own
+
+
 def _finished_table(rows: list[jobs_view.HistoryRow], root: str, now: datetime,
                     what: Callable[[jobs_view.HistoryRow], str] = lambda _r: "",
-                    query: Mapping[str, list[str]] | None = None, base: str = "") -> str:
-    """Finished jobs; with a query, its headings sort the view at `base`."""
-    return (f'<div class="table-wrap"><table class="stack">{_head(HISTORY_COLUMNS, query, base)}'
+                    query: Mapping[str, list[str]] | None = None, base: str = "", view: TableView = HISTORY_VIEW) -> str:
+    """Finished jobs; with a query, the view's headings sort the page at `base`."""
+    return (f'<div class="table-wrap"><table class="stack">{view.head(query, base)}'
             f"<tbody>{_finished_rows(rows, root, now, what)}</tbody></table></div>")
 
 
@@ -1024,7 +1073,7 @@ def index_page(backend: Backend, root: str = "", query: Mapping[str, list[str]] 
     rows = job_rows(backend)
     for position, r in enumerate(rows, 1):
         r["position"] = position  # slurm's order, the # column, kept whatever the table is sorted by
-    shown = _queue_shown(rows, query)
+    shown = QUEUE_VIEW.rows(rows, query)
     now = backend.now()
     day_ago = now - timedelta(days=1)
     recent = sorted(
@@ -1040,19 +1089,25 @@ def index_page(backend: Backend, root: str = "", query: Mapping[str, list[str]] 
         ("Paused", str(count[Kind.PAUSED]), _paused_note(rows)),
         ("Finished, last 24 h", str(len(recent)), f"{failed} failed" if failed else "none failed"),
     ]) + _resource_tiles(backend.capacity(), rows, backend.gpu_busy(), backend.machine(), backend.node_capacity() or [])
-    recent_html = (
-        '<div class="card-head"><h2 id="h-recent">Finished in the last 24 hours</h2>'
-        f'<a class="meta" href="{root}history">All history →</a></div>'
-        + (_finished_table(recent[:RECENT_ROWS], root, now, _described(backend)) if recent else '<div class="empty">No job finished in the last 24 hours.</div>')
+    recent_shown = RECENT_VIEW.rows(recent, query)
+    recent_table = (
+        _finished_table(recent_shown[:RECENT_ROWS], root, now, _described(backend), query, root, RECENT_VIEW) if recent_shown
+        else NO_MATCH if recent
+        else '<div class="empty">No job finished in the last 24 hours.</div>'
     )
     body = _template("index.html").substitute(
         updated=now.strftime("%H:%M:%S"),
         now=_now_card(rows, backend.keeper(), backend, root) + _idle_card(backend),
         tiles=tiles,
-        queue_head=_queue_head(len(shown), len(rows)),
-        queue_tools=_queue_tools(rows, query, root),
+        queue_head=_card_head("h-queue", "Queue", len(shown), len(rows)),
+        queue_tools=QUEUE_VIEW.form(rows, query, root, "Queue search and filters"),
         queue=_queue_table(shown, root, now, query, len(rows)),
-        recent=recent_html,
+        recent_head=_card_head("h-recent", "Finished in the last 24 hours", len(recent_shown), len(recent),
+                               (f"newest {RECENT_ROWS} shown · " if len(recent_shown) > RECENT_ROWS and not RECENT_VIEW.setting(query, "sort")
+                                else f"first {RECENT_ROWS} shown · " if len(recent_shown) > RECENT_ROWS else "")
+                               + f'<a href="{root}history">All history →</a>'),
+        recent_tools=RECENT_VIEW.form(recent, query, root, "Finished jobs search and filters"),
+        recent=recent_table,
         part_time=_part_time_card(backend),
         maintenance=_maintenance_card(backend),
     )
@@ -1342,36 +1397,28 @@ def _options(values: Iterable[str], chosen: str, every: str, label: Callable[[st
 
 def history_page(backend: Backend, query: Mapping[str, list[str]], root: str = "") -> str:
     since, until = _window(query)
-    filters = {k: (query.get(k) or [""])[0] for k in ("user", "project", "state")}
-    text = _first(query, "q")
     try:
         page = max(1, int((query.get("page") or ["1"])[0]))
     except ValueError:
         raise Refused("400 Bad Request", "page must be a number") from None
     every = backend.history(since, until, None, None, None)
-    rows = [
-        r for r in every
-        if (not filters["user"] or r.user == filters["user"])
-        and (not filters["project"] or r.project == filters["project"])
-        and (not filters["state"] or r.state == filters["state"].upper())
-        and _matches(text, r.job_id, r.name, r.project, r.user, _result(r.state)[1], r.node)
-    ]
     now = backend.now()
-    rows.sort(key=lambda r: ((r.start or r.submit or now).timestamp() if r.start or r.submit else 0.0, int(r.job_id) if r.job_id.isdigit() else 0), reverse=True)
-    rows = _sorted(rows, HISTORY_COLUMNS, query)  # newest first unless a heading was clicked
+    newest = sorted(every, key=lambda r: ((r.start or r.submit or now).timestamp() if r.start or r.submit else 0.0,
+                                          int(r.job_id) if r.job_id.isdigit() else 0), reverse=True)
+    rows = HISTORY_VIEW.rows(newest, query)  # newest first unless a heading was clicked
     pages = max(1, -(-len(rows) // HISTORY_PAGE))
     page = min(page, pages)
     shown = rows[(page - 1) * HISTORY_PAGE : page * HISTORY_PAGE]
-    keep = {"since": since, "until": until or "", **filters, "q": text, "sort": _first(query, "sort"), "order": _first(query, "order")}
+    keep = {**_kept(query, {"page"}), "since": since, **({"until": until} if until else {})}
     table = (
-        _finished_table(shown, root, now, _described(backend), {k: [v] for k, v in keep.items() if v}, f"{root}history") if shown
+        _finished_table(shown, root, now, _described(backend), {k: [v] for k, v in keep.items()}, f"{root}history") if shown
         else '<div class="empty"><strong>No jobs match</strong>Try a longer period or clear a filter.</div>'
     )
 
     def page_link(number: int, text: str) -> str:
         if number < 1 or number > pages or number == page:
             return f"<span>{esc(text)}</span>"
-        return f'<a href="{root}history?{esc(urlencode({**{k: v for k, v in keep.items() if v}, "page": number}))}">{esc(text)}</a>'
+        return f'<a href="{root}history?{esc(urlencode({**keep, "page": number}))}">{esc(text)}</a>'
 
     first = (page - 1) * HISTORY_PAGE + 1 if rows else 0
     pager = (
@@ -1379,14 +1426,11 @@ def history_page(backend: Backend, query: Mapping[str, list[str]], root: str = "
         f'<span class="actions">{page_link(page - 1, "← Newer")}{page_link(page + 1, "Older →")}</span></div>'
     )
     body = _template("history.html").substitute(
-        presets=_presets(f"{root}history", since, until, {k: v for k, v in keep.items() if k not in ("since", "until")}),
-        search=_search_box(query),
-        sort_fields="".join(f'<input type="hidden" name="{k}" value="{esc(keep[k])}">' for k in ("sort", "order") if keep[k]),
+        presets=_presets(f"{root}history", since, until, _kept(query, {"page", "since", "until"})),
+        fields=HISTORY_VIEW.fields(every, query),
+        kept=_hidden(_kept(query, HISTORY_VIEW.chosen() | {"page", "since", "until"})),
         since=esc(since[:10]),
         until=esc((until or "")[:10]),
-        project_options=_options((r.project for r in every), filters["project"], "Every project"),
-        user_options=_options((r.user for r in every), filters["user"], "Every user"),
-        state_options=_options((r.state for r in every), filters["state"].upper(), "Every result", lambda s: _result(s)[1]),
         table=table,
         pager=pager,
     )

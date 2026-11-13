@@ -441,3 +441,8 @@ def test_both_tables_sort_search_and_filter_from_the_address() -> None:
     assert took.index('jobid">#6') < took.index('jobid">#5') < took.index('jobid">#4')  # never started: last either way
     assert 'jobid">#4' in history("/history?since=2026-10-01&q=never") and 'jobid">#5' not in history("/history?since=2026-10-01&q=never")
     assert "q=never" in history("/history?since=2026-10-01&q=never&sort=job").split('class="pager"')[0]  # headings keep the search
+    # the queue page's finished card has its own settings (prefix f): the two tables on one page keep apart
+    both = call(fake, "/?fsort=took&forder=desc&user=bob")[1]
+    card = both.split('data-live="recent">', 1)[1]
+    assert card.index('jobid">#6') < card.index('jobid">#5')  # sorted by its own heading; the queue's user filter not applied
+    assert 'name="fsort" value="took"' in both.split('aria-label="Queue search and filters"')[1].split("</form>")[0]
