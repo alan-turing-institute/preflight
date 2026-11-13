@@ -240,7 +240,12 @@ def test_sigterm_is_passed_to_the_child_which_saves_then_the_leg_is_recorded(
     monkeypatch.setattr(job_wrapper, "sample", lambda *a: sampled.append(a) or row)
     leg = job_wrapper.run_and_measure([sys.executable, "-c", "import time; time.sleep(0.5)"], tmp_path / "g.jsonl", None, 0.05, "5",
                                       leg_started=42.0)
-    assert (leg["peak_mem_bytes"], leg["peak_container_bytes"]) == (150, 50)
+    assert (leg["peak_mem_bytes"], leg["peak_container_bytes"]) == (150, 50)  # no held figure read: the kernel's peak
+    # sized by what the guard counts: page cache the host could drop (a model file read at load) is left out
+    row = {**row, "mem_held": 30}
+    leg = job_wrapper.run_and_measure([sys.executable, "-c", "import time; time.sleep(0.5)"], tmp_path / "h.jsonl", None, 0.05, "5",
+                                      leg_started=42.0)
+    assert (leg["peak_mem_bytes"], leg["peak_mem_total_bytes"]) == (80, 150)
     assert sampled[0][2:] == ("5", 42.0)  # containers are counted only from this run's start
     # docker refusing this user (or hung) at the leg's one probe: said once, and no other docker call this leg
     monkeypatch.setattr(job_wrapper, "job_containers", lambda *_a, **_k: None)

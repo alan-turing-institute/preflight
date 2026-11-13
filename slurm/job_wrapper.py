@@ -17,7 +17,9 @@ sbatch script whose only line runs this wrapper. In order:
    process: stage C test 3), records it with who sent it (process id, user, command: a signal from outside
    slurm leaves no other trace), and keeps waiting while the child saves its checkpoint, until `KillWait` ends.
 4. MEASURE every `--sample` s: GPU memory, over all the job's GPUs, of the processes in this job's cgroup
-   and of docker containers labelled `slurm-job=<id>` (`nvidia-smi`), and the cgroup's `memory.current`/`memory.peak` (the CPU side; GPU memory is not charged to the cgroup on the
+   and of docker containers labelled `slurm-job=<id>` (`nvidia-smi`), and the cgroup's `memory.current`/`memory.peak` and what it holds that the host cannot take back
+   (`gpu_jobs.held_bytes`: page cache it could drop left out, as the memory guard counts it; the leg's
+   `peak_mem_bytes`, which `--mem auto` sizes from, is the highest of those samples) (the CPU side; GPU memory is not charged to the cgroup on the
    GB10, trial B2), appended to `footprints/<job id>.jsonl`. The per-job node-exporter textfile
    (`metrics/job_<id>.prom`) is not written here: the wrapper runs as the job's user, and only the agent may write
    that directory, so the agent measures the same numbers itself.
@@ -218,6 +220,8 @@ def sample(cgroup: Path | None, fallback_pids: set[int], job_id: str = "", since
         "gpu_by_pid": gpu,
         "mem_current": read_int(cgroup / "memory.current") if cgroup else None,
         "mem_peak": read_int(cgroup / "memory.peak") if cgroup else None,
+        # what the memory guard counts (page cache it could drop left out): the figure a job is sized by
+        "mem_held": gpu_jobs.held_bytes(cgroup) if cgroup else None,
         "ctr_ids": None if listed is None else [c.short for c in containers],
         "ctr_current": container_bytes(containers, MemoryFile.CURRENT),
         "ctr_peak": container_bytes(containers, MemoryFile.PEAK),
@@ -386,7 +390,8 @@ def run_and_measure(
     if missed:
         with contextlib.suppress(ProcessLookupError):
             os.killpg(child.pid, missed[0])
-    peak_gpu, peak_mem, peak_ctr = 0.0, 0, 0
+    peak_gpu, peak_mem, peak_ctr, peak_total = 0.0, 0, 0, 0
+    held_seen = False  # whether the held figure was read at least once this leg
     told: set[str] = set()  # containers already sent the job's SIGTERM
     stopped: dict[str, object] | None = None
     # waits in short slices so a memory stop is seen within STOP_POLL_S; samples every sample_s
@@ -420,17 +425,26 @@ def run_and_measure(
             peak_gpu = max(peak_gpu, float(row["gpu_mib"]))
             # each container's own peak, summed: an upper bound of what they held together, the safe side for sizing
             peak_ctr = max(peak_ctr, int(row["ctr_peak"]))
-            peak_mem = max(peak_mem, int(row["mem_peak"] or row["mem_current"] or 0) + int(row["ctr_peak"]))
+            total = int(row["mem_peak"] or row["mem_current"] or 0) + int(row["ctr_peak"])
+            peak_total = max(peak_total, total)
+            # sized by what the guard counts, sampled; the cgroup's own peak, page cache included, only without it
+            held = row.get("mem_held")
+            held_seen = held_seen or held is not None
+            peak_mem = max(peak_mem, total if held is None else int(held) + int(row["ctr_peak"]))
     if docker and received:  # a command that ended at once on SIGTERM left the loop before the pass-on above
         pass_term(job_id, leg_started, told=frozenset(told))
     final = read_int(cgroup / "memory.peak") if cgroup else None
+    total_peak = max(peak_total, final or 0)
     return {
         "exit": status,
         "pid": child.pid,
         "signals": [signal.Signals(s).name for s in received],
         **({"senders": senders} if senders else {}),
         "peak_gpu_mib": peak_gpu,
-        "peak_mem_bytes": max(peak_mem, final or 0),
+        # the most the job held that the host could not take back (D35's sizing figure); the kernel's peak, page
+        # cache included, is kept beside it and stands in only when the held figure was never read
+        "peak_mem_bytes": peak_mem if held_seen else total_peak,
+        "peak_mem_total_bytes": total_peak,
         "peak_container_bytes": peak_ctr,
         "docker": docker,
         **({"stopped": stopped} if stopped else {}),
