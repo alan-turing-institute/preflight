@@ -6,6 +6,7 @@ import dataclasses
 import io
 import json
 import os
+import re
 import signal
 import sys
 from datetime import date, datetime
@@ -184,7 +185,7 @@ def test_every_get_route_answers(path: str) -> None:
             site=lambda: SimpleNamespace(nodes=[], cpu_job_cap=None, service=None)))
         assert "it lacks 12.0 GB memory and 1 GPU, held by #7 proj 64.4 GB" in call(fake, "/job/13")[1]
         fake.application = app.make_application(backend)
-        assert "<th scope=\"col\">Running for</th><th scope=\"col\">Queued at</th>" in body
+        assert re.search(r'>Running for</a></th><th scope="col"><a class="sort" [^>]*>Queued at</a></th>', body)  # side by side
         # nvidia-smi and /proc read the portal's own host: no in-use bar unless that host is slurm's one node
         elsewhere = app._resource_tiles({"cpus": 1, "cpus_used": 0, "mem_mb": 1024, "mem_used_mb": 0, "gpus": 1, "gpus_used": 1,
                                          "nodes": 1, "here": 0}, [], 0.5, {"mem_total": 1, "mem_used": 1, "cores": 1, "cores_busy": 1})
@@ -409,3 +410,34 @@ def test_a_running_jobs_cpu_seconds_are_read_from_the_agents_metrics_file(tmp_pa
         assert app._live_memory("7") == {"cpu_ms": 90500}
     finally:
         gpu_jobs.STATE_DIR = old
+
+
+def test_both_tables_sort_search_and_filter_from_the_address() -> None:
+    fake = Fake()
+
+    def queue_of(path: str) -> str:  # the queue card's table only: other cards name the jobs too
+        return call(fake, path)[1].split('data-live="queue">', 1)[1].split("</section>", 1)[0]
+
+    assert queue_of("/").index('jobid">#7') < queue_of("/").index('jobid">#8')  # slurm's order by default
+    flipped = queue_of("/?sort=user&order=desc")
+    assert flipped.index('jobid">#8') < flipped.index('jobid">#7')  # bob before alice
+    assert '<td class="num muted">2</td>' in flipped.split('jobid">#8')[0]  # # stays slurm's place, whatever the order
+    assert 'aria-sort="descending"' in flipped and "user=" not in flipped.split('aria-sort="descending"')[0][-200:]
+    only_bob = queue_of("/?user=bob&sort=user&order=desc")
+    assert 'jobid">#8' in only_bob and 'jobid">#7' not in only_bob
+    assert "user=bob&amp;sort=user&amp;order=asc" in only_bob  # the heading flips the order and keeps the filter
+    assert 'jobid">#7' in queue_of("/?q=ALICE+train") and 'jobid">#8' not in queue_of("/?q=ALICE+train")  # every word, any case
+    assert "No jobs match" in queue_of("/?q=nobody") and "1 of 2 job(s)" in call(fake, "/?user=bob")[1]
+    assert 'value="bob" selected' in call(fake, "/?user=bob")[1]  # the form shows the view it made
+
+    at = lambda h: datetime(2026, 10, 19, h)  # noqa: DTZ001, E731
+    rows = [jobs_view.HistoryRow("5", "p:normal:short", "p", "ann", "normal", "COMPLETED", "0:0", at(8), at(9), at(10), 60, 1, None),
+            jobs_view.HistoryRow("6", "q:normal:long", "q", "bo", "normal", "FAILED", "1:0", at(8), at(9), at(11), 7200, 1, None),
+            jobs_view.HistoryRow("4", "q:normal:never", "q", "bo", "normal", "CANCELLED", "0:0", at(7), None, at(9), 0, 1, None)]
+    fake.backend = dataclasses.replace(fake.backend, history=lambda *_a: rows)
+    fake.application = app.make_application(fake.backend)
+    history = lambda path: call(fake, path)[1]  # noqa: E731
+    took = history("/history?since=2026-10-01&sort=took&order=desc")
+    assert took.index('jobid">#6') < took.index('jobid">#5') < took.index('jobid">#4')  # never started: last either way
+    assert 'jobid">#4' in history("/history?since=2026-10-01&q=never") and 'jobid">#5' not in history("/history?since=2026-10-01&q=never")
+    assert "q=never" in history("/history?since=2026-10-01&q=never&sort=job").split('class="pager"')[0]  # headings keep the search
