@@ -318,13 +318,14 @@ def carry_out_stop(job_id: str, pid: int, leg_started: float) -> dict[str, objec
 WAITED = frozenset({signal.SIGTERM, signal.SIGCHLD})
 
 
-def waited_signal(timeout: float) -> signal.struct_siginfo | None:
-    """A SIGTERM or SIGCHLD that came while waiting up to `timeout` s, None after the timeout. Taken with
+def waited_signal(timeout: float, ended: Callable[[], int | None]) -> signal.struct_siginfo | None:
+    """A SIGTERM or SIGCHLD that came while waiting up to `timeout` s; None after the timeout, or at once when
+    `ended()` (asked after blocking, so an exit just before cannot be missed) already has an exit status. Taken with
     sigtimedwait, because a Python handler is never told who sent a signal; blocked only for the wait, so commands
     started elsewhere inherit the usual mask, and a SIGTERM outside the wait still reaches the handler."""
     old = signal.pthread_sigmask(signal.SIG_BLOCK, WAITED)
     try:
-        return signal.sigtimedwait(WAITED, timeout)
+        return None if ended() is not None else signal.sigtimedwait(WAITED, timeout)
     finally:
         signal.pthread_sigmask(signal.SIG_SETMASK, old)
 
@@ -344,7 +345,13 @@ def sender_text(info: signal.struct_siginfo) -> str:
         command = Path(f"/proc/{info.si_pid}/cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace").strip()
     except OSError:
         command = ""
-    return f"{name} from pid {info.si_pid} (user {user}: {command[:200] or 'already gone'})"
+    command = "".join(c if c.isprintable() else " " for c in command[:200])  # one log line, whatever the sender's argv
+    return f"{name} from pid {info.si_pid} (user {user}: {command or 'already gone'})"
+
+
+def note_sender(senders: list[str], info: signal.struct_siginfo) -> None:
+    senders.append(sender_text(info))
+    print(f"[job] {senders[-1]}", file=sys.stderr, flush=True)
 
 
 def run_and_measure(
@@ -387,14 +394,11 @@ def run_and_measure(
     out = best_effort("footprint", open_footprint, footprint)
     with out or contextlib.nullcontext():
         while True:
+            info = waited_signal(min(STOP_POLL_S, sample_s), child.poll)
+            if info is not None and info.si_signo == signal.SIGTERM:
+                pass_on(info.si_signo)  # first: naming the sender (a user lookup, a log write) must never delay or stop it
+                best_effort("sender", note_sender, senders, info)
             status = child.poll()
-            if status is None:
-                info = waited_signal(min(STOP_POLL_S, sample_s))
-                if info is not None and info.si_signo == signal.SIGTERM:
-                    senders.append(sender_text(info))
-                    print(f"[job] {senders[-1]}", file=sys.stderr, flush=True)
-                    pass_on(info.si_signo)
-                status = child.poll()
             if status is not None:
                 break
             if job_id and stopped is None:  # a run outside slurm never reads requests

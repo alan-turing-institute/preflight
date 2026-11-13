@@ -221,6 +221,19 @@ def test_sigterm_is_passed_to_the_child_which_saves_then_the_leg_is_recorded(
     finally:
         signal.signal(signal.SIGTERM, before)
     assert (leg["signals"], leg["exit"]) == (["SIGTERM"], -signal.SIGTERM)
+
+    # Naming the sender failing (a user lookup, a full log) never stops the SIGTERM reaching the command.
+    def full_log(_info: object) -> str:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(job_wrapper, "sender_text", full_log)
+    threading.Timer(0.5, os.kill, (os.getpid(), signal.SIGTERM)).start()
+    before = signal.getsignal(signal.SIGTERM)
+    try:
+        leg = job_wrapper.run_and_measure([sys.executable, "-c", "import time; time.sleep(5)"], tmp_path / "s.jsonl", None, 0.2)
+    finally:
+        signal.signal(signal.SIGTERM, before)
+    assert (leg["signals"], leg["exit"], "senders" in leg) == (["SIGTERM"], -signal.SIGTERM, False)
     # the leg's memory peak is the job's own plus its containers', which slurm's cgroup does not see
     row = {"gpu_mib": 0.0, "mem_peak": 100, "mem_current": 90, "ctr_peak": 50, "ctr_ids": ["c1"]}
     sampled: list[tuple[object, ...]] = []
