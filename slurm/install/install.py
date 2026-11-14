@@ -58,7 +58,7 @@ MIGRATED = ("jobs", "footprints", "events")
 OPERATOR = "Operator"
 #: slurmctld caches who is in a partition's AllowGroups for GroupUpdateTime (600 s by default); a reconfigure reloads it
 #: (measured 2026-10-23, harness: a user just added stayed refused until it).
-RELOAD_GROUPS = ["scontrol", "reconfigure"]
+RELOAD_GROUPS = slurm_component.RECONFIGURE
 NO_LEVEL = "None"
 Chown = Callable[[Path, str], None]
 #: The kernel settings the shared, world-writable state directories rely on (`man 5 proc_sys_fs`): with any of
@@ -432,7 +432,8 @@ def cmd_upgrade(site, args, modules, chown: Chown | None = _chown) -> int:
         reopen = "\n".join(f"  scontrol update PartitionName={name} State={state}" for name, state in states.items())
         print(f"UPGRADE STOPPED at slurm {version}: {error}\nThe backup is {folder}. Do not stop that slurmdbd or restore "
               f"while it runs. Once it answers, stop it (kill {error.pid}), then as root:\n  systemctl start slurmdbd slurmctld "
-              f"slurmd\nand reopen the partitions, which the upgrade closed:\n{reopen}", file=sys.stderr)
+              f"slurmd\nand reopen the partitions, which the upgrade closed:\n{reopen}\nthen tell the part-time machines: "
+              f"{' '.join(slurm_component.RECONFIGURE)}", file=sys.stderr)
         return UpgradeExit.CONVERSION_RUNNING
     except (SystemExit, *BUILD_ERRORS) as error:
         if not installing:

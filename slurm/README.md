@@ -122,7 +122,12 @@ and pass `--site` each time.
    count. Wait for the running jobs to end (`pause.py` sends a `resume` job back to its checkpoint), or install only other components with
    `apply --component NAME` (repeat the option for several; the choices are `slurm`, `tools`, `agent`, `lease`,
    `metrics`, `portal`). The slurm refusal belongs to the `slurm` component, so `--component portal` does not
-   trigger it.
+   trigger it. On a site with part-time machines the `slurm` component ends with `scontrol reconfigure`: their slurmd
+   takes the settings from the controller at its own start, and a controller restart alone does not make it fetch them
+   again. It first waits up to a minute for them to register with the restarted controller; one still not answering
+   is named, and keeps its old settings until its slurmd restarts or `scontrol reconfigure` is run once it answers. A
+   failed reconfigure is a warning, not a stop. A settings file copied into `/etc/slurm` by hand needs the same
+   `scontrol reconfigure`.
 
    `apply` also copies the site file to `/etc/gpujobs/site.toml`; the agent and the tools read that copy. After
    editing the site file, run `apply` again.
@@ -437,7 +442,7 @@ resume-class one in its way itself) and `urgent` (higher tier, `AllowGroups=` th
 plus `service` when the site file has `[service]` (the agent suspends `cpu` jobs to make room for it). Priority is `priority/basic`; the agent sets each waiting job's priority from its level. The
 levels `low`, `normal` and `high` are created as slurm QOS (no access lists: every level is open to everyone).
 Services restarted:
-`mariadb`, `munge`, `slurmdbd`, then `slurmctld`, `slurmd`. Slurm's own ports (6817, 6818, 6819) are slurm's
+`mariadb`, `munge`, `slurmdbd`, then `slurmctld`, `slurmd`, then `scontrol reconfigure` on a site with part-time machines. Slurm's own ports (6817, 6818, 6819) are slurm's
 defaults, not set by this installer.
 
 **`tools`** (always on). Copies the `*.py` files directly under `slurm/` and everything under `slurm/ood_app/`

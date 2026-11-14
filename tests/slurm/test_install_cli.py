@@ -563,24 +563,45 @@ class PartTimeFake(Fake):
 
 def test_a_controller_restart_tells_the_part_time_nodes_to_fetch_the_settings(monkeypatch, capsys):
     # a configless slurmd keeps the settings it took at its start; only a reconfigure makes it fetch them again
-    class Asleep(Fake):
+    class Listing(Fake):
+        """`rows`: what each `sinfo -N` lists in turn (the last repeats); `reconfigure_rc`: scontrol's exit status."""
+
+        def __init__(self, rows, reconfigure_rc=0):
+            super().__init__()
+            self.rows, self.reconfigure_rc = list(rows), reconfigure_rc
+
         def __call__(self, argv):
             if argv[:2] == ["sinfo", "-h"] and "-N" in argv:
                 self.calls.append(argv)
-                return subprocess.CompletedProcess(argv, 0, "laptop idle*\n", "")
+                return subprocess.CompletedProcess(argv, 0, self.rows.pop(0) if len(self.rows) > 1 else self.rows[0], "")
+            if argv == slurm_component.RECONFIGURE:
+                self.calls.append(argv)
+                return subprocess.CompletedProcess(argv, self.reconfigure_rc, "", "down")
             return super().__call__(argv)
 
-    fake = Asleep()
-    components.set_runner(fake)
-    try:
-        plain = slurm_component.post_install(cli.site_config.parse(tomllib.loads(SITE)))
-        steps = slurm_component.post_install(cli.site_config.parse(tomllib.loads(PART_TIME_SITE)))
-        assert len(steps) == len(plain) + 1  # a site without part-time nodes has nothing to tell
-        assert steps[-1]() == [["scontrol", "reconfigure"]]  # after the controller's restart, last
-    finally:
-        components.set_runner(None)
-    assert ["sinfo", "-h", "-N", "-n", "laptop", "-o", "%N %t"] in fake.calls
-    assert "laptop not answering" in capsys.readouterr().err  # named, so its owner knows to reconfigure once it is back
+    monkeypatch.setattr(slurm_component, "sleep", lambda _s: None)
+    two = SimpleNamespace(part_time_nodes=(SimpleNamespace(name="a"), SimpleNamespace(name="b")))
+
+    def told(fake):
+        components.set_runner(fake)
+        try:
+            assert slurm_component.refresh_part_time(two, wait_s=3) == []  # it runs the reconfigure itself, never stops
+        finally:
+            components.set_runner(None)
+        return fake.calls, capsys.readouterr()
+
+    # just after the restart slurm still marks a node not responding from its saved state: wait for it, then tell
+    calls, out = told(Listing(["a down*\nb idle*\n", "a idle\nb idle\n"]))
+    assert calls[-1] == slurm_component.RECONFIGURE and len(calls) == 3 and "a, b: told to fetch" in out.out and not out.err
+    # one asleep (marked) and one missing from the listing: both named, after the wait; the answering one is told
+    calls, out = told(Listing(["a idle\nb idle*\n"]))
+    assert len(calls) == 5 and "node(s) a: told" in out.out and "a idle" not in out.err
+    calls, out = told(Listing(["a idle\n"]))
+    assert "part-time node(s) b not answering" in out.err
+    calls, out = told(Listing(["a idle\nb idle\n"], reconfigure_rc=1))  # a failed reconfigure is a warning naming it
+    assert "`scontrol reconfigure` failed (1)" in out.err and "told" not in out.out
+    plain = slurm_component.post_install(cli.site_config.parse(tomllib.loads(SITE)))
+    assert len(slurm_component.post_install(cli.site_config.parse(tomllib.loads(PART_TIME_SITE)))) == len(plain) + 1  # last
 
 
 def part_time_env(tmp_path, monkeypatch, fake):

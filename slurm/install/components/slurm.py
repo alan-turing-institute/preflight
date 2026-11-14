@@ -228,22 +228,44 @@ def post_install(site) -> list:
 
 #: `sinfo`'s mark on a node state for a node that is not responding ("idle*").
 NOT_RESPONDING = "*"
+#: Makes every answering slurmd fetch slurm's settings again, and slurmctld re-read its users' groups.
+RECONFIGURE = ["scontrol", "reconfigure"]
+#: How long a part-time node gets to register with a restarted slurmctld before it is told: 3 s on 2026-11-09 (the
+#: controller's log); one still silent after this is asleep or off the network.
+REGISTER_WAIT_S = 60
 
 
-def refresh_part_time(site) -> list[list[str]]:
-    """The settings' fetch by the part-time (configless) nodes. Restarting slurmctld does not make a configless slurmd
-    fetch them again: it keeps the copy it took at its own start (2026-11-14: a part-time node ran five days on the copy
-    from before the 2026-11-09 restart). `scontrol reconfigure` makes every answering slurmd fetch them; a node not
-    answering now (asleep, off the network) keeps its old copy until its slurmd restarts, so it is named."""
-    await_answers(["sinfo", "-h"])
+def answering(names: list[str]) -> set[str]:
+    """Those of `names` slurm lists as responding; a node missing from the listing, or a failed listing, is silent."""
+    done = components.run(["sinfo", "-h", "-N", "-n", ",".join(names), "-o", "%N %t"])
+    rows = [row.split() for row in (done.stdout or "").splitlines()] if done.returncode == 0 else []
+    return {row[0] for row in rows if len(row) > 1 and not row[1].endswith(NOT_RESPONDING)} & set(names)
+
+
+def refresh_part_time(site, wait_s: int = REGISTER_WAIT_S) -> list:
+    """Tell the part-time (configless) nodes to fetch slurm's settings. Restarting slurmctld does not make a configless
+    slurmd fetch them again: it keeps the copy it took at its own start (2026-11-14: a part-time node ran five days on
+    the copy from before the 2026-11-09 restart). Waits up to `wait_s` for the nodes to register with the restarted
+    controller, then `RECONFIGURE`. Never stops the install, whose later components still need their steps: a failure,
+    and each node still silent (it keeps its old copy until its slurmd restarts), is a warning naming the remedy."""
     names = [n.name for n in site.part_time_nodes]
-    listed = components.run(["sinfo", "-h", "-N", "-n", ",".join(names), "-o", "%N %t"]).stdout or ""
-    silent = sorted({row.split()[0] for row in listed.splitlines() if len(row.split()) > 1 and row.split()[1].endswith(NOT_RESPONDING)})
-    print(f"[install] part-time node(s) {', '.join(names)}: told to fetch the new settings (scontrol reconfigure)")
-    if silent:
-        print(f"WARNING: {', '.join(silent)} not answering: it keeps its old settings until its slurmd restarts, or run "
-              "`scontrol reconfigure` once it answers again", file=sys.stderr)
-    return [["scontrol", "reconfigure"]]
+    up: set[str] = set()
+    for second in range(wait_s + 1):
+        up = answering(names)
+        if up == set(names) or second == wait_s:
+            break
+        sleep(1)
+    done = components.run(RECONFIGURE)
+    if done.returncode != 0:
+        print(f"WARNING: `{' '.join(RECONFIGURE)}` failed ({done.returncode}), so part-time node(s) {', '.join(names)} keep "
+              f"their old settings until it is run: {(done.stderr or '').strip()}", file=sys.stderr)
+        return []
+    if up:
+        print(f"[install] part-time node(s) {', '.join(sorted(up))}: told to fetch the new settings ({' '.join(RECONFIGURE)})")
+    if silent := sorted(set(names) - up):
+        print(f"WARNING: part-time node(s) {', '.join(silent)} not answering: they keep their old settings until their "
+              f"slurmd restarts, or until `{' '.join(RECONFIGURE)}` is run once they answer again", file=sys.stderr)
+    return []
 
 
 def _records(site) -> list[list[str]]:
@@ -450,5 +472,6 @@ def restore_text(folder: Path, state_save: str, previous: str, manager: str, par
              f"tar -xzf {folder / STATE_TAR} -C /",
              f"tar -xzf {folder / CONF_TAR} -C /",
              "systemctl restart slurmdbd slurmctld slurmd",
-             *(f"scontrol update PartitionName={name} State={state}" for name, state in partitions.items())]
+             *(f"scontrol update PartitionName={name} State={state}" for name, state in partitions.items()),
+             " ".join(RECONFIGURE)]  # part-time nodes fetch the restored settings
     return "\n".join(f"  {line}" for line in lines)
