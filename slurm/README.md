@@ -576,11 +576,20 @@ Sizing from a job's own history. Give a job `--name` and the same name on every 
 What a run used. At the end of every run (each leg of a requeued job) the job's log gets two lines after the exit line,
 and `gpujobs-wait` repeats the last run's under each job's final state:
 
-    [job] used: memory peak 9.4 GB of 42.9 GB asked (22%); cores 1.7 on average of 8 held (21%)
+    [job] used: memory peak 9.4 GB of 42.9 GB asked (22%), waited on memory 0.3% of the run (all work 0.1%); cores 1.7 on average of 8 held (21%)
     [job] for the same work next time: --mem 10G --cpus 3
 
-Memory asked is the job's cgroup cap (its `--mem`); the peak is the host side plus, where the card shares system memory
-(`unified_memory`), the card's, so it can pass 100% there. Cores held are slurm's cpuset; the average is the cgroup's core
+Memory asked is the job's cgroup cap (its `--mem`); the peak is what the job held that the host could not take back
+(page cache it could drop left out, as the memory guard counts it) plus, where the card shares system memory
+(`unified_memory`), the card's, so it can pass 100% there. The waits are the kernel's pressure stall figures for the
+job's cgroup (`memory.pressure`): the share of the run in which some of its work, or all of it at once, waited for
+memory, from reclaim or from re-reading pages evicted while in use; ", reaching its cap" says its memory reached its
+`--mem` at least once. A cap reached with almost no waiting is a file read once through the page cache, which costs
+nothing; much waiting at the cap is a run its `--mem` slows, which the peak alone cannot show because page cache is
+left out of it. Nothing is printed for them on a kernel without pressure stall information. They are recorded in the
+leg's `usage` (`mem_wait_some`, `mem_wait_full`, `mem_cap_hits`) and do not change the advice yet. A job's docker
+containers run outside its cgroup, so their waits are not in these figures.
+Cores held are slurm's cpuset; the average is the cgroup's core
 time over the run's wall time. The advice is this run's peak plus 10 percent and its average times 1.25 (within the cores
 the job may have); after a memory kill (the job's cap killed a process, or the host's OOM guard killed it) it is the larger of
 1.2 times what the run was given and its peak plus 10 percent (the rule `submit --mem auto` applies); `--mem 0` (the whole box) when that is more than any node gives jobs. GPU jobs get no

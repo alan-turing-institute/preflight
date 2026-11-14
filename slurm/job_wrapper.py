@@ -24,9 +24,10 @@ sbatch script whose only line runs this wrapper. In order:
    (`metrics/job_<id>.prom`) is not written here: the wrapper runs as the job's user, and only the agent may write
    that directory, so the agent measures the same numbers itself.
 5. RECORD the leg's outcome in the job's sidecar (exit status, signal, restart count, peaks), and REPORT what the run
-   used (D37): two lines after the exit line, `[job] used: memory peak ... of ... asked; cores ... on average of ...
-   held` and `[job] for the same work next time: --mem ... --cpus ...` (`usage_lines`), kept in the leg's `usage` so
-   `wait.py` can repeat them. Never per user; the project decides its next request.
+   used (D37): two lines after the exit line, `[job] used: memory peak ... of ... asked, waited on memory ...% of the run
+   (all work ...%); cores ... on average of ... held` (the waits are the cgroup's `memory.pressure`, D51) and
+   `[job] for the same work next time: --mem ... --cpus ...` (`usage_lines`), kept in the leg's `usage` so `wait.py`
+   can repeat them. Never per user; the project decides its next request.
 6. A KILL BY THE HOST'S OOM GUARD is not a finished run. The guard signals a process of the job directly, not through
    slurm, and a training loop that catches SIGTERM exits 0 (2026-10-22: job 428 was recorded COMPLETED at 14.6 of
    23.5 h and its afterok chain started). The agent records each such kill (`agent/oom_kills/`); when the command ended
@@ -57,7 +58,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import IntEnum
 from pathlib import Path
-from typing import IO
+from typing import IO, NamedTuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "hostguard"))
@@ -455,12 +456,31 @@ def run_and_measure(
 SLURM_MB = gpu_jobs.SLURM_MB
 
 
-def cgroup_counters(cgroup: Path | None) -> tuple[int | None, int | None]:
-    """(core time in microseconds, processes the memory cap has killed) of the job's cgroup now, None when unreadable.
-    `memory.events` is hierarchical, so a kill in the batch step or a task below the job's cgroup counts."""
+class Counters(NamedTuple):
+    """The job's cgroup counters, read right before and right after the command; None for one that cannot be read.
+    `memory.events` and `memory.pressure` are hierarchical, so the batch step and every task below the job's cgroup count."""
+
+    core_usec: int | None = None  # core time (`cpu.stat` usage_usec)
+    cap_kills: int | None = None  # processes the memory cap killed (`memory.events` oom_kill)
+    cap_hits: int | None = None  # times its memory reached the cap and the kernel reclaimed (`memory.events` max)
+    wait_some_usec: int | None = None  # time some of its tasks waited on memory (`memory.pressure`, D51)
+    wait_full_usec: int | None = None  # time all of its non-idle tasks waited on memory at once
+
+
+def cgroup_counters(cgroup: Path | None) -> Counters:
+    """The `Counters` of the job's cgroup now; all None without a cgroup."""
     if cgroup is None:
-        return None, None
-    return gpu_jobs.flat_key(cgroup / "cpu.stat", "usage_usec"), gpu_jobs.flat_key(cgroup / "memory.events", "oom_kill")
+        return Counters()
+    events, pressure = cgroup / "memory.events", cgroup / "memory.pressure"
+    return Counters(gpu_jobs.flat_key(cgroup / "cpu.stat", "usage_usec"), gpu_jobs.flat_key(events, "oom_kill"),
+                    gpu_jobs.flat_key(events, "max"), gpu_jobs.stall_usec(pressure, gpu_jobs.Stall.SOME),
+                    gpu_jobs.stall_usec(pressure, gpu_jobs.Stall.FULL))
+
+
+def grew(before: int | None, after: int | None) -> int | None:
+    """How much a counter grew over the run; None when either reading is missing, or when it fell: these counters never
+    fall, so a fall means the two readings are of different cgroups."""
+    return None if before is None or after is None or after < before else after - before
 
 
 @dataclass(frozen=True)
@@ -468,16 +488,21 @@ class Usage:
     """What one run asked for and used (D37); None for a figure that could not be read."""
 
     mem_asked_bytes: int | None
-    mem_peak_bytes: int | None  # host side, plus the card's on a site whose card shares system memory
+    mem_peak_bytes: int | None  # held host side (D50), plus the card's on a site whose card shares system memory
     cores_held: int | None
     cores_avg: float | None
     cap_killed: bool = False  # the job's memory cap killed one of its processes during the run
     guard_killed: bool = False  # the host's OOM guard killed it
     containers_bytes: int = 0  # the part of mem_peak_bytes held by the run's docker containers (outside its cgroup)
+    # D51: share of the run's wall time in which some, or all, of its work waited on memory, and how often it reached its
+    # cap. A cap reached with little waiting is a file read once through the page cache; much waiting is a run its cap slows.
+    mem_wait_some: float | None = None
+    mem_wait_full: float | None = None
+    cap_hits: int | None = None
 
 
-def measure_usage(cgroup: Path | None, outcome: dict[str, object], before: tuple[int | None, int | None],
-                  after: tuple[int | None, int | None], wall_s: float, *, guard_killed: bool, unified: bool) -> Usage:
+def measure_usage(cgroup: Path | None, outcome: dict[str, object], before: Counters, after: Counters, wall_s: float, *,
+                  guard_killed: bool, unified: bool) -> Usage:
     """The run's `Usage` from its cgroup and the peaks `run_and_measure` kept. Asked = the cgroup's memory cap (slurm's
     --mem); "max" (no cap) or no cgroup is unknown, and so is the host peak without a cgroup."""
     asked = gpu_jobs.read_int(cgroup / "memory.max") if cgroup else None
@@ -487,15 +512,26 @@ def measure_usage(cgroup: Path | None, outcome: dict[str, object], before: tuple
         held = len(os.sched_getaffinity(0))
     except OSError:
         held = None
-    used_usec = None if None in (before[0], after[0]) else after[0] - before[0]  # type: ignore[operator]
+
+    def share(usec: int | None) -> float | None:  # of the run's wall time
+        return usec / 1e6 / wall_s if usec is not None and wall_s > 0 else None
+
+    def waited(before_usec: int | None, after_usec: int | None) -> float | None:  # a share of time, at most all of it
+        part = share(grew(before_usec, after_usec))
+        return None if part is None else min(1.0, part)
+
+    kills = grew(before.cap_kills, after.cap_kills)
     return Usage(
         mem_asked_bytes=asked,
         mem_peak_bytes=None if host is None else host + (card if unified else 0),
         cores_held=held,
-        cores_avg=used_usec / 1e6 / wall_s if used_usec is not None and wall_s > 0 else None,
-        cap_killed=None not in (before[1], after[1]) and after[1] > before[1],  # type: ignore[operator]
+        cores_avg=share(grew(before.core_usec, after.core_usec)),
+        cap_killed=bool(kills and kills > 0),
         guard_killed=guard_killed,
         containers_bytes=int(outcome.get("peak_container_bytes") or 0),
+        mem_wait_some=waited(before.wait_some_usec, after.wait_some_usec),
+        mem_wait_full=waited(before.wait_full_usec, after.wait_full_usec),
+        cap_hits=grew(before.cap_hits, after.cap_hits),
     )
 
 
@@ -510,6 +546,11 @@ def usage_lines(u: Usage, *, gpu_job: bool, cores_cap: int | None, most_mb: int 
         peak = gpu_jobs.size_text(u.mem_peak_bytes) + (f" (containers {gpu_jobs.size_text(u.containers_bytes)})" if u.containers_bytes else "")
         memory = (f"memory peak {peak} of {gpu_jobs.size_text(u.mem_asked_bytes)} asked ({round(100 * u.mem_peak_bytes / u.mem_asked_bytes)}%)"
                   if u.mem_asked_bytes else f"memory peak {peak} (asked unknown)")
+    if u.mem_wait_some is not None:  # D51; nothing on a kernel without PSI
+        memory += f", waited on memory {u.mem_wait_some:.1%} of the run" + (
+            f" (all work {u.mem_wait_full:.1%})" if u.mem_wait_full is not None else "")
+    if u.cap_hits:
+        memory += ", reaching its cap"
     if u.cores_avg is None:
         cores = "cores in use unknown" + (f" of {u.cores_held} held" if u.cores_held else "")
     elif u.cores_held:
@@ -548,8 +589,12 @@ def cores_advice(site: site_config.Site, *, card: bool, shard: bool, service: bo
 
 def usage_record(u: Usage, lines: list[str]) -> dict[str, object]:
     """The leg's `usage`: the known figures, whether the cap killed a process, and the printed lines (`wait.py` repeats them)."""
+    def rounded(x: float | None, places: int) -> float | None:
+        return None if x is None else round(x, places)
+
     figures = {"mem_asked_bytes": u.mem_asked_bytes, "mem_peak_bytes": u.mem_peak_bytes, "cores_held": u.cores_held,
-               "cores_avg": None if u.cores_avg is None else round(u.cores_avg, 3)}
+               "cores_avg": rounded(u.cores_avg, 3), "mem_wait_some": rounded(u.mem_wait_some, 5),
+               "mem_wait_full": rounded(u.mem_wait_full, 5), "mem_cap_hits": u.cap_hits}
     return {**{k: v for k, v in figures.items() if v is not None}, "memory_cap_killed": u.cap_killed, "lines": lines,
             **({"containers_bytes": u.containers_bytes} if u.containers_bytes else {})}
 

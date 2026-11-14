@@ -1422,6 +1422,27 @@ def flat_key(path: Path, key: str) -> int | None:
     return None
 
 
+class Stall(StrEnum):
+    """A line of a cgroup's pressure stall file (`memory.pressure`, the kernel's PSI): time in which some of its tasks
+    waited for the resource, or all of its non-idle tasks at once."""
+
+    SOME = "some"
+    FULL = "full"
+
+
+def stall_usec(path: Path, line: Stall) -> int | None:
+    """Total microseconds of one line of a pressure stall file (`some avg10=0.00 avg60=0.00 avg300=0.00 total=N`);
+    None when unreadable, as on a kernel without PSI."""
+    try:
+        for row in path.read_text(encoding="utf-8").splitlines():
+            name, *fields = row.split()
+            if name == line:
+                return int(dict(f.split("=", 1) for f in fields)["total"])
+    except (OSError, ValueError, KeyError):
+        pass
+    return None
+
+
 GB, MB = 10**9, 10**6  # decimal, as every size shown to people
 
 

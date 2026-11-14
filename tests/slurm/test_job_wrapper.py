@@ -480,22 +480,32 @@ def test_the_end_of_run_report_measures_from_the_cgroup_and_advises_the_next_req
     cg.mkdir()
     (cg / "memory.max").write_text(f"{40 * gib}\n")
     (cg / "cpu.stat").write_text("usage_usec 3000000\nuser_usec 1\n")
-    (cg / "memory.events").write_text("low 0\noom 2\noom_kill 1\n")
-    assert job_wrapper.cgroup_counters(cg) == (3_000_000, 1) and job_wrapper.cgroup_counters(None) == (None, None)
+    (cg / "memory.events").write_text("low 0\nmax 7\noom 2\noom_kill 1\n")
+    (cg / "memory.pressure").write_text("some avg10=0.00 avg60=0.00 avg300=0.00 total=600000\n"
+                                        "full avg10=0.00 avg60=0.00 avg300=0.00 total=200000\n")
+    Counters = job_wrapper.Counters
+    assert job_wrapper.cgroup_counters(cg) == Counters(3_000_000, 1, 7, 600_000, 200_000)
+    assert job_wrapper.cgroup_counters(None) == Counters()
     outcome = {"peak_mem_bytes": 4 * 10**9, "peak_gpu_mib": 1024}
 
     def measured(**kw: object) -> job_wrapper.Usage:
-        args = {"cgroup": cg, "before": (1_000_000, 1), "after": (3_000_000, 1), "wall_s": 2.0, "unified": True, **kw}
+        args = {"cgroup": cg, "before": Counters(1_000_000, 1, 2, 100_000, 0), "after": job_wrapper.cgroup_counters(cg),
+                "wall_s": 2.0, "unified": True, **kw}
         return job_wrapper.measure_usage(args.pop("cgroup"), outcome, args.pop("before"), args.pop("after"), args.pop("wall_s"),
                                          guard_killed=False, unified=args.pop("unified"))
 
     u = measured()
     assert (u.mem_asked_bytes, u.mem_peak_bytes, u.cores_avg, u.cap_killed) == (40 * gib, 4 * 10**9 + gib, 1.0, False)  # 2 core-seconds in 2 s
+    assert (u.mem_wait_some, u.mem_wait_full, u.cap_hits) == (0.25, 0.1, 5)  # D51: 0.5 s and 0.2 s of waiting in 2 s; 5 cap hits
+    (cg / "memory.pressure").write_text("some avg10=0.00\n")  # unreadable (as on a kernel without PSI): unknown, not zero
+    assert job_wrapper.cgroup_counters(cg).wait_some_usec is None
+    fell = measured(before=Counters(1_000_000, 1, 9, 900_000, 900_000), after=Counters(3_000_000, 1, 3, 100, 100))
+    assert (fell.mem_wait_some, fell.cap_hits) == (None, None)  # a counter that fell is another cgroup's: unknown, not negative
     assert measured(unified=False).mem_peak_bytes == 4 * 10**9  # the card's memory counts only where it shares the pool
-    assert measured(after=(3_000_000, 2)).cap_killed  # the cap killed a process during this run
+    assert measured(after=Counters(3_000_000, 2)).cap_killed  # the cap killed a process during this run
     (cg / "memory.max").write_text("max\n")
     assert measured().mem_asked_bytes is None  # no cap: unknown
-    assert measured(cgroup=None, before=(None, None), after=(None, None)) == job_wrapper.Usage(None, None, u.cores_held, None)
+    assert measured(cgroup=None, before=Counters(), after=Counters()) == job_wrapper.Usage(None, None, u.cores_held, None)
 
     def lines(peak: float | None = 9.4e9, *, asked: int | None = 40 * gib, avg: float | None = 1.7, gpu: bool = False,
               cap: bool = False, guard: bool = False, cores_cap: int | None = 8) -> list[str]:
@@ -526,6 +536,12 @@ def test_the_end_of_run_report_measures_from_the_cgroup_and_advises_the_next_req
         "[job] used: memory peak 9.4 GB (containers 3.7 GB) of 42.9 GB asked")  # the share outside the job's cgroup
     assert "--mem 7G or more" in lines(peak=6.7e9, asked=2 * gib, guard=True)[1]  # stopped over its ask: its peak + 10% (D44)
     assert lines(peak=None, asked=None, avg=None) == ["[job] used: memory peak unknown; cores in use unknown of 8 held"]
+    waited = dataclasses.replace(contained, containers_bytes=0, mem_wait_some=0.25, mem_wait_full=0.1, cap_hits=5)
+    assert job_wrapper.usage_lines(waited, gpu_job=True, cores_cap=8, most_mb=most_mb)[0] == (
+        "[job] used: memory peak 9.4 GB of 42.9 GB asked (22%), waited on memory 25.0% of the run (all work 10.0%), "
+        "reaching its cap; cores 1.7 on average of 8 held (21%)")
+    assert ", reaching" not in job_wrapper.usage_lines(dataclasses.replace(waited, cap_hits=0), gpu_job=True, cores_cap=8, most_mb=most_mb)[0]
     record = job_wrapper.usage_record(u, ["[job] x"])
     assert record == {"mem_asked_bytes": 40 * gib, "mem_peak_bytes": 4 * 10**9 + gib, "cores_held": u.cores_held,
-                      "cores_avg": 1.0, "memory_cap_killed": False, "lines": ["[job] x"]}
+                      "cores_avg": 1.0, "mem_wait_some": 0.25, "mem_wait_full": 0.1, "mem_cap_hits": 5,
+                      "memory_cap_killed": False, "lines": ["[job] x"]}
