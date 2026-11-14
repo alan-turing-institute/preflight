@@ -5,6 +5,7 @@ import shlex
 import stat
 import subprocess
 import sys
+import tomllib
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -558,6 +559,28 @@ class PartTimeFake(Fake):
         if argv[:3] == ["getent", "group", "slurm"]:
             return subprocess.CompletedProcess(argv, 2, "", "")
         return super().__call__(argv)
+
+
+def test_a_controller_restart_tells_the_part_time_nodes_to_fetch_the_settings(monkeypatch, capsys):
+    # a configless slurmd keeps the settings it took at its start; only a reconfigure makes it fetch them again
+    class Asleep(Fake):
+        def __call__(self, argv):
+            if argv[:2] == ["sinfo", "-h"] and "-N" in argv:
+                self.calls.append(argv)
+                return subprocess.CompletedProcess(argv, 0, "laptop idle*\n", "")
+            return super().__call__(argv)
+
+    fake = Asleep()
+    components.set_runner(fake)
+    try:
+        plain = slurm_component.post_install(cli.site_config.parse(tomllib.loads(SITE)))
+        steps = slurm_component.post_install(cli.site_config.parse(tomllib.loads(PART_TIME_SITE)))
+        assert len(steps) == len(plain) + 1  # a site without part-time nodes has nothing to tell
+        assert steps[-1]() == [["scontrol", "reconfigure"]]  # after the controller's restart, last
+    finally:
+        components.set_runner(None)
+    assert ["sinfo", "-h", "-N", "-n", "laptop", "-o", "%N %t"] in fake.calls
+    assert "laptop not answering" in capsys.readouterr().err  # named, so its owner knows to reconfigure once it is back
 
 
 def part_time_env(tmp_path, monkeypatch, fake):

@@ -222,7 +222,28 @@ def post_install(site) -> list:
         lambda: _records(site),
         ["install", "-d", "-m", "0755", "-o", "slurm", "-g", "slurm", STATE_SAVE],
         ["systemctl", "restart", *controller],
+        *([lambda: refresh_part_time(site)] if site.part_time_nodes else []),
     ]
+
+
+#: `sinfo`'s mark on a node state for a node that is not responding ("idle*").
+NOT_RESPONDING = "*"
+
+
+def refresh_part_time(site) -> list[list[str]]:
+    """The settings' fetch by the part-time (configless) nodes. Restarting slurmctld does not make a configless slurmd
+    fetch them again: it keeps the copy it took at its own start (2026-11-14: a part-time node ran five days on the copy
+    from before the 2026-11-09 restart). `scontrol reconfigure` makes every answering slurmd fetch them; a node not
+    answering now (asleep, off the network) keeps its old copy until its slurmd restarts, so it is named."""
+    await_answers(["sinfo", "-h"])
+    names = [n.name for n in site.part_time_nodes]
+    listed = components.run(["sinfo", "-h", "-N", "-n", ",".join(names), "-o", "%N %t"]).stdout or ""
+    silent = sorted({row.split()[0] for row in listed.splitlines() if len(row.split()) > 1 and row.split()[1].endswith(NOT_RESPONDING)})
+    print(f"[install] part-time node(s) {', '.join(names)}: told to fetch the new settings (scontrol reconfigure)")
+    if silent:
+        print(f"WARNING: {', '.join(silent)} not answering: it keeps its old settings until its slurmd restarts, or run "
+              "`scontrol reconfigure` once it answers again", file=sys.stderr)
+    return [["scontrol", "reconfigure"]]
 
 
 def _records(site) -> list[list[str]]:
