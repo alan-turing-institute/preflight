@@ -3,7 +3,7 @@
 
 Policy: ~/.claude/software-upgrade-policy.md ("RULING 2026-10-29", "A project upgrade").
 
-    weekly.py run [--project NAME] [--dry-run] [--deadline-hours H] [--poll-seconds S]
+    weekly.py run [--project NAME] [--dry-run] [--deadline-hours H] [--check-level L] [--poll-seconds S]
     weekly.py apply-held NAME          # apply a held upgrade's kept lock, its check skipped (owner 2026-10-29)
 
 Per project in `projects.toml` (see README.md): skip when a job of the project is queued or running, or when its
@@ -479,7 +479,7 @@ def check_dir(scratch: Path) -> Path:
     return scratch / "check"
 
 
-def submit_numbers(project: Project, venv: Path, scratch: Path) -> str:
+def submit_numbers(project: Project, venv: Path, scratch: Path, level: str) -> str:
     """Submit the probe under the old and the new venv as one slurm job; returns the job id."""
     out = check_dir(scratch)
     shutil.rmtree(out, ignore_errors=True)
@@ -494,6 +494,7 @@ def submit_numbers(project: Project, venv: Path, scratch: Path) -> str:
         gpu=project.gpu,
         mem=project.mem,
         cpus=project.cpus,
+        level=level,
     )
 
 
@@ -529,7 +530,7 @@ def read_numbers(project: Project, scratch: Path) -> CheckResult:
     )
 
 
-def submit_tests(project: Project, venv: Path, scratch: Path) -> str:
+def submit_tests(project: Project, venv: Path, scratch: Path, level: str) -> str:
     """Submit the project's test command in the side venv as one slurm job; returns the job id."""
     out = check_dir(scratch)
     shutil.rmtree(out, ignore_errors=True)
@@ -548,6 +549,7 @@ def submit_tests(project: Project, venv: Path, scratch: Path) -> str:
         gpu=project.gpu,
         mem=project.mem,
         cpus=project.cpus,
+        level=level,
     )
 
 
@@ -656,7 +658,7 @@ class Submitted:
     before: str  # sha of uv.lock when the check was prepared
 
 
-def prepare(project: Project, *, dry_run: bool) -> Finished | Submitted:
+def prepare(project: Project, *, dry_run: bool, level: str) -> Finished | Submitted:
     """One project up to the moment its check job is submitted: a final outcome when no check is needed."""
     facts = {
         "running_jobs": [],
@@ -712,7 +714,7 @@ def prepare(project: Project, *, dry_run: bool) -> Finished | Submitted:
     shutil.rmtree(venv, ignore_errors=True)
     try:
         build_side_venv(project, work, venv)
-        job = SUBMIT[project.check](project, venv, scratch)
+        job = SUBMIT[project.check](project, venv, scratch, level)
     except BaseException:
         shutil.rmtree(venv, ignore_errors=True)
         raise
@@ -977,7 +979,12 @@ def settle(
 
 
 def run_all(
-    names: list[str], *, dry_run: bool, deadline_hours: float, poll_seconds: float
+    names: list[str],
+    *,
+    dry_run: bool,
+    deadline_hours: float,
+    poll_seconds: float,
+    level: str,
 ) -> int:
     projects = all_projects()
     if names:
@@ -995,7 +1002,7 @@ def run_all(
         waiting: list[Submitted] = []
         try:
             for project in projects:
-                prepared = attempt(lambda p=project: prepare(p, dry_run=dry_run))
+                prepared = attempt(lambda p=project: prepare(p, dry_run=dry_run, level=level))
                 if isinstance(prepared, Submitted):
                     waiting.append(prepared)
                 else:
@@ -1030,10 +1037,16 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument(
         "--deadline-hours",
         type=float,
-        default=3.0,
+        default=24.0,
         help="the run stops waiting this long after it starts (preparing every project counts); a check job still "
         "queued then is cancelled and its project deferred to the next run. The systemd unit's TimeoutStartSec must "
         "exceed it",
+    )
+    r.add_argument(
+        "--check-level",
+        default="high",
+        help="the slurm waiting level of the check jobs (submit.py --level): small jobs that gate every project's "
+        "upgrade, so they go to the front of the waiting line by default; a level never stops a running job",
     )
     r.add_argument(
         "--poll-seconds",
@@ -1063,6 +1076,7 @@ def main() -> None:
             args.project,
             dry_run=args.dry_run,
             deadline_hours=args.deadline_hours,
+            level=args.check_level,
             poll_seconds=args.poll_seconds,
         )
     )

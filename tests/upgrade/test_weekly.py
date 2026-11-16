@@ -651,7 +651,9 @@ def test_a_run_that_stops_early_cancels_the_checks_still_waiting(
     )
 
 
-def test_the_unit_outlasts_the_deadline_it_is_started_with() -> None:
+def test_the_unit_outlasts_the_deadline_and_its_checks_queue_at_the_check_level(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     unit = (
         Path(weekly.__file__).parent / "install/project-upgrades.service"
     ).read_text()
@@ -666,3 +668,11 @@ def test_the_unit_outlasts_the_deadline_it_is_started_with() -> None:
     ]  # drop the interpreter; the rest parses as weekly.py's own
     args = weekly.build_parser().parse_args(argv[1:])
     assert hours > args.deadline_hours
+    submitted_argv: list[str] = []
+    monkeypatch.setattr(
+        upgrade_common, "run", lambda argv, **_: submitted_argv.extend(argv) or "job 7"
+    )
+    project = weekly.Project("p", tmp_path, Check.TESTS, "c")
+    assert weekly.submit_tests(project, tmp_path / "venv", tmp_path, args.check_level) == "7"
+    level_at = submitted_argv.index("--level")
+    assert submitted_argv[level_at + 1] == args.check_level == "high"

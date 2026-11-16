@@ -4,7 +4,7 @@ Dependency upgrades for the uv projects on this machine.
 
 | File | What it does |
 |---|---|
-| `weekly.py` | `run [--project NAME] [--dry-run] [--deadline-hours H] [--poll-seconds S]`: the weekly upgrade of every project in `projects.toml` |
+| `weekly.py` | `run [--project NAME] [--dry-run] [--deadline-hours H] [--check-level L] [--poll-seconds S]`: the weekly upgrade of every project in `projects.toml` |
 | `session_notice.py` | one line at session start when the project under the working directory has an upgrade held or just applied |
 | `torch_upgrade.py` | by hand: `build` a side venv with a new PyTorch stack, `check` it on the GPU (one project, one PyTorch move) |
 | `upgrade_common.py` | what the two share: `run`, `freeze`, hostguard, one slurm job for a check (submit, queue, cancel), probe comparison |
@@ -20,13 +20,14 @@ in `~/cache/upgrades/<name>/` (the scratch lock stays), a side venv from the new
 * `numbers`: the probe under the old and the new venv in ONE slurm job; applied only when every value is identical.
 * `tests`: the registry's fast test command in the side venv, through slurm without a GPU; applied when it passes.
 
-Every due project is prepared first and its check job submitted at once; each project is then applied or held as its
+Every due project is prepared first and its check job submitted at once, at waiting level `--check-level` (default
+`high`: it orders the waiting line only, never stops a running job); each project is then applied or held as its
 own job leaves the queue, so a check stuck in the queue delays only its own project. The run waits for the checks until
-`--deadline-hours` after it started (default 3, preparing the projects counts; the queue is read every `--poll-seconds`,
+`--deadline-hours` after it started (default 24, preparing the projects counts; the queue is read every `--poll-seconds`,
 default 30). A check still queued then is cancelled (`slurm/kill.py`) and its project is DEFERRED: the log and the state
 file say `deferred` with the reason and the job id, nothing is applied, and the next weekly run tries again. A run that is
 stopped early (an error, SIGTERM) cancels the checks still waiting and defers their projects the same way. The unit's
-`TimeoutStartSec` (4 h) must stay above the deadline by the time the last results take to apply; `tests/upgrade` checks it.
+`TimeoutStartSec` (25 h) must stay above the deadline by the time the last results take to apply; `tests/upgrade` checks it.
 
 Pass: commit `uv.lock` alone (`chore(deps): Weekly dependency upgrade`, never pushed), `uv sync --frozen`, hostguard,
 restart the project's active services. Anything else is HELD (numbers moved, tests failed, `uv.lock` has uncommitted

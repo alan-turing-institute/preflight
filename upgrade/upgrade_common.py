@@ -58,6 +58,7 @@ def submit(
     gpu: bool,
     mem: str,
     cpus: int | None = None,
+    level: str | None = None,
 ) -> str:
     """Submit `bash -c command` as one slurm job (class restart: never pre-empted) and return its job id at once.
 
@@ -81,6 +82,7 @@ def submit(
         "--mem",
         mem,
         *(["--cpus", str(cpus)] if cpus else []),
+        *(["--level", level] if level else []),
         "--workdir",
         str(workdir),
         "--log",
