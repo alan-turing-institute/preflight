@@ -99,6 +99,8 @@ def test_apply_then_check_against_a_temp_root(env):
     assert run(site, root, "check") == 0
     assert stat.S_IMODE((root / "etc/slurm/slurmdbd.conf").stat().st_mode) == cli.render.SECRET_MODE
     assert stat.S_IMODE((root / "usr/local/bin/gpujobs-submit").stat().st_mode) == cli.render.EXEC_MODE
+    assert "slurm/fetch_back.py" in (root / "usr/local/bin/gpujobs-fetch-back").read_text()  # the shim drops the '_'
+    assert not (root / "etc/systemd/user/gpujobs-fetch.timer").exists()  # no [remote.*]: nothing to fetch from
     assert stat.S_IMODE((root / "opt/gpujobs/slurm/ood_app/bin/python").stat().st_mode) == cli.render.EXEC_MODE  # OOD runs it
     # The installed wrapper runs a job with only what the install put there (this site leaves hostguard off).
     assert not (root / "opt/gpujobs/hostguard").exists()
@@ -785,3 +787,13 @@ def test_fast_cpus_must_be_the_hosts_fastest_cores_and_an_unset_two_kind_gpu_nod
     (hint,) = cli.core_kind_warnings(unset, halves, "n1")
     assert 'fast_cpus = "5-9,15-19"' in hint
     assert cli.core_kind_warnings(unset, alike, "n1") == []
+
+
+def test_a_site_with_a_remote_gets_the_fetch_timer_at_its_pace():
+    site = SimpleNamespace(remotes={"b": object()}, install_dir=Path("/opt/gpujobs"), tuning=SimpleNamespace(fetch_every_s=120))
+    (fetch,) = components.load(site, ["fetch"])
+    units = fetch.files(site)
+    assert set(units) == {"/etc/systemd/user/gpujobs-fetch.service", "/etc/systemd/user/gpujobs-fetch.timer"}
+    assert "OnUnitActiveSec=120s" in units["/etc/systemd/user/gpujobs-fetch.timer"].content
+    assert "ExecStart=/usr/bin/python3 /opt/gpujobs/slurm/fetch_back.py run" in units["/etc/systemd/user/gpujobs-fetch.service"].content
+    assert components.load(SimpleNamespace(remotes={}), ["fetch"]) == []

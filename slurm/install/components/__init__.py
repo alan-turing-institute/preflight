@@ -22,7 +22,7 @@ from levels import Level
 if TYPE_CHECKING:
     from site_config import Site
 
-ORDER = ["slurm", "tools", "agent", "lease", "metrics", "portal"]
+ORDER = ["slurm", "tools", "agent", "lease", "fetch", "metrics", "portal"]
 Runner = Callable[[list[str]], "subprocess.CompletedProcess[str]"]
 
 #: the site file as given on the command line; the agent component installs a copy of it

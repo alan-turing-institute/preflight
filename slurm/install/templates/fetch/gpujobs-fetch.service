@@ -1,0 +1,9 @@
+# Brings home the folders of remote jobs this user asked for (submit.py --site --fetch-back, fetch_back.py add).
+# A user unit: each user enables it once (`gpujobs-fetch-back enable`). Rendered from the site file by
+# slurm/install/components/fetch.py; do not edit by hand.
+[Unit]
+Description=lifecycle=service fetch remote jobs' folders home ($install_dir/slurm/fetch_back.py)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 $install_dir/slurm/fetch_back.py run
