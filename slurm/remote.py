@@ -3,23 +3,33 @@
 Nothing is queued unless every step before it passed: (1) the import closure of `--entry` is built by
 `dgx/assert_code_parity.py` (an import that lives in the repo but sits on no search root is a refusal); (2) the closure's
 files and the named `--data` folders are copied with rsync by checksum, so what the other site already holds is skipped;
-(3) the closure's checksums are read back from there and must equal this clone's; (4) that site's own `submit.py` is run
-over ssh, so its job wrapper, log and jobs page handle the job. This site does not mirror the job (D2: the other site's
-own tools show it; `status.py --site NAME` runs its status command).
+(3) the closure's checksums are read back from there and must equal this clone's; (4) Python there, from the job's own
+folder, must load every first-party name of the closure from the synced folder (`remote_import_check.py`); (5) that
+site's own `submit.py` is run over ssh, so its job wrapper, log and jobs page handle the job, and with `--check` it runs
+the check there (D47), on the files and data the job will see. A symlink in a `--data` folder that would dangle there
+is refused in (1). This site does not mirror the job (D2: the other site's own tools show it; `status.py --site NAME`
+runs its status command).
 """
 
 from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
+import os
 import shlex
 import subprocess
-from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 import site_config
 
 PARITY = Path(__file__).resolve().parent.parent / "dgx" / "assert_code_parity.py"
+IMPORT_CHECK = Path(__file__).resolve().parent / "remote_import_check.py"
+#: Python names the interpreter by its file name: `python`, `python3`, `python3.12`.
+INTERPRETER_PREFIX = "python"
+#: How many symlinks one refusal lists.
+LISTED_LINKS = 3
 SSH = ["ssh", "-o", "BatchMode=yes"]
 #: `submit.py` options that mean something only on the site that owns the queue, so they are refused with --site.
 LOCAL_ONLY = {"service": "--service", "anywhere": "--anywhere", "suspend": "--suspend", "no_suspend": "--no-suspend", "log": "--log"}
@@ -36,10 +46,10 @@ def _parity():
     return module
 
 
-def _run(argv: list[str], what: str) -> str:
-    done = subprocess.run(argv, capture_output=True, text=True, check=False)
+def _run(argv: list[str], what: str, stdin: str | None = None) -> str:
+    done = subprocess.run(argv, capture_output=True, text=True, check=False, input=stdin)
     if done.returncode != 0:
-        raise RemoteRefused(f"{what} failed (exit {done.returncode}): {(done.stderr or done.stdout).strip()[:400]}")
+        raise RemoteRefused(f"{what} failed (exit {done.returncode}): {(done.stderr or done.stdout).strip()[:800]}")
     return done.stdout
 
 
@@ -51,9 +61,48 @@ def pick(site: site_config.Site, name: str) -> site_config.Remote:
         raise RemoteRefused(f"--site {name}: this site's file names no such remote (known: {known}; add [remote.{name}])") from None
 
 
-def plan(arguments: argparse.Namespace, remote: site_config.Remote) -> tuple[Path, list[str], list[str], list[tuple[Path, str]]]:
-    """(repo, closure files, data folders inside the repo, data folders outside it as (parent, name)); the first two lists
-    are relative to the repo. Refuses what cannot be shipped."""
+@dataclass(frozen=True)
+class Plan:
+    """What `plan` decided to ship; paths are relative to `repo` unless said otherwise."""
+
+    repo: Path
+    files: list[str]  # the code closure
+    data: list[str]  # --data folders inside the repo
+    outside: list[tuple[Path, str]]  # --data folders outside it, as (parent, name)
+    roots: list[str]  # import roots inside the repo, in the order Python meets them
+    names: list[str]  # top-level names the closure's files import as
+
+
+def stray_links(folder: Path) -> list[str]:
+    """Symlinks under `folder` that would not resolve inside it once it is copied, as `path -> text`: an absolute one
+    (its text is copied, and it names a path of this machine) or a relative one that leaves the folder. rsync copies a
+    link, never its target."""
+    base = folder.resolve()
+    found = []
+    for here, dirs, names in os.walk(folder):
+        for name in (*dirs, *names):
+            path = Path(here, name)
+            if path.is_symlink() and (os.path.isabs(os.readlink(path)) or not path.resolve().is_relative_to(base)):
+                found.append(f"{path.relative_to(folder)} -> {os.readlink(path)}")
+    return found
+
+
+def refuse_stray_links(folder: Path, given: str) -> None:
+    """Refuse a `--data` folder holding a link that would dangle there (2026-11-15: a job died in seconds on a link
+    copied without its 487 MB target). Copying each target in would copy it once per link and put it where the project
+    never looks for it, so the target is to be named instead, where it belongs."""
+    stray = stray_links(folder)
+    if stray:
+        more = f"; and {len(stray) - LISTED_LINKS} more" if len(stray) > LISTED_LINKS else ""
+        raise RemoteRefused(
+            f"--data {given}: a symlink would dangle on the other site, because only the link is copied, never what it "
+            f"points at ({'; '.join(stray[:LISTED_LINKS])}{more}). Name the folder it points at with --data (with "
+            "--data-base and --data-env when that is outside the repo), or put a real copy of the file in the folder"
+        )
+
+
+def plan(arguments: argparse.Namespace, remote: site_config.Remote) -> Plan:
+    """What to ship, from the arguments. Refuses what cannot be shipped."""
     for dest, flag in LOCAL_ONLY.items():
         if getattr(arguments, dest, None):
             raise RemoteRefused(f"{flag} belongs to the site that owns the queue; it cannot go with --site")
@@ -61,12 +110,12 @@ def plan(arguments: argparse.Namespace, remote: site_config.Remote) -> tuple[Pat
         raise RemoteRefused("--site needs --repo and --entry: the entry script's imports decide which files are sent")
     repo = arguments.repo.resolve()
     parity = _parity()
-    found = parity.plan_comparison(
-        argparse.Namespace(entry=repo / arguments.entry, search=arguments.search, allow_diff=[], also=[]), repo
-    )
+    entry = repo / arguments.entry
+    found = parity.plan_comparison(argparse.Namespace(entry=entry, search=arguments.search, allow_diff=[], also=[]), repo)
     if found is None:
         raise RemoteRefused("the code closure could not be built (see [parity] above)")
-    data, outside = [], []
+    roots = list(dict.fromkeys(root for root in parity.search_roots(entry.resolve(), repo, arguments.search) if root.is_relative_to(repo)))
+    data, outside, folders = [], [], []
     base = arguments.data_base.resolve() if arguments.data_base else None
     for given in arguments.data:
         path = (repo / given).resolve()
@@ -80,11 +129,15 @@ def plan(arguments: argparse.Namespace, remote: site_config.Remote) -> tuple[Pat
             outside.append((path.parent, path.name))
         else:
             raise RemoteRefused(f"--data {given}: outside --data-base {base}")
+        folders.append((path, given))
     if outside and not remote.data_root:
         raise RemoteRefused(f"--data outside {repo} needs data_root in [remote.{arguments.site}] of the site file")
     if arguments.data_env and not remote.data_root:
         raise RemoteRefused(f"--data-env needs data_root in [remote.{arguments.site}] of the site file")
-    return repo, found[1], data, outside
+    for path, given in folders:  # the walk reads every folder, so after the refusals that cost nothing
+        refuse_stray_links(path, given)
+    return Plan(repo, found[1], data, outside, [str(root.relative_to(repo)) for root in roots],
+                parity.top_level_names(found[1], repo, roots))
 
 
 def project_root(remote: site_config.Remote, project: str) -> str:
@@ -125,8 +178,46 @@ def verify(remote: site_config.Remote, root: str, repo: Path, files: list[str]) 
         raise RemoteRefused(f"after the copy, {remote.host} still differs on: {', '.join(bad)}")
 
 
-def forwarded(arguments: argparse.Namespace) -> list[str]:
-    """The options the other site's `submit.py` takes, from the parsed ones (the sync options stay here)."""
+def interpreter(arguments: argparse.Namespace) -> str:
+    """The Python the job runs there, for the import check: `--remote-python`, else the command's own first word when it
+    is one, relative to the job's folder as the command is. Anything else (`uv run`, a shell script) is refused,
+    because guessing another interpreter would check the wrong Python."""
+    named = getattr(arguments, "remote_python", None)
+    if named:
+        return named
+    first = arguments.command[0]
+    if Path(first).name.startswith(INTERPRETER_PREFIX):
+        return first
+    raise RemoteRefused(
+        f"the command starts with {first!r}, not a Python: --remote-python PATH names the Python the job runs there "
+        "(relative to --workdir, e.g. .venv/bin/python), so the import check uses the same one"
+    )
+
+
+def check_imports(remote: site_config.Remote, inside: str, plan_: Plan, python: str, to_root: str) -> None:
+    """Refuse when Python there, from the job's folder, would load a first-party name from outside the synced folder
+    (`remote_import_check.py`, piped so that site cannot hold a stale copy). `to_root` is the project folder as seen
+    from `inside`."""
+    spec = json.dumps({"project": to_root, "roots": plan_.roots, "names": plan_.names})
+    _run([*SSH, remote.host, f"cd {shlex.quote(inside)} && {python} - {shlex.quote(spec)}"],
+         f"the import check on {remote.host}", IMPORT_CHECK.read_text(encoding="utf-8"))
+
+
+def require_remote_checks(remote: site_config.Remote) -> None:
+    """Refuse when the other site's `submit.py` has no `--check`: it would reject the flag, or (an older script) never
+    run the check, and a check that does not run must not look as if it passed."""
+    out = _run([*SSH, remote.host, f"{remote.submit_command} --help"], f"{remote.submit_command} --help on {remote.host}")
+    if "--check" not in out:
+        raise RemoteRefused(
+            f"--check / --no-check: {remote.submit_command} on {remote.host} predates submit-time checks (D47) and would "
+            "not run it. Update the preflight checkout on that site to a commit that has `--check` (6950607 added it; "
+            "7d2c902 fixed its signal and start-up handling), then submit again"
+        )
+
+
+def forwarded(arguments: argparse.Namespace, env: list[str] = ()) -> list[str]:
+    """The options the other site's `submit.py` takes, from the parsed ones (the sync options stay here).
+    `env` (the job's `env NAME=path` words) prefixes a check so it sees the same data path as the job."""
     out = ["--project", arguments.project, "--what", arguments.what, "--class", arguments.job_class,
            "--name", arguments.name, "--wait-limit", arguments.wait_limit, "--level", str(arguments.level)]
     if arguments.max_jobs:  # unset: that site picks the level itself (its measured one, else the whole card)
@@ -143,29 +234,37 @@ def forwarded(arguments: argparse.Namespace) -> list[str]:
         out.append("--resume-ok")
     if getattr(arguments, "size", None):  # sized there, from that site's own runs (D48)
         out += ["--size", *arguments.size]
+    if getattr(arguments, "check", None):  # run there (D47), after the copy, on the files and data the job will see
+        out += ["--check", f"{shlex.join(env)} {arguments.check}" if env else arguments.check]
+    if getattr(arguments, "no_check", None):
+        out += ["--no-check", arguments.no_check]
     return out
 
 
-def submit(arguments: argparse.Namespace, site: site_config.Site, before_sync: Callable[[], object] | None = None) -> str:
+def submit(arguments: argparse.Namespace, site: site_config.Site) -> str:
     remote = pick(site, arguments.site)
-    repo, files, data, outside = plan(arguments, remote)
+    shipped = plan(arguments, remote)
+    repo, files, data, outside = shipped.repo, shipped.files, shipped.data, shipped.outside
     root = project_root(remote, arguments.project)
     workdir = arguments.workdir.resolve()
     if not workdir.is_relative_to(repo):
         raise RemoteRefused(f"--workdir {workdir} is outside --repo {repo}: the command runs from the same place there")
     inside = f"{root}/{workdir.relative_to(repo)}"
-    job = ["env", f"{arguments.data_env}={remote.data_root}", *arguments.command] if arguments.data_env else arguments.command
-    line = " ".join(shlex.quote(part) for part in [remote.submit_command, *forwarded(arguments), "--", *job])
+    python = interpreter(arguments)
+    env = ["env", f"{arguments.data_env}={remote.data_root}"] if arguments.data_env else []
+    line = " ".join(shlex.quote(part) for part in [remote.submit_command, *forwarded(arguments, env), "--", *env, *arguments.command])
     command = f"cd {shlex.quote(inside)} && {line}"
     print(f"[remote] {len(files)} code file(s) and {len(data)} data folder(s) -> {remote.host}:{root}"
           + (f"; {len(outside)} outside it -> {remote.data_root}" if outside else ""))
-    if before_sync is not None:  # after every refusal above, before anything is copied
-        before_sync()
     if arguments.dry_run:
         return f"[remote] dry run: nothing copied or queued; would run on {remote.host}: {command}"
+    if getattr(arguments, "check", None) or getattr(arguments, "no_check", None):
+        require_remote_checks(remote)  # before anything is copied
     changed = sync(remote, root, repo, files, data, outside)
     verify(remote, root, repo, files)
     print(f"[remote] copied {changed} changed item(s); code on {remote.host} matches this clone")
+    check_imports(remote, inside, shipped, python, os.path.relpath(repo, workdir))
+    print(f"[remote] Python on {remote.host} loads the code's {len(shipped.names)} top-level name(s) from {root}")
     return _run([*SSH, remote.host, command], f"{remote.submit_command} on {remote.host}").strip()
 
 

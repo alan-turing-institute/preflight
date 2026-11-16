@@ -87,6 +87,19 @@ def resolve_module(name: str, search: list[Path]) -> Path | None:
     return None
 
 
+def parent_packages(name: str, found: Path) -> list[Path]:
+    """The `__init__.py` of every package above the module `name` that resolved to `found`, outermost first.
+
+    Python runs each parent package's `__init__.py` when it imports `a.b.c`, and a folder without one is only a
+    namespace portion that any regular package of the same name later on the path (a venv's editable install) replaces.
+    A closure holding `a/b/c.py` alone therefore ships a tree whose `a` is imported from somewhere else on the box.
+    """
+    parts = name.split(".")
+    root = found.parents[len(parts) if found.name == "__init__.py" else len(parts) - 1]
+    inits = [root.joinpath(*parts[: depth + 1], "__init__.py") for depth in range(len(parts) - 1)]
+    return [init for init in inits if init.is_file()]
+
+
 def closure(entry: Path, search: list[Path]) -> tuple[set[Path], set[str]]:
     """Every first-party file reachable from ``entry`` by any import.
 
@@ -136,6 +149,7 @@ def closure(entry: Path, search: list[Path]) -> tuple[set[Path], set[str]]:
                 found = resolve_module(name, search)
                 if found is not None:
                     pending.append(found.resolve())
+                    pending.extend(init.resolve() for init in parent_packages(name, found))
             for name in primaries:
                 if resolve_module(name, search) is None:
                     unresolved.add(name)
@@ -376,6 +390,32 @@ def covered_files(
     return sorted(inside | set(also))
 
 
+def search_roots(entry: Path, local_root: Path, extra: list[str]) -> list[Path]:
+    """The import roots the closure walks, in order: `extra` (repo-relative), the entrypoint's folder, then `src`.
+
+    This is what the entrypoint puts on `sys.path`, so the walk and anything that re-creates the path elsewhere
+    (the remote import check of `slurm/remote.py`) agree on it.
+    """
+    return [*(local_root / s for s in extra), entry.parent, local_root / "src"]
+
+
+def top_level_names(relatives: list[str], local_root: Path, roots: list[Path]) -> list[str]:
+    """The importable top-level name (module or package) each closure file belongs to, from the first root above it.
+
+    A file under no root (an `--also` file such as a shell supervisor) is not imported, so it names nothing.
+    """
+    names: set[str] = set()
+    for name in relatives:
+        path = local_root / name
+        for root in roots:
+            if path.suffix == ".py" and path.is_relative_to(root):
+                first = path.relative_to(root).parts[0]
+                if first != "__init__.py":  # a root's own __init__ is no importable name
+                    names.add(first.removesuffix(".py"))
+                break
+    return sorted(names)
+
+
 def plan_comparison(
     arguments: argparse.Namespace, local_root: Path
 ) -> tuple[Path, list[str], dict[str, str]] | None:
@@ -391,8 +431,7 @@ def plan_comparison(
         print(f"[parity] no such entrypoint: {entry}", file=sys.stderr)
         return None
 
-    search = [local_root / s for s in arguments.search]
-    search += [entry.parent, local_root / "src"]
+    search = search_roots(entry, local_root, arguments.search)
 
     try:
         allowances = parse_allowances(arguments.allow_diff)

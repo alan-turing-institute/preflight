@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -37,13 +40,19 @@ def arguments(repo: Path, **given: object) -> argparse.Namespace:
 class Box:
     """Stands in for subprocess.run: records calls; answers md5sum with the real digests unless told to differ."""
 
-    def __init__(self, repo: Path, *, stale: bool = False) -> None:
+    def __init__(self, repo: Path, *, stale: bool = False, stray: str = "", old: bool = False) -> None:
         self.calls: list[list[str]] = []
-        self.repo, self.stale = repo, stale
+        self.sent: list[str] = []  # what was piped to the other site's Python
+        self.repo, self.stale, self.stray, self.old = repo, stale, stray, old
 
-    def __call__(self, argv: list[str], **_kw: object) -> SimpleNamespace:
+    def __call__(self, argv: list[str], **kw: object) -> SimpleNamespace:
         self.calls.append(argv)
         out = ""
+        if kw.get("input"):  # the import check: refused when `stray` says Python there loads a name from elsewhere
+            self.sent.append(str(kw["input"]))
+            return SimpleNamespace(returncode=1 if self.stray else 0, stdout="", stderr=self.stray)
+        if argv[-1].endswith("gpujobs-submit --help"):
+            return SimpleNamespace(returncode=0, stdout="usage: submit.py" + ("" if self.old else " [--check CMD]"), stderr="")
         if argv[0] == "rsync":
             out = ">f.st...... run.py\n"
         elif argv[0] == "ssh" and "md5sum" in argv[-1]:
@@ -119,3 +128,88 @@ def test_dry_run_copies_nothing_and_what_cannot_be_shipped_is_refused(repo: Path
     (repo / "elsewhere" / "ghost_in_repo.py").write_text("")
     with pytest.raises(remote.RemoteRefused, match="closure could not be built"):  # a repo import on no search root
         remote.submit(arguments(repo), site)
+
+
+def test_the_check_runs_there_after_the_copy_with_the_jobs_data_path_and_an_old_site_is_refused(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D47 with --site: the check travels to the other site's submit.py (it runs after the copy, where the files and
+    data are), under the job's own `env NAME=path`; a site whose submit.py has no --check is refused before any copy."""
+    site = SimpleNamespace(remotes={"turing": REMOTE})
+    box = Box(repo)
+    monkeypatch.setattr(remote.subprocess, "run", box)
+    remote.submit(arguments(repo, check="python -m dry_run", data_env="DATASETS"), site)
+    assert "--check 'env DATASETS=/data/ds python -m dry_run'" in box.calls[-1][-1]  # one word, the data path first
+    assert any(c[0] == "rsync" for c in box.calls)
+    old = Box(repo, old=True)
+    monkeypatch.setattr(remote.subprocess, "run", old)
+    with pytest.raises(remote.RemoteRefused, match="predates submit-time checks"):
+        remote.submit(arguments(repo, no_check="no inputs"), site)
+    assert not any(c[0] == "rsync" for c in old.calls)  # nothing was copied
+    plain = Box(repo, old=True)  # no check asked: an old site is fine, and is not asked
+    monkeypatch.setattr(remote.subprocess, "run", plain)
+    remote.submit(arguments(repo), site)
+    assert not any(c[-1].endswith("--help") for c in plain.calls)
+
+
+def test_the_synced_names_must_load_from_the_synced_folder_before_anything_is_queued(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The Python there is the job's own (named, or the command's first word), run from the job's folder; a name it loads
+    from elsewhere queues nothing; a command that is not a Python needs --remote-python."""
+    site = SimpleNamespace(remotes={"turing": REMOTE})
+    box = Box(repo, stray="lib -> /elsewhere/src/lib.py")
+    monkeypatch.setattr(remote.subprocess, "run", box)
+    with pytest.raises(remote.RemoteRefused, match="/elsewhere/src/lib.py"):
+        remote.submit(arguments(repo, command=[".venv/bin/python", "run.py"]), site)
+    ran = next(c[-1] for c in box.calls if " - '" in c[-1])
+    assert ran.startswith("cd sync/p/. && .venv/bin/python - '") and '"names": ["lib", "run"]' in ran
+    assert '"roots": ["src", "."]' in ran and '"project": "."' in ran  # the roots the closure was walked with
+    assert "find_spec" in box.sent[0]
+    assert not any("gpujobs-submit --project" in c[-1] for c in box.calls)  # nothing was queued
+    clean = Box(repo)
+    monkeypatch.setattr(remote.subprocess, "run", clean)
+    with pytest.raises(remote.RemoteRefused, match="--remote-python"):
+        remote.submit(arguments(repo, command=["uv", "run", "python", "run.py"]), site)
+    assert clean.calls == []  # refused before any copy
+    remote.submit(arguments(repo, command=["uv", "run", "python", "run.py"], remote_python=".venv/bin/python"), site)
+    assert any(c[-1].startswith("cd sync/p/. && .venv/bin/python - ") for c in clean.calls)
+
+
+def test_python_that_would_load_a_package_from_elsewhere_is_caught_by_the_real_check(tmp_path: Path) -> None:
+    """2026-11-16: `src/pkg` shipped without its `__init__.py` is a namespace portion, and a regular `pkg` later on the
+    path (the venv's editable install of another checkout) wins. Run the real script under a real interpreter."""
+    project, other = tmp_path / "project", tmp_path / "editable"
+    (project / "src" / "pkg").mkdir(parents=True)
+    (project / "src" / "pkg" / "mod.py").write_text("")
+    (other / "pkg").mkdir(parents=True)
+    (other / "pkg" / "__init__.py").write_text("")
+    spec = json.dumps({"project": str(project), "roots": ["src"], "names": ["pkg"]})
+
+    def run() -> subprocess.CompletedProcess[str]:
+        return subprocess.run([sys.executable, "-", spec], input=remote.IMPORT_CHECK.read_text(), capture_output=True,
+                              text=True, check=False, cwd=project, env={"PYTHONPATH": str(other)})
+
+    refused = run()
+    assert refused.returncode == 1 and f"pkg -> {other / 'pkg' / '__init__.py'}" in refused.stderr
+    assert "add the missing __init__.py" in refused.stderr  # names the remedy
+    (project / "src" / "pkg" / "__init__.py").write_text("")
+    assert run().returncode == 0
+
+
+def test_a_symlink_that_would_dangle_there_refuses_the_data_folder_naming_it(repo: Path) -> None:
+    """2026-11-15: a link synced without its 487 MB target died in seconds. A link inside its folder travels fine."""
+    outside = repo.parent / "big.bin"
+    outside.write_text("x")
+    folder = repo / "data" / "set"
+    (folder / "real.bin").write_text("y")
+    (folder / "ok.bin").symlink_to("real.bin")  # relative, stays inside
+    assert remote.plan(arguments(repo), REMOTE).data == ["data/set"]
+    (folder / "weights.bin").symlink_to(outside)  # absolute
+    with pytest.raises(remote.RemoteRefused, match="weights.bin -> .*big.bin.*Name the folder it points at") as refused:
+        remote.plan(arguments(repo), REMOTE)
+    assert "ok.bin" not in str(refused.value)
+    (folder / "weights.bin").unlink()
+    (folder / "up.bin").symlink_to(Path("..") / ".." / ".." / "big.bin")  # relative, leaves the folder
+    with pytest.raises(remote.RemoteRefused, match="up.bin"):
+        remote.plan(arguments(repo), REMOTE)

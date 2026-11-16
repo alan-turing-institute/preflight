@@ -165,9 +165,11 @@ def test_a_job_for_another_site_makes_no_local_part_time_decision(monkeypatch: p
         raise remote.RemoteRefused(f"--site {name}: no such remote")
 
     monkeypatch.setattr(submit.remote, "pick", no_such)
-    with pytest.raises(submit.Refused, match="no such remote"):  # remote's cheap refusals come before the check
+    with pytest.raises(submit.Refused, match="no such remote"):
         submit.submit([*RESUME, "--site", "nosuch", "--check", "false", "--", "x"])
     monkeypatch.setattr(submit.remote, "submit", lambda *_a, **_k: "remote")
+    # D47: with --site the check runs on that site, after the sync; a failing one run here would refuse
+    assert submit.submit([*RESUME, "--site", "turing", "--check", "false", "--", "x"]) == "remote"
     assert submit.submit([*RESUME, "--site", "turing", "--no-anywhere", "--", "x"]) == "remote" and calls == []
 
 

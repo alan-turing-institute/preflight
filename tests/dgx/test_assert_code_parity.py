@@ -73,6 +73,26 @@ def test_closure_follows_a_function_body_import(study: Path) -> None:
     assert study / "scripts" / "callee.py" in found
 
 
+def test_closure_includes_the_init_of_every_package_above_an_imported_module(tmp_path: Path) -> None:
+    """2026-11-16: `import pkg.sub.mod` reached `pkg/sub/mod.py` only, so the box held `pkg` without its `__init__.py`
+    and Python there loaded `pkg` from a venv's editable install of another checkout.
+
+    MUTATION: dropping `parent_packages` from `closure` (the closure then lacks both `__init__.py`).
+    """
+    root = tmp_path / "repo"
+    write(root / "src" / "pkg" / "__init__.py", "")
+    write(root / "src" / "pkg" / "sub" / "__init__.py", "from pkg import helper\n")
+    write(root / "src" / "pkg" / "sub" / "mod.py", "")
+    write(root / "src" / "pkg" / "helper.py", "")
+    write(root / "src" / "namespace" / "leaf.py", "")  # no __init__ anywhere: nothing to add
+    write(root / "scripts" / "entry.py", "import pkg.sub.mod\nimport namespace.leaf\n")
+    found, _ = closure(root / "scripts" / "entry.py", [root / "src", root / "scripts"])
+    assert {p.relative_to(root).as_posix() for p in found} == {
+        "scripts/entry.py", "src/pkg/__init__.py", "src/pkg/sub/__init__.py", "src/pkg/sub/mod.py", "src/pkg/helper.py",
+        "src/namespace/leaf.py",
+    }  # and the parent's own imports are followed (helper.py)
+
+
 def test_stdlib_imports_are_not_first_party(study: Path) -> None:
     """MUTATION: resolving unknown modules to a path anyway.
 

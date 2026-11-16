@@ -680,6 +680,9 @@ def parser() -> argparse.ArgumentParser:
                         "DIR/gpe/x lands at data_root/gpe/x there (default: its own name)")
     p.add_argument("--data-env", default=None, metavar="NAME",
                    help="with --site: run the command with NAME set to the site's data_root (e.g. AUTOCAST_DATASETS)")
+    p.add_argument("--remote-python", default=None, metavar="PATH",
+                   help="with --site: the Python the job runs there (relative to --workdir), used to check that its imports "
+                        "load from the synced folder; default: the command's first word when it is a Python")
     p.add_argument("--size", nargs=2, default=None, metavar=("COUNT", "UNIT"),
                    help="the job's size in a unit of the project's choosing (e.g. 30 detectors): memory is then sized from "
                         "earlier runs of this project that declared the same unit (D48, site field memory_from_size)")
@@ -709,14 +712,14 @@ def submit(argv: list[str]) -> str:
         raise Refused(msg)
     arguments.gpus = 1 if arguments.gpu else arguments.gpus or 0
     arguments.gpu = arguments.gpus > 0
-    if (arguments.data or arguments.data_base or arguments.data_env) and not arguments.site:
-        msg = "--data, --data-base and --data-env go with --site (they name data to sync to that site)"
+    if (arguments.data or arguments.data_base or arguments.data_env or arguments.remote_python) and not arguments.site:
+        msg = "--data, --data-base, --data-env and --remote-python go with --site (they say what to sync to that site and how to check it)"
         raise Refused(msg)
     if arguments.site:
         arguments.name = arguments.name or Path(arguments.command[0]).name
         local = gpu_jobs.load_site()
-        try:  # the check runs here, after remote's cheap refusals and before the sync: it checks the code being sent
-            return remote.submit(arguments, local, before_sync=lambda: settle_check(arguments, local, dry_run=arguments.dry_run))
+        try:  # the check runs on that site, after the sync and before the job is queued there (D47)
+            return remote.submit(arguments, local)
         except remote.RemoteRefused as error:
             raise Refused(str(error)) from None
     site = gpu_jobs.load_site()

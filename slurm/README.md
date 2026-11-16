@@ -670,8 +670,10 @@ builds the model, and takes a step or two on the CPU, in seconds and under 4 min
 `submit` with a check allows it at least 300 s. When no check is possible, `--no-check` gives the reason, which
 the record and page keep. A sweep submits the same check many times: a pass of the same command from the same
 folder by the same user counts for 10 minutes. Parallel submissions of one check run it once, and the rest reuse
-its pass. `gpujobs-urgent` takes the same two flags. A `--site` submission runs its check here, before the code is
-sent.
+its pass. `gpujobs-urgent` takes the same two flags. A `--site` submission runs its check on that site, after the
+code and data are copied and before the job is queued there (so it sees what the job will see: the check is run as
+`env NAME=<data_root> CMD` under `--data-env`); that site's `submit.py` needs `--check` (commit 6950607 or later,
+7d2c902 for its signal handling), and a site without it is refused before anything is copied.
 
 The site field `require_check` (section 4) decides what happens when a submission states neither flag: nothing
 (`off`), a warning (`recommend`), or a refusal naming both flags (`enforce`).
@@ -726,8 +728,15 @@ A site file may name other sites it sends jobs to (`[remote.NAME]`: `host`, `roo
 `submit.py --site NAME --repo R --entry E [--search DIR] [--data DIR] <the usual options> -- command` then:
 builds the import closure of `E` with `dgx/assert_code_parity.py` (an import in the repo that sits on no search root is
 a refusal); copies the closure and each `--data` folder (inside `R`) to `root/<project>/` there with `rsync --checksum`,
-so what is already there is skipped; reads the closure's checksums back and refuses if they differ; and runs that
-site's own `gpujobs-submit` over ssh from the same relative folder. Nothing is queued unless every step passed.
+so what is already there is skipped; reads the closure's checksums back and refuses if they differ; runs
+`remote_import_check.py` there with the job's Python (the command's first word when it is a Python, else
+`--remote-python PATH`, relative to `--workdir`) and refuses if Python would load a name of the closure from outside the
+synced folder (a package copied without its `__init__.py` is replaced by a regular package of the same name on the path,
+such as a venv's editable install of another checkout; the closure includes every parent package's `__init__.py`); and
+runs that site's own `gpujobs-submit` over ssh from the same relative folder. Nothing is queued unless every step passed.
+A `--data` folder holding a symlink that would dangle there (absolute, or leaving its folder) is refused: only the link
+is copied, never its target, and copying the target in would copy it once per link and put it where the project never
+looks for it. Name the target's folder with `--data` instead.
 A `--data` folder outside `R` (datasets kept elsewhere) needs `data_root` (absolute) in the `[remote.NAME]` table: it is
 synced by the same checksum rule to `data_root/<name>` there, where `<name>` is its path relative to `--data-base DIR`
 (so `DIR/gpe/x` lands at `data_root/gpe/x`; without `--data-base`, its own folder name), and a folder already there
