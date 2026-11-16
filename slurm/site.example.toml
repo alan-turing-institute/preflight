@@ -119,6 +119,15 @@ python = "/opt/gpujobs/venv/bin/python"       # interpreter with localmodels ins
 # submit_command = "gpujobs-submit"   # optional; these are the defaults
 # status_command = "gpujobs-status"
 # data_root = "/data/shared/datasets"   # optional, absolute: where --data folders from OUTSIDE the repo land there
+# Fetch-back (submit.py --site --fetch-back, fetch_back.py add); every key optional, defaults shown:
+# fetch_exclude = []                  # rsync patterns never fetched from there, e.g. ["snapshot-*.ckpt"]
+# fetch_keep_free_gb = 10             # a fetch waits rather than leave less than this free here
+# fetch_wait_days = 7                 # a job not ended this long after its record was written is given up
+# fetch_retry_s = [60, 300, 900, 3600]   # pause after the 1st, 2nd, ... failure in a row; the last repeats
+# fetch_lost_after_s = 3600           # a job id the accounting there has not known for this long is lost
+# auth_expired_text = ""              # text in ssh's error when the login there has expired; "" = never checked
+# renew_hint = ""                     # what to tell the user to run when it has
+# A remote this site only fetches from (its jobs are queued another way): submit_command = ""
 
 # Optional. A `service` partition for background services' CPU stand-ins (submit.py --service): started at once by
 # suspending CPU-only jobs, never touching GPU jobs. Leave the table out when no service has one.
@@ -159,7 +168,7 @@ python = "/opt/gpujobs/venv/bin/python"       # interpreter with localmodels ins
 
 # Optional. The numbers a site may tune; each line shows its default (today's value, ratified where a decision is named).
 # Leave the table out to keep them all. Every value is a finite number above 0 (the four multipliers: 1 or more);
-# oom_min_bump_mb, history_runs, unclean_min_s, outside_keep_days and ended_kept are whole numbers.
+# oom_min_bump_mb, history_runs, unclean_min_s, outside_keep_days, ended_kept and fetch_every_s are whole numbers.
 # [tuning]
 # auto_margin = 0.10              # --mem auto: the measured peak plus this share (D28, D35)
 # unclean_margin = 0.25           # --mem auto with no clean run: the largest crashed or pre-empted peak plus this share
@@ -179,6 +188,7 @@ python = "/opt/gpujobs/venv/bin/python"       # interpreter with localmodels ins
 # outside_keep_days = 14          # days the record of GPU work found outside slurm is kept
 # ended_kept = 5000               # how many ended jobs the agent remembers
 # memory_guard_min_excess_gb = 1.0  # a job counts as over its ask only beyond this (D44)
+# fetch_every_s = 300             # the per-user fetch-back timer runs this often (D52)
 
 [metrics]
 mode = "off"            # local (install Prometheus and Grafana here), external (use the URLs below), or off. Default: off

@@ -42,7 +42,7 @@ What else the same command can do, each set out in section 7:
 | Several copies of one job to share a card (the site must enable `shards`) | measure once with `gpujobs-sharing measure`, then submit as usual; `--max-jobs N` sets the number |
 | A CPU-only job to run on a spare machine as well (a "part-time" machine, if the site lists one) | nothing for a `resume` job the machine can run; `--anywhere` if you vouch for it |
 | A small CPU stand-in for a background service | `--service` |
-| A job on another site's slurm | `--site NAME` (the site file's `[remote.NAME]`) |
+| A job on another site's slurm | `--site NAME` (the site file's `[remote.NAME]`); `--fetch-back DIR` brings a folder of it home when it ends |
 | Urgent work (administrators only) | use `gpujobs-urgent` instead |
 
 **If you are setting up a machine:** `python3 slurm/install/install.py detect > site.toml`, edit it against the commented
@@ -175,12 +175,12 @@ TOML. Tables: the top level, `[[nodes]]` with `[[nodes.gpus]]`, `[lease]` with `
 | `unified_memory` | `false` | True when the GPU shares system memory with the host (`nvidia-smi` reports total memory as `[N/A]`). `detect` sets it. On such a site the Jobstats dashboard's GPU memory panel plots the agent's per-job series, because the GPU exporter has none to report. |
 | `hostguard` | `false` | The job wrapper marks every job as the preferred out-of-memory victim (`oom_score_adj` 800, through the host memory guard in `hostguard/hostguard.py`), so a memory shortage ends a job rather than a login session. The `tools` component installs the guard when this is on. |
 | `dgx_gate` | `false` | Require the DGX submission gate for jobs submitted with `--entry` (other jobs are not gated). The `tools` component installs the gate (`dgx/`) and the host memory guard it checks when this is on. |
-| `notify_command` | `[]` | Command (list of arguments, no shell, 30 s limit) the agent runs once per notice, with the notice in its environment. Every notice: `GPUJOBS_EVENT` (`failed`: a job ended FAILED, OUT_OF_MEMORY, TIMEOUT or NODE_FAIL; `idle`: a waste finding; `over_ask`: a running job holds at least 1 GB more memory, host plus card, than it asked for, once per run, unified-memory nodes only; `memory_stop`: the memory guard stopped a job, see "Memory on unified-memory nodes"), `GPUJOBS_JOB` (the job the notice is about), its `GPUJOBS_NAME`, `GPUJOBS_PROJECT` (the name's first `:` field) and `GPUJOBS_USER`, and `GPUJOBS_MESSAGE`, one plain sentence ready to send. A failure adds `GPUJOBS_STATE`; a memory stop adds `GPUJOBS_ENDED` (`by_wrapper`, `by_scancel` or `not_ended`). An idle finding is sent to both sides, at most once an hour per pair: `GPUJOBS_ROLE` is `waiting` (the job that waits) or `holding` (a running job holding what it lacks), and `GPUJOBS_OTHER_JOB` and `GPUJOBS_OTHER_PROJECT` name the other side. Names are whatever their submitter typed, with control characters shown as `?`: quote them wherever they go into a shell command or a mail header. Empty means no notification. `slurm/notify_mail.py` is a working example that mails each notice to the job's user through `sendmail` (`["/usr/bin/python3", "/opt/gpujobs/slurm/notify_mail.py", "--domain", "example.org"]`); any other channel is a script reading the same variables. |
+| `notify_command` | `[]` | Command (list of arguments, no shell, 30 s limit) the agent runs once per notice, with the notice in its environment. Every notice: `GPUJOBS_EVENT` (`failed`: a job ended FAILED, OUT_OF_MEMORY, TIMEOUT or NODE_FAIL; `idle`: a waste finding; `over_ask`: a running job holds at least 1 GB more memory, host plus card, than it asked for, once per run, unified-memory nodes only; `memory_stop`: the memory guard stopped a job, see "Memory on unified-memory nodes"; `fetch_failed`, `fetch_blocked`, `fetch_expired`, `fetch_then_failed`: a remote job's fetch-back, sent by `fetch_back.py` as the user, see "Bringing a remote job's folders home"), `GPUJOBS_JOB` (the job the notice is about), its `GPUJOBS_NAME`, `GPUJOBS_PROJECT` (the name's first `:` field) and `GPUJOBS_USER`, and `GPUJOBS_MESSAGE`, one plain sentence ready to send. A failure adds `GPUJOBS_STATE`; a memory stop adds `GPUJOBS_ENDED` (`by_wrapper`, `by_scancel` or `not_ended`). An idle finding is sent to both sides, at most once an hour per pair: `GPUJOBS_ROLE` is `waiting` (the job that waits) or `holding` (a running job holding what it lacks), and `GPUJOBS_OTHER_JOB` and `GPUJOBS_OTHER_PROJECT` name the other side. Names are whatever their submitter typed, with control characters shown as `?`: quote them wherever they go into a shell command or a mail header. Empty means no notification. `slurm/notify_mail.py` is a working example that mails each notice to the job's user through `sendmail` (`["/usr/bin/python3", "/opt/gpujobs/slurm/notify_mail.py", "--domain", "example.org"]`); any other channel is a script reading the same variables. |
 | `sharing_memory_fraction` | absent | Only for sites that share a card (`shards`, below). A number above 0 and at most 1: the share of a node's jobs memory that the jobs sharing a card may fill together, counted at their measured peaks. It tightens two gates alike: `sharing.py measure` drops any level whose peak memory in use passes it (of the box's total memory), and `submit.py` caps the copies by it (of the node's jobs memory). Absent: they may fill all of it. |
 | `cpus_from_history` | `recommend` | Cores for a CPU-only job given `--name` and no `--cpus` (section 7). `off`: nothing. `recommend`: `submit` prints the cores the job's 3 newest completed runs (`[tuning] history_runs`) of the same `project:class:name` justify and asks as before. `enforce`: it asks for them. The figure is their highest average cores in use (core time over wall time, from `sacct`) times 1.25 (`[tuning] cores_margin`), rounded up, from 1 to the cores the job may have. |
 | `memory_from_size` | `recommend` | Memory for a job given `--size COUNT UNIT` and no `--mem` (section 7, "Memory from a declared size"). `off`: nothing. `recommend`: `submit` prints the memory the project's earlier runs of that unit justify and asks as before. `enforce`: it asks for the larger of that figure and the name's own measured one, except a figure as large as the whole box, which is printed and never applied. |
 | `require_check` | `recommend` | A submission that states neither `--check` nor `--no-check` (section 7, "Checks before queuing"). `off`: accepted silently. `recommend`: accepted with a warning. `enforce`: refused, with the two flags named. |
-| `tuning` | all defaults | Optional table of the numbers a site may tune: sizing margins and history (`auto_margin`, `unclean_margin`, `oom_bump_ratio`, `oom_min_bump_mb`, `cores_margin`, `history_runs`, `unclean_min_s`, `size_extrapolation_limit`, `cores_over_ask`), check limits (`check_timeout_s`, `check_reuse_s`, `check_heavy_gb`) and the agent's pace and memory (`idle_every_s`, `idle_notice_every_s`, `copy_every_s`, `outside_keep_days`, `ended_kept`, and the memory guard's `memory_guard_min_excess_gb`). Each default and meaning is in `site.example.toml`; a value must be above 0. The tools read it when they start: the agent after `apply --component agent`. Install the new tools on every node (part-time ones too) before adding the table: an older copy refuses a key it does not know. |
+| `tuning` | all defaults | Optional table of the numbers a site may tune: sizing margins and history (`auto_margin`, `unclean_margin`, `oom_bump_ratio`, `oom_min_bump_mb`, `cores_margin`, `history_runs`, `unclean_min_s`, `size_extrapolation_limit`, `cores_over_ask`), check limits (`check_timeout_s`, `check_reuse_s`, `check_heavy_gb`) and the agent's pace and memory (`idle_every_s`, `idle_notice_every_s`, `copy_every_s`, `outside_keep_days`, `ended_kept`, and the memory guard's `memory_guard_min_excess_gb`) and the fetch-back timer's `fetch_every_s`. Each default and meaning is in `site.example.toml`; a value must be above 0. The tools read it when they start: the agent after `apply --component agent`. Install the new tools on every node (part-time ones too) before adding the table: an older copy refuses a key it does not know. |
 | `nodes` | required | One `[[nodes]]` table per compute node; at least one. |
 | `lease` | absent | Optional table; leave it out when no other service shares the GPU through the lease. Without it the `lease` component is not installed. |
 | `metrics` | all defaults below | Table. |
@@ -465,6 +465,10 @@ an `idle` event on both jobs: the job's page shows it in its timeline and `gpujo
 either job, so nobody has to be messaged. A site that also wants notices pushed sets `notify_command` (told once an
 hour per pair).
 
+**`fetch`** (only when the site file has a `[remote.*]` table). `gpujobs-fetch.service` and `gpujobs-fetch.timer`,
+systemd **user** units in `/etc/systemd/user/`, running `fetch_back.py run` every `[tuning] fetch_every_s` seconds for
+each user who enabled it (`gpujobs-fetch-back enable`); package `rsync`.
+
 **`lease`** (only when `[lease]` is present). `slurm-gpu-lease-keeper.service`, a systemd **user** unit of
 `keeper_user`, written to `/etc/systemd/user/` and enabled through that user's manager (nothing is written in the
 user's home). It needs that user's systemd instance running
@@ -746,6 +750,41 @@ that reads its datasets from an environment variable finds them.
 `--service`, `--anywhere`, `--suspend` and `--log` belong to the owning site and are refused. `--after` takes ids on
 the other site. The job is watched with that site's own tools; `status.py --site NAME` prints its queue. This site keeps
 no copy of the job, so the local page does not list it (D24).
+
+### Bringing a remote job's folders home
+
+`submit.py --site NAME ... --fetch-back PATH [--fetch-to DIR]` (both repeatable, paired in order) records, after the job
+is queued there, that the folder `root/<project>/PATH` there comes back to `R/PATH` here (or to `DIR`, absolute, for
+heavy folders kept outside the repository) when the job ends. `PATH` must be inside `R` and need not exist here yet. A
+job queued there another way (a chain's last job, a cluster without these tools) gets the same record with
+`gpujobs-fetch-back add --site NAME --job ID[,ID] --from DIR --to DIR [--from ... --to ...]`; `--from` is absolute or
+relative to the login home there. The record is the user's own (`~/.local/state/gpujobs/fetch/NAME/`, readable by them
+only); nothing is copied to the shared state folder or shown on the jobs page (D52).
+
+Options (on both): `--fetch-on completed` (default: only when every listed job ended COMPLETED, so a folder that
+arrives still means success) or `finished` (whatever they ended as); `--fetch-include P` and `--fetch-exclude P`,
+rsync patterns applied in the order given after the site's `fetch_exclude` (e.g. `--fetch-exclude 'snapshot-*.ckpt'`);
+`--fetch-existing update` (default: a file newer here is kept), `keep` (nothing here is touched) or `replace`;
+`--fetch-max-size SIZE`; `--fetch-keep-free GB` and `--fetch-wait DAYS` (defaults from the site file);
+`--fetch-then CMD`, run once from `R` (no shell) after a successful fetch, its exit code kept and a failure told.
+
+`gpujobs-fetch-back run` does the work and is what the user's timer runs (enable it once with
+`gpujobs-fetch-back enable`; without user systemd, run it from cron). Each run takes a lock per remote, asks that
+site's `sacct` once for every waiting job over one ssh connection, and pulls the folders of the jobs that ended as
+asked with `rsync -rltE` from that site: nothing there is changed or removed, nothing here is deleted, an interrupted
+file waits in `.gpujobs-partial` and never appears under its own name, links pointing out of the folder are not made,
+and a folder is pulled only when its size (from a dry run) leaves `fetch_keep_free_gb` free. A dropped connection is
+retried after `fetch_retry_s`; a job unknown to the accounting there for `fetch_lost_after_s` is `lost`; one not ended
+by the deadline is `expired`; a job of another account, or one run outside `root/<project>` there, is refused. An
+expired login (ssh's error contains `auth_expired_text`) blocks the record with `renew_hint` until it is renewed; the
+tools never renew it. `gpujobs-fetch-back status` lists the records (waiting, fetching, blocked, done, skipped,
+failed, expired, lost) with what was pulled and why one stopped; `run --force ID` fetches a skipped job anyway
+(`--then-again` reruns its command); `status --prune DAYS` deletes old final records; `wait ID` runs until the record
+is final and exits 0 only when its folders arrived. `status.py --site NAME` ends with this user's counts. Failures,
+blocks and expiries go through `notify_command` once each; a fetch that worked is not pushed.
+
+Limits: the check of the job's end needs a shell there for `sacct`, so a key restricted to `rrsync -ro` cannot be used.
+A `[remote.NAME]` whose `submit_command` is `""` is a remote this site only fetches from: `submit.py --site` refuses it.
 
 ## 8. Operations and caveats
 
