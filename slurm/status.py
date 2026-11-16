@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import agent  # noqa: E402 - path set just above
 import audit  # noqa: E402
+import fetch_back
 import gpu_jobs  # noqa: E402
 import jobs_view  # noqa: E402
 import remote  # noqa: E402
@@ -174,6 +175,9 @@ def main() -> int:
     if arguments.site:
         try:
             print(remote.status(gpu_jobs.load_site(), arguments.site))
+            fetched = fetch_back.summary_line(arguments.site)  # this user's records for that site (D52)
+            if fetched:
+                print(fetched)
         except remote.RemoteRefused as error:
             print(f"[status] REFUSED: {error}", file=sys.stderr)
             return 1

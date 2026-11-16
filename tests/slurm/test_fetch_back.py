@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import dataclasses
 import fcntl
 import os
@@ -304,3 +305,30 @@ def test_wait_ends_with_the_fetch_and_says_whether_the_folders_arrived(there: Re
     assert fb.main(["wait", "41", "--site", "site-b"], ctx, sleep=complete) == 0
     assert pauses == [site.tuning.fetch_every_s]
     assert fb.main(["wait", "99", "--site", "site-b"], ctx, sleep=complete) == 1
+
+
+def test_a_submitted_job_gets_its_record_or_the_exact_command_that_writes_it(there: Remote, tmp_path: Path) -> None:
+    repo = tmp_path / "proj"
+    repo.mkdir()
+    site = SimpleSite({"site-b": site_config.Remote("site-b", "gpujobs-sync", fetch_exclude=("snapshot-*.ckpt",))})
+    given = argparse.Namespace(site="site-b", project="proj", repo=repo, fetch_to=[], fetch_filters=[("+", "*resume_*"), ("-", "*")],
+                               fetch_on=fr.FetchOn.COMPLETED, fetch_existing=Existing.UPDATE, fetch_max_size=None,
+                               fetch_keep_free=None, fetch_wait=None, fetch_then=None)
+    pairs = [("gpujobs-sync/proj/out", str(repo / "out"))]
+    there.states = {"41": "PENDING"}
+    there.workdir = "/home/alice/gpujobs-sync/proj"
+    ctx = context(there, tmp_path)
+    said = fb.record_after_submit(given, site, "[submit] job 41 (normal)\n41\n", pairs, ctx)
+    assert said.startswith("[fetch] job 41: 1 folder(s) come home")
+    record = fr.find(fr.store_dir("site-b", ctx.env), "41")
+    assert record.paths[0].filters == (("-", "snapshot-*.ckpt"), ("+", "*resume_*"), ("-", "*"))
+    assert record.workdir_root == "/home/alice/gpujobs-sync/proj" and record.repo == str(repo.resolve())
+    failed = fb.record_after_submit(given, site, "[submit] something else\n", pairs, ctx)
+    assert failed.startswith("[fetch] NOT RECORDED") and "the job is queued" in failed
+    assert "--from gpujobs-sync/proj/out --to" in failed and "--fetch-include '*resume_*' --fetch-exclude '*'" in failed
+
+
+class SimpleSite:
+    def __init__(self, remotes: dict) -> None:
+        self.remotes, self.notify_command = remotes, ()
+        self.tuning = site_config.Tuning()

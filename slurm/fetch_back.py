@@ -416,6 +416,38 @@ def add_record(name: str, settings: Settings, jobs: list[str], pairs: list[tuple
     return record
 
 
+def flags_of(options: Options, pairs: list[tuple[str, str]]) -> list[str]:
+    """The `fetch_back.py add` arguments that write the same record (printed when `submit.py` could not write it)."""
+    out = [part for there, here in pairs for part in ("--from", there, "--to", here)]
+    out += [part for sign, pattern in options.filters for part in (f"--fetch-{'include' if sign == '+' else 'exclude'}", pattern)]
+    out += ["--fetch-on", options.fetch_on, "--fetch-existing", options.existing]
+    for flag, value in (("--fetch-max-size", options.max_size), ("--fetch-keep-free", options.keep_free_gb),
+                        ("--fetch-wait", options.wait_days), ("--fetch-then", options.then),
+                        ("--project", options.project or None)):
+        out += [flag, str(value)] if value is not None else []
+    return out
+
+
+def record_after_submit(arguments: argparse.Namespace, site: site_config.Site, output: str,
+                        pairs: list[tuple[str, str]], ctx: Context | None = None) -> str:
+    """Write the record for a job `submit.py --site` has just queued; the job id is the last line the remote
+    `submit.py` printed. The job is queued either way, so a record that cannot be written is a printed remedy."""
+    name, options = arguments.site, options_from(arguments, arguments.project)
+    job = output.strip().splitlines()[-1].strip() if output.strip() else ""
+    command = ["fetch_back.py", "add", "--site", name, "--job", job or "ID", *flags_of(options, pairs)]
+    try:
+        if not gpu_jobs.JOB_ID.fullmatch(job):
+            raise FetchRefused(f"the remote submit did not end with a job id ({job!r})")
+        remote_ = remote.pick(site, name)
+        record = add_record(name, Settings.from_site(site, name), [job], pairs, options,
+                            ctx or Context(notify_command=site.notify_command),
+                            repo=None if getattr(arguments, "fetch_to", None) else arguments.repo,
+                            workdir_root=remote.project_root(remote_, arguments.project))
+    except (FetchRefused, remote.RemoteRefused) as error:
+        return f"[fetch] NOT RECORDED: {error}; the job is queued: once that is fixed, run `{shlex.join(command)}`"
+    return f"[fetch] job {job}: {len(record.paths)} folder(s) come home when it ends (fetch_back.py status --site {name})"
+
+
 # ---------------------------------------------------------------------------------------------------------------------
 # What the user sees.
 

@@ -245,8 +245,32 @@ def forwarded(arguments: argparse.Namespace, env: list[str] = ()) -> list[str]:
     return out
 
 
+def fetch_pairs(arguments: argparse.Namespace, remote: site_config.Remote) -> list[tuple[str, str]]:
+    """`--fetch-back PATH` (and `--fetch-to DIR`) as (folder there, folder here) pairs, refused before anything is sent:
+    each PATH is inside --repo and not the repo itself; it lands at the same place in the repo or at its --fetch-to."""
+    targets = getattr(arguments, "fetch_to", None) or []
+    if targets and len(targets) != len(arguments.fetch_back):
+        raise RemoteRefused("give one --fetch-to for each --fetch-back, in the same order, or none")
+    repo = arguments.repo.resolve()
+    pairs = []
+    for index, given in enumerate(arguments.fetch_back):
+        path = (repo / given).resolve()
+        if ".." in Path(given).parts or path == repo or not path.is_relative_to(repo):
+            raise RemoteRefused(f"--fetch-back {given}: give a folder inside --repo {repo}")
+        if path.exists() and not path.is_dir():
+            raise RemoteRefused(f"--fetch-back {given}: not a folder")
+        here = targets[index] if targets else str(path)
+        if not Path(here).is_absolute():
+            raise RemoteRefused(f"--fetch-to {here}: give an absolute path")
+        pairs.append((f"{project_root(remote, arguments.project)}/{path.relative_to(repo)}", here))
+    return pairs
+
+
 def submit(arguments: argparse.Namespace, site: site_config.Site) -> str:
     remote = pick(site, arguments.site)
+    if not remote.submit_command:
+        raise RemoteRefused(f"[remote.{arguments.site}] has no submit_command: jobs are not sent there; for a job queued "
+                            f"there another way, `fetch_back.py add --site {arguments.site} ...` brings its folders home")
     shipped = plan(arguments, remote)
     repo, files, data, outside = shipped.repo, shipped.files, shipped.data, shipped.outside
     root = project_root(remote, arguments.project)

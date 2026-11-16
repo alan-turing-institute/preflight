@@ -173,6 +173,24 @@ def test_a_job_for_another_site_makes_no_local_part_time_decision(monkeypatch: p
     assert submit.submit([*RESUME, "--site", "turing", "--no-anywhere", "--", "x"]) == "remote" and calls == []
 
 
+def test_fetch_back_goes_with_a_site_and_its_record_is_printed_before_the_remote_output(
+        monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    fake_site(monkeypatch, lease=None, dgx_gate=False)
+    with pytest.raises(submit.Refused, match="--fetch-back goes with --site"):
+        submit.submit([*RESUME, "--fetch-back", "out", "--", "x"])
+    with pytest.raises(submit.Refused, match="go with --fetch-back"):
+        submit.submit([*RESUME, "--site", "turing", "--fetch-exclude", "*.ckpt", "--", "x"])
+    monkeypatch.setattr(submit.remote, "pick", lambda *_a: None)
+    monkeypatch.setattr(submit.remote, "fetch_pairs", lambda arguments, _r: [("sync/p/out", "/home/u/p/out")])
+    monkeypatch.setattr(submit.remote, "submit", lambda *_a, **_k: "[submit] job 7\n7")
+    seen = []
+    monkeypatch.setattr(submit.fetch_back, "record_after_submit",
+                        lambda arguments, _site, out, pairs: seen.append((out, pairs, arguments.fetch_filters)) or "[fetch] recorded")
+    assert submit.submit([*RESUME, "--site", "turing", "--fetch-back", "out", "--fetch-exclude", "*.ckpt", "--", "x"]) == "[submit] job 7\n7"
+    assert seen == [("[submit] job 7\n7", [("sync/p/out", "/home/u/p/out")], [("-", "*.ckpt")])]
+    assert capsys.readouterr().out == "[fetch] recorded\n"  # before the output, whose last line is the job id
+
+
 def test_an_unknown_class_is_refused_by_the_parser() -> None:
     with pytest.raises(SystemExit):
         dry("--project", "p", "--what", "w", "--class", "service", "--mem", "1G", "--", "x")

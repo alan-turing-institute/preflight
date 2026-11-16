@@ -83,6 +83,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import audit  # noqa: E402 - path set just above
 import checks
 import cores
+import fetch_back
 import gpu_jobs  # noqa: E402
 import jobs_view
 import portability
@@ -680,6 +681,11 @@ def parser() -> argparse.ArgumentParser:
                         "DIR/gpe/x lands at data_root/gpe/x there (default: its own name)")
     p.add_argument("--data-env", default=None, metavar="NAME",
                    help="with --site: run the command with NAME set to the site's data_root (e.g. AUTOCAST_DATASETS)")
+    p.add_argument("--fetch-back", action="append", default=[], metavar="PATH",
+                   help="with --site: a folder inside --repo to bring home when the job ends (repeatable; D52)")
+    p.add_argument("--fetch-to", action="append", default=[], metavar="DIR",
+                   help="with --fetch-back: where that folder lands here instead (absolute; one per --fetch-back, in order)")
+    fetch_back.add_fetch_arguments(p)
     p.add_argument("--remote-python", default=None, metavar="PATH",
                    help="with --site: the Python the job runs there (relative to --workdir), used to check that its imports "
                         "load from the synced folder; default: the command's first word when it is a Python")
@@ -715,13 +721,24 @@ def submit(argv: list[str]) -> str:
     if (arguments.data or arguments.data_base or arguments.data_env or arguments.remote_python) and not arguments.site:
         msg = "--data, --data-base, --data-env and --remote-python go with --site (they say what to sync to that site and how to check it)"
         raise Refused(msg)
+    fetching = (arguments.fetch_to or arguments.fetch_filters or arguments.fetch_then or arguments.fetch_max_size
+                or arguments.fetch_keep_free is not None or arguments.fetch_wait is not None)
+    if (arguments.fetch_back and not arguments.site) or (fetching and not arguments.fetch_back):
+        msg = "--fetch-back goes with --site, and the other --fetch-* options go with --fetch-back"
+        raise Refused(msg)
     if arguments.site:
         arguments.name = arguments.name or Path(arguments.command[0]).name
         local = gpu_jobs.load_site()
         try:  # the check runs on that site, after the sync and before the job is queued there (D47)
-            return remote.submit(arguments, local)
+            pairs = remote.fetch_pairs(arguments, remote.pick(local, arguments.site)) if arguments.fetch_back else []
+            out = remote.submit(arguments, local)
         except remote.RemoteRefused as error:
             raise Refused(str(error)) from None
+        if pairs and arguments.dry_run:
+            print(f"[fetch] dry run: would bring home {', '.join(f'{there} -> {here}' for there, here in pairs)}")
+        elif pairs:  # printed before the remote's output, whose last line stays the job id
+            print(fetch_back.record_after_submit(arguments, local, out, pairs))
+        return out
     site = gpu_jobs.load_site()
     named = arguments.name
     arguments.name = arguments.name or Path(arguments.command[0]).name

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -216,3 +217,25 @@ def test_a_symlink_that_would_dangle_there_refuses_the_data_folder_naming_it(rep
     (folder / "up.bin").symlink_to(Path("..") / ".." / ".." / "big.bin")  # relative, leaves the folder
     with pytest.raises(remote.RemoteRefused, match="up.bin"):
         remote.plan(arguments(repo), REMOTE)
+
+
+def test_fetch_back_folders_must_be_inside_the_repo_and_land_where_asked(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    (repo / "out").mkdir()
+    (repo / "notes.txt").write_text("x")
+    pairs = remote.fetch_pairs(arguments(repo, fetch_back=["out", "runs/new"]), REMOTE)
+    assert pairs == [("sync/p/out", str(repo / "out")), ("sync/p/runs/new", str(repo / "runs" / "new"))]  # may not exist yet
+    moved = remote.fetch_pairs(arguments(repo, fetch_back=["out"], fetch_to=["/cache/p/out"]), REMOTE)
+    assert moved == [("sync/p/out", "/cache/p/out")]
+    for given, extra, fragment in [
+        ("../elsewhere", {}, "inside --repo"), (".", {}, "inside --repo"), ("out/../..", {}, "inside --repo"),
+        ("notes.txt", {}, "not a folder"), ("out", {"fetch_to": ["/a", "/b"]}, "one --fetch-to for each"),
+        ("out", {"fetch_to": ["cache/out"]}, "absolute path"),
+    ]:
+        with pytest.raises(remote.RemoteRefused, match=re.escape(fragment)):
+            remote.fetch_pairs(arguments(repo, fetch_back=[given], **extra), REMOTE)
+    box = Box(repo)
+    monkeypatch.setattr(remote.subprocess, "run", box)
+    fetch_only = site_config.Remote("box", "sync", submit_command="")
+    with pytest.raises(remote.RemoteRefused, match="fetch_back.py add --site turing"):
+        remote.submit(arguments(repo), SimpleNamespace(remotes={"turing": fetch_only}))
+    assert box.calls == []
