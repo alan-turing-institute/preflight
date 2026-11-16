@@ -82,6 +82,7 @@ import levels
 import memory_guard
 import node_check
 import site_config
+from transfer import COPY_IO_TIMEOUT_S, RSYNC_PARTIAL
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "install"))  # the installer ships render.py there
 
@@ -126,7 +127,6 @@ THRESHOLD_FIELDS = {"close_below_gb": "close_below_mb", "push_back_below_gb": "p
 MAX_THRESHOLD_GB = 1000
 #: Job state is copied back from each part-time machine this often (plan B5b); rsync gives up after its own timeout.
 COPY_EVERY_S = gpu_jobs.TUNING.copy_every_s  # site file [tuning]
-COPY_IO_TIMEOUT_S = 20
 COPY_CALL_TIMEOUT_S = 300
 COPY_KEY = Path(render.COPY_KEY)  # under the state dir; `install.py part-time add` makes it
 KNOWN_HOSTS = COPY_KEY.parent / "known_hosts"  # and this: the node's host key from the admin's own known_hosts (B7.1)
@@ -136,8 +136,6 @@ COPY_OPTIONS = [
     "--no-perms", "--chmod=D755,F644", "--no-links", "--max-size=50M",
     *(f"--include=/{sub}/***" for sub in ("jobs", "events", "logs", "footprints", "owners")), "--exclude=*",
 ]
-#: rsync's "some files could not be transferred" and "some files vanished": the rest was copied.
-RSYNC_PARTIAL = frozenset({23, 24})
 RESUME_PROTECTED = frozenset({gpu_jobs.Partition.URGENT, gpu_jobs.Partition.SERVICE})
 
 #: The idle check (Part C2) looks this often, and tells one project about one holder at most this often.
