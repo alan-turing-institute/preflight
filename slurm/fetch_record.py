@@ -201,6 +201,15 @@ def _waiting(record: Record, now: float) -> Record:
     return dataclasses.replace(record, state=RecordState.WAITING)
 
 
+def expire_if_late(record: Record, now: float) -> Record:
+    """Past its deadline a record that is not final ends EXPIRED, whatever it was doing (waiting for the job, blocked on
+    a login or on room here, or retrying a copy), so nothing waits for ever."""
+    if is_final(record) or now <= record.deadline:
+        return record
+    doing = f"it was {record.state}{f': {record.note}' if record.note else ''}"
+    return dataclasses.replace(record, state=RecordState.EXPIRED, finished_at=now, note=f"not fetched by the deadline ({doing})")
+
+
 def advance(record: Record, answer: Answer, now: float, policy: Policy) -> Record:
     """The record after one `sacct` answer (design 3, 4, 6). A final record stays as it is, except a skipped one that
     `run --force` re-opened."""
@@ -213,7 +222,7 @@ def advance(record: Record, answer: Answer, now: float, policy: Policy) -> Recor
     first = next(iter(rows.values()), None)
     record = dataclasses.replace(
         record,
-        failures=0,
+        failures=record.failures if record.state == RecordState.FETCHING else 0,  # a failing copy keeps its backoff
         next_try=0.0,
         job_states={**record.job_states, **{job: row[0] for job, row in rows.items()}},
         owner=record.owner or (first[1] if first else ""),

@@ -139,6 +139,9 @@ NOTICES = {
     fr.RecordState.EXPIRED: agent.NotifyEvent.FETCH_EXPIRED,
 }
 TIMER = "gpujobs-fetch.timer"
+#: Exit codes kept for a `--fetch-then` command that did not finish, as timeout(1) and the shell report them.
+THEN_TIMED_OUT = 124
+THEN_NOT_RUN = 127
 
 
 class FetchRefused(Exception):
@@ -159,12 +162,14 @@ class Settings:
     auth_expired_text: str
     renew_hint: str
     every_s: int
+    then_timeout_s: int
 
     @classmethod
     def from_site(cls, site: site_config.Site, name: str) -> Settings:
         r = remote.pick(site, name)
         return cls(r.host, r.root, r.fetch_exclude, r.fetch_keep_free_gb, r.fetch_wait_days, r.fetch_retry_s,
-                   r.fetch_lost_after_s, r.auth_expired_text, r.renew_hint, site.tuning.fetch_every_s)
+                   r.fetch_lost_after_s, r.auth_expired_text, r.renew_hint, site.tuning.fetch_every_s,
+                   site.tuning.fetch_then_timeout_s)
 
     @property
     def policy(self) -> fr.Policy:
@@ -210,7 +215,7 @@ def read_jobs(settings: Settings, ssh: list[str], jobs: list[str], ctx: Context)
         return fr.Answer(False), done.stderr
     rows = {}
     for line in done.stdout.splitlines():
-        parts = line.split("|")
+        parts = line.split("|", len(SACCT_FIELDS) - 1)  # WorkDir is last and may itself hold a '|'
         if len(parts) == len(SACCT_FIELDS) and parts[0] in jobs:
             rows[parts[0]] = (parts[1], parts[2], parts[3])
     return fr.Answer(True, rows), ""
@@ -226,20 +231,34 @@ def owner_problem(record: fr.Record, user: str, workdir: str) -> str | None:
     return None
 
 
+def _rsync(ctx: Context, argv: list[str]) -> subprocess.CompletedProcess[str]:
+    """rsync in the C locale, whose numbers the size check reads ("5,000,003"; a German locale prints "5.000.003").
+    No overall time limit: a stalled transfer ends by rsync's own --timeout."""
+    try:
+        return ctx.runner(argv, capture_output=True, text=True, check=False, env={**ctx.env, "LC_ALL": "C"})
+    except OSError as exc:
+        return subprocess.CompletedProcess(argv, 1, "", str(exc))
+
+
 def _pull_one(record: fr.Record, path: FetchPath, settings: Settings, ssh: list[str], ctx: Context, log: Path) -> FetchPath:
     local = Path(path.local)
     if not inside(local, Path(record.repo)):
         return dataclasses.replace(path, state=fr.PathState.FAILED, last_error=f"{local} now leads outside {record.repo}")
-    local.mkdir(parents=True, exist_ok=True)
+    try:
+        local.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return dataclasses.replace(path, state=fr.PathState.FAILED, last_error=f"cannot make {local}: {exc}")
     tried = dataclasses.replace(path, attempts=path.attempts + 1)
-    dry = agent.call(ctx.runner, rsync_argv(settings.host, path, record.existing, ssh, dry_run=True), timeout=None)
+    dry = _rsync(ctx, rsync_argv(settings.host, path, record.existing, ssh, dry_run=True))
     outcome = classify(dry.returncode, dry.stderr)
     if outcome == Outcome.DONE:
-        need = planned_bytes(dry.stdout) or 0
+        need = planned_bytes(dry.stdout)
+        if need is None:  # fail closed: without the size, the free-space check cannot be made
+            return dataclasses.replace(tried, state=fr.PathState.PENDING, last_error="rsync's dry run reported no size")
         short = short_of_space(local, need, record.keep_free_gb)
         if short:
             return dataclasses.replace(tried, state=fr.PathState.BLOCKED, last_error=short)
-        done = agent.call(ctx.runner, rsync_argv(settings.host, path, record.existing, ssh), timeout=None)
+        done = _rsync(ctx, rsync_argv(settings.host, path, record.existing, ssh))
         with log.open("a", encoding="utf-8") as out:
             out.write(done.stdout)
         outcome = classify(done.returncode, done.stderr)
@@ -258,8 +277,10 @@ def fetch_paths(record: fr.Record, settings: Settings, ssh: list[str], ctx: Cont
     """Pull every folder not yet pulled; the record is DONE when all are, BLOCKED when one waits for room here, FAILED
     when one cannot be pulled and nothing else is left, else still FETCHING with a pause (design 4, 5)."""
     log = folder / f"{record.jobs[0]}.log"
-    paths = tuple(p if p.state == fr.PathState.DONE else _pull_one(record, p, settings, ssh, ctx, log) for p in record.paths)
-    record = dataclasses.replace(record, paths=paths)
+    settled = {fr.PathState.DONE, fr.PathState.FAILED}  # a failed folder is not tried again (`run --force` re-opens)
+    paths = tuple(p if p.state in settled else _pull_one(record, p, settings, ssh, ctx, log) for p in record.paths)
+    progress = sum(p.state == fr.PathState.DONE for p in paths) > sum(p.state == fr.PathState.DONE for p in record.paths)
+    record = dataclasses.replace(record, paths=paths, failures=0 if progress else record.failures)
     now, states = ctx.clock(), {p.state for p in paths}
     if states == {fr.PathState.DONE}:
         return dataclasses.replace(record, state=fr.RecordState.DONE, finished_at=now, note="")
@@ -274,7 +295,7 @@ def fetch_paths(record: fr.Record, settings: Settings, ssh: list[str], ctx: Cont
     return fr.retry_after(dataclasses.replace(record, note=pending.last_error), now, settings.policy)
 
 
-def run_then(record: fr.Record, folder: Path, ctx: Context, *, again: bool = False) -> fr.Record:
+def run_then(record: fr.Record, folder: Path, ctx: Context, timeout_s: float, *, again: bool = False) -> fr.Record:
     """The record's `--fetch-then` command, once, from its repo, after a successful fetch only (design 17.2)."""
     if record.state != fr.RecordState.DONE or not record.then or (record.then_result is not None and not again):
         return record
@@ -282,10 +303,13 @@ def run_then(record: fr.Record, folder: Path, ctx: Context, *, again: bool = Fal
     with log.open("a", encoding="utf-8") as out:
         try:
             code = ctx.runner(shlex.split(record.then), cwd=record.repo, stdout=out, stderr=subprocess.STDOUT,
-                              check=False).returncode
-        except OSError as exc:
+                              check=False, timeout=timeout_s).returncode
+        except subprocess.TimeoutExpired:
+            out.write(f"stopped after {timeout_s} s ([tuning] fetch_then_timeout_s)\n")
+            code = THEN_TIMED_OUT
+        except (OSError, ValueError) as exc:  # not found, or quoting shlex cannot read
             out.write(f"{exc}\n")
-            code = 127  # the shell's "command not found"
+            code = THEN_NOT_RUN
     return dataclasses.replace(record, then_result={"exit": code, "at": ctx.clock(), "log": str(log)})
 
 
@@ -310,7 +334,7 @@ def step(record: fr.Record, answer: fr.Answer, error: str, settings: Settings, s
         moved = dataclasses.replace(moved, note="")
     if moved.state == fr.RecordState.FETCHING:
         moved = fetch_paths(moved, settings, ssh, ctx, folder)
-    return run_then(moved, folder, ctx, again=then_again)
+    return run_then(moved, folder, ctx, settings.then_timeout_s, again=then_again)
 
 
 def _notice(old: fr.Record, new: fr.Record, ctx: Context) -> list[str]:
@@ -345,13 +369,16 @@ def run_site(name: str, settings: Settings, ctx: Context, *, force: frozenset[st
     folder = fr.store_dir(name, ctx.env)
     if not folder.is_dir():
         return []
-    with (folder / ".lock").open("w") as lock:
+    # one lock per remote host (not per site name): one connection to a host at a time, whatever names it has
+    with (folder.parent / f".{settings.host}.lock").open("w") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            return [f"[fetch] {name}: another run is fetching from it; this one leaves it"]
+            return [f"[fetch] {name}: another run is fetching from {settings.host}; this one leaves it"]
         now = ctx.clock()
-        records = [dataclasses.replace(r, force=True, next_try=0.0) if force & set(r.jobs) else r for r in fr.load_all(folder)]
+        reopen = {fr.RecordState.SKIPPED, *([fr.RecordState.DONE] if then_again else [])}  # --then-again: rerun its command
+        records = [dataclasses.replace(r, force=True, next_try=0.0) if force & set(r.jobs) and r.state in reopen
+                   else r for r in fr.load_all(folder)]
         due = [r for r in records if (not fr.is_final(r) or r.force) and r.next_try <= now]
         if not due:
             return []
@@ -359,7 +386,12 @@ def run_site(name: str, settings: Settings, ctx: Context, *, force: frozenset[st
         try:
             answer, error = read_jobs(settings, ssh, sorted({job for r in due for job in r.jobs}), ctx)
             for old in due:
-                new = step(old, answer, error, settings, ssh, ctx, folder, then_again=then_again)
+                try:  # one record that cannot be processed must not stop the others
+                    new = step(old, answer, error, settings, ssh, ctx, folder, then_again=then_again)
+                except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                    new = dataclasses.replace(old, state=fr.RecordState.FAILED, finished_at=ctx.clock(),
+                                              note=f"could not be processed: {exc}")
+                new = dataclasses.replace(fr.expire_if_late(new, ctx.clock()), force=False)  # --force acts once
                 fr.save(new, folder)
                 lines += _notice(old, new, ctx)
         finally:
@@ -379,21 +411,29 @@ def add_record(name: str, settings: Settings, jobs: list[str], pairs: list[tuple
     for there, here in pairs:
         if ".." in Path(there).parts:
             raise FetchRefused(f"--from {there}: no '..' in it")
+        if not there.strip().strip("/"):
+            raise FetchRefused(f"--from {there!r}: name the job's folder there, not the login home or the root")
         if not Path(here).is_absolute():
             raise FetchRefused(f"--to {here}: give an absolute path")
     base = (repo or Path(os.path.commonpath([here for _, here in pairs]))).resolve()
     for _, here in pairs:
         if not inside(Path(here), base):
             raise FetchRefused(f"--to {here} is outside {base}")
+    if options.then is not None:
+        try:
+            shlex.split(options.then)
+        except ValueError as exc:
+            raise FetchRefused(f"--fetch-then {options.then!r}: {exc}") from None
     folder = fr.store_dir(name, ctx.env)
-    taken = [job for job in jobs if fr.find(folder, job)]
+    taken = [job for job in jobs if fr.find(folder, job) or (folder / f"{job}.json").exists()]
     if taken:
         raise FetchRefused(f"job {', '.join(taken)} already has a fetch record (fetch_back.py status --site {name})")
     ssh = ssh_command()
     who = agent.call(ctx.runner, [*ssh, settings.host, "id -un && pwd"], timeout=CALL_TIMEOUT_S)
-    if who.returncode != 0 or len(who.stdout.split()) < len(("user", "home")):
+    answer_lines = who.stdout.splitlines()[-len(("user", "home")):]  # the last two: a login banner may come first
+    if who.returncode != 0 or len(answer_lines) < len(("user", "home")):
         raise FetchRefused(f"ssh to {settings.host} failed ({_tail(who.stderr)}); the record is checked there first")
-    login, home = who.stdout.split()[:2]
+    login, home = (line.strip() for line in answer_lines)
     root = workdir_root if not workdir_root or workdir_root.startswith("/") else f"{home}/{workdir_root}"
     now = ctx.clock()
     filters = tuple(("-", pattern) for pattern in settings.exclude) + options.filters
@@ -434,16 +474,18 @@ def record_after_submit(arguments: argparse.Namespace, site: site_config.Site, o
     `submit.py` printed. The job is queued either way, so a record that cannot be written is a printed remedy."""
     name, options = arguments.site, options_from(arguments, arguments.project)
     job = output.strip().splitlines()[-1].strip() if output.strip() else ""
-    command = ["fetch_back.py", "add", "--site", name, "--job", job or "ID", *flags_of(options, pairs)]
+    repo = None if getattr(arguments, "fetch_to", None) else arguments.repo
+    command = ["fetch_back.py", "add", "--site", name, "--job", job or "ID", *flags_of(options, pairs),
+               *(["--repo", str(repo)] if repo else [])]
     try:
         if not gpu_jobs.JOB_ID.fullmatch(job):
             raise FetchRefused(f"the remote submit did not end with a job id ({job!r})")
         remote_ = remote.pick(site, name)
         record = add_record(name, Settings.from_site(site, name), [job], pairs, options,
                             ctx or Context(notify_command=site.notify_command),
-                            repo=None if getattr(arguments, "fetch_to", None) else arguments.repo,
+                            repo=repo,
                             workdir_root=remote.project_root(remote_, arguments.project))
-    except (FetchRefused, remote.RemoteRefused) as error:
+    except (FetchRefused, remote.RemoteRefused, OSError) as error:  # never a traceback: the job id must stay last
         return f"[fetch] NOT RECORDED: {error}; the job is queued: once that is fixed, run `{shlex.join(command)}`"
     return f"[fetch] job {job}: {len(record.paths)} folder(s) come home when it ends (fetch_back.py status --site {name})"
 
@@ -492,9 +534,9 @@ def add_fetch_arguments(parser: argparse.ArgumentParser) -> None:
                         help="rsync pattern to fetch (repeatable; with --fetch-exclude, the first match wins, in the order given)")
     parser.add_argument("--fetch-exclude", dest="fetch_filters", action=_Filter, sign="-", default=[], metavar="PATTERN",
                         help="rsync pattern to leave there (repeatable), e.g. 'snapshot-*.ckpt'")
-    parser.add_argument("--fetch-on", type=fr.FetchOn, choices=list(fr.FetchOn), default=fr.FetchOn.COMPLETED,
+    parser.add_argument("--fetch-on", type=fr.FetchOn, choices=list(fr.FetchOn), default=None,
                         help="completed (default): only when every job ended COMPLETED; finished: whatever they ended as")
-    parser.add_argument("--fetch-existing", type=Existing, choices=list(Existing), default=Existing.UPDATE,
+    parser.add_argument("--fetch-existing", type=Existing, choices=list(Existing), default=None,
                         help="a file already here: update (default) keeps it if newer, keep never touches it, replace "
                              "takes the remote's when they differ")
     parser.add_argument("--fetch-max-size", default=None, metavar="SIZE", help="leave files larger than this (rsync --max-size)")
@@ -516,7 +558,8 @@ class _Filter(argparse.Action):
 
 
 def options_from(arguments: argparse.Namespace, project: str = "") -> Options:
-    return Options(tuple(arguments.fetch_filters), arguments.fetch_on, arguments.fetch_existing, arguments.fetch_max_size,
+    return Options(tuple(arguments.fetch_filters), arguments.fetch_on or fr.FetchOn.COMPLETED,
+                   arguments.fetch_existing or Existing.UPDATE, arguments.fetch_max_size,
                    arguments.fetch_keep_free, arguments.fetch_wait, arguments.fetch_then, project)
 
 
@@ -592,11 +635,13 @@ def main(argv: list[str] | None = None, ctx: Context | None = None, sleep: Calla
             raise FetchRefused(f"no fetch record lists job {arguments.job} (fetch_back.py status)")
         while True:  # wait
             found = fr.find(fr.store_dir(owner, ctx.env), arguments.job)
+            if found is None:
+                raise FetchRefused(f"the record of job {arguments.job} was removed while waiting")
             if not fr.is_final(found):
                 for line in run_site(owner, Settings.from_site(site, owner), ctx):
                     print(line)
                 found = fr.find(fr.store_dir(owner, ctx.env), arguments.job)
-            if fr.is_final(found):
+            if found is not None and fr.is_final(found):
                 print("\n".join(status_lines(owner, ctx.env)))
                 return 0 if found.state == fr.RecordState.DONE else 1
             sleep(site.tuning.fetch_every_s)

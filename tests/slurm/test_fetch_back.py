@@ -114,6 +114,7 @@ def test_an_interrupted_pull_leaves_no_truncated_file_and_the_rerun_completes_it
     running.send_signal(signal.SIGTERM)
     running.wait()
     assert not (dest / "big.bin").exists()
+    assert (dest / fb.PARTIAL_DIR / "big.bin").exists()  # it really was stopped part-way
     done = subprocess.run(pull(source, dest, fake_ssh), capture_output=True, text=True, check=False)
     assert fb.classify(done.returncode, done.stderr) == fb.Outcome.DONE
     assert (dest / "big.bin").read_bytes() == (source / "big.bin").read_bytes()
@@ -144,7 +145,7 @@ def test_a_real_pull_keeps_newer_local_files_skips_outward_links_and_names_a_mis
 
 ROOT_THERE = "/home/alice/gpujobs-sync/proj"
 SETTINGS = fb.Settings("site-b", "gpujobs-sync", ("snapshot-*.ckpt",), 0.0, 7.0, (60, 300), 3600,
-                       "Permission denied (publickey)", "run the renew command", 300)
+                       "Permission denied (publickey)", "run the renew command", 300, 3600)
 RENEWED_AFTER_S = 120
 
 
@@ -157,6 +158,7 @@ class Remote:
         self.calls: list[list[str]] = []
         self.then_exit = 0
         self.now = 1_000_000.0
+        self.rsync_exit, self.dry_out, self.rsync_env = 0, "Total transferred file size: 5 bytes\n", {}
 
     def __call__(self, argv, **kwargs):
         self.calls.append(list(argv))
@@ -172,8 +174,12 @@ class Remote:
             return ok("alice\n/home/alice\n")
         if "sacct" in line:
             return ok("".join(f"{job}|{state}|{self.user}|{self.workdir}\n" for job, state in self.states.items()))
+        if argv[0] == "rsync":
+            self.rsync_env = kwargs.get("env") or {}
+            if self.rsync_exit:
+                return subprocess.CompletedProcess(argv, self.rsync_exit, "", "timeout in data send/receive")
         if "-n" in argv:
-            return ok("Total transferred file size: 5 bytes\n")
+            return ok(self.dry_out)
         dest = Path(argv[-1])
         (dest / "result.txt").write_text("from the job")
         return ok(">f+++++++++ result.txt\n")
@@ -226,9 +232,13 @@ def test_a_second_run_leaves_a_locked_remote_alone(there: Remote, tmp_path: Path
     added(there, tmp_path)
     ctx = context(there, tmp_path)
     there.calls.clear()
-    with (fr.store_dir("site-b", ctx.env) / ".lock").open("w") as held:
+    store = fr.store_dir("site-b", ctx.env)
+    (store.parent / "alias").mkdir()  # another name for the same host: one connection to a host at a time
+    fr.save(dataclasses.replace(fr.find(store, "41"), site="alias"), store.parent / "alias")
+    with (store.parent / f".{SETTINGS.host}.lock").open("w") as held:
         fcntl.flock(held, fcntl.LOCK_EX)
         assert "another run" in fb.run_site("site-b", SETTINGS, ctx)[0]
+        assert "another run" in fb.run_site("alias", SETTINGS, ctx)[0]
     assert there.calls == []
 
 
@@ -258,6 +268,8 @@ def test_an_expired_login_blocks_once_with_the_remedy_and_resumes_after_renewal(
         (lambda r, a: a.update(sources=["../../etc"]), "no '..'"),
         (lambda r, a: a.update(targets=["relative/out"]), "absolute path"),
         (lambda r, a: a.update(jobs=["41;rm"]), "not a slurm job id"),
+        (lambda r, a: a.update(sources=[""]), "not the login home or the root"),
+        (lambda r, a: a.update(sources=["/"]), "not the login home or the root"),
     ],
 )
 def test_add_refuses_another_persons_job_and_paths_that_leave_the_folders(there: Remote, tmp_path: Path, change, fragment) -> None:
@@ -332,3 +344,75 @@ class SimpleSite:
     def __init__(self, remotes: dict) -> None:
         self.remotes, self.notify_command = remotes, ()
         self.tuning = site_config.Tuning()
+
+
+def test_one_record_that_cannot_be_processed_does_not_stop_the_others(there: Remote, tmp_path: Path, monkeypatch) -> None:
+    ctx = context(there, tmp_path)
+    repo = tmp_path / "proj"
+    repo.mkdir()
+    (repo / "out").write_text("a file where the folder should go")
+    there.states = {"40": "COMPLETED", "41": "COMPLETED", "42": "COMPLETED"}
+    for job, target in (("40", repo / "out"), ("41", repo / "fine"), ("42", repo / "other")):
+        fb.add_record("site-b", SETTINGS, [job], [(f"{ROOT_THERE}/out", str(target))], fb.Options(), ctx, repo=repo)
+    real_step = fb.step
+    monkeypatch.setattr(fb, "step", lambda record, *a, **k: (_ for _ in ()).throw(ValueError("odd")) if record.jobs == ("42",)
+                        else real_step(record, *a, **k))
+    fb.run_site("site-b", SETTINGS, ctx)
+    folder = fr.store_dir("site-b", ctx.env)
+    blocked, fine, odd = (fr.find(folder, job) for job in ("40", "41", "42"))
+    assert (blocked.state, fine.state, odd.state) == (fr.RecordState.FAILED, fr.RecordState.DONE, fr.RecordState.FAILED)
+    assert "cannot make" in blocked.note and "could not be processed: odd" in odd.note
+    with pytest.raises(fb.FetchRefused, match="No closing quotation"):
+        fb.add_record("site-b", SETTINGS, ["43"], [(f"{ROOT_THERE}/out", str(repo / "x"))],
+                      fb.Options(then="echo 'unterminated"), ctx, repo=repo)
+
+
+def test_a_copy_that_keeps_failing_backs_off_and_ends_at_the_deadline(there: Remote, tmp_path: Path) -> None:
+    added(there, tmp_path)
+    ctx = context(there, tmp_path)
+    folder = fr.store_dir("site-b", ctx.env)
+    there.states["41"], there.rsync_exit = "COMPLETED", 30
+    pauses = []
+    for _ in range(3):
+        fb.run_site("site-b", SETTINGS, ctx)
+        record = fr.find(folder, "41")
+        pauses.append(record.next_try - there.now)
+        there.now = record.next_try
+    assert pauses == [60, 300, 300]  # the backoff grows while the copy keeps failing; the last step repeats
+    assert record.state == fr.RecordState.FETCHING and "timeout" in record.note
+    assert there.rsync_env.get("LC_ALL") == "C"  # the size check reads rsync's numbers in one locale
+    there.now = record.deadline + 1
+    fb.run_site("site-b", SETTINGS, ctx)
+    late = fr.find(folder, "41")
+    assert late.state == fr.RecordState.EXPIRED and "it was fetching" in late.note
+
+
+@pytest.mark.parametrize(("dry_out", "keep_free_gb", "expected"), [
+    ("no size line\n", 0.0, fr.RecordState.FETCHING),  # fail closed: no size, no copy
+    ("Total transferred file size: 5 bytes\n", 1e9, fr.RecordState.BLOCKED),  # no room here
+])
+def test_no_copy_starts_without_a_size_or_without_room(there: Remote, tmp_path: Path, dry_out, keep_free_gb, expected) -> None:
+    added(there, tmp_path, keep_free_gb=keep_free_gb)
+    notices: list = []
+    ctx = context(there, tmp_path, notices)
+    there.states["41"], there.dry_out = "COMPLETED", dry_out
+    fb.run_site("site-b", SETTINGS, ctx)
+    record = fr.find(fr.store_dir("site-b", ctx.env), "41")
+    assert record.state == expected and not (tmp_path / "proj" / "out" / "result.txt").exists()
+    assert [n["GPUJOBS_EVENT"] for n in notices] == (["fetch_blocked"] if expected == fr.RecordState.BLOCKED else [])
+
+
+def test_a_record_that_cannot_be_saved_after_the_submit_still_leaves_the_job_id_last(there: Remote, tmp_path: Path, monkeypatch) -> None:
+    repo = tmp_path / "proj"
+    repo.mkdir()
+    site = SimpleSite({"site-b": site_config.Remote("site-b", "gpujobs-sync")})
+    given = argparse.Namespace(site="site-b", project="proj", repo=repo, fetch_to=[], fetch_filters=[], fetch_on=None,
+                               fetch_existing=None, fetch_max_size=None, fetch_keep_free=None, fetch_wait=None, fetch_then=None)
+    there.workdir = ROOT_THERE
+
+    def full_disk(*_a, **_k):
+        raise PermissionError("state dir not writable")
+
+    monkeypatch.setattr(fr, "save", full_disk)
+    said = fb.record_after_submit(given, site, "41\n", [("gpujobs-sync/proj/out", str(repo / "out"))], context(there, tmp_path))
+    assert said.startswith("[fetch] NOT RECORDED: state dir not writable") and f"--repo {repo}" in said

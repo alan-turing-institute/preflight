@@ -180,6 +180,8 @@ def test_fetch_back_goes_with_a_site_and_its_record_is_printed_before_the_remote
         submit.submit([*RESUME, "--fetch-back", "out", "--", "x"])
     with pytest.raises(submit.Refused, match="go with --fetch-back"):
         submit.submit([*RESUME, "--site", "turing", "--fetch-exclude", "*.ckpt", "--", "x"])
+    with pytest.raises(submit.Refused, match="go with --fetch-back"):  # an option with a default, given alone
+        submit.submit([*RESUME, "--site", "turing", "--fetch-on", "finished", "--", "x"])
     monkeypatch.setattr(submit.remote, "pick", lambda *_a: None)
     monkeypatch.setattr(submit.remote, "fetch_pairs", lambda arguments, _r: [("sync/p/out", "/home/u/p/out")])
     monkeypatch.setattr(submit.remote, "submit", lambda *_a, **_k: "[submit] job 7\n7")

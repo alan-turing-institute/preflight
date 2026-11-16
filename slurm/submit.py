@@ -722,6 +722,7 @@ def submit(argv: list[str]) -> str:
         msg = "--data, --data-base, --data-env and --remote-python go with --site (they say what to sync to that site and how to check it)"
         raise Refused(msg)
     fetching = (arguments.fetch_to or arguments.fetch_filters or arguments.fetch_then or arguments.fetch_max_size
+                or arguments.fetch_on or arguments.fetch_existing
                 or arguments.fetch_keep_free is not None or arguments.fetch_wait is not None)
     if (arguments.fetch_back and not arguments.site) or (fetching and not arguments.fetch_back):
         msg = "--fetch-back goes with --site, and the other --fetch-* options go with --fetch-back"

@@ -240,7 +240,7 @@ class Remote:
     # Fetch-back (D52, `fetch_back.py`): a `submit_command` of "" makes this a remote it only fetches from.
     fetch_exclude: tuple[str, ...] = ()  # rsync patterns left out of every fetch from there
     fetch_keep_free_gb: float = 10.0  # a fetch waits rather than leave less than this free here
-    fetch_wait_days: float = 7.0  # a job not ended this long after its record was written is given up
+    fetch_wait_days: float = 7.0  # a record not fetched this long after it was written is given up
     fetch_retry_s: tuple[int, ...] = (60, 300, 900, 3600)  # pause after the 1st, 2nd, ... failure in a row; the last repeats
     fetch_lost_after_s: int = 3600  # a job id the accounting there has not known for this long is lost
     auth_expired_text: str = ""  # text in ssh's error when the login there has expired (a certificate); "" = never checked
@@ -275,6 +275,7 @@ class Tuning:
     ended_kept: int = 5000  # how many ended jobs the agent remembers
     memory_guard_min_excess_gb: float = 1.0  # a job counts as over its ask only beyond this, above sampling noise (D44)
     fetch_every_s: int = 300  # the per-user fetch-back timer runs this often (D52)
+    fetch_then_timeout_s: int = 3600  # a fetch-back's --fetch-then command is stopped after this long (D52)
 
 
 #: `[tuning]` keys that multiply a measured figure or bound one by a multiple of it: below 1 they would shrink or invert
@@ -535,10 +536,11 @@ def _parse_remotes(raw: Any) -> dict[str, Remote]:
             raise SiteError(f"{where}.fetch_retry_s = {retry!r}; expected a list of whole seconds above 0")
         if not _whole(t["fetch_lost_after_s"]) or t["fetch_lost_after_s"] <= 0:
             raise SiteError(f"{where}.fetch_lost_after_s = {t['fetch_lost_after_s']!r}; expected whole seconds above 0")
-        for key, least in (("fetch_keep_free_gb", 0), ("fetch_wait_days", 0)):
+        for key, above_zero in (("fetch_keep_free_gb", False), ("fetch_wait_days", True)):
             value = t[key]
-            if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value) or value < least:
-                raise SiteError(f"{where}.{key} = {value!r}; expected a finite number of at least {least}")
+            if (isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value)
+                    or value < 0 or (above_zero and value == 0)):
+                raise SiteError(f"{where}.{key} = {value!r}; expected a finite number{' above 0' if above_zero else ', 0 or more'}")
         remotes[name] = Remote(**{
             **t, "fetch_exclude": tuple(exclude), "fetch_retry_s": tuple(retry),
             "fetch_keep_free_gb": float(t["fetch_keep_free_gb"]), "fetch_wait_days": float(t["fetch_wait_days"]),

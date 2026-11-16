@@ -5,7 +5,6 @@ Description=fetch remote jobs' folders home every $every_s s
 [Timer]
 OnBootSec=2min
 OnUnitActiveSec=${every_s}s
-Persistent=true
 
 [Install]
 WantedBy=timers.target

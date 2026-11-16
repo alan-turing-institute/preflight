@@ -180,7 +180,7 @@ TOML. Tables: the top level, `[[nodes]]` with `[[nodes.gpus]]`, `[lease]` with `
 | `cpus_from_history` | `recommend` | Cores for a CPU-only job given `--name` and no `--cpus` (section 7). `off`: nothing. `recommend`: `submit` prints the cores the job's 3 newest completed runs (`[tuning] history_runs`) of the same `project:class:name` justify and asks as before. `enforce`: it asks for them. The figure is their highest average cores in use (core time over wall time, from `sacct`) times 1.25 (`[tuning] cores_margin`), rounded up, from 1 to the cores the job may have. |
 | `memory_from_size` | `recommend` | Memory for a job given `--size COUNT UNIT` and no `--mem` (section 7, "Memory from a declared size"). `off`: nothing. `recommend`: `submit` prints the memory the project's earlier runs of that unit justify and asks as before. `enforce`: it asks for the larger of that figure and the name's own measured one, except a figure as large as the whole box, which is printed and never applied. |
 | `require_check` | `recommend` | A submission that states neither `--check` nor `--no-check` (section 7, "Checks before queuing"). `off`: accepted silently. `recommend`: accepted with a warning. `enforce`: refused, with the two flags named. |
-| `tuning` | all defaults | Optional table of the numbers a site may tune: sizing margins and history (`auto_margin`, `unclean_margin`, `oom_bump_ratio`, `oom_min_bump_mb`, `cores_margin`, `history_runs`, `unclean_min_s`, `size_extrapolation_limit`, `cores_over_ask`), check limits (`check_timeout_s`, `check_reuse_s`, `check_heavy_gb`) and the agent's pace and memory (`idle_every_s`, `idle_notice_every_s`, `copy_every_s`, `outside_keep_days`, `ended_kept`, and the memory guard's `memory_guard_min_excess_gb`) and the fetch-back timer's `fetch_every_s`. Each default and meaning is in `site.example.toml`; a value must be above 0. The tools read it when they start: the agent after `apply --component agent`. Install the new tools on every node (part-time ones too) before adding the table: an older copy refuses a key it does not know. |
+| `tuning` | all defaults | Optional table of the numbers a site may tune: sizing margins and history (`auto_margin`, `unclean_margin`, `oom_bump_ratio`, `oom_min_bump_mb`, `cores_margin`, `history_runs`, `unclean_min_s`, `size_extrapolation_limit`, `cores_over_ask`), check limits (`check_timeout_s`, `check_reuse_s`, `check_heavy_gb`) and the agent's pace and memory (`idle_every_s`, `idle_notice_every_s`, `copy_every_s`, `outside_keep_days`, `ended_kept`, and the memory guard's `memory_guard_min_excess_gb`) and the fetch-back timer's `fetch_every_s` and `fetch_then_timeout_s`. Each default and meaning is in `site.example.toml`; a value must be above 0. The tools read it when they start: the agent after `apply --component agent`. Install the new tools on every node (part-time ones too) before adding the table: an older copy refuses a key it does not know. |
 | `nodes` | required | One `[[nodes]]` table per compute node; at least one. |
 | `lease` | absent | Optional table; leave it out when no other service shares the GPU through the lease. Without it the `lease` component is not installed. |
 | `metrics` | all defaults below | Table. |
@@ -766,16 +766,20 @@ arrives still means success) or `finished` (whatever they ended as); `--fetch-in
 rsync patterns applied in the order given after the site's `fetch_exclude` (e.g. `--fetch-exclude 'snapshot-*.ckpt'`);
 `--fetch-existing update` (default: a file newer here is kept), `keep` (nothing here is touched) or `replace`;
 `--fetch-max-size SIZE`; `--fetch-keep-free GB` and `--fetch-wait DAYS` (defaults from the site file);
-`--fetch-then CMD`, run once from `R` (no shell) after a successful fetch, its exit code kept and a failure told.
+`--fetch-then CMD`, run once from `R` (no shell) after a successful fetch, its exit code kept and a failure told; it
+is stopped after `[tuning] fetch_then_timeout_s` (1 hour).
 
 `gpujobs-fetch-back run` does the work and is what the user's timer runs (enable it once with
-`gpujobs-fetch-back enable`; without user systemd, run it from cron). Each run takes a lock per remote, asks that
+`gpujobs-fetch-back enable`; without user systemd, run it from cron). Each run takes a lock per remote host, asks that
 site's `sacct` once for every waiting job over one ssh connection, and pulls the folders of the jobs that ended as
 asked with `rsync -rltE` from that site: nothing there is changed or removed, nothing here is deleted, an interrupted
 file waits in `.gpujobs-partial` and never appears under its own name, links pointing out of the folder are not made,
-and a folder is pulled only when its size (from a dry run) leaves `fetch_keep_free_gb` free. A dropped connection is
-retried after `fetch_retry_s`; a job unknown to the accounting there for `fetch_lost_after_s` is `lost`; one not ended
-by the deadline is `expired`; a job of another account, or one run outside `root/<project>` there, is refused. An
+and a folder is pulled only when its size (from a dry run in the C locale) leaves `fetch_keep_free_gb` free; no size,
+no copy. A dropped connection or a failed copy is retried after `fetch_retry_s`, the pause growing while it keeps
+failing; a folder that cannot be pulled for good (missing there, or files vanishing twice) is not tried again; a job
+unknown to the accounting there for `fetch_lost_after_s` is `lost`; a record not fetched by its deadline is `expired`,
+whatever it was waiting on; a job of another account, or one run outside `root/<project>` there, is refused; one record
+that cannot be processed fails alone, the others go on. `--from` must name a folder, not the login home or `/`. An
 expired login (ssh's error contains `auth_expired_text`) blocks the record with `renew_hint` until it is renewed; the
 tools never renew it. `gpujobs-fetch-back status` lists the records (waiting, fetching, blocked, done, skipped,
 failed, expired, lost) with what was pulled and why one stopped; `run --force ID` fetches a skipped job anyway

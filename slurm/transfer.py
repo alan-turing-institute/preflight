@@ -10,12 +10,12 @@ from enum import StrEnum
 
 #: rsync gives up a stalled transfer after this many seconds (`--timeout`; exit 30).
 COPY_IO_TIMEOUT_S = 20
-#: rsync's "some files could not be transferred" and "some files vanished": the rest was copied.
-RSYNC_PARTIAL = frozenset({23, 24})
 #: rsync(1) EXIT VALUES: 23 partial transfer due to error, 24 source files vanished, 30 timeout in data send/receive,
 #: 255 the remote shell (ssh) failed.
 RSYNC_PARTIAL_ERROR = 23
 RSYNC_VANISHED = 24
+#: rsync's "some files could not be transferred" and "some files vanished": the rest was copied.
+RSYNC_PARTIAL = frozenset({RSYNC_PARTIAL_ERROR, RSYNC_VANISHED})
 RSYNC_IO_TIMEOUT = 30
 RSYNC_SSH_FAILED = 255
 #: rsync's stderr when the remote folder does not exist; the exit value is 23, the same as a partial transfer
