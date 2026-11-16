@@ -626,8 +626,9 @@ def stage_service() -> None:
         w = submit("alice", "waits", 600, "--cpus", "2", cls="restart")  # the cpu cap is full: it waits, and must not take the room
         ask = cl("gpujobs-submit", "--project", "e2e", "--what", "e2e ask", "--class", "restart", "--mem", "200M", *flags,
                  "--dry-run", "--", "true", user="bob")
-        line = ask.out.splitlines()[0] if ask.out else ""
-        told = json.loads(line.removeprefix("[submit] service room: ")) if line.startswith("[submit] service room: ") else {}
+        room = "[submit] service room: "  # not the first line: submit.py explains the room first (D48)
+        line = next((x for x in ask.out.splitlines() if x.startswith(room)), "")
+        told = json.loads(line.removeprefix(room)) if line else {}
         check("S20: bob's dry run names the cpu job a service job would suspend (D9: its user is asked first)",
               told.get("starts") == "after_suspending" and [x.get("job") for x in told.get("suspends", [])] == [c],
               ask.text[:300])
@@ -1023,7 +1024,8 @@ def stage_ssh() -> None:
         through_relay(user, "/nginx/init?redir=%2fpun%2fsys%2fgpujobs%2f")  # first visit starts the per-user server
     pages = {user: through_relay(user, "/pun/sys/gpujobs/", "-H 'X-Gpujobs-User: carol'") for user in ("alice", "bob")}
     check("through the relay each person is signed in as themselves, with no login page, whatever user they claim",
-          all(code == "200" and f"Signed in as <strong>{user}</strong>" in body and "carol" not in body
+          all(code == "200" and f"Signed in as <strong>{user}</strong>" in body  # carol may be named elsewhere (a
+              and "Signed in as <strong>carol</strong>" not in body  # user filter lists everyone with jobs)
               for user, (code, body) in pages.items()), str({u: (c, b[:80]) for u, (c, b) in pages.items()}))
     code, jobs = through_relay("alice", "/pun/sys/gpujobs/api/jobs")
     check("through the relay /api/jobs returns JSON", code == "200" and isinstance(json.loads(jobs or "{}").get("jobs"), list),
