@@ -11,6 +11,8 @@ x-node: &node
     # slurm_build.py comes from the repository; SLURM_VERSION/SLURM_SHA256 (both or neither) pick SchedMD's slurm.
     additional_contexts:
       src: ../..
+      # this machine's finished slurm builds, reused instead of compiling (run.sh sets it; any folder works)
+      slurmcache: ${GPUJOBS_SLURM_CACHE:-.}
     args:
       SLURM_VERSION: ${SLURM_VERSION:-}
       SLURM_SHA256: ${SLURM_SHA256:-}

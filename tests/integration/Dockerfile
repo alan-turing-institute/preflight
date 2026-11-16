@@ -9,11 +9,21 @@ ARG SLURM_VERSION=
 ARG SLURM_SHA256=
 ENV DEBIAN_FRONTEND=noninteractive
 RUN install -d /debs
+# Compiling slurm takes about 7 minutes, so a finished build is reused: first this machine's own (the installer's cache,
+# the `slurmcache` context, always holding the version installed here), then BuildKit's kept cache (/cache, outside the
+# image; pruned when unused for a while). A build counts only with slurm_build.py's marker holding the tarball's sha256.
 RUN --mount=type=bind,from=src,source=slurm/install/slurm_build.py,target=/build/slurm_build.py \
+    --mount=type=bind,from=slurmcache,target=/seed \
+    --mount=type=cache,id=gpujobs-slurm-build,target=/cache,sharing=locked \
     if [ -n "$SLURM_VERSION" ]; then \
-      apt-get update && apt-get install -y --no-install-recommends python3 ca-certificates \
-      && python3 -I /build/slurm_build.py --version "$SLURM_VERSION" --sha256 "$SLURM_SHA256" --cache /cache \
-      && cp /cache/"$SLURM_VERSION"/deb-*/*.deb /debs/ ; \
+      built="/seed/$SLURM_VERSION/deb-$(. /etc/os-release && echo "$ID$VERSION_ID")-$(uname -m)"; \
+      if [ "$(cat "$built/.built-sha256" 2>/dev/null)" = "$SLURM_SHA256" ]; then \
+        cp "$built"/*.deb /debs/ && echo "slurm $SLURM_VERSION: this machine's build reused, nothing compiled"; \
+      else \
+        apt-get update && apt-get install -y --no-install-recommends python3 ca-certificates \
+        && python3 -I /build/slurm_build.py --version "$SLURM_VERSION" --sha256 "$SLURM_SHA256" --cache /cache \
+        && cp /cache/"$SLURM_VERSION"/deb-*/*.deb /debs/ ; \
+      fi; \
     fi
 
 FROM ubuntu:24.04

@@ -53,6 +53,12 @@ wait_booted() {
 
 cmd_up() {
     docker volume create gpujobs-slurm-build-cache >/dev/null  # external: kept across runs (compose.yml)
+    # The installer's cache of finished slurm builds, which the image build reuses (Dockerfile); none here: this folder.
+    if [[ -z ${GPUJOBS_SLURM_CACHE:-} ]]; then
+        GPUJOBS_SLURM_CACHE=/var/cache/gpujobs/slurm
+        [[ -d $GPUJOBS_SLURM_CACHE ]] || GPUJOBS_SLURM_CACHE=$HERE
+        export GPUJOBS_SLURM_CACHE
+    fi
     "${COMPOSE[@]}" up -d --build
     wait_booted
     wait_ready
