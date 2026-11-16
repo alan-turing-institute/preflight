@@ -1560,18 +1560,26 @@ def gpu_usage(timeout: float = 30.0) -> dict[int, float] | None:
     return usage
 
 
-def gpu_busy() -> float | None:
-    """How busy the GPUs are, 0-1, averaged over them (`nvidia-smi` utilization.gpu); None when it does not answer, or
-    when any GPU gives no number (`[N/A]`): an average over the GPUs that did answer would misstate the box."""
+def gpu_numbers(field_name: str) -> list[float] | None:
+    """One `nvidia-smi --query-gpu` number per GPU; None when it does not answer, or when any GPU gives no number
+    (`[N/A]`): a figure over only the GPUs that did answer would misstate the box."""
     try:
-        done = subprocess.run(["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
+        done = subprocess.run(["nvidia-smi", f"--query-gpu={field_name}", "--format=csv,noheader,nounits"],
                               capture_output=True, text=True, timeout=10, check=False)
     except (OSError, subprocess.TimeoutExpired):
         return None
     lines = [line.strip() for line in done.stdout.splitlines() if line.strip()] if done.returncode == 0 else []
-    if not lines or not all(line.isdigit() for line in lines):
+    try:
+        return [float(line) for line in lines] or None
+    except ValueError:
         return None
-    return sum(int(line) for line in lines) / 100 / len(lines)
+
+
+def gpu_busy() -> float | None:
+    """How busy the GPUs are, 0-1, averaged over them (`nvidia-smi` utilization.gpu). Not a test of whether a card is
+    free: an idle GB10 reads about 96% (`status.card_lines` decides that)."""
+    found = gpu_numbers("utilization.gpu")
+    return sum(found) / 100 / len(found) if found else None
 
 
 def gpu_mib_by_pid() -> dict[int, float]:

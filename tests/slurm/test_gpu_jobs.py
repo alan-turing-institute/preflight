@@ -20,6 +20,7 @@ import gpu_jobs
 import levels
 import pytest
 import site_config
+import audit
 import status
 import urgent
 import wait
@@ -99,6 +100,7 @@ def test_a_hostile_or_foreign_record_is_ignored_and_never_blocks(tmp_path: Path,
     monkeypatch.setattr(status.audit, "report", lambda _u: [])
     monkeypatch.setattr(status.gpu_jobs, "known_containers", list)  # never this machine's map or docker
     monkeypatch.setattr(status.gpu_jobs, "node_capacity", lambda *_a, **_k: None)  # never the live cluster's
+    monkeypatch.setattr(status.shutil, "which", lambda _name: None)  # never this machine's card (card_lines is tested alone)
     assert not any("forged" in line for line in status.lines([job]))
     named = QueuedJob("8", "normal", "PENDING", "None", "p:resume:\x1b]0;forged\x07")
     assert all(line.isprintable() for line in status.lines([named]))  # a terminal shows a name, never acts on it
@@ -431,6 +433,20 @@ def test_state_dir_resolution_env_over_site_file_and_no_fallback(tmp_path: Path,
 def test_gpu_busy_is_unknown_unless_every_gpu_answers(out: str, busy: float | None, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a, 0, stdout=out))
     assert gpu_jobs.gpu_busy() == busy  # an average over only the GPUs that answered would misstate the box
+
+
+def test_the_card_verdict_comes_from_holders_never_from_gpu_util() -> None:
+    """2026-11-16: GPU-Util read ~96% on an idle GB10 and sessions moved GPU work to CPU."""
+    waiting = QueuedJob("3", "normal", "PENDING", "Resources", "p:resume:w", gpus=1)
+    elsewhere = QueuedJob("4", "normal", "RUNNING", "None", "p:resume:x", gpus=1, node="other")
+    free = status.card_lines([waiting, elsewhere], "box", {}, [17.0], {7: gpu_jobs.LEASE_PROJECT}, [])
+    assert free == ["[card] FREE: no slurm job, GPU lease or compute process holds it (17 W, 0 compute process(es) "
+                    "holding 0 MB of card memory; GPU-Util is not a test of this); GPU jobs waiting for it: 3"]
+    shard = QueuedJob("5", "normal", "RUNNING", "None", "p:resume:s", shards=2, node="box")
+    held = status.card_lines([shard], "box", {9: 1024.0}, None, {8: "svc"}, [audit.Stray(11, 1.0, "x", "")])
+    assert held[0].startswith("[card] HELD by slurm job 5 (p:resume:s); the GPU lease of svc; pid 11, outside")
+    assert "power unknown, 1 compute process(es) holding 1.1 GB" in held[0]
+    assert status.card_lines([], "box", None, [17.0], {}, [])[0].startswith("[card] UNKNOWN")  # unanswered is never free
 
 
 def part_time_copy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ran: dict[str, tuple[str, str]]) -> Path:
