@@ -35,10 +35,23 @@ GENERIC = (
 )
 
 
+def main_checkout_patterns() -> Path | None:
+    """The main checkout's `.private-patterns` when this is a linked worktree. The file is ignored by git, so a new
+    worktree has none of its own, and a hook run there would otherwise check no names at all."""
+    done = subprocess.run(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], cwd=ROOT,
+                          capture_output=True, text=True, check=False)
+    main = Path(done.stdout.strip()).parent / LOCAL_PATTERNS.name if done.returncode == 0 and done.stdout.strip() else None
+    return main if main is not None and main != LOCAL_PATTERNS else None
+
+
 def patterns() -> list[tuple[str, re.Pattern[str]]]:
     found = [(name, re.compile(rx)) for name, rx in GENERIC]
-    if LOCAL_PATTERNS.exists():
-        lines = [x.strip() for x in LOCAL_PATTERNS.read_text().splitlines()]
+    files = [f for f in (LOCAL_PATTERNS, main_checkout_patterns()) if f is not None and f.exists()]
+    if not files:
+        print(f"check_private: no {LOCAL_PATTERNS.name} here or in the main checkout: only the generic rules were checked",
+              file=sys.stderr)
+    for path in files:
+        lines = [x.strip() for x in path.read_text().splitlines()]
         found += [("a name in .private-patterns", re.compile(x)) for x in lines if x and not x.startswith("#")]
     return found
 

@@ -53,7 +53,7 @@ CHECK_TIMEOUT_S = gpu_jobs.TUNING.check_timeout_s  # site file [tuning]
 CHECK_KILL_GRACE_S = 5.0
 #: A sweep submitted in one go shares its inputs: one pass of the same check from the same folder covers it this long.
 CHECK_REUSE_S = gpu_jobs.TUNING.check_reuse_s  # site file [tuning]
-#: Work holding more than this belongs in slurm (a site's rule; spark-ad27's owner set 8 GB): a check this heavy is a job.
+#: Work holding more than this belongs in slurm (a site's rule; the first site's owner set 8 GB): a check this heavy is a job.
 CHECK_HEAVY_BYTES = gpu_jobs.TUNING.check_heavy_gb * gpu_jobs.GB  # site file [tuning]
 #: Set in the check's environment; a submission from inside a check is refused.
 IN_CHECK = "GPUJOBS_CHECK"

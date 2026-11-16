@@ -41,6 +41,7 @@ def test_each_generic_rule_catches_its_line_and_lets_the_placeholders_through() 
 
 def test_a_commit_message_is_held_to_the_same_rules(tmp_path: Path, monkeypatch, capsys) -> None:
     monkeypatch.setattr(check_private, "LOCAL_PATTERNS", tmp_path / "patterns")
+    monkeypatch.setattr(check_private, "main_checkout_patterns", lambda: None)
     (tmp_path / "patterns").write_text("gpu-host-7\n")
     message = tmp_path / "COMMIT_EDITMSG"
     message.write_text("fix: Count only idle hardware\n\nOn gpu-host-7 the page listed 25 lines.\n# gpu-host-7 in a comment\n")
@@ -48,3 +49,16 @@ def test_a_commit_message_is_held_to_the_same_rules(tmp_path: Path, monkeypatch,
     assert "commit message:3: a name in .private-patterns" in capsys.readouterr().out
     message.write_text("fix: Count only idle hardware\n\nOn the GPU host the page listed 25 lines.\n# gpu-host-7 git's comment\n")
     assert check_private.main(["--message", str(message)]) == 0  # git strips its own comment lines
+
+
+def test_a_worktree_without_its_own_patterns_uses_the_main_checkouts_and_says_when_there_are_none(
+        tmp_path: Path, monkeypatch, capsys) -> None:
+    main = tmp_path / "main" / ".private-patterns"
+    main.parent.mkdir()
+    main.write_text("gpu-host-7\n")
+    monkeypatch.setattr(check_private, "LOCAL_PATTERNS", tmp_path / "worktree" / ".private-patterns")
+    monkeypatch.setattr(check_private, "main_checkout_patterns", lambda: main)
+    assert check_private.hits("ssh gpu-host-7", check_private.patterns())
+    monkeypatch.setattr(check_private, "main_checkout_patterns", lambda: None)
+    assert not check_private.hits("ssh gpu-host-7", check_private.patterns())
+    assert "only the generic rules" in capsys.readouterr().err
