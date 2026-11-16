@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import signal
+import os
 import shlex
 import subprocess
 from collections.abc import Iterable
@@ -624,6 +626,17 @@ def test_a_queued_check_does_not_hold_back_another_projects_result_and_one_past_
     assert (
         not slow.venv.exists() and not quick.venv.exists()
     )  # the side venvs are removed either way
+
+
+def test_a_second_sigterm_cannot_cut_the_cleanup_short() -> None:
+    previous = signal.getsignal(signal.SIGTERM)
+    try:
+        weekly.stop_on_terminate()
+        with pytest.raises(SystemExit):
+            os.kill(os.getpid(), signal.SIGTERM)
+        os.kill(os.getpid(), signal.SIGTERM)  # during the cleanup: ignored, not a second exit
+    finally:
+        signal.signal(signal.SIGTERM, previous)
 
 
 def test_a_run_that_stops_early_cancels_the_checks_still_waiting(

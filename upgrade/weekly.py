@@ -1061,9 +1061,16 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
+def terminated(signum: int, _frame: object) -> None:
+    """Unwind like an error, ignoring any further SIGTERM: a second one (timeout(1) passing its own on, a repeated stop)
+    would otherwise cut short the cleanup that cancels the waiting check jobs (2026-11-16: it left job 2759 orphaned)."""
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    sys.exit(128 + signum)
+
+
 def stop_on_terminate() -> None:
     """A SIGTERM (systemd's start timeout, `systemctl stop`) unwinds like an error, so waiting check jobs are cancelled."""
-    signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(128 + signum))
+    signal.signal(signal.SIGTERM, terminated)
 
 
 def main() -> None:
