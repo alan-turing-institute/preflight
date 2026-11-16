@@ -1572,12 +1572,12 @@ def gpu_usage(timeout: float = 30.0) -> dict[int, float] | None:
     return usage
 
 
-def gpu_numbers(field_name: str) -> list[float] | None:
+def gpu_numbers(field_name: str, timeout: float = 10.0) -> list[float] | None:
     """One `nvidia-smi --query-gpu` number per GPU; None when it does not answer, or when any GPU gives no number
     (`[N/A]`): a figure over only the GPUs that did answer would misstate the box."""
     try:
         done = subprocess.run(["nvidia-smi", f"--query-gpu={field_name}", "--format=csv,noheader,nounits"],
-                              capture_output=True, text=True, timeout=10, check=False)
+                              capture_output=True, text=True, timeout=timeout, check=False)
     except (OSError, subprocess.TimeoutExpired):
         return None
     lines = [line.strip() for line in done.stdout.splitlines() if line.strip()] if done.returncode == 0 else []
@@ -1602,19 +1602,47 @@ class CardReading:
     leases: int  # GPU leases services hold (admitted, not waiting); the keeper's own stands for slurm's jobs: left out
     watts: float | None  # power drawn by the machine's cards; None when any card gives no number
 
-    def state(self, slurm_jobs: int) -> CardState:
-        """`slurm_jobs`: the running jobs on this machine that hold a GPU or shards."""
-        return CardState.HELD if slurm_jobs or self.processes or self.leases else CardState.FREE
+    def fields(self) -> dict[str, float]:
+        """The reading as a node comment carries it (`node_check.report_free` writes it, the page reads it)."""
+        return {CardKey.PROCESSES: self.processes, CardKey.LEASES: self.leases,
+                **({CardKey.WATTS: self.watts} if self.watts is not None else {})}
+
+    @classmethod
+    def from_fields(cls, found: Mapping[str, float]) -> CardReading | None:
+        """The reading in a node comment's fields; None when the machine's check gave none."""
+        if CardKey.PROCESSES not in found or CardKey.LEASES not in found:
+            return None
+        return cls(int(found[CardKey.PROCESSES]), int(found[CardKey.LEASES]), found.get(CardKey.WATTS))
 
 
-def card_reading(lease_dir: Path | None = None) -> CardReading | None:
-    """This machine's `CardReading`; None when `nvidia-smi` does not answer (no card, or one hidden from this process)."""
-    usage = gpu_usage()
+class CardKey(StrEnum):
+    """The node-comment keys a `CardReading` travels in."""
+
+    PROCESSES = "gpu_procs"
+    LEASES = "gpu_leases"
+    WATTS = "gpu_watts"
+
+
+def card_state(reading: CardReading | None, slurm_jobs: int) -> CardState:
+    """The one free-or-held rule (status.py and the page): held when a slurm job on the machine holds a GPU or shards
+    (`slurm_jobs`, suspended ones included), or a compute process or a service's lease does; unknown with no reading
+    and no such job; never from GPU-Util."""
+    if slurm_jobs:
+        return CardState.HELD
+    if reading is None:
+        return CardState.UNKNOWN
+    return CardState.HELD if reading.processes or reading.leases else CardState.FREE
+
+
+def card_reading(lease_dir: Path | None = None, timeout: float = 10.0) -> CardReading | None:
+    """This machine's `CardReading`; None when `nvidia-smi` does not answer (no card, or one hidden from this process).
+    `timeout` bounds each of its two `nvidia-smi` calls (the health check passes its own, shorter)."""
+    usage = gpu_usage(timeout)
     if usage is None:
         return None
     lease_dir = lease_dir or LEASE_DIR
     services = set(lease_pids(lease_dir, holding=True).values()) - {LEASE_PROJECT} if lease_dir else set()
-    watts = gpu_numbers("power.draw")
+    watts = gpu_numbers("power.draw", timeout)
     return CardReading(len(usage), len(services), sum(watts) if watts else None)
 
 

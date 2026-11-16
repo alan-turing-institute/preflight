@@ -96,26 +96,30 @@ def gpu_lines(queue: list[gpu_jobs.QueuedJob]) -> list[str]:
 
 def card_lines(queue: list[gpu_jobs.QueuedJob], here: str, usage: dict[int, float] | None, watts: list[float] | None,
                leases: dict[int, str], strays: list[audit.Stray]) -> list[str]:
-    """This machine's card: FREE or HELD, and by whom. Held means a slurm job here holds a GPU or shards, a service
-    holds a GPU lease, not merely waits for one (the keeper's own lease stands for slurm's jobs, already counted), or
-    a compute process belongs
-    to neither. Never judged from nvidia-smi's GPU-Util, which reads about 96% on an idle GB10; the power draw and
-    the compute processes are printed as the evidence."""
+    """This machine's card, by `gpu_jobs.card_state` (the page's rule too), and who holds it: the slurm jobs here that
+    hold a GPU or shards, the services holding a GPU lease (not waiting for one; the keeper's own lease stands for
+    slurm's jobs), the compute processes outside both. The power draw and the compute processes are the evidence;
+    nvidia-smi's GPU-Util never is (it reads about 96% on an idle GB10)."""
+    jobs = [job for job in queue if job.uses_card and job.node == here and job.state in gpu_jobs.ACTIVE_STATES]
+    services = sorted(set(leases.values()) - {gpu_jobs.LEASE_PROJECT})
+    reading = None if usage is None else gpu_jobs.CardReading(len(usage), len(services), sum(watts) if watts else None)
+    state = gpu_jobs.card_state(reading, len(jobs))
     if usage is None:
-        return [(f"[card] {gpu_jobs.CardState.UNKNOWN.upper()}: nvidia-smi did not answer (inside a slurm job without a GPU the card is hidden); "
-                 "do not treat the card as free")]
-    holders = [f"slurm job {job.job_id} ({job.name})" for job in queue
-               if job.uses_card and job.node == here and job.state in gpu_jobs.ACTIVE_STATES]
-    holders += [f"the GPU lease of {project}" for project in sorted(set(leases.values()) - {gpu_jobs.LEASE_PROJECT})]
-    holders += [f"pid {stray.pid}, outside slurm and the lease protocol" for stray in strays]
-    power = f"{sum(watts):.0f} W" if watts else "power unknown"
-    card = gpu_jobs.size_text(gpu_jobs.card_bytes(usage, usage))
-    evidence = f"{power}, {len(usage)} compute process(es) holding {card} of card memory; GPU-Util is not a test of this"
-    if holders:
-        return [gpu_jobs.printable(f"[card] {gpu_jobs.CardState.HELD.upper()} by {'; '.join(holders)} ({evidence})")]
+        evidence = "nvidia-smi did not answer (inside a slurm job without a GPU the card is hidden)"
+    else:
+        power = f"{sum(watts):.0f} W" if watts else "power unknown"
+        card = gpu_jobs.size_text(gpu_jobs.card_bytes(usage, usage))
+        evidence = f"{power}, {len(usage)} compute process(es) holding {card} of card memory; GPU-Util is not a test of this"
+    if state == gpu_jobs.CardState.UNKNOWN:
+        return [f"[card] {state.upper()}: {evidence}; do not treat the card as free"]
+    if state == gpu_jobs.CardState.HELD:
+        holders = [f"slurm job {job.job_id} ({job.name})" for job in jobs] + [f"the GPU lease of {name}" for name in services]
+        holders += [f"pid {stray.pid}, outside slurm and the lease protocol" for stray in strays] or (
+            [] if holders else [f"{len(usage or {})} compute process(es)"])
+        return [gpu_jobs.printable(f"[card] {state.upper()} by {'; '.join(holders)} ({evidence})")]
     waiting = [job.job_id for job in queue if job.uses_card and job.state == gpu_jobs.State.PENDING]
     after = f"; GPU jobs waiting for it: {', '.join(waiting)}" if waiting else ""
-    return [f"[card] {gpu_jobs.CardState.FREE.upper()}: no slurm job, GPU lease or compute process holds it ({evidence}){after}"]
+    return [f"[card] {state.upper()}: no slurm job, GPU lease or compute process holds it ({evidence}){after}"]
 
 
 #: `--reserve` (D44): the share of the one-minute samples the reserve must cover, and the least history to judge from.

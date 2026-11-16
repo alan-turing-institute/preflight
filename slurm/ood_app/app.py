@@ -821,13 +821,15 @@ def _resource_tiles(
         return ""
     if len(per_node) <= 1:  # one machine or none: no per-machine strips
         if have.get("nodes") == 1 and have.get("here"):
-            live = {**(use or {}), **_card_fields(card)}
+            reported = _reading(per_node[0].get("comment")) if per_node else {}
+            live = _with_card({**(use or {}), **{k: v for k, v in reported.items() if k in set(gpu_jobs.CardKey)}}, card)
             return _box("This machine", have, rows, _card_line(live, rows), live)
         return _box("This machine", have, rows)
     # every machine reports through its own health check, so every strip reads the same way; the page's own machine falls
     # back to its live reading when its check has not reported yet
-    seen = {str(n["name"]): _reading(n.get("comment")) or ({**(use or {}), **_card_fields(card)} if n["here"] else {})
-            for n in per_node}
+    base = {str(n["name"]): _reading(n.get("comment")) or (dict(use or {}) if n["here"] else {}) for n in per_node}
+    seen = {name: _with_card(reading, card) if reading and here else reading
+            for (name, reading), here in zip(base.items(), (n["here"] for n in per_node), strict=True)}
     missing = [name for name, reading in seen.items() if not reading]
     combined = _combined([(n, seen[str(n["name"])]) for n in per_node if seen[str(n["name"])]])
     on = {str(n["name"]): [r for r in rows if r["node"] == n["name"]] for n in per_node}
@@ -842,26 +844,26 @@ def _resource_tiles(
     )
 
 
-def _card_fields(card: gpu_jobs.CardReading | None) -> dict[str, float]:
-    """A live `CardReading` in the keys a machine's health check puts in its comment (`node_check.report_free`)."""
-    if card is None:
-        return {}
-    return {"gpu_procs": card.processes, "gpu_leases": card.leases, **({"gpu_watts": card.watts} if card.watts is not None else {})}
+def _with_card(reading: Mapping[str, float], card: gpu_jobs.CardReading | None) -> dict[str, float]:
+    """A machine's reading with this host's live card reading added where its health check gave none. The health
+    check's is preferred: it runs as root and sees every service's lease, which a page running as another user cannot."""
+    if gpu_jobs.CardReading.from_fields(reading) is not None or card is None:
+        return dict(reading)
+    return {**reading, **card.fields()}
 
 
 def _card_state(use: Mapping[str, float], rows: list[dict[str, object]]) -> gpu_jobs.CardState:
-    """Free or held from the machine's card reading and its running jobs that hold a GPU or shards; unknown without a
-    reading. Never from GPU-Util, which reads about 96% on an idle GB10."""
-    if "gpu_procs" not in use:
-        return gpu_jobs.CardState.UNKNOWN
-    jobs = sum(1 for r in rows if r["kind"] == Kind.RUNNING and (r["gpus"] or r.get("shards")))
-    return gpu_jobs.CardReading(int(use["gpu_procs"]), int(use.get("gpu_leases", 0)), use.get("gpu_watts")).state(jobs)
+    """`gpu_jobs.card_state` (status.py's rule too) from the machine's card reading and its jobs that hold a GPU or
+    shards, suspended ones included. Never from GPU-Util, which reads about 96% on an idle GB10."""
+    jobs = sum(1 for r in rows if (r["kind"] == Kind.RUNNING or r.get("state") in gpu_jobs.ACTIVE_STATES)
+               and (r["gpus"] or r.get("shards")))
+    return gpu_jobs.card_state(gpu_jobs.CardReading.from_fields(use), jobs)
 
 
 def _card_line(use: Mapping[str, float], rows: list[dict[str, object]]) -> tuple[str, str, float | None]:
     """The GPU meter's second bar: the card's state (full when held, empty when free), with its power draw."""
     state = _card_state(use, rows)
-    watts = f" · {use['gpu_watts']:.0f} W" if "gpu_watts" in use else ""
+    watts = f" · {use[gpu_jobs.CardKey.WATTS]:.0f} W" if gpu_jobs.CardKey.WATTS in use else ""
     return "Card now", f"{state}{watts}", None if state == gpu_jobs.CardState.UNKNOWN else float(state == gpu_jobs.CardState.HELD)
 
 
@@ -1685,7 +1687,7 @@ def _reading(comment: object) -> dict[str, float]:
         return {}
     return {"mem_total": found["total_mb"] * 1_000_000, "mem_used": (found["total_mb"] - found["available_mb"]) * 1_000_000,
             "cores": found["cores"], "cores_busy": found["cores_busy"],
-            **{key: found[key] for key in ("gpu_procs", "gpu_leases", "gpu_watts") if key in found}}
+            **{key: found[key] for key in gpu_jobs.CardKey if key in found}}
 
 
 def _part_time_state(names: list[str]) -> dict[str, PartTimeState]:

@@ -50,7 +50,8 @@ REASON_PREFIX = "gpujobs-check: "
 #: (`gpu_procs=N;gpu_leases=N`, and `gpu_watts=X` when the cards give it, too on a machine whose `nvidia-smi` answers:
 #: `gpu_jobs.CardReading`; no spaces: `scontrol -o` splits on them). A comment that does not start with the prefix is someone else's: left alone.
 COMMENT_PREFIX = "available_mb="
-#: slurm kills a health check after 60 s; every slurm call gets far less.
+#: slurm kills a health check after `HealthCheckTimeout` (interval - 5 s, at most 60, as rendered); every call gets far less. The card
+#: reading's two `nvidia-smi` calls get half each, together the one call they replaced.
 CALL_TIMEOUT_S = 10
 MB_BYTES = 1_000_000  # decimal, as everything shown to people
 GB_MB = 1000
@@ -403,8 +404,7 @@ def report_free(run: Runner, info: NodeInfo, free: int, use: dict[str, float], c
     if use:
         value += f";total_mb={use['mem_total'] // MB_BYTES};cores={int(use['cores'])};cores_busy={use['cores_busy']:.1f}"
         if card is not None:
-            value += f";gpu_procs={card.processes};gpu_leases={card.leases}"
-            value += f";gpu_watts={card.watts:.0f}" if card.watts is not None else ""
+            value += "".join(f";{key}={number:.0f}" for key, number in card.fields().items())
     if value != info.comment and (not info.comment or info.comment.startswith(COMMENT_PREFIX)):
         run(["scontrol", "update", f"NodeName={info.name}", f"Comment={value}"])
 
@@ -432,7 +432,7 @@ def log_line(path: Path, line: str) -> None:
 
 def check(
     settings_path: Path, run: Runner = run_command, record: Recorder = gpu_jobs.write_event,
-    hostname: str | None = None, card: Callable[[], gpu_jobs.CardReading | None] = gpu_jobs.card_reading,
+    hostname: str | None = None, card: Callable[[], gpu_jobs.CardReading | None] = lambda: gpu_jobs.card_reading(timeout=CALL_TIMEOUT_S / 2),
     sleep: Callable[[float], None] = time.sleep, containers: Lister = gpu_jobs.job_containers,
     container_map: Path = gpu_jobs.CONTAINER_MAP,
 ) -> list[str]:

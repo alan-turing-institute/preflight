@@ -211,7 +211,17 @@ def test_every_get_route_answers(path: str) -> None:
         unread = app._resource_tiles(total, running, None, {"mem_total": 2 * 10**9, "mem_used": 10**9, "cores": 20, "cores_busy": 3.0}, [dgx, lap])
         reported = {**dgx, "comment": "available_mb=90000;total_mb=120000;cores=20;cores_busy=2.0;gpu_procs=1;gpu_leases=0;gpu_watts=70"}
         assert "held · 70 W" in app._resource_tiles(total, running, idle, None, [reported, lap])  # its health check's reading wins
-        assert "0 of 1 held, 1 unknown" in unread and "Card now</span><span class=\"num\">unknown" in unread  # never free
+        assert "0 of 1 held, 1 unknown" in unread
+        unread_busy = app._resource_tiles(total, sharing, None, {"mem_total": 2 * 10**9, "mem_used": 10**9, "cores": 20, "cores_busy": 3.0}, [dgx, lap])
+        assert "1 of 1 held" in unread_busy  # its jobs prove it held without a reading
+        suspended = [*running, {"kind": app.Kind.PAUSED, "state": "SUSPENDED", "node": "dgx", "cpus": 2, "gpus": 1}]
+        assert "held · 17 W" in app._resource_tiles(total, suspended, idle, {"mem_total": 2 * 10**9, "mem_used": 10**9, "cores": 20, "cores_busy": 3.0}, [dgx, lap])  # suspended: keeps its card
+        old_check = {**dgx, "comment": "available_mb=90000;total_mb=120000;cores=20;cores_busy=2.0;gpu_busy=0.96"}
+        assert "Card now</span><span class=\"num\">unknown" in app._resource_tiles(total, running, None, None, [old_check, lap])
+        # one machine: its root health check's reading wins over the page's own (another user cannot read the leases)
+        one = {**total, "nodes": 1, "here": 1}
+        leased = {**dgx, "comment": "available_mb=90000;total_mb=120000;cores=20;cores_busy=2.0;gpu_procs=0;gpu_leases=1"}
+        assert "Card now</span><span class=\"num\">held" in app._resource_tiles(one, [], idle, None, [leased]) and "Card now</span><span class=\"num\">unknown" in unread  # never free
         assert ">GPU<" in strips[1] and ">GPU<" not in strips[2] and "not reported" not in both  # the laptop has none
         lap_silent = {**lap, "comment": ""}  # a machine that has not reported: said so on its strip and the cluster's, left out of the sum
         silent = app._resource_tiles(total, running, idle, {"mem_total": 2 * 10**9, "mem_used": 10**9, "cores": 20, "cores_busy": 3.0}, [dgx, lap_silent])
