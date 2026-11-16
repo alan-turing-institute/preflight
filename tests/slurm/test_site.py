@@ -47,7 +47,7 @@ def test_each_local_site_file_still_loads(path: Path) -> None:
     assert gpujobs_site.load(path).nodes
 
 
-def test_fixture_site_file_loads() -> None:
+def test_fixture_site_file_loads(tmp_path: Path) -> None:
     site = gpujobs_site.load(ROOT / "tests/slurm/fixtures/site.toml")
     assert (site.name, site.cluster_name, site.account) == ("gpu-node-1", "spark", "local") and site.unified_memory and site.hostguard and site.dgx_gate
     gpu = site.nodes[0].gpus[0]
@@ -55,6 +55,9 @@ def test_fixture_site_file_loads() -> None:
     assert set(site.lease.services) == {"service-a", "service-b", "service-c-app"}
     assert site.service == gpujobs_site.Service(4, "gpujobs-service")
     assert site.remotes == {"turing": gpujobs_site.Remote("site-b", "gpujobs-sync", data_root="/data/site/user1/datasets")}
+    fetch_only = gpujobs_site.load(write(tmp_path, MINIMAL + "[remote.t]\nhost = 'h'\nroot = 'r'\nsubmit_command = ''\n"
+                                         "fetch_exclude = ['snapshot-*.ckpt']\nfetch_retry_s = [5]\n")).remotes["t"]
+    assert (fetch_only.submit_command, fetch_only.fetch_exclude, fetch_only.fetch_retry_s) == ("", ("snapshot-*.ckpt",), (5,))
     fedora = site.part_time_nodes[0]  # what a job may ask of it: 16 abstract cores less keep_cpus "8-15"; 12 GB of 31.5
     assert (fedora.cores_lent, fedora.jobs_mb, fedora.default_jobs) == (8, 11444, True)
     assert site.lease.lease_dir == Path("/home/user1/.local/state/gpu-lease")
@@ -217,6 +220,12 @@ def test_example_loads_and_minimal_file_gets_every_default(tmp_path: Path) -> No
         (MINIMAL + "[remote.t]\nhost = 'h'\nroot = '../x'\n", "no '..'"),
         (MINIMAL + "[remote.t]\nhost = ' '\nroot = 'r'\n", "remote.t.host = ' '"),
         (MINIMAL + "[remote.t]\nhost = 'h'\nroot = 'r'\ndata_root = 'd'\n", "expected an absolute path"),
+        (MINIMAL + "[remote.t]\nhost = 'h'\nroot = 'r'\nstatus_command = ''\n", "remote.t.status_command = ''"),
+        (MINIMAL + "[remote.t]\nhost = 'h'\nroot = 'r'\nfetch_retry_s = []\n", "remote.t.fetch_retry_s = []"),
+        (MINIMAL + "[remote.t]\nhost = 'h'\nroot = 'r'\nfetch_retry_s = [60, 0]\n", "fetch_retry_s = [60, 0]"),
+        (MINIMAL + "[remote.t]\nhost = 'h'\nroot = 'r'\nfetch_exclude = '*.ckpt'\n", "expected a list of rsync patterns"),
+        (MINIMAL + "[remote.t]\nhost = 'h'\nroot = 'r'\nfetch_keep_free_gb = -1\n", "fetch_keep_free_gb = -1"),
+        (MINIMAL + "[remote.t]\nhost = 'h'\nroot = 'r'\nfetch_lost_after_s = 0\n", "fetch_lost_after_s = 0"),
         (MINIMAL + "[[nodes]]\nname = 'm'\ncpus = 2\nreal_memory_mb = 1000\n[service]\ncores = 1\n", "a site of one node"),
         (MINIMAL + "[service]\ncores = 1\ngroups = 'g'\n", "unknown key(s) in [service]: groups"),
         (MINIMAL + "[slurm]\nversion = '26.05.5'\n", "needs both version and sha256"),

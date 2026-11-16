@@ -95,6 +95,10 @@ class Record:
     empty_since: float | None = None
     finished_at: float | None = None
     force: bool = False  # `run --force`: fetch a skipped record once
+    project: str = ""  # the submitter's project, for notices
+    login: str = ""  # the account our ssh logs in as there: the jobs must be its own (design 8)
+    workdir_root: str = ""  # absolute folder there the jobs must have run in ("" = anywhere: a remote without preflight)
+    note: str = ""  # why the record is blocked or failed, in one sentence
 
 
 @dataclass(frozen=True)

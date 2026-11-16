@@ -152,6 +152,10 @@ class NotifyEvent(StrEnum):
     IDLE = "idle"  # a waste finding (D40): a job waits beside hardware a moved job would put to work
     OVER_ASK = "over_ask"  # a running job holds more memory (host + card) than it asked for (D44)
     MEMORY_STOP = "memory_stop"  # the memory guard stopped a job, and how it ended (D44)
+    FETCH_FAILED = "fetch_failed"  # a remote job's folders could not be fetched back, or its id was lost (D52)
+    FETCH_BLOCKED = "fetch_blocked"  # a fetch-back waits on the user: no room here, or the login there expired
+    FETCH_EXPIRED = "fetch_expired"  # a remote job had not ended by its fetch-back deadline
+    FETCH_THEN_FAILED = "fetch_then_failed"  # the command run after a fetch-back failed
 
 
 class NotifyRole(StrEnum):
@@ -241,6 +245,20 @@ def slurmctld_active_s(
         return monotonic() - int(fields["ActiveEnterTimestampMonotonic"]) / 1e6
     except (KeyError, ValueError):
         return None
+
+
+def notice_env(event: NotifyEvent, job: str, user: str, name: str, project: str, message: str, **extra: str) -> dict[str, str]:
+    """A notice as the site's notify command receives it (the README's `notify_command` row); names are what their
+    submitter typed, so control characters are shown as `?`."""
+    return {
+        "GPUJOBS_EVENT": event.value,
+        "GPUJOBS_JOB": job,
+        "GPUJOBS_USER": user,
+        "GPUJOBS_NAME": gpu_jobs.printable(name),
+        "GPUJOBS_PROJECT": gpu_jobs.printable(project),
+        "GPUJOBS_MESSAGE": gpu_jobs.printable(message),
+        **{f"GPUJOBS_{key.upper()}": gpu_jobs.printable(value) for key, value in extra.items()},
+    }
 
 
 def notify_run(argv: list[str], env: dict[str, str]) -> None:
@@ -1182,15 +1200,7 @@ class Agent:
         `extra` fields (GPUJOBS_<KEY>) such as the failed state or an idle finding's other side."""
         if not self.site.notify_command:
             return
-        env = {
-            "GPUJOBS_EVENT": event.value,
-            "GPUJOBS_JOB": job,
-            "GPUJOBS_USER": user,
-            "GPUJOBS_NAME": gpu_jobs.printable(name),  # what the submitter typed
-            "GPUJOBS_PROJECT": gpu_jobs.printable(jobs_view.project_of(name)),
-            "GPUJOBS_MESSAGE": gpu_jobs.printable(message),
-            **{f"GPUJOBS_{key.upper()}": gpu_jobs.printable(value) for key, value in extra.items()},
-        }
+        env = notice_env(event, job, user, name, jobs_view.project_of(name), message, **extra)
         try:
             self.notify(list(self.site.notify_command), env)
         except (OSError, subprocess.SubprocessError) as exc:

@@ -237,6 +237,18 @@ class Remote:
     submit_command: str = "gpujobs-submit"  # that site's own submit.py
     status_command: str = "gpujobs-status"
     data_root: str = ""  # absolute folder there for --data folders from outside the repo; empty: those are refused
+    # Fetch-back (D52, `fetch_back.py`): a `submit_command` of "" makes this a remote it only fetches from.
+    fetch_exclude: tuple[str, ...] = ()  # rsync patterns left out of every fetch from there
+    fetch_keep_free_gb: float = 10.0  # a fetch waits rather than leave less than this free here
+    fetch_wait_days: float = 7.0  # a job not ended this long after its record was written is given up
+    fetch_retry_s: tuple[int, ...] = (60, 300, 900, 3600)  # pause after the 1st, 2nd, ... failure in a row; the last repeats
+    fetch_lost_after_s: int = 3600  # a job id the accounting there has not known for this long is lost
+    auth_expired_text: str = ""  # text in ssh's error when the login there has expired (a certificate); "" = never checked
+    renew_hint: str = ""  # what to tell the user to run when it has
+
+
+#: `[remote.NAME]` texts that may be empty (an empty `submit_command` makes the remote fetch-only).
+REMOTE_MAY_BE_EMPTY = frozenset({"submit_command", "data_root", "auth_expired_text", "renew_hint"})
 
 
 @dataclass(frozen=True)
@@ -262,6 +274,7 @@ class Tuning:
     outside_keep_days: int = 14  # days the record of GPU work found outside slurm is kept
     ended_kept: int = 5000  # how many ended jobs the agent remembers
     memory_guard_min_excess_gb: float = 1.0  # a job counts as over its ask only beyond this, above sampling noise (D44)
+    fetch_every_s: int = 300  # the per-user fetch-back timer runs this often (D52)
 
 
 #: `[tuning]` keys that multiply a measured figure or bound one by a multiple of it: below 1 they would shrink or invert
@@ -501,20 +514,40 @@ def _parse_lease(raw: Any) -> Lease:
 def _parse_remotes(raw: Any) -> dict[str, Remote]:
     if not isinstance(raw, dict):
         raise SiteError(f"site file: [remote] must hold one [remote.NAME] table per site; {_HINT}")
+    defaults = {f.name: f.default for f in fields(Remote) if f.name not in {"host", "root"}}
     remotes = {}
     for name, table in raw.items():
-        t = _table(table, f"remote.{name}", {"host", "root"}, {"submit_command": "gpujobs-submit", "status_command": "gpujobs-status", "data_root": ""})
+        t = _table(table, f"remote.{name}", {"host", "root"}, defaults)
+        where = f"site file: remote.{name}"
         for key, value in t.items():
-            if key == "data_root" and value == "":
+            if not isinstance(defaults.get(key, ""), str):
                 continue
-            if not isinstance(value, str) or not value.strip() or value != value.strip():
-                raise SiteError(f"site file: remote.{name}.{key} = {value!r}; expected a non-empty text")
+            if not isinstance(value, str) or value != value.strip() or not (value or key in REMOTE_MAY_BE_EMPTY):
+                raise SiteError(f"{where}.{key} = {value!r}; expected a non-empty text")
         if ".." in Path(t["root"]).parts:
-            raise SiteError(f"site file: remote.{name}.root = {t['root']!r}; no '..' in it")
+            raise SiteError(f"{where}.root = {t['root']!r}; no '..' in it")
         if t["data_root"] and not t["data_root"].startswith("/"):
-            raise SiteError(f"site file: remote.{name}.data_root = {t['data_root']!r}; expected an absolute path")
-        remotes[name] = Remote(t["host"], t["root"], t["submit_command"], t["status_command"], t["data_root"])
+            raise SiteError(f"{where}.data_root = {t['data_root']!r}; expected an absolute path")
+        exclude, retry = t["fetch_exclude"], t["fetch_retry_s"]
+        if not isinstance(exclude, list | tuple) or not all(isinstance(p, str) and p for p in exclude):
+            raise SiteError(f"{where}.fetch_exclude = {exclude!r}; expected a list of rsync patterns")
+        if not isinstance(retry, list | tuple) or not retry or not all(_whole(v) and v > 0 for v in retry):
+            raise SiteError(f"{where}.fetch_retry_s = {retry!r}; expected a list of whole seconds above 0")
+        if not _whole(t["fetch_lost_after_s"]) or t["fetch_lost_after_s"] <= 0:
+            raise SiteError(f"{where}.fetch_lost_after_s = {t['fetch_lost_after_s']!r}; expected whole seconds above 0")
+        for key, least in (("fetch_keep_free_gb", 0), ("fetch_wait_days", 0)):
+            value = t[key]
+            if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value) or value < least:
+                raise SiteError(f"{where}.{key} = {value!r}; expected a finite number of at least {least}")
+        remotes[name] = Remote(**{
+            **t, "fetch_exclude": tuple(exclude), "fetch_retry_s": tuple(retry),
+            "fetch_keep_free_gb": float(t["fetch_keep_free_gb"]), "fetch_wait_days": float(t["fetch_wait_days"]),
+        })
     return remotes
+
+
+def _whole(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
 
 
 def _parse_service(raw: Any, nodes: tuple[Node, ...]) -> Service:
