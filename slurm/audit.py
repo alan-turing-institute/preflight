@@ -45,18 +45,6 @@ def descends_from(pid: int, ancestor: int, proc: Path = Path("/proc")) -> bool:
     return False
 
 
-def lease_pids(lease_dir: Path, *, holding: bool = False) -> dict[int, str]:
-    """Live lease records' pids and projects; `holding` leaves out waiters (a record with `requested_at`), which the
-    lease protocol has not admitted yet."""
-    pids = {}
-    for path in lease_dir.glob("*.json"):
-        record = gpu_jobs.read_json(path) or {}
-        pid = record.get("pid")
-        if gpu_jobs.pid_alive(pid) and not (holding and record.get("requested_at") is not None):
-            pids[int(pid)] = str(record.get("project") or path.stem)
-    return pids
-
-
 def command_of(pid: int, proc: Path = Path("/proc")) -> str:
     try:
         text = (proc / str(pid) / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace").strip()
@@ -114,7 +102,7 @@ def unregistered(
     usage = gpu_mib_by_pid() if usage is None else usage
     containers, queue = containers or gpu_jobs.known_containers, queue or gpu_jobs.read_queue  # looked up when called
     lease_dir = lease_dir or gpu_jobs.LEASE_DIR
-    leases = lease_pids(lease_dir) if lease_dir else {}
+    leases = gpu_jobs.lease_pids(lease_dir) if lease_dir else {}
     lease_cgroups = {cgroup_of(pid, proc) for pid in leases} - {""}
     found = []
     host = here or gpu_jobs.this_host()

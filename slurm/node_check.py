@@ -47,7 +47,8 @@ SETTINGS_PATH = Path("/etc/gpujobs/node_check.json")
 LOG_PATH = Path("/var/log/gpujobs/node_check.log")  # the settings name it too; this is for a run that cannot read them
 REASON_PREFIX = "gpujobs-check: "
 #: The node's `Comment` carries what the check just read, for the page: `available_mb=N;total_mb=N;cores=N;cores_busy=X`
-#: (`gpu_busy=X`, 0-1, too on a machine with a GPU; no spaces: `scontrol -o` splits on them). A comment that does not start with the prefix is someone else's: left alone.
+#: (`gpu_procs=N;gpu_leases=N`, and `gpu_watts=X` when the cards give it, too on a machine whose `nvidia-smi` answers:
+#: `gpu_jobs.CardReading`; no spaces: `scontrol -o` splits on them). A comment that does not start with the prefix is someone else's: left alone.
 COMMENT_PREFIX = "available_mb="
 #: slurm kills a health check after 60 s; every slurm call gets far less.
 CALL_TIMEOUT_S = 10
@@ -394,15 +395,16 @@ def read_comment(text: object) -> dict[str, float]:
     return {k: float(v) for k, v in found.items()}
 
 
-def report_free(run: Runner, info: NodeInfo, free: int, use: dict[str, float], gpu_busy: float | None = None) -> None:
+def report_free(run: Runner, info: NodeInfo, free: int, use: dict[str, float], card: gpu_jobs.CardReading | None = None) -> None:
     """Put what the check judged by, and what the machine is doing, on the node, where the page reads it (slurm's own
     `FreeMem` leaves out the cache, so it is not the figure the limits are about). Display only: a failure never closes
     the node."""
     value = f"{COMMENT_PREFIX}{free}"
     if use:
         value += f";total_mb={use['mem_total'] // MB_BYTES};cores={int(use['cores'])};cores_busy={use['cores_busy']:.1f}"
-        if gpu_busy is not None:
-            value += f";gpu_busy={gpu_busy:.2f}"
+        if card is not None:
+            value += f";gpu_procs={card.processes};gpu_leases={card.leases}"
+            value += f";gpu_watts={card.watts:.0f}" if card.watts is not None else ""
     if value != info.comment and (not info.comment or info.comment.startswith(COMMENT_PREFIX)):
         run(["scontrol", "update", f"NodeName={info.name}", f"Comment={value}"])
 
@@ -430,7 +432,7 @@ def log_line(path: Path, line: str) -> None:
 
 def check(
     settings_path: Path, run: Runner = run_command, record: Recorder = gpu_jobs.write_event,
-    hostname: str | None = None, gpu_busy: Callable[[], float | None] = gpu_jobs.gpu_busy,
+    hostname: str | None = None, card: Callable[[], gpu_jobs.CardReading | None] = gpu_jobs.card_reading,
     sleep: Callable[[float], None] = time.sleep, containers: Lister = gpu_jobs.job_containers,
     container_map: Path = gpu_jobs.CONTAINER_MAP,
 ) -> list[str]:
@@ -495,7 +497,7 @@ def check(
         decisions.append(f"reopen ({settings.reopen_after} passing runs)")
 
     gpu_jobs.write_json(settings.state_path, state)
-    report_free(run, info, free, gpu_jobs.machine_use(lambda path: (settings.meminfo_path if path == "/proc/meminfo" else Path(path)).read_text(encoding="ascii"), sleep), gpu_busy())
+    report_free(run, info, free, gpu_jobs.machine_use(lambda path: (settings.meminfo_path if path == "/proc/meminfo" else Path(path)).read_text(encoding="ascii"), sleep), card())
     try:
         if skipped := write_manifest(settings.state_dir):
             log_line(settings.log_path, f"{info.name} {skipped}")

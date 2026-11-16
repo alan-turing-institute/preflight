@@ -763,6 +763,18 @@ def pid_alive(pid: object) -> bool:
     return True
 
 
+def lease_pids(lease_dir: Path, *, holding: bool = False) -> dict[int, str]:
+    """Live lease records' pids and projects; `holding` leaves out waiters (a record with `requested_at`), which the
+    lease protocol has not admitted yet."""
+    pids = {}
+    for path in lease_dir.glob("*.json"):
+        record = read_json(path) or {}
+        pid = record.get("pid")
+        if pid_alive(pid) and not (holding and record.get("requested_at") is not None):
+            pids[int(pid)] = str(record.get("project") or path.stem)
+    return pids
+
+
 def slurm_lease_admitted(lease_dir: Path | None = None) -> bool:
     """Whether the keeper holds the GPU lease for slurm: a live pid and no outstanding request."""
     lease_dir = lease_dir or LEASE_DIR
@@ -1575,11 +1587,35 @@ def gpu_numbers(field_name: str) -> list[float] | None:
         return None
 
 
-def gpu_busy() -> float | None:
-    """How busy the GPUs are, 0-1, averaged over them (`nvidia-smi` utilization.gpu). Not a test of whether a card is
-    free: an idle GB10 reads about 96% (`status.card_lines` decides that)."""
-    found = gpu_numbers("utilization.gpu")
-    return sum(found) / 100 / len(found) if found else None
+class CardState(StrEnum):
+    FREE = "free"
+    HELD = "held"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class CardReading:
+    """What holds this machine's card outside slurm's own bookkeeping, as `nvidia-smi` and the GPU lease folder show it.
+    Never `utilization.gpu` (GPU-Util): it reads about 96% on an idle GB10, and sessions read that as a busy card."""
+
+    processes: int  # compute processes on the machine's cards, slurm jobs' included
+    leases: int  # GPU leases services hold (admitted, not waiting); the keeper's own stands for slurm's jobs: left out
+    watts: float | None  # power drawn by the machine's cards; None when any card gives no number
+
+    def state(self, slurm_jobs: int) -> CardState:
+        """`slurm_jobs`: the running jobs on this machine that hold a GPU or shards."""
+        return CardState.HELD if slurm_jobs or self.processes or self.leases else CardState.FREE
+
+
+def card_reading(lease_dir: Path | None = None) -> CardReading | None:
+    """This machine's `CardReading`; None when `nvidia-smi` does not answer (no card, or one hidden from this process)."""
+    usage = gpu_usage()
+    if usage is None:
+        return None
+    lease_dir = lease_dir or LEASE_DIR
+    services = set(lease_pids(lease_dir, holding=True).values()) - {LEASE_PROJECT} if lease_dir else set()
+    watts = gpu_numbers("power.draw")
+    return CardReading(len(usage), len(services), sum(watts) if watts else None)
 
 
 def gpu_mib_by_pid() -> dict[int, float]:

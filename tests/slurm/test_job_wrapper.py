@@ -97,7 +97,7 @@ def test_declared_sharing_skips_the_occupancy_check(monkeypatch) -> None:
 
     monkeypatch.setattr(job_wrapper.gpu_jobs, "gpu_usage", lambda: {10: 300.0, 20: 50.0})
     monkeypatch.setattr(audit, "cgroup_of", lambda pid, *_a: "/x/slurmstepd.scope/job_5" if pid == 10 else "/user.slice")
-    monkeypatch.setattr(audit, "lease_pids", lambda *_a: {})
+    monkeypatch.setattr(audit.gpu_jobs, "lease_pids", lambda *_a: {})
     monkeypatch.setattr(audit, "descends_from", lambda *_a: False)
     monkeypatch.setattr(audit, "command_of", lambda *_a: "python")
     monkeypatch.setattr(job_wrapper.gpu_jobs, "container_label", lambda *_a: "")

@@ -89,7 +89,7 @@ def gpu_lines(queue: list[gpu_jobs.QueuedJob]) -> list[str]:
     strays = audit.unregistered(usage) if usage is not None else []
     out = []
     if has_card:
-        leases = audit.lease_pids(gpu_jobs.LEASE_DIR, holding=True) if gpu_jobs.LEASE_DIR else {}
+        leases = gpu_jobs.lease_pids(gpu_jobs.LEASE_DIR, holding=True) if gpu_jobs.LEASE_DIR else {}
         out += card_lines(queue, gpu_jobs.this_host(), usage, gpu_jobs.gpu_numbers("power.draw"), leases, strays)
     return out + (audit.report(strays) if usage is not None else [])  # unknown is said once, by the card line
 
@@ -102,7 +102,7 @@ def card_lines(queue: list[gpu_jobs.QueuedJob], here: str, usage: dict[int, floa
     to neither. Never judged from nvidia-smi's GPU-Util, which reads about 96% on an idle GB10; the power draw and
     the compute processes are printed as the evidence."""
     if usage is None:
-        return [("[card] UNKNOWN: nvidia-smi did not answer (inside a slurm job without a GPU the card is hidden); "
+        return [(f"[card] {gpu_jobs.CardState.UNKNOWN.upper()}: nvidia-smi did not answer (inside a slurm job without a GPU the card is hidden); "
                  "do not treat the card as free")]
     holders = [f"slurm job {job.job_id} ({job.name})" for job in queue
                if job.uses_card and job.node == here and job.state in gpu_jobs.ACTIVE_STATES]
@@ -112,10 +112,10 @@ def card_lines(queue: list[gpu_jobs.QueuedJob], here: str, usage: dict[int, floa
     card = gpu_jobs.size_text(gpu_jobs.card_bytes(usage, usage))
     evidence = f"{power}, {len(usage)} compute process(es) holding {card} of card memory; GPU-Util is not a test of this"
     if holders:
-        return [gpu_jobs.printable(f"[card] HELD by {'; '.join(holders)} ({evidence})")]
+        return [gpu_jobs.printable(f"[card] {gpu_jobs.CardState.HELD.upper()} by {'; '.join(holders)} ({evidence})")]
     waiting = [job.job_id for job in queue if job.uses_card and job.state == gpu_jobs.State.PENDING]
     after = f"; GPU jobs waiting for it: {', '.join(waiting)}" if waiting else ""
-    return [f"[card] FREE: no slurm job, GPU lease or compute process holds it ({evidence}){after}"]
+    return [f"[card] {gpu_jobs.CardState.FREE.upper()}: no slurm job, GPU lease or compute process holds it ({evidence}){after}"]
 
 
 #: `--reserve` (D44): the share of the one-minute samples the reserve must cover, and the least history to judge from.

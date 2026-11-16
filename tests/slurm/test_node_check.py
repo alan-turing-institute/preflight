@@ -117,7 +117,7 @@ def box(tmp_path: Path):
         def run(slurm: FakeSlurm) -> list[str]:
             return node_check.check(
                 path, slurm, lambda *args, **fields: (events.append((*args, fields)), Path("/events") / args[0])[1],
-                hostname=NODE + ".lan", gpu_busy=lambda: 0.4, sleep=lambda _s: None,
+                hostname=NODE + ".lan", card=lambda: gpu_jobs.CardReading(2, 1, 17.4), sleep=lambda _s: None,
                 containers=lambda: Box.containers, container_map=Box.container_map,
             )
 
@@ -134,7 +134,7 @@ def test_push_back_takes_the_latest_started_resume_job_only_and_excludes_at_the_
     )
     decisions = box.run(slurm)
     assert [c[:3] for c in slurm.calls] == [["scontrol", "requeue", "2"]]  # one job; not restart/urgent/service
-    assert slurm.comment.startswith("available_mb=1000;total_mb=") and ";cores_busy=" in slurm.comment and slurm.comment.endswith(";gpu_busy=0.40")  # what the page shows
+    assert slurm.comment.startswith("available_mb=1000;total_mb=") and ";cores_busy=" in slurm.comment and slurm.comment.endswith(";gpu_procs=2;gpu_leases=1;gpu_watts=17")  # what the page shows
     assert box.pushes == [("2", gpu_jobs.EventAction.PUSH_BACK, {"node": NODE, "free_mb": 1000})]
     assert [d.split(" (")[0] for d in decisions] == ["push back 2", "would close"]  # and the foreign drain left alone
     slurm.jobs[1].update(job_state=["RUNNING"], nodes=NODE)  # it started here again

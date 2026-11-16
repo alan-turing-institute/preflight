@@ -75,7 +75,7 @@ class Fake:
             node_capacity=lambda: [],  # one machine: never the live cluster's
             partition_tiers=lambda: None,  # never the live cluster's
             machine=lambda: {"mem_total": 120 * 1024**3, "mem_used": 110 * 1024**3, "cores": 20, "cores_busy": 3.0},
-            gpu_busy=lambda: 0.37,
+            card=lambda: gpu_jobs.CardReading(1, 0, 72.4),
         )
         self.application = app.make_application(self.backend)
 
@@ -138,7 +138,7 @@ def test_every_get_route_answers(path: str) -> None:
         assert app._waits_cell(waits * 2, "/r/", "9").startswith(
             '<details class="waits" data-key="waits-9"><summary class="why">waits for 4 jobs</summary>')
         # each resource as reserved by jobs (of what slurm can give) beside really in use (of the whole machine), in GB
-        assert "Reserved by jobs" in body and "1 of 1" in body and "37%" in body
+        assert "Reserved by jobs" in body and "1 of 1" in body and "Card now</span><span class=\"num\">held · 72 W" in body
         assert "8 of 20" in body and "3.0 of 20" in body and "12 left to reserve" in body
         assert "68.7 of 107.4 GB" in body and "38.7 GB left to reserve" in body
         assert "118.1 of 128.8 GB" in body and "10.7 GB available" in body
@@ -188,8 +188,8 @@ def test_every_get_route_answers(path: str) -> None:
         assert re.search(r'>Running for</a></th><th scope="col"><a class="sort" [^>]*>Queued at</a></th>', body)  # side by side
         # nvidia-smi and /proc read the portal's own host: no in-use bar unless that host is slurm's one node
         elsewhere = app._resource_tiles({"cpus": 1, "cpus_used": 0, "mem_mb": 1024, "mem_used_mb": 0, "gpus": 1, "gpus_used": 1,
-                                         "nodes": 1, "here": 0}, [], 0.5, {"mem_total": 1, "mem_used": 1, "cores": 1, "cores_busy": 1})
-        assert "Reserved by jobs" in elsewhere and "Busy" not in elsewhere and "In use" not in elsewhere
+                                         "nodes": 1, "here": 0}, [], gpu_jobs.CardReading(0, 0, 1.0), {"mem_total": 1, "mem_used": 1, "cores": 1, "cores_busy": 1})
+        assert "Reserved by jobs" in elsewhere and "Card now" not in elsewhere and "In use" not in elsewhere
         # two machines: a strip for the cluster, then one each; only the page's own machine reads /proc, the other's reading
         # is the one its health check left in its comment
         total = {"cpus": 28, "cpus_used": 4, "mem_mb": 112000, "mem_used_mb": 0, "gpus": 1, "gpus_used": 0, "nodes": 2, "here": 1}
@@ -197,14 +197,24 @@ def test_every_get_route_answers(path: str) -> None:
         lap = {"name": "lap", "here": 0, "cpus": 8, "cpus_used": 0, "mem_mb": 12000, "mem_used_mb": 0, "gpus": 0, "gpus_used": 0,
                "comment": "available_mb=9000;total_mb=30000;cores=22;cores_busy=1.5"}
         running = [{"kind": app.Kind.RUNNING, "node": "lap", "cpus": 8, "gpus": 0}]
-        both = app._resource_tiles(total, running, 0.5, {"mem_total": 2 * 10**9, "mem_used": 10**9, "cores": 20, "cores_busy": 3.0}, [dgx, lap])
+        idle = gpu_jobs.CardReading(0, 0, 17.0)  # GPU-Util would read ~96% here; nothing holds the card
+        both = app._resource_tiles(total, running, idle, {"mem_total": 2 * 10**9, "mem_used": 10**9, "cores": 20, "cores_busy": 3.0}, [dgx, lap])
         strips = both.split('<section')[1:]
         assert [x.split("</h2>")[0].rsplit(">", 1)[1] for x in strips] == ["Whole cluster", "dgx", "lap"]
         assert "3.0 of 20" in strips[1] and "1.5 of 22" in strips[2] and "21.0 of 30.0 GB" in strips[2]
-        assert "4.5 of 42" in strips[0] and "22.0 of 32.0 GB" in strips[0] and "Busy</span><span class=\"num\">50%" in strips[0]  # summed
+        assert "4.5 of 42" in strips[0] and "22.0 of 32.0 GB" in strips[0] and "free card now</span><span class=\"num\">1 of 1" in strips[0]  # summed
+        assert "Card now</span><span class=\"num\">free · 17 W" in strips[1]
+        sharing = [*running, {"kind": app.Kind.RUNNING, "node": "dgx", "cpus": 2, "gpus": 0, "shards": 2}]  # a shard job holds it
+        held = app._resource_tiles(total, sharing, idle, {"mem_total": 2 * 10**9, "mem_used": 10**9, "cores": 20, "cores_busy": 3.0}, [dgx, lap])
+        assert "free card now</span><span class=\"num\">0 of 1" in held and "held · 17 W" in held
+        assert held.split("free card now")[1].split("</svg>")[0].endswith('class="fill used" width="100.0" height="8"/>')  # held: full
+        unread = app._resource_tiles(total, running, None, {"mem_total": 2 * 10**9, "mem_used": 10**9, "cores": 20, "cores_busy": 3.0}, [dgx, lap])
+        reported = {**dgx, "comment": "available_mb=90000;total_mb=120000;cores=20;cores_busy=2.0;gpu_procs=1;gpu_leases=0;gpu_watts=70"}
+        assert "held · 70 W" in app._resource_tiles(total, running, idle, None, [reported, lap])  # its health check's reading wins
+        assert "0 of 1 (1 unknown)" in unread and "Card now</span><span class=\"num\">unknown" in unread  # never free
         assert ">GPU<" in strips[1] and ">GPU<" not in strips[2] and "not reported" not in both  # the laptop has none
         lap_silent = {**lap, "comment": ""}  # a machine that has not reported: said so on its strip and the cluster's, left out of the sum
-        silent = app._resource_tiles(total, running, 0.5, {"mem_total": 2 * 10**9, "mem_used": 10**9, "cores": 20, "cores_busy": 3.0}, [dgx, lap_silent])
+        silent = app._resource_tiles(total, running, idle, {"mem_total": 2 * 10**9, "mem_used": 10**9, "cores": 20, "cores_busy": 3.0}, [dgx, lap_silent])
         assert silent.count("in use not reported by lap") == SILENT_NOTES and "3.0 of 20" in silent.split("<section")[1]
 
 

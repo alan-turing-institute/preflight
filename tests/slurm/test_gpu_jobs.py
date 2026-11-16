@@ -429,10 +429,10 @@ def test_state_dir_resolution_env_over_site_file_and_no_fallback(tmp_path: Path,
         importlib.reload(gpu_jobs)
 
 
-@pytest.mark.parametrize(("out", "busy"), [("40\n60\n", 0.5), ("40\n[N/A]\n", None), ("", None)])
-def test_gpu_busy_is_unknown_unless_every_gpu_answers(out: str, busy: float | None, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(("out", "found"), [("40\n60.5\n", [40.0, 60.5]), ("40\n[N/A]\n", None), ("", None)])
+def test_gpu_numbers_are_unknown_unless_every_gpu_answers(out: str, found: list[float] | None, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a, 0, stdout=out))
-    assert gpu_jobs.gpu_busy() == busy  # an average over only the GPUs that answered would misstate the box
+    assert gpu_jobs.gpu_numbers("power.draw") == found  # a total over only the GPUs that answered would misstate the box
 
 
 def test_the_card_verdict_comes_from_holders_never_from_gpu_util(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -447,6 +447,7 @@ def test_the_card_verdict_comes_from_holders_never_from_gpu_util(tmp_path: Path,
     monkeypatch.setattr(gpu_jobs, "gpu_numbers", lambda _field: [17.0])
     monkeypatch.setattr(gpu_jobs, "this_host", lambda: "box")
     monkeypatch.setattr(audit, "unregistered", lambda _usage: [])
+    assert gpu_jobs.card_reading() == gpu_jobs.CardReading(0, 0, 17.0)  # what the health check puts on the node
     free = status.gpu_lines([waiting, elsewhere])
     assert free[0] == ("[card] FREE: no slurm job, GPU lease or compute process holds it (17 W, 0 compute process(es) "
                        "holding 0 MB of card memory; GPU-Util is not a test of this); GPU jobs waiting for it: 3")
