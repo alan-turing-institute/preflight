@@ -174,6 +174,9 @@ def test_the_synced_names_must_load_from_the_synced_folder_before_anything_is_qu
     assert clean.calls == []  # refused before any copy
     remote.submit(arguments(repo, command=["uv", "run", "python", "run.py"], remote_python=".venv/bin/python"), site)
     assert any(c[-1].startswith("cd sync/p/. && .venv/bin/python - ") for c in clean.calls)
+    clean.calls.clear()  # a command led by `env NAME=value`: the check runs under the same variables (PYTHONPATH)
+    remote.submit(arguments(repo, command=["env", "PYTHONPATH=/g", "py/bin/python3", "-m", "run"]), site)
+    assert any(c[-1].startswith("cd sync/p/. && env PYTHONPATH=/g py/bin/python3 - ") for c in clean.calls)
 
 
 def test_python_that_would_load_a_package_from_elsewhere_is_caught_by_the_real_check(tmp_path: Path) -> None:

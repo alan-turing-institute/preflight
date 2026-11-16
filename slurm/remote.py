@@ -178,28 +178,32 @@ def verify(remote: site_config.Remote, root: str, repo: Path, files: list[str]) 
         raise RemoteRefused(f"after the copy, {remote.host} still differs on: {', '.join(bad)}")
 
 
-def interpreter(arguments: argparse.Namespace) -> str:
-    """The Python the job runs there, for the import check: `--remote-python`, else the command's own first word when it
-    is one, relative to the job's folder as the command is. Anything else (`uv run`, a shell script) is refused,
-    because guessing another interpreter would check the wrong Python."""
+def interpreter(arguments: argparse.Namespace) -> list[str]:
+    """The words that start the job's Python there, for the import check: `--remote-python`, else the command's own
+    leading words up to its Python (`python ...`, or `env NAME=value ... python ...`, so the check sees the job's own
+    variables such as PYTHONPATH), relative to the job's folder as the command is. Anything else (`uv run`, a shell
+    script) is refused, because guessing another interpreter would check the wrong Python."""
     named = getattr(arguments, "remote_python", None)
     if named:
-        return named
-    first = arguments.command[0]
-    if Path(first).name.startswith(INTERPRETER_PREFIX):
-        return first
+        return [named]
+    command = list(arguments.command)
+    lead = 1 if command[0] == "env" else 0
+    while lead and lead < len(command) and "=" in command[lead] and not command[lead].startswith("-"):
+        lead += 1
+    if lead < len(command) and Path(command[lead]).name.startswith(INTERPRETER_PREFIX):
+        return command[: lead + 1]
     raise RemoteRefused(
-        f"the command starts with {first!r}, not a Python: --remote-python PATH names the Python the job runs there "
-        "(relative to --workdir, e.g. .venv/bin/python), so the import check uses the same one"
+        f"the command starts with {shlex.join(command[:3])!r}, not a Python: --remote-python PATH names the Python the job "
+        "runs there (relative to --workdir, e.g. .venv/bin/python), so the import check uses the same one"
     )
 
 
-def check_imports(remote: site_config.Remote, inside: str, plan_: Plan, python: str, to_root: str) -> None:
+def check_imports(remote: site_config.Remote, inside: str, plan_: Plan, python: list[str], to_root: str) -> None:
     """Refuse when Python there, from the job's folder, would load a first-party name from outside the synced folder
     (`remote_import_check.py`, piped so that site cannot hold a stale copy). `to_root` is the project folder as seen
     from `inside`."""
     spec = json.dumps({"project": to_root, "roots": plan_.roots, "names": plan_.names})
-    _run([*SSH, remote.host, f"cd {shlex.quote(inside)} && {python} - {shlex.quote(spec)}"],
+    _run([*SSH, remote.host, f"cd {shlex.quote(inside)} && {shlex.join([*python, '-', spec])}"],
          f"the import check on {remote.host}", IMPORT_CHECK.read_text(encoding="utf-8"))
 
 
