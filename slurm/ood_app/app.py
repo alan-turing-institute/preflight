@@ -832,9 +832,9 @@ def _resource_tiles(
     combined = _combined([(n, seen[str(n["name"])]) for n in per_node if seen[str(n["name"])]])
     on = {str(n["name"]): [r for r in rows if r["node"] == n["name"]] for n in per_node}
     states = [_card_state(seen[str(n["name"])], on[str(n["name"])]) for n in per_node if n["gpus"]]
-    free, unknown = states.count(gpu_jobs.CardState.FREE), states.count(gpu_jobs.CardState.UNKNOWN)
-    cards = ("Machines with a free card now", f"{free} of {len(states)}" + (f" ({unknown} unknown)" if unknown else ""),
-             1 - free / len(states)) if states else None
+    held, unknown = states.count(gpu_jobs.CardState.HELD), states.count(gpu_jobs.CardState.UNKNOWN)
+    cards = ("Cards now", f"{held} of {len(states)} held" + (f", {unknown} unknown" if unknown else ""),
+             held / len(states)) if states else None
     return _box("Whole cluster", have, rows, cards, combined, missing) + "".join(
         _box(str(n["name"]), n, on[str(n["name"])], _card_line(seen[str(n["name"])], on[str(n["name"])]) if seen[str(n["name"])] else None,
              seen[str(n["name"])], missing if not seen[str(n["name"])] else ())

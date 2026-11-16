@@ -202,16 +202,16 @@ def test_every_get_route_answers(path: str) -> None:
         strips = both.split('<section')[1:]
         assert [x.split("</h2>")[0].rsplit(">", 1)[1] for x in strips] == ["Whole cluster", "dgx", "lap"]
         assert "3.0 of 20" in strips[1] and "1.5 of 22" in strips[2] and "21.0 of 30.0 GB" in strips[2]
-        assert "4.5 of 42" in strips[0] and "22.0 of 32.0 GB" in strips[0] and "free card now</span><span class=\"num\">1 of 1" in strips[0]  # summed
+        assert "4.5 of 42" in strips[0] and "22.0 of 32.0 GB" in strips[0] and "Cards now</span><span class=\"num\">0 of 1 held" in strips[0]  # summed
         assert "Card now</span><span class=\"num\">free · 17 W" in strips[1]
         sharing = [*running, {"kind": app.Kind.RUNNING, "node": "dgx", "cpus": 2, "gpus": 0, "shards": 2}]  # a shard job holds it
         held = app._resource_tiles(total, sharing, idle, {"mem_total": 2 * 10**9, "mem_used": 10**9, "cores": 20, "cores_busy": 3.0}, [dgx, lap])
-        assert "free card now</span><span class=\"num\">0 of 1" in held and "held · 17 W" in held
-        assert held.split("free card now")[1].split("</svg>")[0].endswith('class="fill used" width="100.0" height="8"/>')  # held: full
+        assert "Cards now</span><span class=\"num\">1 of 1 held" in held and "held · 17 W" in held
+        assert held.split("Cards now")[1].split("</svg>")[0].endswith('class="fill used" width="100.0" height="8"/>')  # held: full
         unread = app._resource_tiles(total, running, None, {"mem_total": 2 * 10**9, "mem_used": 10**9, "cores": 20, "cores_busy": 3.0}, [dgx, lap])
         reported = {**dgx, "comment": "available_mb=90000;total_mb=120000;cores=20;cores_busy=2.0;gpu_procs=1;gpu_leases=0;gpu_watts=70"}
         assert "held · 70 W" in app._resource_tiles(total, running, idle, None, [reported, lap])  # its health check's reading wins
-        assert "0 of 1 (1 unknown)" in unread and "Card now</span><span class=\"num\">unknown" in unread  # never free
+        assert "0 of 1 held, 1 unknown" in unread and "Card now</span><span class=\"num\">unknown" in unread  # never free
         assert ">GPU<" in strips[1] and ">GPU<" not in strips[2] and "not reported" not in both  # the laptop has none
         lap_silent = {**lap, "comment": ""}  # a machine that has not reported: said so on its strip and the cluster's, left out of the sum
         silent = app._resource_tiles(total, running, idle, {"mem_total": 2 * 10**9, "mem_used": 10**9, "cores": 20, "cores_busy": 3.0}, [dgx, lap_silent])
