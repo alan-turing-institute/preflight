@@ -137,6 +137,8 @@ def test_example_loads_and_minimal_file_gets_every_default(tmp_path: Path) -> No
     # [tuning] (coding standard 3): absent = today's values; a key given replaces only itself, an int may stand for a float
     tuned = gpujobs_site.load(write(tmp_path, MINIMAL + "[tuning]\nhistory_runs = 5\nauto_margin = 1\n")).tuning
     assert site.tuning == gpujobs_site.Tuning() and (tuned.history_runs, tuned.auto_margin, tuned.cores_margin) == (5, 1.0, 1.25)
+    checked = gpujobs_site.load(write(tmp_path, MINIMAL + "[health_check]\nreopen_after = 5\npushes_before_exclude = 4\n")).health_check
+    assert (checked.reopen_after, checked.pushes_before_exclude) == (5, 4)
     # and the tools read it: a fresh import under that site file sizes, checks and paces by it
     tuned_file = write(tmp_path, MINIMAL + "[tuning]\nhistory_runs = 5\ncheck_timeout_s = 30\nidle_every_s = 7\n")
     probe = "import gpu_jobs, checks, agent; print(gpu_jobs.HISTORY_RUNS, checks.CHECK_TIMEOUT_S, agent.IDLE_EVERY_S)"
@@ -205,6 +207,11 @@ def test_example_loads_and_minimal_file_gets_every_default(tmp_path: Path) -> No
         (MINIMAL + "[tuning]\nauto_margin = 0\n", "tuning.auto_margin = 0"),
         (MINIMAL + "[tuning]\nauto_margin = true\n", "tuning.auto_margin = True"),
         (MINIMAL + "[tuning]\nmargin = 1\n", "unknown key(s) in [tuning]: margin"),
+        (MINIMAL + "[tuning]\ncheck_timeout_s = inf\n", "tuning.check_timeout_s = inf"),  # would lift the limit
+        (MINIMAL + "[tuning]\nauto_margin = nan\n", "tuning.auto_margin = nan"),
+        (MINIMAL + "[tuning]\noom_bump_ratio = 0.5\n", "tuning.oom_bump_ratio = 0.5"),  # would shrink after a kill
+        (MINIMAL + "[health_check]\nreopen_after = 0\n", "health_check.reopen_after = 0"),
+        (MINIMAL + "[health_check]\npushes_before_exclude = 1.5\n", "health_check.pushes_before_exclude = 1.5"),
         (MINIMAL + "[service]\ncores = 0\n", "service.cores = 0"),
         (MINIMAL + "[remote.t]\nhost = 'h'\n", "[remote.t] is missing root"),
         (MINIMAL + "[remote.t]\nhost = 'h'\nroot = '../x'\n", "no '..'"),

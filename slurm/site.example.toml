@@ -154,9 +154,12 @@ python = "/opt/gpujobs/venv/bin/python"       # interpreter with localmodels ins
 # in [[nodes]]; settings are rendered to /etc/gpujobs/node_check.json. Leave the table out for no health check.
 # [health_check]
 # interval_s = 30              # seconds between checks (slurm HealthCheckInterval). Default: 30
+# reopen_after = 3             # passing checks in a row before a node the check closed is reopened (D22). Default: 3
+# pushes_before_exclude = 2    # times a job is pushed off a node before it is barred from it (D22). Default: 2
 
 # Optional. The numbers a site may tune; each line shows its default (today's value, ratified where a decision is named).
-# Leave the table out to keep them all. Every value is a number above 0; counts and days are whole numbers.
+# Leave the table out to keep them all. Every value is a finite number above 0 (the four multipliers: 1 or more);
+# oom_min_bump_mb, history_runs, unclean_min_s, outside_keep_days and ended_kept are whole numbers.
 # [tuning]
 # auto_margin = 0.10              # --mem auto: the measured peak plus this share (D28, D35)
 # unclean_margin = 0.25           # --mem auto with no clean run: the largest crashed or pre-empted peak plus this share

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import re
 import os
 import shlex
 import signal
@@ -453,9 +454,11 @@ def test_a_new_uv_project_joins_by_itself_and_a_worktree_or_registered_one_does_
     assert "pytest -q -x" in found["app"].command
     assert "timeout -k 5 77" in found["app"].command  # the registry's cap, not a constant
     assert weekly.load_discovery(tmp_path / "absent.toml") == weekly.Discovery()  # no registry: today's defaults
-    registry.write_text("[discover]\ntest_cap = 5\n")
-    with pytest.raises(ValueError, match="test_cap"):
-        weekly.load_discovery(registry)
+    for bad, said in (("[discover]\ntest_cap = 5\n", "test_cap"), ('[discover]\nroots = "~/dev"\n', "roots = '~/dev'"),
+                      ("discover = 5\n", "must be a table"), ("[discover]\nroots = [1]\n", "roots = [1]")):
+        registry.write_text(bad)  # a plain string would have been read as one folder per character, '/' among them
+        with pytest.raises(ValueError, match=re.escape(said)):
+            weekly.load_discovery(registry)
     assert found["app"].sync == ("--all-extras",)
 
 

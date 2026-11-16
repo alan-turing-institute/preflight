@@ -264,15 +264,22 @@ class Tuning:
     memory_guard_min_excess_gb: float = 1.0  # a job counts as over its ask only beyond this, above sampling noise (D44)
 
 
+#: `[tuning]` keys that multiply a measured figure or bound one by a multiple of it: below 1 they would shrink or invert
+#: the rule they belong to, so they are refused there.
+TUNING_AT_LEAST_ONE = frozenset({"oom_bump_ratio", "cores_margin", "size_extrapolation_limit", "cores_over_ask"})
+
+
 def _parse_tuning(raw: Any) -> Tuning:
     defaults = {f.name: f.default for f in fields(Tuning)}
     values = _table(raw, "tuning", set(), defaults)
     for key, value in values.items():
         whole = isinstance(defaults[key], int)
         kinds = int if whole else int | float
-        if isinstance(value, bool) or not isinstance(value, kinds) or value <= 0:
-            kind = "a whole number" if whole else "a number"
-            raise SiteError(f"site file: tuning.{key} = {value!r}; expected {kind} above 0 (default {defaults[key]})")
+        least = 1 if key in TUNING_AT_LEAST_ONE else 0
+        if isinstance(value, bool) or not isinstance(value, kinds) or not math.isfinite(value) or (value < 1 if least else value <= 0):
+            kind = "a whole number" if whole else "a finite number"
+            bound = "1 or more" if least else "above 0"
+            raise SiteError(f"site file: tuning.{key} = {value!r}; expected {kind}, {bound} (default {defaults[key]})")
     return Tuning(**{key: value if isinstance(defaults[key], int) else float(value) for key, value in values.items()})
 
 
@@ -475,7 +482,8 @@ def _parse_maintenance(raw: Any) -> Maintenance:
 
 
 def _parse_health_check(raw: Any) -> HealthCheck:
-    t = _table(raw, "health_check", set(), {"interval_s": 30, "reopen_after": 3, "pushes_before_exclude": 2})
+    t = _table(raw, "health_check", set(), {"interval_s": 30, "reopen_after": HealthCheck.reopen_after,
+                                             "pushes_before_exclude": HealthCheck.pushes_before_exclude})
     for key in ("reopen_after", "pushes_before_exclude"):
         if type(t[key]) is not int or t[key] < 1:
             raise SiteError(f"site file: health_check.{key} = {t[key]!r}; expected a whole number, 1 or more")

@@ -219,11 +219,20 @@ def test_reopen_after_three_passing_runs_not_two_and_a_foreign_drain_never(box):
 
 
 def test_the_reopen_and_bar_counts_come_from_the_settings_file(box):
+    """`[health_check]` reopen_after / pushes_before_exclude, rendered into the settings, drive the check itself."""
     raw = json.loads(box.settings_path.read_text())
-    assert (node_check.load_settings(box.settings_path, (NODE,)).reopen_after, node_check.Settings.pushes_before_exclude) == (3, 2)
-    box.settings_path.write_text(json.dumps({**raw, "reopen_after": 5, "pushes_before_exclude": 4}))
-    loaded = node_check.load_settings(box.settings_path, (NODE,))
-    assert (loaded.reopen_after, loaded.pushes_before_exclude) == (5, 4)
+    assert (node_check.Settings.reopen_after, node_check.Settings.pushes_before_exclude) == (3, 2)  # older file: defaults
+    box.settings_path.write_text(json.dumps({**raw, "reopen_after": 1, "pushes_before_exclude": 1}))
+    reopened = FakeSlurm(drained=OURS)
+    box.run(reopened)
+    assert reopened.updates() == [RESUME_CALL]  # after one passing run, not three
+    box.free(1000)
+    slurm = FakeSlurm([job("2", 50)], drained="gpujobs-admin: held by the owner")
+    box.run(slurm)
+    assert slurm.calls[-1] == ["scontrol", "update", "JobId=2", f"ExcNodeList={NODE}"]  # barred at the first push
+    box.settings_path.write_text(json.dumps({**raw, "reopen_after": 0}))
+    with pytest.raises(ValueError, match="reopen_after = 0"):
+        node_check.load_settings(box.settings_path, (NODE,))
 
 
 def test_extra_overrides_valid_keys_only_and_the_settings_may_be_keyed_by_node(box):

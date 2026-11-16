@@ -171,15 +171,23 @@ class Discovery:
 
 def load_discovery(path: Path = REGISTRY) -> Discovery:
     raw = tomllib.loads(path.read_text()).get("discover", {}) if path.exists() else {}
+    if not isinstance(raw, dict):
+        msg = f"{path}: [discover] must be a table (roots = [...], test_cap_s = N)"
+        raise ValueError(msg)  # noqa: TRY004 - a registry error, reported like every other one here
     unknown = sorted(set(raw) - {"roots", "test_cap_s"})
     if unknown:
         msg = f"{path}: unknown key(s) in [discover]: {', '.join(unknown)} (known: roots, test_cap_s)"
         raise ValueError(msg)
     roots, cap = raw.get("roots", Discovery.roots), raw.get("test_cap_s", Discovery.test_cap_s)
+    if "roots" in raw and not (isinstance(roots, list) and roots and all(isinstance(r, str) and r for r in roots)):
+        msg = f"{path}: [discover] roots = {roots!r}; expected a list of folder paths, e.g. [\"~/dev\"]"
+        raise ValueError(msg)
     if isinstance(cap, bool) or not isinstance(cap, int) or cap <= 0:
         msg = f"{path}: [discover] test_cap_s = {cap!r}; expected a whole number of seconds above 0"
         raise ValueError(msg)
     return Discovery(tuple(Path(root).expanduser() for root in roots), cap)
+
+
 # Tried in order; the first whose `uv export` matches the venv is how that venv was built.
 SYNC_CANDIDATES: tuple[tuple[str, ...], ...] = (
     (),

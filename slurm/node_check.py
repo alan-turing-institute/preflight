@@ -41,6 +41,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import gpu_jobs  # noqa: E402 - path set just above
+import site_config  # noqa: E402 - path set just above
 
 SETTINGS_PATH = Path("/etc/gpujobs/node_check.json")
 LOG_PATH = Path("/var/log/gpujobs/node_check.log")  # the settings name it too; this is for a run that cannot read them
@@ -91,8 +92,8 @@ class Settings:
     state_path: Path
     log_path: Path
     state_dir: Path = gpu_jobs.STATE_DIR
-    reopen_after: int = 3  # consecutive passing runs before we reopen a node we closed ([health_check], D22)
-    pushes_before_exclude: int = 2  # pushes off a node before a job is barred from it ([health_check], D22)
+    reopen_after: int = site_config.HealthCheck.reopen_after  # passing runs before we reopen a node we closed
+    pushes_before_exclude: int = site_config.HealthCheck.pushes_before_exclude  # pushes off a node before a job is barred
 
 
 def load_settings(path: Path, names: tuple[str, ...]) -> Settings:
@@ -106,8 +107,17 @@ def load_settings(path: Path, names: tuple[str, ...]) -> Settings:
         meminfo_path=Path(raw["meminfo_path"]), power_supply_dir=Path(raw["power_supply_dir"]),
         state_path=Path(raw["state_path"]), log_path=Path(raw["log_path"]),
         **({"state_dir": Path(raw["state_dir"])} if raw.get("state_dir") else {}),
-        **{key: int(raw[key]) for key in ("reopen_after", "pushes_before_exclude") if key in raw},  # older files: defaults
+        **{key: _count(raw, key) for key in ("reopen_after", "pushes_before_exclude") if key in raw},  # older: defaults
     )
+
+
+def _count(raw: dict, key: str) -> int:
+    """A whole count of 1 or more from the settings file; anything else is refused (and so fails closed)."""
+    value = raw[key]
+    if type(value) is not int or value < 1:
+        msg = f"node_check settings: {key} = {value!r}; expected a whole number, 1 or more (re-render with install.py apply)"
+        raise ValueError(msg)
+    return value
 
 
 def apply_extra(settings: Settings, extra: str) -> tuple[Settings, str]:
