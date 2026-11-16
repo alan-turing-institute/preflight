@@ -783,7 +783,9 @@ def stage_recovery() -> None:
     after = jobinfo(j)
     alive = sorted(job_pids(j))
     check("S10: a slurmctld-only restart keeps the live job running (same processes, no requeue)",
-          after.get("JobState") == "RUNNING" and after.get("Restarts") == before.get("Restarts") and pids == alive and bool(pids),
+          # every process from before is still there (the job may start more after its first ones: a later one is fine)
+          after.get("JobState") == "RUNNING" and after.get("Restarts") == before.get("Restarts") and set(pids) <= set(alive)
+          and bool(pids),
           f"state={after.get('JobState')} restarts={after.get('Restarts')} pids {pids} -> {alive}")
     clear_queue()
 
