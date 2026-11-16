@@ -15,7 +15,7 @@ import pwd
 import re
 import tomllib
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from enum import IntEnum, StrEnum
 from pathlib import Path
 from typing import Any
@@ -186,6 +186,8 @@ class HealthCheck:
     """`[health_check]`: slurmd runs `node_check.py` on every node each `interval_s` seconds (slurm's HealthCheckInterval)."""
 
     interval_s: int
+    reopen_after: int = 3  # consecutive passing runs before a node the check closed is reopened (D22)
+    pushes_before_exclude: int = 2  # times a job is pushed off a node before it is barred from it (D22)
 
 
 @dataclass(frozen=True)
@@ -238,6 +240,43 @@ class Remote:
 
 
 @dataclass(frozen=True)
+class Tuning:
+    """Numbers a site may tune (`[tuning]` in the site file, coding standard 3: configurable, never hard-coded). Each
+    default is today's value, ratified where a decision is named, so a site file without the table changes nothing."""
+
+    auto_margin: float = 0.10  # --mem auto: the measured peak plus this share (D28, D35)
+    unclean_margin: float = 0.25  # --mem auto with no clean run: the largest crashed or pre-empted peak plus this share
+    oom_bump_ratio: float = 1.2  # after a memory kill the next ask is at least this many times what it was given (D35)
+    oom_min_bump_mb: int = 100  # ... and at least this many slurm MB more (D35)
+    cores_margin: float = 1.25  # cores from use: the average in use times this, rounded up (D35, D37)
+    history_runs: int = 3  # sizes come from the highest of this many newest clean runs (D35)
+    unclean_min_s: int = 600  # an unclean leg counts towards a size only after running this long
+    size_extrapolation_limit: float = 2.0  # --size scales from the largest measured count up to this many times it (D48)
+    cores_over_ask: float = 2.0  # a hand-set --cpus this many times the cores from history warns
+    check_timeout_s: float = 240.0  # longest a --check may run (D47; the owner's limit)
+    check_reuse_s: float = 600.0  # a passed check from the same folder and user counts this long (D47)
+    check_heavy_gb: float = 8.0  # a check holding more than this many GB is refused: such work is a job (D47)
+    idle_every_s: float = 600.0  # the agent's idle check runs this often (D23 C2)
+    idle_notice_every_s: float = 3600.0  # one idle notice per waiting/holding pair at most this often (D41)
+    copy_every_s: float = 60.0  # the agent copies part-time nodes' state back this often (D22)
+    outside_keep_days: int = 14  # days the record of GPU work found outside slurm is kept
+    ended_kept: int = 5000  # how many ended jobs the agent remembers
+    memory_guard_min_excess_gb: float = 1.0  # a job counts as over its ask only beyond this, above sampling noise (D44)
+
+
+def _parse_tuning(raw: Any) -> Tuning:
+    defaults = {f.name: f.default for f in fields(Tuning)}
+    values = _table(raw, "tuning", set(), defaults)
+    for key, value in values.items():
+        whole = isinstance(defaults[key], int)
+        kinds = int if whole else int | float
+        if isinstance(value, bool) or not isinstance(value, kinds) or value <= 0:
+            kind = "a whole number" if whole else "a number"
+            raise SiteError(f"site file: tuning.{key} = {value!r}; expected {kind} above 0 (default {defaults[key]})")
+    return Tuning(**{key: value if isinstance(defaults[key], int) else float(value) for key, value in values.items()})
+
+
+@dataclass(frozen=True)
 class Site:
     name: str
     cluster_name: str  # slurm's ClusterName; Open OnDemand names its cluster file after it
@@ -268,6 +307,7 @@ class Site:
     cpus_from_history: Policy = Policy.RECOMMEND  # cores for a named CPU-only job without --cpus (D35)
     memory_from_size: Policy = Policy.RECOMMEND  # memory for a job given --size, from runs of its project and unit (D48)
     require_check: Policy = Policy.RECOMMEND  # every submission states --check or --no-check REASON (D47)
+    tuning: Tuning = field(default_factory=Tuning)  # `[tuning]`: the numbers a site may tune
 
     @property
     def cpu_job_cap(self) -> int | None:
@@ -435,11 +475,14 @@ def _parse_maintenance(raw: Any) -> Maintenance:
 
 
 def _parse_health_check(raw: Any) -> HealthCheck:
-    t = _table(raw, "health_check", set(), {"interval_s": 30})
+    t = _table(raw, "health_check", set(), {"interval_s": 30, "reopen_after": 3, "pushes_before_exclude": 2})
+    for key in ("reopen_after", "pushes_before_exclude"):
+        if type(t[key]) is not int or t[key] < 1:
+            raise SiteError(f"site file: health_check.{key} = {t[key]!r}; expected a whole number, 1 or more")
     if type(t["interval_s"]) is not int or t["interval_s"] < MIN_HEALTH_CHECK_S:
         raise SiteError(f"site file: health_check.interval_s = {t['interval_s']!r}; expected a whole number of seconds, {MIN_HEALTH_CHECK_S} or more "
                         "(slurm's HealthCheckTimeout must stay below it)")
-    return HealthCheck(t["interval_s"])
+    return HealthCheck(t["interval_s"], t["reopen_after"], t["pushes_before_exclude"])
 
 
 def _parse_lease(raw: Any) -> Lease:
@@ -612,6 +655,7 @@ def parse(raw: dict[str, Any]) -> Site:
             "metrics": {},
             "portal": {},
             "notify_command": [],
+            "tuning": {},
         },
     )
     m = _table(
@@ -697,6 +741,7 @@ def parse(raw: dict[str, Any]) -> Site:
         cpus_from_history=_enum(Policy, top["cpus_from_history"], "cpus_from_history"),
         memory_from_size=_enum(Policy, top["memory_from_size"], "memory_from_size"),
         require_check=_enum(Policy, top["require_check"], "require_check"),
+        tuning=_parse_tuning(top["tuning"]),
     )
 
 

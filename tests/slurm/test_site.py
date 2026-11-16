@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import grp
+import os
 import pwd
 import re
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import site_config as gpujobs_site
+from conftest import SLURM
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -130,6 +134,15 @@ def test_example_loads_and_minimal_file_gets_every_default(tmp_path: Path) -> No
         assert (getattr(site, field), getattr(shared("", f"{field} = 'off'\n"), field),
                 getattr(shared("", f"{field} = 'enforce'\n"), field)) == (
             gpujobs_site.Policy.RECOMMEND, gpujobs_site.Policy.OFF, gpujobs_site.Policy.ENFORCE)
+    # [tuning] (coding standard 3): absent = today's values; a key given replaces only itself, an int may stand for a float
+    tuned = gpujobs_site.load(write(tmp_path, MINIMAL + "[tuning]\nhistory_runs = 5\nauto_margin = 1\n")).tuning
+    assert site.tuning == gpujobs_site.Tuning() and (tuned.history_runs, tuned.auto_margin, tuned.cores_margin) == (5, 1.0, 1.25)
+    # and the tools read it: a fresh import under that site file sizes, checks and paces by it
+    tuned_file = write(tmp_path, MINIMAL + "[tuning]\nhistory_runs = 5\ncheck_timeout_s = 30\nidle_every_s = 7\n")
+    probe = "import gpu_jobs, checks, agent; print(gpu_jobs.HISTORY_RUNS, checks.CHECK_TIMEOUT_S, agent.IDLE_EVERY_S)"
+    read = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, check=True, cwd=SLURM,
+                          env={**os.environ, "GPUJOBS_SITE": str(tuned_file), "PYTHONPATH": str(SLURM)})
+    assert read.stdout.split() == ["5", "30.0", "7.0"]
 
 
 @pytest.mark.parametrize(
@@ -188,6 +201,10 @@ def test_example_loads_and_minimal_file_gets_every_default(tmp_path: Path) -> No
         ("cpus_from_history = 'always'\n" + MINIMAL, "cpus_from_history"),
         ("memory_from_size = 'maybe'\n" + MINIMAL, "memory_from_size"),
         ("require_check = 'maybe'\n" + MINIMAL, "require_check"),
+        (MINIMAL + "[tuning]\nhistory_runs = 2.5\n", "tuning.history_runs = 2.5"),  # a count of runs is whole
+        (MINIMAL + "[tuning]\nauto_margin = 0\n", "tuning.auto_margin = 0"),
+        (MINIMAL + "[tuning]\nauto_margin = true\n", "tuning.auto_margin = True"),
+        (MINIMAL + "[tuning]\nmargin = 1\n", "unknown key(s) in [tuning]: margin"),
         (MINIMAL + "[service]\ncores = 0\n", "service.cores = 0"),
         (MINIMAL + "[remote.t]\nhost = 'h'\n", "[remote.t] is missing root"),
         (MINIMAL + "[remote.t]\nhost = 'h'\nroot = '../x'\n", "no '..'"),

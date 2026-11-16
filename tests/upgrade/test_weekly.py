@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import datetime as dt
 import json
-import signal
 import os
 import shlex
+import signal
 import subprocess
 from collections.abc import Iterable
 from pathlib import Path
@@ -444,12 +444,18 @@ def test_a_new_uv_project_joins_by_itself_and_a_worktree_or_registered_one_does_
     monkeypatch.setattr(weekly, "pick_sync", lambda path: ("--all-extras",))
     listed = weekly.Project("listed", registered, Check.TESTS, "true")
 
-    found = {p.name: p for p in weekly.discover([listed], roots=(tmp_path,))}
+    registry = tmp_path / "registry.toml"
+    registry.write_text(f'[discover]\nroots = ["{tmp_path}"]\ntest_cap_s = 77\n')
+    found = {p.name: p for p in weekly.discover([listed], weekly.load_discovery(registry))}
 
     assert sorted(found) == ["app", "new-lib"]
     assert found["new-lib"].command == 'python -c "import new_lib"'
     assert "pytest -q -x" in found["app"].command
-    assert "timeout -k 5 300" in found["app"].command
+    assert "timeout -k 5 77" in found["app"].command  # the registry's cap, not a constant
+    assert weekly.load_discovery(tmp_path / "absent.toml") == weekly.Discovery()  # no registry: today's defaults
+    registry.write_text("[discover]\ntest_cap = 5\n")
+    with pytest.raises(ValueError, match="test_cap"):
+        weekly.load_discovery(registry)
     assert found["app"].sync == ("--all-extras",)
 
 

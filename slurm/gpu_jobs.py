@@ -44,16 +44,18 @@ def load_site() -> site_config.Site:
         sys.exit(f"[gpujobs] REFUSED: {error}")
 
 
-def _site_dirs() -> tuple[Path, Path | None]:
+def _site_dirs(site: site_config.Site) -> tuple[Path, Path | None]:
     """(state dir, lease dir), each from its environment variable, else from the site file, which is read on import
     either way: no tool runs without one."""
-    site = load_site()
     state, lease = os.environ.get("SLURM_GPU_STATE_DIR"), os.environ.get("GPU_LEASE_DIR")
     lease_dir = Path(lease) if lease else site.lease.lease_dir if site.lease else None
     return Path(state or site.state_dir).expanduser(), lease_dir.expanduser() if lease_dir else None
 
 
-_STATE, _LEASE = _site_dirs()
+_SITE = load_site()
+_STATE, _LEASE = _site_dirs(_SITE)
+#: The site's tunable numbers (`[tuning]`), read once on import like the folders: every sizing figure below comes from it.
+TUNING = _SITE.tuning
 #: Where the tools keep their records (sidecars, events, footprints, the keeper's state). Overridable for tests.
 STATE_DIR = _STATE
 #: The cross-project GPU lease directory (service-c's protocol document); same override as localmodels. None for a
@@ -825,7 +827,7 @@ def completion_records(job_ids: Iterable[str] | None = None) -> dict[str, dict[s
 
 #: An unclean leg (crashed or pre-empted) counts towards `measured_peak_bytes(..., clean=False)` only after this long:
 #: one that died while loading has not reached its working size.
-UNCLEAN_MIN_S = 600
+UNCLEAN_MIN_S = TUNING.unclean_min_s
 
 
 #: A sidecar `kind` for a sharing measurement's own jobs (`sharing.py`): never a real run.
@@ -859,7 +861,7 @@ def measured_sharing(name: str) -> dict[str, object] | None:
 
 
 #: Memory and cores from history (D35): the highest of this many newest clean runs, so one light run cannot shrink the next.
-HISTORY_RUNS = 3
+HISTORY_RUNS = TUNING.history_runs
 
 
 def _clean(leg: Mapping[str, object]) -> bool:
@@ -1001,7 +1003,7 @@ def memory_kill_in(records: list[Mapping[str, object]]) -> MemoryKill | None:
 
 #: Scaling a peak in proportion to a declared size bounds it only when memory grows no faster than linearly with the
 #: size; beyond twice the largest measured size that is too much to assume, so no figure is given (D48).
-SIZE_EXTRAPOLATION_LIMIT = 2
+SIZE_EXTRAPOLATION_LIMIT = TUNING.size_extrapolation_limit
 
 
 @dataclass(frozen=True)
@@ -1066,7 +1068,7 @@ def size_memory(project: str, unit: str, card: bool, count: float) -> SizeFigure
         return SizeFigure(base, f"{count:g} {unit}; {said}: {at:g} -> {highest[at] / GB:.1f} GB peak", kill)
     largest = max(highest)
     if count > SIZE_EXTRAPOLATION_LIMIT * largest:
-        return SizeFigure(None, f"{count:g} {unit} is more than {SIZE_EXTRAPOLATION_LIMIT} times the largest of the "
+        return SizeFigure(None, f"{count:g} {unit} is more than {SIZE_EXTRAPOLATION_LIMIT:g} times the largest of the "
                                 f"{said} ({largest:g}), too far to scale", kill)
     base = max(math.ceil(highest[largest] * count / largest), *highest.values())
     return SizeFigure(base, f"{count:g} {unit}, scaled from {said}: {largest:g} -> {highest[largest] / GB:.1f} GB peak", kill)
@@ -1510,13 +1512,13 @@ class JobMemory:
 # audit, which imports the wrapper).
 
 #: --mem auto: the measured peak, plus this share, rounded up to whole G.
-AUTO_MARGIN = 0.10
+AUTO_MARGIN = TUNING.auto_margin
 #: After a run killed for memory (D35): the next ask is at least this many times what it was given ...
-OOM_BUMP_RATIO = 1.2
+OOM_BUMP_RATIO = TUNING.oom_bump_ratio
 #: ... and at least this many slurm MB (2^20 bytes) more: the Vertical Pod Autoscaler's OOMBumpUpRatio and OOMMinBumpUp.
-OOM_MIN_BUMP_MB = 100
+OOM_MIN_BUMP_MB = TUNING.oom_min_bump_mb
 #: Cores from a job's use (D35, D37): the average in use, times this, rounded up.
-CORES_MARGIN = 1.25
+CORES_MARGIN = TUNING.cores_margin
 #: Slurm's G is 1024 of its MB.
 MB_PER_G = 1024
 

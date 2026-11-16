@@ -100,10 +100,10 @@ MIB = 1024 * 1024
 #: How often a unified-memory node records the memory used outside its jobs (`status.py --reserve` reads it, D44).
 OUTSIDE_EVERY_S = 60.0
 #: Days of that record kept.
-OUTSIDE_KEEP_DAYS = 14
+OUTSIDE_KEEP_DAYS = gpu_jobs.TUNING.outside_keep_days  # site file [tuning]
 DAY_S = 86400
 #: How many ended jobs are remembered.
-ENDED_KEPT = 5000
+ENDED_KEPT = gpu_jobs.TUNING.ended_kept  # site file [tuning]
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
 
@@ -125,7 +125,7 @@ PART_TIME_REQUEST = re.compile(r"part_time-(.+)-(\d+)\.json")
 THRESHOLD_FIELDS = {"close_below_gb": "close_below_mb", "push_back_below_gb": "push_back_below_mb"}
 MAX_THRESHOLD_GB = 1000
 #: Job state is copied back from each part-time machine this often (plan B5b); rsync gives up after its own timeout.
-COPY_EVERY_S = 60.0
+COPY_EVERY_S = gpu_jobs.TUNING.copy_every_s  # site file [tuning]
 COPY_IO_TIMEOUT_S = 20
 COPY_CALL_TIMEOUT_S = 300
 COPY_KEY = Path(render.COPY_KEY)  # under the state dir; `install.py part-time add` makes it
@@ -141,8 +141,8 @@ RSYNC_PARTIAL = frozenset({23, 24})
 RESUME_PROTECTED = frozenset({gpu_jobs.Partition.URGENT, gpu_jobs.Partition.SERVICE})
 
 #: The idle check (Part C2) looks this often, and tells one project about one holder at most this often.
-IDLE_EVERY_S = 600.0
-IDLE_NOTICE_EVERY_S = 3600.0
+IDLE_EVERY_S = gpu_jobs.TUNING.idle_every_s  # site file [tuning]
+IDLE_NOTICE_EVERY_S = gpu_jobs.TUNING.idle_notice_every_s  # site file [tuning]
 #: Waiting for room, as opposed to a dependency, a hold or a begin time.
 IDLE_WAITING_REASONS = frozenset({gpu_jobs.Reason.RESOURCES, gpu_jobs.Reason.PRIORITY})
 

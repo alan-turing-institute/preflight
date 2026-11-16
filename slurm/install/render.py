@@ -187,6 +187,8 @@ def node_check_json(site: Site) -> str:
             "power_supply_dir": "/sys/class/power_supply",
             "state_path": "/var/lib/gpujobs/node_check/state.json",
             "log_path": "/var/log/gpujobs/node_check.log",
+            **({"reopen_after": site.health_check.reopen_after,
+                "pushes_before_exclude": site.health_check.pushes_before_exclude} if site.health_check else {}),
         } for n in site.nodes
     }, indent=2) + "\n"
 

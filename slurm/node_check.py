@@ -50,10 +50,6 @@ REASON_PREFIX = "gpujobs-check: "
 COMMENT_PREFIX = "available_mb="
 #: slurm kills a health check after 60 s; every slurm call gets far less.
 CALL_TIMEOUT_S = 10
-#: Consecutive runs that must pass rule 3 before we reopen a node we closed.
-REOPEN_AFTER = 3
-#: A job is pushed back this many times from a node before it is barred from it (when its partition has another node).
-PUSHES_BEFORE_EXCLUDE = 2
 MB_BYTES = 1_000_000  # decimal, as everything shown to people
 GB_MB = 1000
 DRAIN_FLAG = "DRAIN"
@@ -95,6 +91,8 @@ class Settings:
     state_path: Path
     log_path: Path
     state_dir: Path = gpu_jobs.STATE_DIR
+    reopen_after: int = 3  # consecutive passing runs before we reopen a node we closed ([health_check], D22)
+    pushes_before_exclude: int = 2  # pushes off a node before a job is barred from it ([health_check], D22)
 
 
 def load_settings(path: Path, names: tuple[str, ...]) -> Settings:
@@ -108,6 +106,7 @@ def load_settings(path: Path, names: tuple[str, ...]) -> Settings:
         meminfo_path=Path(raw["meminfo_path"]), power_supply_dir=Path(raw["power_supply_dir"]),
         state_path=Path(raw["state_path"]), log_path=Path(raw["log_path"]),
         **({"state_dir": Path(raw["state_dir"])} if raw.get("state_dir") else {}),
+        **{key: int(raw[key]) for key in ("reopen_after", "pushes_before_exclude") if key in raw},  # older files: defaults
     )
 
 
@@ -452,7 +451,7 @@ def check(
             state["pushes"][key] = state["pushes"].get(key, 0) + 1
             event(record, victim, gpu_jobs.EventAction.PUSH_BACK, node=info.name, free_mb=free)
             decisions.append(f"push back {job} ({free} MB free)")
-            if (state["pushes"][key] >= PUSHES_BEFORE_EXCLUDE and has_other_node(run, job, info.name)
+            if (state["pushes"][key] >= settings.pushes_before_exclude and has_other_node(run, job, info.name)
                     and (value := exclusion(run, victim.excluded, info.name))):
                 done = run(["scontrol", "update", f"JobId={job}", f"ExcNodeList={value}"])
                 if done.returncode != 0:
@@ -481,9 +480,9 @@ def check(
     elif why and not info.ours:
         drain(run, info.name, why)
         decisions.append(f"close ({why})")
-    elif info.ours and state["passes"] >= REOPEN_AFTER:
+    elif info.ours and state["passes"] >= settings.reopen_after:
         reopen(run, info.name)
-        decisions.append(f"reopen ({REOPEN_AFTER} passing runs)")
+        decisions.append(f"reopen ({settings.reopen_after} passing runs)")
 
     gpu_jobs.write_json(settings.state_path, state)
     report_free(run, info, free, gpu_jobs.machine_use(lambda path: (settings.meminfo_path if path == "/proc/meminfo" else Path(path)).read_text(encoding="ascii"), sleep), gpu_busy())

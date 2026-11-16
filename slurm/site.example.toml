@@ -155,6 +155,28 @@ python = "/opt/gpujobs/venv/bin/python"       # interpreter with localmodels ins
 # [health_check]
 # interval_s = 30              # seconds between checks (slurm HealthCheckInterval). Default: 30
 
+# Optional. The numbers a site may tune; each line shows its default (today's value, ratified where a decision is named).
+# Leave the table out to keep them all. Every value is a number above 0; counts and days are whole numbers.
+# [tuning]
+# auto_margin = 0.10              # --mem auto: the measured peak plus this share (D28, D35)
+# unclean_margin = 0.25           # --mem auto with no clean run: the largest crashed or pre-empted peak plus this share
+# oom_bump_ratio = 1.2            # after a memory kill, the next ask is at least this many times what it was given (D35)
+# oom_min_bump_mb = 100           # ... and at least this many slurm MB more (D35)
+# cores_margin = 1.25             # cores from use: the average in use times this, rounded up (D35, D37)
+# history_runs = 3                # sizes come from the highest of this many newest clean runs (D35)
+# unclean_min_s = 600             # an unclean leg counts towards a size only after running this long
+# size_extrapolation_limit = 2.0  # --size scales from the largest measured count up to this many times it (D48)
+# cores_over_ask = 2.0            # a hand-set --cpus this many times the cores from history warns
+# check_timeout_s = 240           # longest a --check may run (D47)
+# check_reuse_s = 600             # a passed check from the same folder and user counts this long (D47)
+# check_heavy_gb = 8              # a check holding more than this is refused: such work is a job (D47)
+# idle_every_s = 600              # the agent's idle check runs this often (D23)
+# idle_notice_every_s = 3600      # one idle notice per waiting/holding pair at most this often (D41)
+# copy_every_s = 60               # part-time nodes' job state is copied back this often (D22)
+# outside_keep_days = 14          # days the record of GPU work found outside slurm is kept
+# ended_kept = 5000               # how many ended jobs the agent remembers
+# memory_guard_min_excess_gb = 1.0  # a job counts as over its ask only beyond this (D44)
+
 [metrics]
 mode = "off"            # local (install Prometheus and Grafana here), external (use the URLs below), or off. Default: off
 prometheus_url = ""     # used when mode = "external". Default: empty

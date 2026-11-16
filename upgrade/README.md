@@ -8,7 +8,7 @@ Dependency upgrades for the uv projects on this machine.
 | `session_notice.py` | one line at session start when the project under the working directory has an upgrade held or just applied |
 | `torch_upgrade.py` | by hand: `build` a side venv with a new PyTorch stack, `check` it on the GPU (one project, one PyTorch move) |
 | `upgrade_common.py` | what the two share: `run`, `freeze`, hostguard, one slurm job for a check (submit, queue, cancel), probe comparison |
-| `projects.example.toml` | the registry format; copy it to `projects.toml` (local to the machine, not tracked) and list your projects |
+| `projects.example.toml` | the registry format; copy it to `projects.toml` (local to the machine, not tracked) and list your projects; its optional `[discover]` table sets where unlisted projects are found (`roots`) and their tests' cap (`test_cap_s`) |
 | `install/` | the systemd user service and timer (Sunday 05:00, `Persistent=true`) |
 
 ## The weekly rule

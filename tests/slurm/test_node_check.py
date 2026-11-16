@@ -211,11 +211,19 @@ def test_reopen_after_three_passing_runs_not_two_and_a_foreign_drain_never(box):
     box.run(again)
     assert again.updates() == []
     foreign = FakeSlurm(drained="gpujobs-admin: closed from the page")  # never reopened, however many runs pass
-    for _ in range(node_check.REOPEN_AFTER + 1):
+    for _ in range(node_check.Settings.reopen_after + 1):
         box.run(foreign)
     box.free(1000)  # and never changed while memory is low either
     box.run(foreign)
     assert foreign.updates() == [] and foreign.drained == "gpujobs-admin: closed from the page"
+
+
+def test_the_reopen_and_bar_counts_come_from_the_settings_file(box):
+    raw = json.loads(box.settings_path.read_text())
+    assert (node_check.load_settings(box.settings_path, (NODE,)).reopen_after, node_check.Settings.pushes_before_exclude) == (3, 2)
+    box.settings_path.write_text(json.dumps({**raw, "reopen_after": 5, "pushes_before_exclude": 4}))
+    loaded = node_check.load_settings(box.settings_path, (NODE,))
+    assert (loaded.reopen_after, loaded.pushes_before_exclude) == (5, 4)
 
 
 def test_extra_overrides_valid_keys_only_and_the_settings_may_be_keyed_by_node(box):

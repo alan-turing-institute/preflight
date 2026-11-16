@@ -25,8 +25,8 @@ from pathlib import Path
 import gpu_jobs
 from gpu_jobs import JobMemory, MemoryStopEnd, QueuedJob, State, size_text
 
-#: Bytes over its ask before a job counts as over it: above the sampling noise.
-MIN_EXCESS = 10**9
+#: Bytes over its ask before a job counts as over it: above the sampling noise (site file [tuning]).
+MIN_EXCESS = int(gpu_jobs.TUNING.memory_guard_min_excess_gb * gpu_jobs.GB)
 #: After a stop, a further one waits this long for the stopped job's memory to come back.
 HOLD_S = 10.0
 #: A wrapper that has not acknowledged a stop by then is not there (a plain sbatch job) or hung: scancel.

@@ -48,13 +48,13 @@ from site_config import Policy
 
 #: The owner's limit on any check (2026-11-07: "tests that take ... 10 minutes, it's just ridiculous"): seconds, never
 #: over about four minutes.
-CHECK_TIMEOUT_S = 240.0
+CHECK_TIMEOUT_S = gpu_jobs.TUNING.check_timeout_s  # site file [tuning]
 #: After SIGTERM at the time limit, how long the check's group has to stop before SIGKILL.
 CHECK_KILL_GRACE_S = 5.0
 #: A sweep submitted in one go shares its inputs: one pass of the same check from the same folder covers it this long.
-CHECK_REUSE_S = 600.0
-#: Work holding more than about 8 GB belongs in slurm (the owner's rule for this machine): a check this heavy is a job.
-CHECK_HEAVY_BYTES = 8 * gpu_jobs.GB
+CHECK_REUSE_S = gpu_jobs.TUNING.check_reuse_s  # site file [tuning]
+#: Work holding more than this belongs in slurm (a site's rule; spark-ad27's owner set 8 GB): a check this heavy is a job.
+CHECK_HEAVY_BYTES = gpu_jobs.TUNING.check_heavy_gb * gpu_jobs.GB  # site file [tuning]
 #: Set in the check's environment; a submission from inside a check is refused.
 IN_CHECK = "GPUJOBS_CHECK"
 #: Where the flags and what makes a good check are explained.

@@ -260,6 +260,7 @@ def test_part_time_node_and_health_check():
         "node": "lap", "close_below_mb": 8000, "push_back_below_mb": 2000, "mains_only": True,
         "meminfo_path": "/proc/meminfo", "power_supply_dir": "/sys/class/power_supply",
         "state_path": "/var/lib/gpujobs/node_check/state.json", "log_path": "/var/log/gpujobs/node_check.log",
+        "reopen_after": 3, "pushes_before_exclude": 2,  # [health_check] defaults (D22)
     }
     assert (node_check["head"]["close_below_mb"], node_check["head"]["push_back_below_mb"],
             node_check["head"]["mains_only"]) == (16000, 10000, None)

@@ -104,12 +104,12 @@ KEEPER_STALE_S = 60
 #: Longest `--comment` we write: our choice (it keeps `squeue` output readable), not a slurm limit.
 COMMENT_MAX = 200
 #: --mem auto with no clean run: the largest peak of the crashed or pre-empted runs (a lower bound), plus this share.
-UNCLEAN_MARGIN = 0.25
+UNCLEAN_MARGIN = gpu_jobs.TUNING.unclean_margin  # site file [tuning]
 #: --mem with no measured run, for a GPU job: slurm's "all of the memory on each node".
 WHOLE_BOX = "0"
 DEFAULT_CPUS = 4  # a CPU-only job, or any job on a site whose nodes have no GPUs
 #: A hand-set --cpus more than this many times the cores from history warns (never a refusal, as for memory).
-CORES_OVER_ASK = 2
+CORES_OVER_ASK = gpu_jobs.TUNING.cores_over_ask  # site file [tuning]
 _DURATION = re.compile(r"^(\d+(?:\.\d+)?)([smh]?)$")
 _UNIT_S = {"": 1, "s": 1, "m": 60, "h": 3600}
 
@@ -159,10 +159,10 @@ def resolve_mem(mem: str | None, name: str | None, gpu: bool) -> str | None:
             ask = math.ceil(max(gpu_jobs.bumped_mem_mb(kill.asked_mb, kill.used_mb), (history or 0) * MB_PER_G) / MB_PER_G)
             most_mb = max((node.jobs_mb for node in gpu_jobs.load_site().nodes), default=None)
             said += f" with {_gb(kill.asked_mb)} given"
-            rule = f"at least {OOM_BUMP_RATIO} times that (D35)"
+            rule = f"at least {OOM_BUMP_RATIO:g} times that (D35)"
             if kill.used_mb is not None:
                 said += f" and {_gb(kill.used_mb)} measured in use (memory + card)"
-                rule = f"at least {OOM_BUMP_RATIO} times what it was given and what it used plus {AUTO_MARGIN:.0%} (D35, D44)"
+                rule = f"at least {OOM_BUMP_RATIO:g} times what it was given and what it used plus {AUTO_MARGIN:.0%} (D35, D44)"
             if most_mb is not None and ask * MB_PER_G > most_mb:
                 warn(f"{said}; that is more than any node gives jobs, so it asks for the whole box")
                 return WHOLE_BOX
@@ -621,7 +621,7 @@ def cores_from_history(arguments: argparse.Namespace, named: str | None, hand_se
     print(said + (f"asking {proposal} (was {asking})" if applied else
                   f"would ask {proposal} (asking {asking} now{', set by --cpus' if hand_set else ''})"))
     if hand_set and asking > CORES_OVER_ASK * proposal:
-        warn(f"--cpus {asking} is more than {CORES_OVER_ASK} times the {proposal} cores {named!r} would ask for from its "
+        warn(f"--cpus {asking} is more than {CORES_OVER_ASK:g} times the {proposal} cores {named!r} would ask for from its "
              f"last {runs} completed runs ({average:.1f} in use on average at most); the idle cores are held from other jobs")
     return {"mode": str(mode), "average": round(average, 2), "runs": runs, "proposal": proposal, "asked": arguments.cpus}
 

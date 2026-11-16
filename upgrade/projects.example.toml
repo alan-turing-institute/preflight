@@ -5,6 +5,12 @@
 # must pass on the CURRENT venv: it is a fast selection (target under 30 s), never the whole suite, and leaves out tests
 # already red or flaky on the old venv.
 
+# Optional: where projects without an entry are looked for, and how long their own tests may run (seconds).
+# These are the defaults; leave the table out to keep them.
+# [discover]
+# roots = ["~/dev", "~/dev/turing"]
+# test_cap_s = 300
+
 [[project]]
 name = "myproject"
 path = "/home/you/dev/myproject"

@@ -160,8 +160,26 @@ def load_registry(path: Path = REGISTRY) -> list[Project]:
 # A uv project under these roots that projects.toml does not name joins by itself, with the cheapest honest check:
 # its own tests (first failure stops them, five-minute cap) or, with no tests folder, an import of its package.
 # projects.toml stays the place to give one a faster test selection, a probe, services or a GPU.
-DISCOVER_ROOTS = (Path.home() / "dev", Path.home() / "dev/turing")
-DISCOVERED_TEST_CAP_S = 300
+@dataclass(frozen=True)
+class Discovery:
+    """Where unregistered projects are looked for and how long their own tests may run: the optional `[discover]`
+    table of projects.toml (`roots`, `test_cap_s`); these defaults stand when it is absent."""
+
+    roots: tuple[Path, ...] = (Path.home() / "dev", Path.home() / "dev/turing")
+    test_cap_s: int = 300
+
+
+def load_discovery(path: Path = REGISTRY) -> Discovery:
+    raw = tomllib.loads(path.read_text()).get("discover", {}) if path.exists() else {}
+    unknown = sorted(set(raw) - {"roots", "test_cap_s"})
+    if unknown:
+        msg = f"{path}: unknown key(s) in [discover]: {', '.join(unknown)} (known: roots, test_cap_s)"
+        raise ValueError(msg)
+    roots, cap = raw.get("roots", Discovery.roots), raw.get("test_cap_s", Discovery.test_cap_s)
+    if isinstance(cap, bool) or not isinstance(cap, int) or cap <= 0:
+        msg = f"{path}: [discover] test_cap_s = {cap!r}; expected a whole number of seconds above 0"
+        raise ValueError(msg)
+    return Discovery(tuple(Path(root).expanduser() for root in roots), cap)
 # Tried in order; the first whose `uv export` matches the venv is how that venv was built.
 SYNC_CANDIDATES: tuple[tuple[str, ...], ...] = (
     (),
@@ -193,9 +211,9 @@ def pick_sync(path: Path) -> tuple[str, ...]:
     return ()  # none matches: the weekly run then skips it, saying the lock does not describe the venv
 
 
-def default_project(path: Path) -> Project:
+def default_project(path: Path, test_cap_s: int) -> Project:
     if (path / "tests").is_dir():
-        command = f"timeout -k 5 {DISCOVERED_TEST_CAP_S} python -m pytest -q -x -p no:cacheprovider tests"
+        command = f"timeout -k 5 {test_cap_s} python -m pytest -q -x -p no:cacheprovider tests"
     else:
         name = (
             tomllib.loads((path / "pyproject.toml").read_text())
@@ -206,13 +224,11 @@ def default_project(path: Path) -> Project:
     return Project(path.name, path, Check.TESTS, command, sync=pick_sync(path))
 
 
-def discover(
-    registered: list[Project], roots: tuple[Path, ...] = DISCOVER_ROOTS
-) -> list[Project]:
+def discover(registered: list[Project], discovery: Discovery) -> list[Project]:
     known_paths = {p.path.resolve() for p in registered}
     known_names = {p.name for p in registered}
     found: list[Project] = []
-    for root in roots:
+    for root in discovery.roots:
         for path in sorted(root.iterdir()) if root.is_dir() else []:
             if (
                 path.resolve() in known_paths
@@ -220,7 +236,7 @@ def discover(
                 or not is_candidate(path)
             ):
                 continue
-            found.append(default_project(path))
+            found.append(default_project(path, discovery.test_cap_s))
             known_paths.add(path.resolve())
             known_names.add(path.name)
     return found
@@ -924,7 +940,7 @@ def apply_held(name: str) -> int:
 
 def all_projects() -> list[Project]:
     projects = load_registry()
-    found = discover(projects)
+    found = discover(projects, load_discovery())
     for project in found:
         print(
             f"[weekly] found {project.name} ({project.path}), not in projects.toml: check `{project.command}`"
