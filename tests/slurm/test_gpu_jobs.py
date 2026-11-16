@@ -16,11 +16,11 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
+import audit
 import gpu_jobs
 import levels
 import pytest
 import site_config
-import audit
 import status
 import urgent
 import wait
@@ -435,18 +435,27 @@ def test_gpu_busy_is_unknown_unless_every_gpu_answers(out: str, busy: float | No
     assert gpu_jobs.gpu_busy() == busy  # an average over only the GPUs that answered would misstate the box
 
 
-def test_the_card_verdict_comes_from_holders_never_from_gpu_util() -> None:
+def test_the_card_verdict_comes_from_holders_never_from_gpu_util(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """2026-11-16: GPU-Util read ~96% on an idle GB10 and sessions moved GPU work to CPU."""
     waiting = QueuedJob("3", "normal", "PENDING", "Resources", "p:resume:w", gpus=1)
     elsewhere = QueuedJob("4", "normal", "RUNNING", "None", "p:resume:x", gpus=1, node="other")
-    free = status.card_lines([waiting, elsewhere], "box", {}, [17.0], {7: gpu_jobs.LEASE_PROJECT}, [])
-    assert free == ["[card] FREE: no slurm job, GPU lease or compute process holds it (17 W, 0 compute process(es) "
-                    "holding 0 MB of card memory; GPU-Util is not a test of this); GPU jobs waiting for it: 3"]
+    (tmp_path / "keeper.json").write_text(json.dumps({"pid": os.getpid(), "project": gpu_jobs.LEASE_PROJECT}))
+    (tmp_path / "queued.json").write_text(json.dumps({"pid": os.getpid(), "project": "waiter", "requested_at": 1}))
+    monkeypatch.setattr(gpu_jobs, "LEASE_DIR", tmp_path)  # a service still waiting for the lease holds nothing
+    monkeypatch.setattr(status.shutil, "which", lambda _name: "/usr/bin/nvidia-smi")
+    monkeypatch.setattr(gpu_jobs, "gpu_usage", dict)
+    monkeypatch.setattr(gpu_jobs, "gpu_numbers", lambda _field: [17.0])
+    monkeypatch.setattr(gpu_jobs, "this_host", lambda: "box")
+    monkeypatch.setattr(audit, "unregistered", lambda _usage: [])
+    free = status.gpu_lines([waiting, elsewhere])
+    assert free[0] == ("[card] FREE: no slurm job, GPU lease or compute process holds it (17 W, 0 compute process(es) "
+                       "holding 0 MB of card memory; GPU-Util is not a test of this); GPU jobs waiting for it: 3")
     shard = QueuedJob("5", "normal", "RUNNING", "None", "p:resume:s", shards=2, node="box")
     held = status.card_lines([shard], "box", {9: 1024.0}, None, {8: "svc"}, [audit.Stray(11, 1.0, "x", "")])
     assert held[0].startswith("[card] HELD by slurm job 5 (p:resume:s); the GPU lease of svc; pid 11, outside")
     assert "power unknown, 1 compute process(es) holding 1.1 GB" in held[0]
-    assert status.card_lines([], "box", None, [17.0], {}, [])[0].startswith("[card] UNKNOWN")  # unanswered is never free
+    monkeypatch.setattr(gpu_jobs, "gpu_usage", lambda: None)
+    assert status.gpu_lines([])[0].startswith("[card] UNKNOWN")  # unanswered is never free
 
 
 def part_time_copy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ran: dict[str, tuple[str, str]]) -> Path:

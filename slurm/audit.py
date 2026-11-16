@@ -45,12 +45,14 @@ def descends_from(pid: int, ancestor: int, proc: Path = Path("/proc")) -> bool:
     return False
 
 
-def lease_pids(lease_dir: Path) -> dict[int, str]:
+def lease_pids(lease_dir: Path, *, holding: bool = False) -> dict[int, str]:
+    """Live lease records' pids and projects; `holding` leaves out waiters (a record with `requested_at`), which the
+    lease protocol has not admitted yet."""
     pids = {}
     for path in lease_dir.glob("*.json"):
         record = gpu_jobs.read_json(path) or {}
         pid = record.get("pid")
-        if gpu_jobs.pid_alive(pid):
+        if gpu_jobs.pid_alive(pid) and not (holding and record.get("requested_at") is not None):
             pids[int(pid)] = str(record.get("project") or path.stem)
     return pids
 

@@ -76,21 +76,29 @@ def lines(queue: list[gpu_jobs.QueuedJob] | None) -> list[str]:
             f" | {record.get('what', '(no sidecar)')}{f' | {why}' if why else ''}"
         ))
     out += [f"[idle] {line}" for line in agent.idle_summary(agent.read_idle())]
-    has_card = shutil.which("nvidia-smi") is not None  # a machine without one has no card verdict and no GPU work
-    usage = gpu_jobs.gpu_usage() if has_card else {}
-    strays = audit.unregistered(usage) if usage is not None else []
-    if has_card:
-        leases = audit.lease_pids(gpu_jobs.LEASE_DIR) if gpu_jobs.LEASE_DIR else {}
-        out += card_lines(queue, gpu_jobs.this_host(), usage, gpu_jobs.gpu_numbers("power.draw"), leases, strays)
-    out += audit.report(strays) if usage is not None else []  # unknown is said once, by the card line
+    out += gpu_lines(queue)
     out += audit.leftover_containers(gpu_jobs.known_containers(), queue, gpu_jobs.this_host(), time.time())
     return out
+
+
+def gpu_lines(queue: list[gpu_jobs.QueuedJob]) -> list[str]:
+    """The card verdict and the audit of GPU work outside slurm, from one `nvidia-smi` reading. A machine without
+    `nvidia-smi` has no card: no verdict, and the audit finds no GPU work."""
+    has_card = shutil.which("nvidia-smi") is not None
+    usage = gpu_jobs.gpu_usage() if has_card else {}
+    strays = audit.unregistered(usage) if usage is not None else []
+    out = []
+    if has_card:
+        leases = audit.lease_pids(gpu_jobs.LEASE_DIR, holding=True) if gpu_jobs.LEASE_DIR else {}
+        out += card_lines(queue, gpu_jobs.this_host(), usage, gpu_jobs.gpu_numbers("power.draw"), leases, strays)
+    return out + (audit.report(strays) if usage is not None else [])  # unknown is said once, by the card line
 
 
 def card_lines(queue: list[gpu_jobs.QueuedJob], here: str, usage: dict[int, float] | None, watts: list[float] | None,
                leases: dict[int, str], strays: list[audit.Stray]) -> list[str]:
     """This machine's card: FREE or HELD, and by whom. Held means a slurm job here holds a GPU or shards, a service
-    holds a GPU lease (the keeper's own lease stands for slurm's jobs, already counted), or a compute process belongs
+    holds a GPU lease, not merely waits for one (the keeper's own lease stands for slurm's jobs, already counted), or
+    a compute process belongs
     to neither. Never judged from nvidia-smi's GPU-Util, which reads about 96% on an idle GB10; the power draw and
     the compute processes are printed as the evidence."""
     if usage is None:

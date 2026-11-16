@@ -6,6 +6,7 @@ import getpass
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -152,6 +153,9 @@ def test_the_test_records_only_runs_that_reported_and_always_takes_the_cluster_d
     assert sr.test(loaded, R, T, SHA_T, run=fake) == 0
     runs = [(argv, env) for argv, env in fake.calls if "e2e" in argv and "--only" in argv]
     assert [argv[-1] for argv, _ in runs] == ["install,jobs", "install,upgrade"]  # every stage but upgrade and the host's card, then the upgrade
+    listed = subprocess.run([sys.executable, str(Path(sr.__file__).parents[1] / "tests/integration/e2e.py"), "--list"],
+                            capture_output=True, text=True, check=True).stdout.split()
+    assert sr.HOST_ONLY_STAGES <= set(listed)  # a renamed stage would run again in a job that cannot see the card
     assert runs[0][1]["GPUJOBS_TEST_IMAGE"] == sr.image(T) and runs[1][1]["GPUJOBS_TEST_IMAGE"] == sr.image(R)
     assert runs[1][1]["UPGRADE_TO"] == f"{T}:{SHA_T}" and runs[1][1]["SLURM_SHA256"] == SHA_R  # from the site's own pin
     assert fake.ran("run.sh down") and fake.ran("image rm") == [["docker", "image", "rm", "gpujobs-testcluster:slurm-25.05.9"]]
