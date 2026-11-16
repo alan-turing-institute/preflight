@@ -44,6 +44,9 @@ SERIES_WINDOW = 3
 #: A test that could not run (image build, compose) is tried again on later nights, this many times for one release.
 MAX_ATTEMPTS = 3
 TEST_NAME = "slurm-release-test"
+#: e2e stages that test this machine's own card, not a slurm release: the test runs as a CPU-only slurm job, which
+#: cannot see the card (`nvidia-smi`: "No devices were found", 2026-11-11).
+HOST_ONLY_STAGES = frozenset({"host"})
 #: The test cluster (tests/integration): its compose file, and one image per slurm release (`GPUJOBS_TEST_IMAGE`).
 COMPOSE = ("tests", "integration", "compose.yml")
 IMAGE_REPO = "gpujobs-testcluster"
@@ -245,7 +248,8 @@ def check(site: site_config.Site, *, run: Run = subprocess.run, fetch: Callable[
         return 0
     to = text_of(chosen.version)
     if (record := watch.record(to)) is not None:
-        print(f"{PREFIX} slurm {to} was tested from {record.source}: {'passed' if record.passed else 'FAILED'} ({record.log})")
+        again = "" if record.passed else f"; once its cause is fixed, move {watch.folder / f'{to}.json'} aside to test it again"
+        print(f"{PREFIX} slurm {to} was tested from {record.source}: {'passed' if record.passed else 'FAILED'} ({record.log}){again}")
         return 0
     queued = run(["squeue", "-h", "-u", cfg.test_user, "-o", "%j"], capture_output=True, text=True, check=False)
     if any(line.endswith(f":{TEST_NAME}") for line in (queued.stdout or "").split()):
@@ -282,7 +286,7 @@ def test(site: site_config.Site, source: str, to: str, sha256: str, *, run: Run 
     env = {**os.environ, "GPUJOBS_TEST_PROJECT": f"slurm-release-{to.replace('.', '-')}"}
     stages = run([sys.executable, str(here / "e2e.py"), "--list"], capture_output=True, text=True, check=False).stdout.split()
     runs = [({"SLURM_VERSION": to, "SLURM_SHA256": sha256, "GPUJOBS_TEST_IMAGE": image(to)},
-             ",".join(s for s in stages if s != "upgrade")),
+             ",".join(s for s in stages if s not in {"upgrade", *HOST_ONLY_STAGES})),
             ({"SLURM_VERSION": source, "SLURM_SHA256": site.slurm_build[1], "GPUJOBS_TEST_IMAGE": image(source),
               "UPGRADE_TO": f"{to}:{sha256}"}, "install,upgrade")]
 

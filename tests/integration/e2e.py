@@ -1913,8 +1913,10 @@ def stage_upgrade() -> None:
     old = submit("alice", "before-upgrade", 2)
     check("before: a job completes on the old slurm, so accounting has history to keep",
           bool(old) and wait_state(old, "COMPLETED", 60) and old in sh("sacct -X -n -P -S now-7days -o JobID").out.split(), f"job {old}")
-    waiting = submit("alice", "waits-through-upgrade", 2)  # a job still waiting is no reason to refuse; it must come through
-    sh(f"scontrol hold {waiting}")
+    # a job still waiting is no reason to refuse; it must come through. Held from submission: submitting and then
+    # holding let it start in between on 2026-11-11, and the upgrade then rightly refused a running job.
+    waiting = cl("sbatch", "--parsable", "--hold", "-J", "waits-through-upgrade", "--mem=200M", "-c", "1",
+                 "--wrap", "sleep 2", user="alice").out.strip().split(";")[0]
     before = sh("sinfo -V").text
     put(UPGRADE_SITE, with_slurm_pin(sh(f"cat {SITE}").out, *UPGRADE_TARGET, UPGRADE_STEPS))
     done = sh(f"{INSTALL} upgrade-slurm --site {UPGRADE_SITE}", timeout=UPGRADE_TIMEOUT_S)

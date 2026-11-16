@@ -139,6 +139,7 @@ def test_the_nightly_check_submits_one_test_sized_to_the_cluster(site: Path, cap
     assert sr.check(loaded, run=fake, fetch=lambda: listing) == 0 and len(fake.ran("submit.py")) == 1  # gave up on this one
     record(folder, T, passed=False)
     assert sr.check(loaded, run=fake, fetch=lambda: listing) == 0 and len(fake.ran("submit.py")) == 1  # a failure is not retried
+    assert f"move {folder / f'{T}.json'} aside to test it again" in capsys.readouterr().out  # the remedy is named
     assert sr.check(loaded, run=Fake(**{"sinfo": (0, f"slurm {T}\n")}), fetch=lambda: listing) == 0
     assert "is the newest this site follows" in capsys.readouterr().out.splitlines()[-1]
 
@@ -146,11 +147,11 @@ def test_the_nightly_check_submits_one_test_sized_to_the_cluster(site: Path, cap
 def test_the_test_records_only_runs_that_reported_and_always_takes_the_cluster_down(site: Path) -> None:
     loaded = site_config.load(site)
     folder = Path(loaded.slurm_release.records)
-    stages = "install\njobs\nupgrade\n"
+    stages = "install\njobs\nhost\nupgrade\n"
     fake = Fake(**{"e2e.py": (0, stages), "run.sh e2e": (0, "3 passed, 0 failed of 3 checks\n")})
     assert sr.test(loaded, R, T, SHA_T, run=fake) == 0
     runs = [(argv, env) for argv, env in fake.calls if "e2e" in argv and "--only" in argv]
-    assert [argv[-1] for argv, _ in runs] == ["install,jobs", "install,upgrade"]  # every stage but upgrade, then the upgrade
+    assert [argv[-1] for argv, _ in runs] == ["install,jobs", "install,upgrade"]  # every stage but upgrade and the host's card, then the upgrade
     assert runs[0][1]["GPUJOBS_TEST_IMAGE"] == sr.image(T) and runs[1][1]["GPUJOBS_TEST_IMAGE"] == sr.image(R)
     assert runs[1][1]["UPGRADE_TO"] == f"{T}:{SHA_T}" and runs[1][1]["SLURM_SHA256"] == SHA_R  # from the site's own pin
     assert fake.ran("run.sh down") and fake.ran("image rm") == [["docker", "image", "rm", "gpujobs-testcluster:slurm-25.05.9"]]
