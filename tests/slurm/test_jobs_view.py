@@ -106,7 +106,7 @@ def test_waiting_reason_sentences() -> None:
         "newest": "paused by root at 2026-10-20 12:40 UTC; resume: resume.py 300",
         "nobody": "paused; resume: resume.py 300",
         "admin": "held by an admin (requeue limit or admin hold)",
-        "urgent": "held since 2026-10-20 12:40 UTC while urgent work (timing: time 3 models) runs, so the jobs it "
+        "urgent": "held since 2026-10-20 12:40 UTC while urgent work (timing) runs, so the jobs it "
                   "pushed out start first; released automatically",
         "released": "held by an admin (requeue limit or admin hold)",  # an old urgent hold, released since
         "resources": "waiting for 1 GPU(s) / 104.9 GB memory to free",

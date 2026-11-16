@@ -348,7 +348,7 @@ def run(argv: list[str]) -> int:
             print(f"[urgent] held {held} until the pre-empted jobs {victims} run again")
             for held_id in held:
                 try:
-                    gpu_jobs.write_event(held_id, gpu_jobs.EventAction.URGENT_HOLD, urgent=f"{arguments.name}: {arguments.what}")
+                    gpu_jobs.write_event(held_id, gpu_jobs.EventAction.URGENT_HOLD, urgent=arguments.name)  # the name only: the page repeats it per held job
                 except OSError as error:  # the history only: the request above is what matters
                     print(f"[urgent] warning: job {held_id}'s history misses this hold ({error})", file=sys.stderr)
     for victim in cpu_victims:  # a `cpu` job resumes but slurm never pre-empts it (PreemptMode=OFF): requeue it here

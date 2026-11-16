@@ -433,7 +433,7 @@ def waiting_reason(
     if reason == Reason.HELD_ADMIN:
         holds = [e for e in events if e.job == job.job_id and e.action in _HOLD_ACTIONS]
         if holds and holds[-1].action == EventAction.URGENT_HOLD:
-            urgent = holds[-1].fields.get("urgent")
+            urgent = str(holds[-1].fields.get("urgent") or "").split(": ", 1)[0]  # older holds also carry its description
             work = f" ({urgent})" if urgent else ""
             return (f"held since {_when(holds[-1].at)} while urgent work{work} runs, so the jobs it pushed out start "
                     "first; released automatically")
