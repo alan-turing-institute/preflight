@@ -1,7 +1,8 @@
 """Pieces shared by `torch_upgrade.py` (one PyTorch upgrade, by hand) and `weekly.py` (every project, on a timer).
 
 Nothing here decides anything: running a command, listing a venv, putting hostguard into a venv, running a
-script under two venvs in ONE slurm job and comparing what it wrote. Stdlib only.
+script under two venvs in ONE slurm job (submitting it, watching the queue, cancelling it) and comparing what it
+wrote. Stdlib only.
 """
 
 from __future__ import annotations
@@ -46,7 +47,7 @@ def install_hostguard(venv: Path) -> None:
     run([sys.executable, str(HOSTGUARD / "install_pth.py"), str(venv)])
 
 
-def submit_and_wait(
+def submit(
     project: str,
     what: str,
     name: str,
@@ -58,7 +59,7 @@ def submit_and_wait(
     mem: str,
     cpus: int | None = None,
 ) -> str:
-    """Submit `bash -c command` as one slurm job (class restart: never pre-empted), wait, return the job id.
+    """Submit `bash -c command` as one slurm job (class restart: never pre-empted) and return its job id at once.
 
     The caller reads the files the command wrote: a job's exit state alone says nothing about what it measured.
     """
@@ -89,11 +90,39 @@ def submit_and_wait(
         "-c",
         command,
     ]
-    job = run(argv).split()[-1]
+    return run(argv).split()[-1]
+
+
+def submit_and_wait(*args, poll: float = 5.0, **kwargs) -> str:
+    """`submit`, then block in `slurm/wait.py` until the job ends; returns the job id (`torch_upgrade.py`, one job)."""
+    job = submit(*args, **kwargs)
     subprocess.run(
-        [sys.executable, str(SLURM / "wait.py"), job, "--poll", "5"], check=False
+        [sys.executable, str(SLURM / "wait.py"), job, "--poll", str(poll)], check=False
     )
     return job
+
+
+def queued_job_ids() -> set[str] | None:
+    """Ids of every job still in slurm's queue (pending, running or completing), or None when squeue does not answer.
+
+    None means "no information", never "all finished": a caller that read it as empty would collect results that
+    are not there yet.
+    """
+    done = subprocess.run(
+        ["squeue", "-h", "-o", "%i"], text=True, capture_output=True, check=False
+    )
+    return set(done.stdout.split()) if done.returncode == 0 else None
+
+
+def cancel(job: str, reason: str) -> bool:
+    """Cancel a job through `slurm/kill.py` (which records the kill with `reason`); False when slurm refused."""
+    done = subprocess.run(
+        [sys.executable, str(SLURM / "kill.py"), job, "--reason", reason],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    return done.returncode == 0
 
 
 def probe_legs(old: Path, new: Path, probe: str, out: Path) -> str:

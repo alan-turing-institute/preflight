@@ -3,15 +3,19 @@
 
 Policy: ~/.claude/software-upgrade-policy.md ("RULING 2026-10-29", "A project upgrade").
 
-    weekly.py run [--project NAME] [--dry-run]
+    weekly.py run [--project NAME] [--dry-run] [--deadline-hours H] [--poll-seconds S]
     weekly.py apply-held NAME          # apply a held upgrade's kept lock, its check skipped (owner 2026-10-29)
 
 Per project in `projects.toml` (see README.md): skip when a job of the project is queued or running, or when its
 uv.lock does not describe its venv; otherwise `uv lock --upgrade` in a scratch copy; build a side venv from the new lock;
 check it (numbers: the project's probe under the old and the new venv in ONE slurm job, applied only when every value is
 identical; tests: the project's fast test command in the side venv); then APPLY (commit uv.lock alone, `uv sync --frozen`,
-hostguard, restart the project's services) or HOLD (announced by `session_notice.py`; applied at the study boundary
-with `apply-held`, or cleared by the next run once a failing-tests hold is fixed in the project's code). Records:
+hostguard, restart the project's services), HOLD (announced by `session_notice.py`; applied at the study boundary
+with `apply-held`, or cleared by the next run once a failing-tests hold is fixed in the project's code) or DEFER
+(the check job had not finished by the run's deadline: cancelled, tried again next week).
+
+Every due project's check job is submitted first, then each project is applied or held as its own job leaves the queue,
+so one queued check delays only its own project. Records:
 ~/.local/state/upgrades/<name>.json and weekly.log (a dry run writes dry-run/<name>.json instead).
 
 A project that checks by `tests` keeps its PyTorch stack at the locked version: tests do not measure numbers or speed, so
@@ -28,11 +32,15 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
+import time
 import tomllib
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from enum import StrEnum
+from functools import partial
 from pathlib import Path
 
 import upgrade_common as common
@@ -41,6 +49,7 @@ REGISTRY = Path(__file__).resolve().parent / "projects.toml"
 STATE = Path.home() / ".local/state/upgrades"
 CACHE = Path.home() / "cache/upgrades"
 COMMIT_SUBJECT = "chore(deps): Weekly dependency upgrade"
+SECONDS_PER_HOUR = 3600  # a unit conversion
 # The PyTorch stack: torch pins its own CUDA libraries and Triton.
 STACK = re.compile(r"^(torch|torchvision|torchaudio|triton|nvidia-|cuda-)")
 
@@ -55,6 +64,7 @@ class Status(StrEnum):
     UP_TO_DATE = "up_to_date"
     APPLIED = "applied"
     HELD = "held"
+    DEFERRED = "deferred"  # the check job had not finished by the run's deadline: cancelled, next week
     WOULD_APPLY = "would_apply"  # a dry run whose check passed
     ERROR = "error"
 
@@ -465,11 +475,16 @@ def build_side_venv(project: Project, work: Path, venv: Path) -> None:
         common.install_hostguard(venv)
 
 
-def check_numbers(project: Project, venv: Path, scratch: Path) -> CheckResult:
-    out = scratch / "check"
+def check_dir(scratch: Path) -> Path:
+    return scratch / "check"
+
+
+def submit_numbers(project: Project, venv: Path, scratch: Path) -> str:
+    """Submit the probe under the old and the new venv as one slurm job; returns the job id."""
+    out = check_dir(scratch)
     shutil.rmtree(out, ignore_errors=True)
     out.mkdir(parents=True)
-    common.submit_and_wait(
+    return common.submit(
         project.name,
         f"weekly upgrade check (numbers): {project.name}",
         "weekly-upgrade-check",
@@ -480,6 +495,10 @@ def check_numbers(project: Project, venv: Path, scratch: Path) -> CheckResult:
         mem=project.mem,
         cpus=project.cpus,
     )
+
+
+def read_numbers(project: Project, scratch: Path) -> CheckResult:
+    out = check_dir(scratch)
     probes = common.read_probes(out)
     if probes is None:
         return CheckResult(
@@ -510,15 +529,16 @@ def check_numbers(project: Project, venv: Path, scratch: Path) -> CheckResult:
     )
 
 
-def check_tests(project: Project, venv: Path, scratch: Path) -> CheckResult:
-    out = scratch / "check"
+def submit_tests(project: Project, venv: Path, scratch: Path) -> str:
+    """Submit the project's test command in the side venv as one slurm job; returns the job id."""
+    out = check_dir(scratch)
     shutil.rmtree(out, ignore_errors=True)
     out.mkdir(parents=True)
     env = f"VIRTUAL_ENV={venv} PATH={venv}/bin:$PATH" + (
         "" if project.gpu else " CUDA_VISIBLE_DEVICES="
     )
     runner = f"{sys.executable} {Path(common.__file__)} timed {out} {project.path}"
-    common.submit_and_wait(
+    return common.submit(
         project.name,
         f"weekly upgrade check (tests): {project.name}",
         "weekly-upgrade-check",
@@ -529,6 +549,10 @@ def check_tests(project: Project, venv: Path, scratch: Path) -> CheckResult:
         mem=project.mem,
         cpus=project.cpus,
     )
+
+
+def read_tests(project: Project, scratch: Path) -> CheckResult:
+    out = check_dir(scratch)
     result = out / "result.json"
     if not result.exists():
         return CheckResult(
@@ -550,6 +574,11 @@ def check_tests(project: Project, venv: Path, scratch: Path) -> CheckResult:
         f"exit {data['returncode']} in {data['seconds']:.1f} s: {lines[-1] if lines else ''}"
         + (f"; {', '.join(failed[:3])}" if failed else ""),
     )
+
+
+# What each kind of check does: submit its one slurm job, then read what the job wrote.
+SUBMIT = {Check.NUMBERS: submit_numbers, Check.TESTS: submit_tests}
+READ = {Check.NUMBERS: read_numbers, Check.TESTS: read_tests}
 
 
 def apply(
@@ -611,10 +640,24 @@ def apply(
     return commit
 
 
-def process(
-    project: Project, *, dry_run: bool
-) -> tuple[Outcome, list[Change], CheckResult | None, str]:
-    """One project end to end; returns what to record."""
+Finished = tuple[Outcome, list[Change], CheckResult | None, str]  # what `record` takes
+
+
+@dataclass(frozen=True)
+class Submitted:
+    """A project whose check job is in the queue: all `finish` needs once the job has left it."""
+
+    project: Project
+    job: str
+    scratch: Path
+    venv: Path
+    changes: list[Change]
+    lock: LockState
+    before: str  # sha of uv.lock when the check was prepared
+
+
+def prepare(project: Project, *, dry_run: bool) -> Finished | Submitted:
+    """One project up to the moment its check job is submitted: a final outcome when no check is needed."""
     facts = {
         "running_jobs": [],
         "lock_problems": [],
@@ -669,25 +712,86 @@ def process(
     shutil.rmtree(venv, ignore_errors=True)
     try:
         build_side_venv(project, work, venv)
-        check = check_numbers if project.check is Check.NUMBERS else check_tests
-        result = check(project, venv, scratch)
-    finally:
+        job = SUBMIT[project.check](project, venv, scratch)
+    except BaseException:
         shutil.rmtree(venv, ignore_errors=True)
-    outcome = decide(**{**facts, "result": result})
+        raise
+    return Submitted(project, job, scratch, venv, changes, facts["lock"], before)
+
+
+def finish(submitted: Submitted, *, dry_run: bool) -> Finished:
+    """Read what a finished check job wrote and decide; applies the upgrade when the check passed."""
+    project = submitted.project
+    try:
+        result = READ[project.check](project, submitted.scratch)
+    finally:
+        shutil.rmtree(submitted.venv, ignore_errors=True)
+    outcome = decide(
+        running_jobs=[],
+        lock_problems=[],
+        changes=submitted.changes,
+        lock=submitted.lock,
+        result=result,
+        dry_run=dry_run,
+    )
     commit = ""
     if outcome.status is Status.APPLIED:
-        commit = apply(project, scratch / "uv.lock.new", changes, before, facts["lock"])
-    return outcome, changes, result, commit
+        commit = apply(
+            project,
+            submitted.scratch / "uv.lock.new",
+            submitted.changes,
+            submitted.before,
+            submitted.lock,
+        )
+    return outcome, submitted.changes, result, commit
+
+
+def defer(submitted: Submitted, why: str) -> Finished:
+    """Cancel a check job that must not keep waiting; the project is recorded as deferred to the next run."""
+    cancelled = common.cancel(submitted.job, f"weekly upgrade: {why}")
+    shutil.rmtree(submitted.venv, ignore_errors=True)
+    note = (
+        f"job {submitted.job} cancelled"
+        if cancelled
+        else f"cancelling job {submitted.job} failed, it may still run"
+    )
+    return (
+        Outcome(Status.DEFERRED, f"{why}; {note}; the next weekly run tries again"),
+        submitted.changes,
+        None,
+        "",
+    )
+
+
+def errored(error: Exception) -> Finished:
+    if isinstance(error, subprocess.CalledProcessError):
+        tail = (error.stderr or "").strip().splitlines()[-3:]
+        reason = f"{' '.join(map(str, error.cmd))[:120]} failed: {' | '.join(tail)}"
+    else:
+        reason = repr(error)
+    return Outcome(Status.ERROR, reason), [], None, ""
+
+
+def attempt(step: Callable[[], Finished | Submitted]) -> Finished | Submitted:
+    """`step()`, with one project's failure turned into an ERROR outcome so it cannot stop the others."""
+    try:
+        return step()
+    except Exception as error:  # noqa: BLE001 - one project's failure must not stop the others
+        return errored(error)
 
 
 def keeps_record(existing: dict | None, new: Status, now: dt.datetime) -> bool:
-    """A quiet outcome (nothing to upgrade, or skipped for now) must not erase what `session_notice.py` still announces:
+    """A quiet outcome (nothing to upgrade, or skipped or deferred for now) must not erase what `session_notice.py` still announces:
     a hold, or an upgrade applied within the last week."""
-    if existing is None or new not in (Status.UP_TO_DATE, Status.SKIPPED):
+    if existing is None or new not in (
+        Status.UP_TO_DATE,
+        Status.SKIPPED,
+        Status.DEFERRED,
+    ):
         return False
     if existing.get("status") == Status.HELD:
         return (
-            new is Status.SKIPPED
+            new is not Status.UP_TO_DATE
         )  # up to date means someone applied it by hand: the hold is over
     if existing.get("status") == Status.APPLIED:
         return now - dt.datetime.fromisoformat(existing["date"]) <= dt.timedelta(days=7)
@@ -826,7 +930,55 @@ def all_projects() -> list[Project]:
     return projects + found
 
 
-def run_all(names: list[str], *, dry_run: bool) -> int:
+def abandon(waiting: list[Submitted], *, dry_run: bool) -> None:
+    """Cancel every check job still waiting and record its project as deferred: no check outlives the run."""
+    for submitted in waiting:
+        outcome = defer(submitted, "the run was stopped before the check finished")
+        record(submitted.project, *outcome, dry_run=dry_run)
+
+
+def conclude(submitted: Submitted, *, done: bool, dry_run: bool) -> Finished:
+    """A check job that has left the queue is read; one that has not, at the deadline, is deferred."""
+    if done:
+        return finish(submitted, dry_run=dry_run)
+    return defer(submitted, "the check job had not finished by the run's deadline")
+
+
+def settle(
+    waiting: list[Submitted],
+    *,
+    dry_run: bool,
+    deadline_at: float,
+    poll_seconds: float,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> None:
+    """Apply or hold each project as its own check job leaves the queue; a job still queued at `deadline_at` is
+    cancelled and its project recorded as deferred. An error or stop signal abandons the jobs still waiting."""
+    waiting = list(waiting)
+    try:
+        while waiting:
+            queued = common.queued_job_ids()
+            past = clock() >= deadline_at
+            for submitted in list(waiting):
+                done = queued is not None and submitted.job not in queued
+                if not (done or past):
+                    continue
+                waiting.remove(submitted)
+                outcome = attempt(
+                    partial(conclude, submitted, done=done, dry_run=dry_run)
+                )
+                record(submitted.project, *outcome, dry_run=dry_run)
+            if waiting:
+                sleep(poll_seconds)
+    except BaseException:
+        abandon(waiting, dry_run=dry_run)
+        raise
+
+
+def run_all(
+    names: list[str], *, dry_run: bool, deadline_hours: float, poll_seconds: float
+) -> int:
     projects = all_projects()
     if names:
         unknown = set(names) - {p.name for p in projects}
@@ -839,32 +991,28 @@ def run_all(names: list[str], *, dry_run: bool) -> int:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             sys.exit("another weekly upgrade is running")
-        for project in projects:
-            try:
-                outcome, changes, result, commit = process(project, dry_run=dry_run)
-            except subprocess.CalledProcessError as error:
-                tail = (error.stderr or "").strip().splitlines()[-3:]
-                outcome, changes, result, commit = (
-                    Outcome(
-                        Status.ERROR,
-                        f"{' '.join(map(str, error.cmd))[:120]} failed: {' | '.join(tail)}",
-                    ),
-                    [],
-                    None,
-                    "",
-                )
-            except Exception as error:  # noqa: BLE001 - one project's failure must not stop the others
-                outcome, changes, result, commit = (
-                    Outcome(Status.ERROR, repr(error)),
-                    [],
-                    None,
-                    "",
-                )
-            record(project, outcome, changes, result, commit, dry_run=dry_run)
+        deadline_at = time.monotonic() + deadline_hours * SECONDS_PER_HOUR
+        waiting: list[Submitted] = []
+        try:
+            for project in projects:
+                prepared = attempt(lambda p=project: prepare(p, dry_run=dry_run))
+                if isinstance(prepared, Submitted):
+                    waiting.append(prepared)
+                else:
+                    record(project, *prepared, dry_run=dry_run)
+        except BaseException:
+            abandon(waiting, dry_run=dry_run)
+            raise
+        settle(
+            waiting,
+            dry_run=dry_run,
+            deadline_at=deadline_at,
+            poll_seconds=poll_seconds,
+        )
     return 0
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("run")
@@ -879,14 +1027,45 @@ def main() -> None:
         action="store_true",
         help="check, record under dry-run/, apply nothing",
     )
+    r.add_argument(
+        "--deadline-hours",
+        type=float,
+        default=3.0,
+        help="the run stops waiting this long after it starts (preparing every project counts); a check job still "
+        "queued then is cancelled and its project deferred to the next run. The systemd unit's TimeoutStartSec must "
+        "exceed it",
+    )
+    r.add_argument(
+        "--poll-seconds",
+        type=float,
+        default=30.0,
+        help="how often the queue is read while checks run",
+    )
     h = sub.add_parser(
         "apply-held", help="apply a held upgrade's kept lock without its check"
     )
     h.add_argument("name")
-    args = ap.parse_args()
+    return ap
+
+
+def stop_on_terminate() -> None:
+    """A SIGTERM (systemd's start timeout, `systemctl stop`) unwinds like an error, so waiting check jobs are cancelled."""
+    signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(128 + signum))
+
+
+def main() -> None:
+    args = build_parser().parse_args()
     if args.cmd == "apply-held":
         sys.exit(apply_held(args.name))
-    sys.exit(run_all(args.project, dry_run=args.dry_run))
+    stop_on_terminate()
+    sys.exit(
+        run_all(
+            args.project,
+            dry_run=args.dry_run,
+            deadline_hours=args.deadline_hours,
+            poll_seconds=args.poll_seconds,
+        )
+    )
 
 
 if __name__ == "__main__":

@@ -3,7 +3,9 @@ Description=Weekly dependency upgrade of every uv project (preflight/upgrade, ow
 
 [Service]
 Type=oneshot
-# Checks go through slurm (submit.py); this process only waits. A tests check is seconds, a numbers check one short GPU job.
+# Checks go through slurm (submit.py); this process submits them all, then applies each as its job ends. A tests check is
+# seconds, a numbers check one short GPU job. The run stops waiting after --deadline-hours (default 3) and cancels what is
+# still queued, so TimeoutStartSec below must stay above it: systemd must not kill the run before its own deadline handling.
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=/usr/bin/python3 %h/dev/turing/preflight/upgrade/weekly.py run
 # Idle priority: it never competes with the work it is upgrading.

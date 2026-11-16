@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import shlex
 import subprocess
+from collections.abc import Iterable
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -362,6 +364,10 @@ def test_a_quiet_week_does_not_erase_a_hold_or_a_recent_apply() -> None:
     )  # applied by hand: the hold is over
     assert not keeps({"status": "applied", "date": recent}, Status.HELD, now)
     assert not keeps(None, Status.UP_TO_DATE, now)
+    assert keeps(
+        {"status": "held", "date": old}, Status.DEFERRED, now
+    )  # a late check changes no standing notice
+    assert keeps({"status": "applied", "date": recent}, Status.DEFERRED, now)
 
 
 def test_record_writes_the_state_file_and_a_quiet_run_leaves_an_apply_standing(
@@ -509,3 +515,154 @@ def test_apply_held_refuses_what_a_check_must_settle_and_applies_a_kept_lock(
         "abc1234",
     ) and "check skipped" in kept["reason"]
     assert weekly.apply_held("p") == 1  # applied: nothing is held any more
+
+
+# ---- every check job is submitted first; each project settles on its own -----------------------------
+
+
+def submitted(
+    tmp_path: Path, name: str, job: str, *, tests_pass: bool = True
+) -> weekly.Submitted:
+    """A project whose tests job is queued; the job's result file is already on disk, as when it has run."""
+    scratch = tmp_path / "cache" / name
+    (scratch / "check").mkdir(parents=True)
+    (scratch / "check/result.json").write_text(
+        json.dumps({"returncode": 0 if tests_pass else 1, "seconds": 2.0})
+    )
+    (scratch / "venv").mkdir()
+    project = weekly.Project(name, tmp_path / name, Check.TESTS, "c")
+    return weekly.Submitted(
+        project, job, scratch, scratch / "venv", CHANGES, weekly.LockState.CLEAN, "sha"
+    )
+
+
+class Clock:
+    """Time that only moves when `settle` sleeps: one second per poll."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def settle_with(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    waiting: list[weekly.Submitted],
+    polls: Iterable[set[str] | None],
+    clock: Clock,
+    *,
+    deadline_at: float,
+    sleep=None,
+) -> list[str]:
+    """Run `settle` against a scripted queue (one entry per poll, then the last one forever); returns the events."""
+    events: list[str] = []
+    script = iter(polls)
+    last: list[set[str] | None] = [set()]
+
+    def queue() -> set[str] | None:
+        last[0] = next(script, last[0])
+        return last[0]
+
+    monkeypatch.setattr(weekly, "STATE", tmp_path / "state")
+    (tmp_path / "state").mkdir()
+    monkeypatch.setattr(upgrade_common, "queued_job_ids", queue)
+    monkeypatch.setattr(
+        upgrade_common,
+        "cancel",
+        lambda job, reason: events.append(f"cancel {job} t={clock()}") or True,
+    )
+    monkeypatch.setattr(
+        weekly,
+        "apply",
+        lambda project, *a: (
+            events.append(f"apply {project.name} t={clock()}") or "abc1234"
+        ),
+    )
+    weekly.settle(
+        waiting,
+        dry_run=False,
+        deadline_at=deadline_at,
+        poll_seconds=1.0,
+        clock=clock,
+        sleep=sleep or clock.sleep,
+    )
+    return events
+
+
+def state_of(tmp_path: Path, name: str) -> dict:
+    return json.loads((tmp_path / "state" / f"{name}.json").read_text())
+
+
+def test_a_queued_check_does_not_hold_back_another_projects_result_and_one_past_the_deadline_is_deferred(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    slow, quick = submitted(tmp_path, "slow", "11"), submitted(tmp_path, "quick", "12")
+    clock = Clock()
+    # t=0: squeue does not answer (nobody is finished); t=1: both queued; t=2: 12 has left the queue, 11 never does.
+    events = settle_with(
+        monkeypatch,
+        tmp_path,
+        [slow, quick],
+        [None, {"11", "12"}, {"11"}],
+        clock,
+        deadline_at=4.0,
+    )
+    assert events == [
+        "apply quick t=2.0",
+        "cancel 11 t=4.0",
+    ]  # applied while 11 was still queued; 11 cancelled at the deadline
+    assert state_of(tmp_path, "quick")["status"] == Status.APPLIED
+    deferred = state_of(tmp_path, "slow")
+    assert deferred["status"] == Status.DEFERRED
+    assert "deadline" in deferred["reason"] and "job 11 cancelled" in deferred["reason"]
+    assert "slow deferred" in (tmp_path / "state/weekly.log").read_text()
+    assert (
+        not slow.venv.exists() and not quick.venv.exists()
+    )  # the side venvs are removed either way
+
+
+def test_a_run_that_stops_early_cancels_the_checks_still_waiting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    waiting = submitted(tmp_path, "p", "21")
+
+    def stopped(seconds: float) -> None:
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        settle_with(
+            monkeypatch,
+            tmp_path,
+            [waiting],
+            [{"21"}],
+            Clock(),
+            deadline_at=100.0,
+            sleep=stopped,
+        )
+    assert state_of(tmp_path, "p")["status"] == Status.DEFERRED
+    assert (
+        "stopped" in state_of(tmp_path, "p")["reason"]
+        and "job 21 cancelled" in state_of(tmp_path, "p")["reason"]
+    )
+
+
+def test_the_unit_outlasts_the_deadline_it_is_started_with() -> None:
+    unit = (
+        Path(weekly.__file__).parent / "install/project-upgrades.service"
+    ).read_text()
+    lines = dict(
+        line.split("=", 1)
+        for line in unit.splitlines()
+        if "=" in line and not line.startswith("#")
+    )
+    hours = float(lines["TimeoutStartSec"].removesuffix("h"))
+    argv = shlex.split(lines["ExecStart"])[
+        1:
+    ]  # drop the interpreter; the rest parses as weekly.py's own
+    args = weekly.build_parser().parse_args(argv[1:])
+    assert hours > args.deadline_hours

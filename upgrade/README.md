@@ -4,10 +4,10 @@ Dependency upgrades for the uv projects on this machine.
 
 | File | What it does |
 |---|---|
-| `weekly.py` | `run [--project NAME] [--dry-run]`: the weekly upgrade of every project in `projects.toml` |
+| `weekly.py` | `run [--project NAME] [--dry-run] [--deadline-hours H] [--poll-seconds S]`: the weekly upgrade of every project in `projects.toml` |
 | `session_notice.py` | one line at session start when the project under the working directory has an upgrade held or just applied |
 | `torch_upgrade.py` | by hand: `build` a side venv with a new PyTorch stack, `check` it on the GPU (one project, one PyTorch move) |
-| `upgrade_common.py` | what the two share: `run`, `freeze`, hostguard, one slurm job for a check, probe comparison |
+| `upgrade_common.py` | what the two share: `run`, `freeze`, hostguard, one slurm job for a check (submit, queue, cancel), probe comparison |
 | `projects.example.toml` | the registry format; copy it to `projects.toml` (local to the machine, not tracked) and list your projects |
 | `install/` | the systemd user service and timer (Sunday 05:00, `Persistent=true`) |
 
@@ -20,6 +20,14 @@ in `~/cache/upgrades/<name>/` (the scratch lock stays), a side venv from the new
 * `numbers`: the probe under the old and the new venv in ONE slurm job; applied only when every value is identical.
 * `tests`: the registry's fast test command in the side venv, through slurm without a GPU; applied when it passes.
 
+Every due project is prepared first and its check job submitted at once; each project is then applied or held as its
+own job leaves the queue, so a check stuck in the queue delays only its own project. The run waits for the checks until
+`--deadline-hours` after it started (default 3, preparing the projects counts; the queue is read every `--poll-seconds`,
+default 30). A check still queued then is cancelled (`slurm/kill.py`) and its project is DEFERRED: the log and the state
+file say `deferred` with the reason and the job id, nothing is applied, and the next weekly run tries again. A run that is
+stopped early (an error, SIGTERM) cancels the checks still waiting and defers their projects the same way. The unit's
+`TimeoutStartSec` (4 h) must stay above the deadline by the time the last results take to apply; `tests/upgrade` checks it.
+
 Pass: commit `uv.lock` alone (`chore(deps): Weekly dependency upgrade`, never pushed), `uv sync --frozen`, hostguard,
 restart the project's active services. Anything else is HELD (numbers moved, tests failed, `uv.lock` has uncommitted
 changes, the lock changed while the check ran) and announced by `session_notice.py`. At the study boundary,
@@ -28,7 +36,10 @@ refuses a hold whose tests failed (fix the code, then `weekly.py run --project N
 lock that moved since the hold, and a venv the lock no longer describes. A `tests` project keeps its PyTorch stack at the
 locked version, because tests do not measure numbers or speed.
 
-State: `~/.local/state/upgrades/<name>.json` and `weekly.log`; a dry run writes `dry-run/<name>.json`.
+State: `~/.local/state/upgrades/<name>.json` and `weekly.log`; a dry run writes `dry-run/<name>.json`. The status is
+`applied`, `held`, `deferred`, `skipped`, `up_to_date` or `error`. A `skipped` or `deferred` week leaves a standing
+hold or a recent apply in the file (`session_notice.py` keeps announcing it); a `deferred` one is not announced itself,
+since the next run simply tries again.
 
 ## Probe contract (`check = "numbers"`)
 
